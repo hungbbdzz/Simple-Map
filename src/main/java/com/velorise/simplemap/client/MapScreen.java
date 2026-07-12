@@ -216,9 +216,9 @@ public class MapScreen extends Screen {
 
         int highestY;
         if (isNether) {
-            highestY = 120;
+            highestY = 65;
             boolean foundAir = false;
-            for (int y = 120; y >= minBuildHeight; y--) {
+            for (int y = 65; y >= minBuildHeight; y--) {
                 pos.setY(y);
                 net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
                 if (!foundAir) {
@@ -401,15 +401,15 @@ public class MapScreen extends Screen {
                                 targetY = info.y + 1;
                             } else {
                                 if (isNether) {
-                                    targetY = 64; // Safe middle height in Nether
+                                    targetY = 65; // Safe middle height in Nether
                                 } else {
                                     int surfaceY = this.minecraft.level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, tpX, tpZ);
                                     targetY = surfaceY > minBuildHeight ? surfaceY + 1 : 100;
                                 }
                             }
                         } else {
-                            // Unloaded chunk: Teleport to a reasonable default height (100 in Overworld, 64 in Nether)
-                            targetY = isNether ? 64 : 100;
+                            // Unloaded chunk: Teleport to a reasonable default height (100 in Overworld, 65 in Nether)
+                            targetY = isNether ? 65 : 100;
                         }
 
                         // Execute command using connection.sendCommand (WITHOUT leading slash) in 1.19+
