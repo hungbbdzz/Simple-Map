@@ -19,6 +19,9 @@ Simple Map is designed to fit seamlessly into the base game without bloated UIs 
 
 ### Minimap HUD
 - Always-on minimap overlay during gameplay (top-right by default, draggable)
+- **Two shapes (toggle in settings):**
+  - **Circular Shape (Default):** Premium circular layout with sleek border ring and rotating compass directions (N, E, S, W) for intuitive navigation. North is highlighted in red.
+  - **Square Shape:** Sleek rectangular layout with scaling borders.
 - Two rotation modes (toggle in settings):
   - Rotate map: minimap spins, player icon always faces up
   - Rotate icon: map stays North-up, player icon rotates
