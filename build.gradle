@@ -1,0 +1,81 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.78'
+    id 'idea'
+}
+
+version = mod_version
+group = mod_group_id
+
+sourceSets.main.resources {
+    srcDir('src/generated/resources')
+    exclude("**/*.bbmodel")
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+base {
+    archivesName = "${mod_id}-1.21.1-neoforge"
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+neoForge {
+    version = project.neo_version
+
+    parchment {
+        mappingsVersion = project.parchment_mappings_version
+        minecraftVersion = project.parchment_minecraft_version
+    }
+
+    runs {
+        client {
+            client()
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        server {
+            server()
+            programArgument '--nogui'
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+    }
+
+    mods {
+        "${project.mod_id}" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+tasks.withType(ProcessResources).configureEach {
+    var replaceProperties = [
+        minecraft_version      : minecraft_version,
+        minecraft_version_range: minecraft_version_range,
+        neo_version            : neo_version,
+        neo_version_range      : neo_version_range,
+        loader_version_range   : loader_version_range,
+        mod_id                 : mod_id,
+        mod_name               : mod_name,
+        mod_license            : mod_license,
+        mod_version            : mod_version,
+        mod_authors            : mod_authors,
+        mod_description        : mod_description
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+dependencies {
+}
+
+jar {
+    destinationDirectory = file("../mods")
+}
