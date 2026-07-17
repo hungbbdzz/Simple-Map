@@ -37,7 +37,6 @@ neoForge {
             client()
             systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
         }
-
         server {
             server()
             programArgument '--nogui'
@@ -67,7 +66,6 @@ tasks.withType(ProcessResources).configureEach {
         mod_description        : mod_description
     ]
     inputs.properties replaceProperties
-
     filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
         expand replaceProperties
     }

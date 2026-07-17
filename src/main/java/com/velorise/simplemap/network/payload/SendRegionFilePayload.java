@@ -11,17 +11,17 @@ public record SendRegionFilePayload(String bookId, String regionName, byte[] dat
 
     public static final StreamCodec<FriendlyByteBuf, SendRegionFilePayload> STREAM_CODEC = StreamCodec.of(
             (buf, val) -> {
-                buf.writeUtf(val.bookId);
-                buf.writeUtf(val.regionName);
+                buf.writeUtf(val.bookId, 36);
+                buf.writeUtf(val.regionName, 48);
                 buf.writeByteArray(val.data);
                 buf.writeInt(val.currentIdx);
                 buf.writeInt(val.totalCount);
                 buf.writeBoolean(val.mainHand);
             },
             buf -> new SendRegionFilePayload(
-                    buf.readUtf(),
-                    buf.readUtf(),
-                    buf.readByteArray(),
+                    buf.readUtf(36),
+                    buf.readUtf(48),
+                    buf.readByteArray(4194304), // Bounded to 4MB; canonical .smdat is normally much smaller
                     buf.readInt(),
                     buf.readInt(),
                     buf.readBoolean()

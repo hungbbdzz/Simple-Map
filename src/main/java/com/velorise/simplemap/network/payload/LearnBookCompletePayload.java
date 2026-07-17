@@ -10,8 +10,8 @@ public record LearnBookCompletePayload(String bookId) implements CustomPacketPay
     public static final Type<LearnBookCompletePayload> TYPE = new Type<>(ResourceLocation.fromNamespaceAndPath(SimpleMap.MODID, "learn_book_complete"));
 
     public static final StreamCodec<FriendlyByteBuf, LearnBookCompletePayload> STREAM_CODEC = StreamCodec.of(
-            (buf, val) -> buf.writeUtf(val.bookId),
-            buf -> new LearnBookCompletePayload(buf.readUtf())
+            (buf, val) -> buf.writeUtf(val.bookId, 36),
+            buf -> new LearnBookCompletePayload(buf.readUtf(36))
     );
 
     @Override
