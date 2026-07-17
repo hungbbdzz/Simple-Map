@@ -10,8 +10,8 @@ public record SaveBookCompletePayload(String bookId) implements CustomPacketPayl
     public static final Type<SaveBookCompletePayload> TYPE = new Type<>(ResourceLocation.fromNamespaceAndPath(SimpleMap.MODID, "save_book_complete"));
 
     public static final StreamCodec<FriendlyByteBuf, SaveBookCompletePayload> STREAM_CODEC = StreamCodec.of(
-            (buf, val) -> buf.writeUtf(val.bookId),
-            buf -> new SaveBookCompletePayload(buf.readUtf())
+            (buf, val) -> buf.writeUtf(val.bookId, 36),
+            buf -> new SaveBookCompletePayload(buf.readUtf(36))
     );
 
     @Override

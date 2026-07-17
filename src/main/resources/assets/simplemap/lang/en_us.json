@@ -1,4 +1,27 @@
 {
   "item.simplemap.empty_book_map": "Empty Map Book",
-  "item.simplemap.book_map": "Learned Map Book"
+  "item.simplemap.book_map": "Learned Map Book",
+  "key.categories.simplemap": "Simple Map",
+  "key.simplemap.open_map": "Open Full Map",
+  "key.simplemap.toggle_minimap": "Toggle Minimap",
+  "key.simplemap.toggle_north_lock": "Toggle North Lock",
+  "key.simplemap.zoom_in": "Zoom Map In",
+  "key.simplemap.zoom_out": "Zoom Map Out",
+  "key.simplemap.reset_zoom": "Reset Minimap Zoom",
+  "key.simplemap.add_waypoint": "Add Waypoint Here",
+  "key.simplemap.toggle_waypoints": "Toggle Waypoints",
+  "key.simplemap.toggle_coordinates": "Toggle Coordinates",
+  "key.simplemap.cycle_cave_mode": "Cycle Cave View",
+  "key.simplemap.cycle_night_mode": "Cycle Map Brightness",
+  "key.simplemap.toggle_shape": "Toggle Minimap Shape",
+  "key.simplemap.toggle_screen_visibility": "Toggle Minimap in Menus",
+  "key.simplemap.toggle_fast_loading": "Toggle Fast Full-Map Loading",
+  "key.simplemap.open_settings": "Open Simple Map Settings",
+  "key.simplemap.refresh_map": "Refresh Visible Map",
+  "key.simplemap.clear_pin": "Clear Navigation Pin",
+  "key.simplemap.toggle_compass": "Toggle Compass Letters",
+  "key.simplemap.toggle_cursor_biome": "Toggle Cursor Biome",
+  "key.simplemap.cycle_color_mode": "Cycle Map Color Mode",
+  "key.simplemap.cycle_terrain_mode": "Cycle Terrain Relief",
+  "key.simplemap.center_full_map": "Center Full Map on Player"
 }

@@ -1,24 +1,26 @@
 package com.velorise.simplemap.network;
 
-import com.mojang.blaze3d.platform.NativeImage;
 import com.velorise.simplemap.ModItems;
-import com.velorise.simplemap.SimpleMap;
-import com.velorise.simplemap.client.MapConfig;
-import com.velorise.simplemap.client.MapManager;
-import com.velorise.simplemap.client.MapTextureManager;
-import com.velorise.simplemap.network.payload.*;
-import net.minecraft.client.Minecraft;
+import com.velorise.simplemap.client.RegionDataStore;
+import com.velorise.simplemap.network.payload.AckLearnRegionPayload;
+import com.velorise.simplemap.network.payload.InitSaveBookPayload;
+import com.velorise.simplemap.network.payload.LearnBookCompletePayload;
+import com.velorise.simplemap.network.payload.RequestLearnBookPayload;
+import com.velorise.simplemap.network.payload.RequestRegionFilePayload;
+import com.velorise.simplemap.network.payload.SaveBookCompletePayload;
+import com.velorise.simplemap.network.payload.SendLearnRegionPayload;
+import com.velorise.simplemap.network.payload.SendRegionFilePayload;
+import com.velorise.simplemap.network.payload.SyncConfigPayload;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
-import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.CustomData;
 import net.minecraft.world.level.storage.LevelResource;
-import net.neoforged.api.distmarker.Dist;
-import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.neoforge.network.PacketDistributor;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.handling.IPayloadContext;
@@ -26,433 +28,607 @@ import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.ByteArrayInputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-public class NetworkHandler {
+/** Map-book transport with bounded sessions and palette-safe {@code .smdat} merging. */
+public final class NetworkHandler {
     private static final Logger LOGGER = LogManager.getLogger();
+    private static final int MAX_REGIONS_PER_BOOK = 4096;
+    static final int MAX_REGION_FILE_BYTES = 4 * 1024 * 1024;
+    private static final long SESSION_TIMEOUT_MS = 2 * 60 * 1000L;
+    /** Protocol 4 separates the client-only map core from the optional server extension. */
+    public static final String PROTOCOL_VERSION = "5";
 
-    // Server-side active saving sessions
-    private static final Map<String, SavingSession> activeSavingSessions = new ConcurrentHashMap<>();
-    
-    // Server-side active learning sessions
-    private static final Map<String, LearningSession> activeLearningSessions = new ConcurrentHashMap<>();
+    static final ExecutorService BOOK_IO_POOL = Executors.newFixedThreadPool(2, runnable -> {
+        Thread thread = new Thread(runnable, "SimpleMap-BookIO");
+        thread.setDaemon(true);
+        thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
+        return thread;
+    });
+
+    private static final Map<String, SavingSession> ACTIVE_SAVES = new ConcurrentHashMap<>();
+    private static final Map<String, LearningSession> ACTIVE_LEARNS = new ConcurrentHashMap<>();
+
+    private NetworkHandler() {
+    }
 
     public static void register(RegisterPayloadHandlersEvent event) {
-        final PayloadRegistrar registrar = event.registrar("1");
-
-        // 1. Sync Config (Server -> Client)
-        registrar.playToClient(
-                SyncConfigPayload.TYPE,
-                SyncConfigPayload.STREAM_CODEC,
-                NetworkHandler::handleSyncConfigOnClient
-        );
-
-        // 2. Init Save Book (Client -> Server)
-        registrar.playToServer(
-                InitSaveBookPayload.TYPE,
-                InitSaveBookPayload.STREAM_CODEC,
-                NetworkHandler::handleInitSaveBookOnServer
-        );
-
-        // 3. Request Region File (Server -> Client)
-        registrar.playToClient(
-                RequestRegionFilePayload.TYPE,
-                RequestRegionFilePayload.STREAM_CODEC,
-                NetworkHandler::handleRequestRegionFileOnClient
-        );
-
-        // 4. Send Region File (Client -> Server)
-        registrar.playToServer(
-                SendRegionFilePayload.TYPE,
-                SendRegionFilePayload.STREAM_CODEC,
-                NetworkHandler::handleSendRegionFileOnServer
-        );
-
-        // 5. Save Book Complete (Server -> Client)
-        registrar.playToClient(
-                SaveBookCompletePayload.TYPE,
-                SaveBookCompletePayload.STREAM_CODEC,
-                NetworkHandler::handleSaveBookCompleteOnClient
-        );
-
-        // 6. Request Learn Book (Client -> Server)
-        registrar.playToServer(
-                RequestLearnBookPayload.TYPE,
-                RequestLearnBookPayload.STREAM_CODEC,
-                NetworkHandler::handleRequestLearnBookOnServer
-        );
-
-        // 7. Send Learn Region (Server -> Client)
-        registrar.playToClient(
-                SendLearnRegionPayload.TYPE,
-                SendLearnRegionPayload.STREAM_CODEC,
-                NetworkHandler::handleSendLearnRegionOnClient
-        );
-
-        // 8. Learn Book Complete (Server -> Client)
-        registrar.playToClient(
-                LearnBookCompletePayload.TYPE,
-                LearnBookCompletePayload.STREAM_CODEC,
-                NetworkHandler::handleLearnBookCompleteOnClient
-        );
-
-        // 9. Ack Learn Region (Client -> Server)
-        registrar.playToServer(
-                AckLearnRegionPayload.TYPE,
-                AckLearnRegionPayload.STREAM_CODEC,
-                NetworkHandler::handleAckLearnRegionOnServer
-        );
+        // Public servers are allowed to omit Simple Map entirely. Map Book/config
+        // packets become available only when the remote side advertises the channel.
+        PayloadRegistrar registrar = event.registrar(PROTOCOL_VERSION).optional();
+        registrar.playToClient(SyncConfigPayload.TYPE, SyncConfigPayload.STREAM_CODEC,
+                NetworkHandler::handleSyncConfigOnClient);
+        registrar.playToServer(InitSaveBookPayload.TYPE, InitSaveBookPayload.STREAM_CODEC,
+                NetworkHandler::handleInitSaveBookOnServer);
+        registrar.playToClient(RequestRegionFilePayload.TYPE, RequestRegionFilePayload.STREAM_CODEC,
+                NetworkHandler::handleRequestRegionFileOnClient);
+        registrar.playToServer(SendRegionFilePayload.TYPE, SendRegionFilePayload.STREAM_CODEC,
+                NetworkHandler::handleSendRegionFileOnServer);
+        registrar.playToClient(SaveBookCompletePayload.TYPE, SaveBookCompletePayload.STREAM_CODEC,
+                NetworkHandler::handleSaveBookCompleteOnClient);
+        registrar.playToServer(RequestLearnBookPayload.TYPE, RequestLearnBookPayload.STREAM_CODEC,
+                NetworkHandler::handleRequestLearnBookOnServer);
+        registrar.playToClient(SendLearnRegionPayload.TYPE, SendLearnRegionPayload.STREAM_CODEC,
+                NetworkHandler::handleSendLearnRegionOnClient);
+        registrar.playToClient(LearnBookCompletePayload.TYPE, LearnBookCompletePayload.STREAM_CODEC,
+                NetworkHandler::handleLearnBookCompleteOnClient);
+        registrar.playToServer(AckLearnRegionPayload.TYPE, AckLearnRegionPayload.STREAM_CODEC,
+                NetworkHandler::handleAckLearnRegionOnServer);
     }
 
-    public static void sendToServer(CustomPacketPayload payload) {
-        PacketDistributor.sendToServer(payload);
-    }
-
-    public static void sendToPlayer(ServerPlayer player, CustomPacketPayload payload) {
+    /** Server-side counterpart; silently skips clients without the optional channel. */
+    public static boolean sendToPlayer(ServerPlayer player, CustomPacketPayload payload) {
+        if (player == null || player.connection == null || payload == null
+                || !player.connection.hasChannel(payload)) return false;
         PacketDistributor.sendToPlayer(player, payload);
+        return true;
     }
-
-    // =========================================================================
-    // HANDLERS
-    // =========================================================================
 
     private static void handleSyncConfigOnClient(SyncConfigPayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            MapConfig.serverRequireMapBook = payload.requireMapBook();
-            LOGGER.info("SimpleMap synced requireMapBook config from server: {}", payload.requireMapBook());
-        });
+        ClientPayloadHooks.handleSyncConfig(payload, context);
     }
 
     private static void handleInitSaveBookOnServer(InitSaveBookPayload payload, IPayloadContext context) {
         context.enqueueWork(() -> {
-            Player player = context.player();
-            if (!(player instanceof ServerPlayer serverPlayer)) return;
+            if (!(context.player() instanceof ServerPlayer player)) return;
+            cleanupExpiredSessions();
+            ACTIVE_SAVES.entrySet().removeIf(entry -> entry.getValue().playerId.equals(player.getUUID()));
 
-            // Enforce item cooldown on server side to prevent packet spam
-            InteractionHand hand = payload.mainHand() ? InteractionHand.MAIN_HAND : InteractionHand.OFF_HAND;
-            ItemStack held = serverPlayer.getItemInHand(hand);
-            if (!held.isEmpty()) {
-                serverPlayer.getCooldowns().addCooldown(held.getItem(), 120); // 6s cooldown
-            }
-
-            String bookId = payload.bookId();
-            if (bookId == null || bookId.isEmpty()) {
-                bookId = UUID.randomUUID().toString();
-            }
-
-            SavingSession session = new SavingSession(bookId, payload.regionNames(), payload.mainHand());
-            activeSavingSessions.put(bookId, session);
-
-            LOGGER.info("Server initiated map book saving session {} for player {}", bookId, player.getName().getString());
-
-            // Request the first region file
-            if (!payload.regionNames().isEmpty()) {
-                String firstRegion = payload.regionNames().get(0);
-                sendToPlayer(serverPlayer, new RequestRegionFilePayload(bookId, firstRegion, 0, payload.regionNames().size(), payload.mainHand()));
-            } else {
-                // Empty book
-                completeSaveBook(serverPlayer, session);
-            }
-        });
-    }
-
-    private static void handleRequestRegionFileOnClient(RequestRegionFilePayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            Minecraft mc = Minecraft.getInstance();
-            File dir = MapManager.getInstance().getCurrentDimensionDir();
-            if (dir == null || !dir.exists()) return;
-
-            File file = new File(dir, payload.regionName());
-            if (!file.exists()) {
-                // Skip if file deleted in between
-                sendToServer(new SendRegionFilePayload(payload.bookId(), payload.regionName(), new byte[0], payload.currentIdx(), payload.totalCount(), payload.mainHand()));
+            if (!isValidBookId(payload.bookId(), true)
+                    || payload.regionNames() == null
+                    || payload.regionNames().size() > MAX_REGIONS_PER_BOOK) {
+                LOGGER.warn("[SimpleMap] Rejected invalid save-book initialization from {}",
+                        player.getName().getString());
                 return;
             }
 
-            try {
-                byte[] data = Files.readAllBytes(file.toPath());
-                sendToServer(new SendRegionFilePayload(payload.bookId(), payload.regionName(), data, payload.currentIdx(), payload.totalCount(), payload.mainHand()));
-            } catch (IOException e) {
-                LOGGER.error("Failed to read region file: " + payload.regionName(), e);
-                sendToServer(new SendRegionFilePayload(payload.bookId(), payload.regionName(), new byte[0], payload.currentIdx(), payload.totalCount(), payload.mainHand()));
+            List<String> regionNames = sanitizeRegionNames(payload.regionNames());
+            if (regionNames == null) {
+                LOGGER.warn("[SimpleMap] Rejected invalid region list from {}", player.getName().getString());
+                return;
             }
+
+            InteractionHand hand = payload.mainHand() ? InteractionHand.MAIN_HAND : InteractionHand.OFF_HAND;
+            ItemStack held = player.getItemInHand(hand);
+            String requestedId = payload.bookId();
+            if (!canSaveHeldBook(player, held, requestedId)) {
+                LOGGER.warn("[SimpleMap] {} attempted to save a map book not held or not owned",
+                        player.getName().getString());
+                return;
+            }
+            if (!requestedId.isEmpty() && isBookMergePending(player, requestedId)) {
+                player.sendSystemMessage(Component.literal("§eThis merged map book is still being prepared."));
+                return;
+            }
+            player.getCooldowns().addCooldown(held.getItem(), 120);
+
+            String bookId = requestedId.isEmpty() ? UUID.randomUUID().toString() : requestedId;
+            SavingSession session = new SavingSession(player.getUUID(), bookId, regionNames,
+                    payload.mainHand(), dimensionFolder(player), System.currentTimeMillis());
+            ACTIVE_SAVES.put(sessionKey(bookId, player.getUUID()), session);
+
+            LOGGER.info("Started map-book save {} for {} with {} regions", bookId,
+                    player.getName().getString(), regionNames.size());
+            requestNextSaveRegion(player, session);
         });
     }
 
-    private static void handleSendRegionFileOnServer(SendRegionFilePayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            Player player = context.player();
-            if (!(player instanceof ServerPlayer serverPlayer)) return;
-
-            SavingSession session = activeSavingSessions.get(payload.bookId());
-            if (session == null) return;
-
-            // Save region bytes to server storage
-            if (payload.data().length > 0) {
-                Path serverBooksDir = serverPlayer.server.getWorldPath(LevelResource.ROOT).resolve("simplemap_books").resolve(payload.bookId()).resolve(serverPlayer.level().dimension().location().getPath());
-                try {
-                    Files.createDirectories(serverBooksDir);
-                    Path destFile = serverBooksDir.resolve(payload.regionName());
-                    Files.write(destFile, payload.data());
-                } catch (IOException e) {
-                    LOGGER.error("Server failed to save region file " + payload.regionName() + " for book " + payload.bookId(), e);
+    private static void requestNextSaveRegion(ServerPlayer player, SavingSession session) {
+        synchronized (session) {
+            if (session.expired() || !session.playerId.equals(player.getUUID())
+                    || !session.dimensionFolder.equals(dimensionFolder(player))) {
+                ACTIVE_SAVES.remove(sessionKey(session.bookId, session.playerId), session);
+                if (!session.dimensionFolder.equals(dimensionFolder(player))) {
+                    player.sendSystemMessage(Component.literal("§eMap-book saving stopped because you changed dimension."));
                 }
+                return;
+            }
+            session.touch();
+            if (session.nextIndex >= session.regionNames.size()) {
+                completeSaveBook(player, session);
+                return;
+            }
+            String name = session.regionNames.get(session.nextIndex);
+            sendToPlayer(player, new RequestRegionFilePayload(session.bookId, name,
+                    session.nextIndex, session.regionNames.size(), session.mainHand));
+        }
+    }
+
+    private static void handleRequestRegionFileOnClient(RequestRegionFilePayload payload,
+            IPayloadContext context) {
+        ClientPayloadHooks.handleRequestRegion(payload, context);
+    }
+
+    private static void handleSendRegionFileOnServer(SendRegionFilePayload payload,
+            IPayloadContext context) {
+        context.enqueueWork(() -> {
+            if (!(context.player() instanceof ServerPlayer player)) return;
+            if (!validTransferMetadata(payload.bookId(), payload.regionName(), payload.currentIdx(),
+                    payload.totalCount()) || payload.data().length > MAX_REGION_FILE_BYTES) {
+                LOGGER.warn("[SimpleMap] Rejected malformed region upload from {}",
+                        player.getName().getString());
+                return;
             }
 
-            int nextIdx = payload.currentIdx() + 1;
-            if (nextIdx < payload.totalCount()) {
-                String nextRegion = session.regionNames.get(nextIdx);
-                sendToPlayer(serverPlayer, new RequestRegionFilePayload(payload.bookId(), nextRegion, nextIdx, payload.totalCount(), payload.mainHand()));
-            } else {
-                // Complete
-                completeSaveBook(serverPlayer, session);
+            String key = sessionKey(payload.bookId(), player.getUUID());
+            SavingSession session = ACTIVE_SAVES.get(key);
+            if (session == null) return;
+            synchronized (session) {
+                if (session.expired()
+                        || !session.dimensionFolder.equals(dimensionFolder(player))
+                        || session.processing
+                        || payload.currentIdx() != session.nextIndex
+                        || payload.totalCount() != session.regionNames.size()
+                        || payload.mainHand() != session.mainHand
+                        || !payload.regionName().equals(session.regionNames.get(session.nextIndex))) {
+                    LOGGER.warn("[SimpleMap] Rejected out-of-order region upload from {}",
+                            player.getName().getString());
+                    return;
+                }
+                session.processing = true;
+                session.touch();
             }
+
+            byte[] data = Arrays.copyOf(payload.data(), payload.data().length);
+            BOOK_IO_POOL.execute(() -> {
+                boolean accepted = true;
+                try {
+                    if (data.length > 0) {
+                        RegionDataStore.StoredRegion decoded = RegionDataStore.read(data);
+                        Path base = player.server.getWorldPath(LevelResource.ROOT)
+                                .resolve("simplemap_books").normalize();
+                        Path destinationDirectory = base.resolve(session.bookId)
+                                .resolve(session.dimensionFolder).normalize();
+                        Path destination = destinationDirectory.resolve(payload.regionName()).normalize();
+                        if (!isPathContained(destination, base)) {
+                            throw new IOException("Map-book destination escaped base directory");
+                        }
+                        Files.createDirectories(destinationDirectory);
+                        // The client sends its complete canonical surface region, so update replaces it.
+                        RegionDataStore.writeAtomic(destination.toFile(), decoded);
+                    }
+                } catch (IOException exception) {
+                    accepted = false;
+                    LOGGER.warn("Rejected or failed map-book region {}", payload.regionName(), exception);
+                }
+
+                boolean finalAccepted = accepted;
+                player.server.execute(() -> {
+                    SavingSession current = ACTIVE_SAVES.get(key);
+                    if (current != session) return;
+                    synchronized (session) {
+                        session.processing = false;
+                        // Invalid data is skipped rather than stalling the entire session.
+                        session.nextIndex++;
+                    }
+                    if (!finalAccepted) {
+                        player.sendSystemMessage(Component.literal("§eSkipped one damaged map region while saving."));
+                    }
+                    requestNextSaveRegion(player, session);
+                });
+            });
         });
     }
 
     private static void completeSaveBook(ServerPlayer player, SavingSession session) {
-        activeSavingSessions.remove(session.bookId);
-
+        ACTIVE_SAVES.remove(sessionKey(session.bookId, session.playerId), session);
         InteractionHand hand = session.mainHand ? InteractionHand.MAIN_HAND : InteractionHand.OFF_HAND;
         ItemStack held = player.getItemInHand(hand);
-        
+
         if (held.is(ModItems.EMPTY_MAP_BOOK.get())) {
             ItemStack writtenBook = new ItemStack(ModItems.MAP_BOOK.get());
-            
             CompoundTag tag = new CompoundTag();
             tag.putString("MapBookID", session.bookId);
             tag.putString("OwnerUUID", player.getUUID().toString());
             tag.putString("OwnerName", player.getName().getString());
-            writtenBook.set(net.minecraft.core.component.DataComponents.CUSTOM_DATA, net.minecraft.world.item.component.CustomData.of(tag));
-            
-            // Set custom display name
-            writtenBook.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal("§6Map Book of " + player.getName().getString()));
-            
+            writtenBook.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+            writtenBook.set(DataComponents.CUSTOM_NAME,
+                    Component.literal("§6Map Book of " + player.getName().getString()));
             player.setItemInHand(hand, writtenBook);
             player.sendSystemMessage(Component.literal("§aMap successfully saved to the book!"));
-            
             sendToPlayer(player, new SaveBookCompletePayload(session.bookId));
-        } else if (held.is(ModItems.MAP_BOOK.get())) {
-            // Write owner tags just in case they were missing
-            net.minecraft.world.item.component.CustomData customData = held.get(net.minecraft.core.component.DataComponents.CUSTOM_DATA);
-            CompoundTag tag = customData != null ? customData.copyTag() : new CompoundTag();
+            return;
+        }
+
+        if (held.is(ModItems.MAP_BOOK.get()) && heldBookId(held).equals(session.bookId)) {
+            CompoundTag tag = customTag(held);
+            tag.putString("MapBookID", session.bookId);
             tag.putString("OwnerUUID", player.getUUID().toString());
             tag.putString("OwnerName", player.getName().getString());
-            held.set(net.minecraft.core.component.DataComponents.CUSTOM_DATA, net.minecraft.world.item.component.CustomData.of(tag));
-
+            held.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
             player.sendSystemMessage(Component.literal("§aMap successfully updated in the book!"));
             sendToPlayer(player, new SaveBookCompletePayload(session.bookId));
         }
     }
 
-    private static void handleSaveBookCompleteOnClient(SaveBookCompletePayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            if (MapConfig.serverRequireMapBook) {
-                MapManager.getInstance().setHasLearnedMap(true);
-            }
-        });
+    private static void handleSaveBookCompleteOnClient(SaveBookCompletePayload payload,
+            IPayloadContext context) {
+        ClientPayloadHooks.handleSaveComplete(payload, context);
     }
 
-    private static void handleRequestLearnBookOnServer(RequestLearnBookPayload payload, IPayloadContext context) {
+    private static void handleRequestLearnBookOnServer(RequestLearnBookPayload payload,
+            IPayloadContext context) {
         context.enqueueWork(() -> {
-            Player player = context.player();
-            if (!(player instanceof ServerPlayer serverPlayer)) return;
-
-            Path serverBookDir = serverPlayer.server.getWorldPath(LevelResource.ROOT).resolve("simplemap_books").resolve(payload.bookId()).resolve(serverPlayer.level().dimension().location().getPath());
-            File dir = serverBookDir.toFile();
-            
-            if (!dir.exists()) {
-                player.sendSystemMessage(Component.literal("§cThis book has no map data for the current dimension!"));
-                sendToPlayer(serverPlayer, new LearnBookCompletePayload(payload.bookId()));
+            if (!(context.player() instanceof ServerPlayer player)) return;
+            cleanupExpiredSessions();
+            ACTIVE_LEARNS.entrySet().removeIf(entry -> entry.getValue().playerId.equals(player.getUUID()));
+            if (!isValidBookId(payload.bookId(), false) || !playerHasBook(player, payload.bookId())) {
+                LOGGER.warn("[SimpleMap] Rejected learn request without matching book from {}",
+                        player.getName().getString());
+                return;
+            }
+            if (isBookMergePending(player, payload.bookId())) {
+                player.sendSystemMessage(Component.literal("§eThis merged map book is still being prepared."));
                 return;
             }
 
-            File[] files = dir.listFiles((d, name) -> name.startsWith("r.") && name.endsWith(".png"));
-            if (files == null || files.length == 0) {
-                sendToPlayer(serverPlayer, new LearnBookCompletePayload(payload.bookId()));
-                return;
-            }
-
-            List<File> fileList = Arrays.asList(files);
-            LearningSession session = new LearningSession(payload.bookId(), fileList);
-            activeLearningSessions.put(payload.bookId() + "_" + player.getUUID(), session);
-
-            // Send first region
-            sendNextLearnRegion(serverPlayer, session, 0);
-        });
-    }
-
-    private static void sendNextLearnRegion(ServerPlayer player, LearningSession session, int idx) {
-        if (idx >= session.regionFiles.size()) {
-            activeLearningSessions.remove(session.bookId + "_" + player.getUUID());
-            
-            // Check if player is holding the Map Book and consume if they are not the owner
-            for (InteractionHand hand : InteractionHand.values()) {
-                ItemStack stack = player.getItemInHand(hand);
-                if (stack.is(ModItems.MAP_BOOK.get())) {
-                    net.minecraft.world.item.component.CustomData customData = stack.get(net.minecraft.core.component.DataComponents.CUSTOM_DATA);
-                    CompoundTag tag = customData != null ? customData.copyTag() : null;
-                    if (tag != null && tag.contains("MapBookID") && tag.getString("MapBookID").equals(session.bookId)) {
-                        if (tag.contains("OwnerUUID")) {
-                            String ownerUuid = tag.getString("OwnerUUID");
-                            if (!ownerUuid.equals(player.getUUID().toString())) {
-                                stack.shrink(1);
-                                player.sendSystemMessage(Component.literal("§eThe map book crumbles to dust as you finish learning its secrets!"));
-                                player.level().playSound(null, player.getX(), player.getY(), player.getZ(), 
-                                        net.minecraft.sounds.SoundEvents.ITEM_BREAK, net.minecraft.sounds.SoundSource.PLAYERS, 1.0f, 1.0f);
-                                break;
-                            }
-                        }
-                    }
+            Path base = player.server.getWorldPath(LevelResource.ROOT).resolve("simplemap_books").normalize();
+            String requestedDimension = dimensionFolder(player);
+            Path bookRoot = base.resolve(payload.bookId()).normalize();
+            Path bookDirectory = bookRoot.resolve(requestedDimension).normalize();
+            if (!isPathContained(bookDirectory, base)) return;
+            File directory = bookDirectory.toFile();
+            // Compatibility with books written by older builds that used only the
+            // custom dimension path and omitted its namespace.
+            if (!directory.isDirectory()) {
+                String legacy = legacyDimensionFolder(player);
+                Path legacyDirectory = bookRoot.resolve(legacy).normalize();
+                if (isPathContained(legacyDirectory, base) && legacyDirectory.toFile().isDirectory()) {
+                    directory = legacyDirectory.toFile();
                 }
             }
+            if (!directory.isDirectory()) {
+                player.sendSystemMessage(Component.literal("§cThis book has no map data for the current dimension!"));
+                return;
+            }
 
-            sendToPlayer(player, new LearnBookCompletePayload(session.bookId));
+            File[] files = directory.listFiles((dir, name) -> isValidRegionName(name));
+            if (files == null || files.length == 0) {
+                player.sendSystemMessage(Component.literal("§cThis book contains no usable map regions here."));
+                return;
+            }
+            Arrays.sort(files, Comparator.comparing(File::getName));
+            List<File> bounded = Arrays.asList(files).subList(0, Math.min(files.length, MAX_REGIONS_PER_BOOK));
+            LearningSession session = new LearningSession(player.getUUID(), payload.bookId(),
+                    requestedDimension, new ArrayList<>(bounded), System.currentTimeMillis());
+            ACTIVE_LEARNS.put(sessionKey(payload.bookId(), player.getUUID()), session);
+            sendNextLearnRegion(player, session);
+        });
+    }
+
+    private static void sendNextLearnRegion(ServerPlayer player, LearningSession session) {
+        String key = sessionKey(session.bookId, session.playerId);
+        synchronized (session) {
+            if (session.expired() || !session.playerId.equals(player.getUUID())
+                    || !session.dimensionFolder.equals(dimensionFolder(player))) {
+                ACTIVE_LEARNS.remove(key, session);
+                if (!session.dimensionFolder.equals(dimensionFolder(player))) {
+                    player.sendSystemMessage(Component.literal("§eMap-book learning stopped because you changed dimension."));
+                }
+                return;
+            }
+            session.touch();
+            if (session.nextIndex >= session.regionFiles.size()) {
+                ACTIVE_LEARNS.remove(key, session);
+                if (session.successfulRegions <= 0) {
+                    player.sendSystemMessage(Component.literal(
+                            "§cNo map regions could be learned from this book."));
+                    return;
+                }
+                consumeLearnedBookIfNeeded(player, session.bookId);
+                if (session.failedRegions > 0) {
+                    player.sendSystemMessage(Component.literal(
+                            "§eMap learned, but " + session.failedRegions
+                                    + " damaged region(s) were skipped."));
+                }
+                sendToPlayer(player, new LearnBookCompletePayload(session.bookId));
+                return;
+            }
+            if (session.waitingForAck || session.reading) return;
+            session.reading = true;
+        }
+
+        int index = session.nextIndex;
+        File file = session.regionFiles.get(index);
+        BOOK_IO_POOL.execute(() -> {
+            byte[] data = null;
+            try {
+                if (Files.size(file.toPath()) <= MAX_REGION_FILE_BYTES) {
+                    RegionDataStore.read(file);
+                    data = Files.readAllBytes(file.toPath());
+                }
+            } catch (IOException exception) {
+                LOGGER.warn("Skipping damaged map-book region {}", file.getName(), exception);
+            }
+            byte[] result = data;
+            player.server.execute(() -> {
+                if (ACTIVE_LEARNS.get(key) != session) return;
+                synchronized (session) {
+                    session.reading = false;
+                    if (result == null) {
+                        session.nextIndex++;
+                        session.failedRegions++;
+                    } else {
+                        session.waitingForAck = true;
+                    }
+                }
+                if (result == null) {
+                    sendNextLearnRegion(player, session);
+                } else {
+                    sendToPlayer(player, new SendLearnRegionPayload(session.bookId, file.getName(),
+                            result, index, session.regionFiles.size()));
+                }
+            });
+        });
+    }
+
+    private static void handleAckLearnRegionOnServer(AckLearnRegionPayload payload,
+            IPayloadContext context) {
+        context.enqueueWork(() -> {
+            if (!(context.player() instanceof ServerPlayer player)
+                    || !isValidBookId(payload.bookId(), false)) return;
+            String key = sessionKey(payload.bookId(), player.getUUID());
+            LearningSession session = ACTIVE_LEARNS.get(key);
+            if (session == null) return;
+            synchronized (session) {
+                if (session.expired() || !session.dimensionFolder.equals(dimensionFolder(player))
+                        || !session.waitingForAck
+                        || payload.nextIdx() != session.nextIndex + 1) {
+                    LOGGER.warn("[SimpleMap] Rejected out-of-order map-book acknowledgement from {}",
+                            player.getName().getString());
+                    return;
+                }
+                session.waitingForAck = false;
+                session.nextIndex++;
+                if (payload.accepted()) {
+                    session.successfulRegions++;
+                } else {
+                    session.failedRegions++;
+                }
+                session.touch();
+            }
+            sendNextLearnRegion(player, session);
+        });
+    }
+
+    private static void handleSendLearnRegionOnClient(SendLearnRegionPayload payload,
+            IPayloadContext context) {
+        ClientPayloadHooks.handleLearnRegion(payload, context);
+    }
+
+    private static void handleLearnBookCompleteOnClient(LearnBookCompletePayload payload,
+            IPayloadContext context) {
+        ClientPayloadHooks.handleLearnComplete(payload, context);
+    }
+
+    private static boolean canSaveHeldBook(ServerPlayer player, ItemStack held, String requestedId) {
+        if (requestedId.isEmpty()) return held.is(ModItems.EMPTY_MAP_BOOK.get());
+        if (!held.is(ModItems.MAP_BOOK.get()) || !requestedId.equals(heldBookId(held))) return false;
+        CompoundTag tag = customTag(held);
+        return !tag.contains("OwnerUUID") || player.getUUID().toString().equals(tag.getString("OwnerUUID"));
+    }
+
+    private static boolean playerHasBook(ServerPlayer player, String bookId) {
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (stack.is(ModItems.MAP_BOOK.get()) && bookId.equals(heldBookId(stack))) return true;
+        }
+        return false;
+    }
+
+    private static void consumeLearnedBookIfNeeded(ServerPlayer player, String bookId) {
+        for (InteractionHand hand : InteractionHand.values()) {
+            ItemStack stack = player.getItemInHand(hand);
+            if (!stack.is(ModItems.MAP_BOOK.get()) || !bookId.equals(heldBookId(stack))) continue;
+            CompoundTag tag = customTag(stack);
+            if (tag.contains("OwnerUUID")
+                    && !player.getUUID().toString().equals(tag.getString("OwnerUUID"))) {
+                stack.shrink(1);
+                player.sendSystemMessage(Component.literal(
+                        "§eThe map book crumbles to dust as you finish learning its secrets!"));
+                player.level().playSound(null, player.getX(), player.getY(), player.getZ(),
+                        net.minecraft.sounds.SoundEvents.ITEM_BREAK,
+                        net.minecraft.sounds.SoundSource.PLAYERS, 1.0f, 1.0f);
+            }
             return;
         }
+    }
 
-        File file = session.regionFiles.get(idx);
+    private static CompoundTag customTag(ItemStack stack) {
+        CustomData data = stack.get(DataComponents.CUSTOM_DATA);
+        return data == null ? new CompoundTag() : data.copyTag();
+    }
+
+    private static String heldBookId(ItemStack stack) {
+        CompoundTag tag = customTag(stack);
+        return tag.contains("MapBookID") ? tag.getString("MapBookID") : "";
+    }
+
+    private static List<String> sanitizeRegionNames(List<String> names) {
+        if (names.size() > MAX_REGIONS_PER_BOOK) return null;
+        Set<String> unique = new HashSet<>();
+        for (String name : names) {
+            if (!isValidRegionName(name) || !unique.add(name)) return null;
+        }
+        List<String> result = new ArrayList<>(unique);
+        result.sort(String::compareTo);
+        return List.copyOf(result);
+    }
+
+    static boolean validTransferMetadata(String bookId, String regionName, int index, int total) {
+        return isValidBookId(bookId, false)
+                && isValidRegionName(regionName)
+                && total >= 0 && total <= MAX_REGIONS_PER_BOOK
+                && index >= 0 && index < total;
+    }
+
+    static boolean isValidBookId(String id, boolean allowEmpty) {
+        if (id == null) return false;
+        if (allowEmpty && id.isEmpty()) return true;
+        return id.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
+    }
+
+    /** Canonical surface-map filename: {@code r.<rx>.<rz>.smdat}. */
+    public static boolean isValidRegionName(String name) {
+        return name != null && name.matches("r\\.-?\\d{1,7}\\.-?\\d{1,7}\\.smdat");
+    }
+
+    static int[] parseRegionCoordinates(String name) {
+        if (!isValidRegionName(name)) return null;
+        String[] parts = name.split("\\.");
         try {
-            byte[] data = Files.readAllBytes(file.toPath());
-            sendToPlayer(player, new SendLearnRegionPayload(session.bookId, file.getName(), data, idx, session.regionFiles.size()));
-        } catch (IOException e) {
-            LOGGER.error("Server failed to read book region: " + file.getName(), e);
-            // Skip
-            sendNextLearnRegion(player, session, idx + 1);
+            return new int[]{Integer.parseInt(parts[1]), Integer.parseInt(parts[2])};
+        } catch (RuntimeException ignored) {
+            return null;
         }
     }
 
-    private static void handleAckLearnRegionOnServer(AckLearnRegionPayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            Player player = context.player();
-            if (!(player instanceof ServerPlayer serverPlayer)) return;
-
-            LearningSession session = activeLearningSessions.get(payload.bookId() + "_" + player.getUUID());
-            if (session == null) return;
-
-            sendNextLearnRegion(serverPlayer, session, payload.nextIdx());
-        });
-    }
-
-    private static void handleSendLearnRegionOnClient(SendLearnRegionPayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            File dir = MapManager.getInstance().getCurrentDimensionDir();
-            if (dir != null && dir.exists()) {
-                File localFile = new File(dir, payload.regionName());
-                if (payload.data().length > 0) {
-                    if (!localFile.exists()) {
-                        // Write directly
-                        try {
-                            Files.write(localFile.toPath(), payload.data());
-                        } catch (IOException e) {
-                            LOGGER.error("Failed to write learned region: " + payload.regionName(), e);
-                        }
-                    } else {
-                        // Merge pixel logic!
-                        mergeRegionFiles(localFile, payload.data());
-                    }
-                }
-            }
-
-            // Unload region from MapManager memory cache to force reload from disk
-            String[] parts = payload.regionName().split("\\.");
-            if (parts.length >= 4) {
-                try {
-                    int rx = Integer.parseInt(parts[1]);
-                    int rz = Integer.parseInt(parts[2]);
-                    MapManager.getInstance().unloadRegion(rx, rz);
-                } catch (NumberFormatException ignored) {}
-            }
-
-            // Send ACK back to Server to request next file
-            sendToServer(new AckLearnRegionPayload(payload.bookId(), payload.currentIdx() + 1));
-        });
-    }
-
-    private static void mergeRegionFiles(File localFile, byte[] serverData) {
+    static boolean isPathContained(Path file, Path baseDirectory) {
         try {
-            NativeImage localImage;
-            try (FileInputStream fis = new FileInputStream(localFile)) {
-                localImage = NativeImage.read(fis);
-            }
-            NativeImage serverImage;
-            try (ByteArrayInputStream bais = new ByteArrayInputStream(serverData)) {
-                serverImage = NativeImage.read(bais);
-            }
-
-            int width = Math.min(512, Math.min(localImage.getWidth(), serverImage.getWidth()));
-            int height = Math.min(512, Math.min(localImage.getHeight(), serverImage.getHeight()));
-
-            boolean changed = false;
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x++) {
-                    int serverPixel = serverImage.getPixelRGBA(x, y);
-                    // NativeImage reads ABGR. If pixel is not transparent (color != 0)
-                    if (serverPixel != 0) {
-                        int localPixel = localImage.getPixelRGBA(x, y);
-                        if (localPixel != serverPixel) {
-                            localImage.setPixelRGBA(x, y, serverPixel);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-
-            if (changed) {
-                localImage.writeToFile(localFile);
-            }
-            localImage.close();
-            serverImage.close();
-        } catch (Exception e) {
-            LOGGER.error("Error merging region file " + localFile.getName(), e);
+            return file.toAbsolutePath().normalize().startsWith(baseDirectory.toAbsolutePath().normalize());
+        } catch (RuntimeException exception) {
+            LOGGER.warn("Failed to normalize map-book path", exception);
+            return false;
         }
     }
 
-    private static void handleLearnBookCompleteOnClient(LearnBookCompletePayload payload, IPayloadContext context) {
-        context.enqueueWork(() -> {
-            MapManager.getInstance().setHasLearnedMap(true);
-            MapManager.getInstance().setLastLearnedBookId(payload.bookId());
-            
-            // Clear OpenGL textures cache and reload
-            MapTextureManager.getInstance().clearCache();
-            
-            Minecraft mc = Minecraft.getInstance();
-            if (mc.player != null) {
-                mc.player.sendSystemMessage(Component.literal("§aMap learned successfully! Your map has been updated."));
-            }
-        });
+    private static boolean isBookMergePending(ServerPlayer player, String bookId) {
+        if (!isValidBookId(bookId, false)) return false;
+        Path root = player.server.getWorldPath(LevelResource.ROOT)
+                .resolve("simplemap_books").resolve(bookId).normalize();
+        return Files.isRegularFile(root.resolve(".merge_pending"));
     }
 
-    // =========================================================================
-    // HELPER CLASSES FOR SECTIONS
-    // =========================================================================
+    private static String dimensionFolder(ServerPlayer player) {
+        var location = player.level().dimension().location();
+        return location.getNamespace().equals("minecraft")
+                ? location.getPath()
+                : location.toString().replace(':', '_').replace('/', '_');
+    }
 
-    private static class SavingSession {
+    private static String legacyDimensionFolder(ServerPlayer player) {
+        String path = player.level().dimension().location().getPath();
+        return path.replace('/', '_');
+    }
+
+    static boolean sameFile(File first, File second) {
+        if (first == second) return true;
+        if (first == null || second == null) return false;
+        return first.toPath().toAbsolutePath().normalize()
+                .equals(second.toPath().toAbsolutePath().normalize());
+    }
+
+    private static String sessionKey(String bookId, UUID playerId) {
+        return bookId + ':' + playerId;
+    }
+
+    /** Releases bounded book-transfer state immediately when a player leaves. */
+    public static void clearSessionsForPlayer(UUID playerId) {
+        if (playerId == null) return;
+        ACTIVE_SAVES.entrySet().removeIf(entry -> entry.getValue().playerId.equals(playerId));
+        ACTIVE_LEARNS.entrySet().removeIf(entry -> entry.getValue().playerId.equals(playerId));
+    }
+
+    private static void cleanupExpiredSessions() {
+        long now = System.currentTimeMillis();
+        ACTIVE_SAVES.entrySet().removeIf(entry -> now - entry.getValue().lastActivity > SESSION_TIMEOUT_MS);
+        ACTIVE_LEARNS.entrySet().removeIf(entry -> now - entry.getValue().lastActivity > SESSION_TIMEOUT_MS);
+    }
+
+    private static final class SavingSession {
+        final UUID playerId;
         final String bookId;
         final List<String> regionNames;
         final boolean mainHand;
+        final String dimensionFolder;
+        final long startedAt;
+        volatile long lastActivity;
+        int nextIndex;
+        boolean processing;
 
-        SavingSession(String bookId, List<String> regionNames, boolean mainHand) {
+        SavingSession(UUID playerId, String bookId, List<String> regionNames, boolean mainHand,
+                String dimensionFolder, long startedAt) {
+            this.playerId = playerId;
             this.bookId = bookId;
             this.regionNames = regionNames;
             this.mainHand = mainHand;
+            this.dimensionFolder = dimensionFolder;
+            this.startedAt = startedAt;
+            this.lastActivity = startedAt;
+        }
+
+        void touch() {
+            lastActivity = System.currentTimeMillis();
+        }
+
+        boolean expired() {
+            return System.currentTimeMillis() - lastActivity > SESSION_TIMEOUT_MS;
         }
     }
 
-    private static class LearningSession {
+    private static final class LearningSession {
+        final UUID playerId;
         final String bookId;
+        final String dimensionFolder;
         final List<File> regionFiles;
+        final long startedAt;
+        volatile long lastActivity;
+        int nextIndex;
+        int successfulRegions;
+        int failedRegions;
+        boolean reading;
+        boolean waitingForAck;
 
-        LearningSession(String bookId, List<File> regionFiles) {
+        LearningSession(UUID playerId, String bookId, String dimensionFolder,
+                List<File> regionFiles, long startedAt) {
+            this.playerId = playerId;
             this.bookId = bookId;
+            this.dimensionFolder = dimensionFolder;
             this.regionFiles = regionFiles;
+            this.startedAt = startedAt;
+            this.lastActivity = startedAt;
+        }
+
+        void touch() {
+            lastActivity = System.currentTimeMillis();
+        }
+
+        boolean expired() {
+            return System.currentTimeMillis() - lastActivity > SESSION_TIMEOUT_MS;
         }
     }
 }

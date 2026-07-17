@@ -11,15 +11,15 @@ public record RequestRegionFilePayload(String bookId, String regionName, int cur
 
     public static final StreamCodec<FriendlyByteBuf, RequestRegionFilePayload> STREAM_CODEC = StreamCodec.of(
             (buf, val) -> {
-                buf.writeUtf(val.bookId);
-                buf.writeUtf(val.regionName);
+                buf.writeUtf(val.bookId, 36);
+                buf.writeUtf(val.regionName, 48);
                 buf.writeInt(val.currentIdx);
                 buf.writeInt(val.totalCount);
                 buf.writeBoolean(val.mainHand);
             },
             buf -> new RequestRegionFilePayload(
-                    buf.readUtf(),
-                    buf.readUtf(),
+                    buf.readUtf(36),
+                    buf.readUtf(48),
                     buf.readInt(),
                     buf.readInt(),
                     buf.readBoolean()

@@ -10,8 +10,8 @@ public record RequestLearnBookPayload(String bookId) implements CustomPacketPayl
     public static final Type<RequestLearnBookPayload> TYPE = new Type<>(ResourceLocation.fromNamespaceAndPath(SimpleMap.MODID, "request_learn_book"));
 
     public static final StreamCodec<FriendlyByteBuf, RequestLearnBookPayload> STREAM_CODEC = StreamCodec.of(
-            (buf, val) -> buf.writeUtf(val.bookId),
-            buf -> new RequestLearnBookPayload(buf.readUtf())
+            (buf, val) -> buf.writeUtf(val.bookId, 36),
+            buf -> new RequestLearnBookPayload(buf.readUtf(36))
     );
 
     @Override
