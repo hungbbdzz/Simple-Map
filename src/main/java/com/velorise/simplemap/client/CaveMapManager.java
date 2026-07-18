@@ -64,8 +64,6 @@ public final class CaveMapManager {
     private final Map<String, CaveRegion> regions = new LinkedHashMap<>(16, 0.75f, true);
     private final Set<String> dirtyRegions = new HashSet<>();
     private final Set<String> seedJobs = ConcurrentHashMap.newKeySet();
-    /** Last vertical-archive revision projected into each active layer region. */
-    private final Map<String, Long> projectedArchiveRevisions = new ConcurrentHashMap<>();
     private final Map<String, Boolean> fileExists = new ConcurrentHashMap<>();
     private final Map<String, CaveSaveRequest> pendingSaves = new ConcurrentHashMap<>();
     private final Map<String, CaveSaveRequest> inFlightSaves = new ConcurrentHashMap<>();
@@ -116,14 +114,11 @@ public final class CaveMapManager {
         dirtyRegions.clear();
         fileExists.clear();
         seedJobs.clear();
-        projectedArchiveRevisions.clear();
         activeLayerY = layerY;
-        // This namespace excludes V6 textures produced while the client-side
-        // OCEAN_FLOOR lookup could reject every underground sample. Layer semantics
-        // remain the same bounded 32-block cave-floor view.
         activeLayerDirectory = baseDirectory == null ? null
-                : new File(baseDirectory, "layer_v10_reliable_surface_band32_" + layerY);
-        legacyLayerDirectory = null;
+                : new File(baseDirectory, "layer_v4_band32_" + layerY);
+        legacyLayerDirectory = baseDirectory == null ? null
+                : new File(baseDirectory, "layer_v3_band32_" + layerY);
         if (activeLayerDirectory != null && !activeLayerDirectory.exists()
                 && !activeLayerDirectory.mkdirs()) {
             LOGGER.warn("Could not create cave layer directory {}", activeLayerDirectory);
@@ -139,8 +134,9 @@ public final class CaveMapManager {
         if (layerY != activeLayerY) return;
         CaveRegion region = getRegion(rx, rz, true);
         if (region == null) return;
-        // Re-project the persistent vertical archive into this exact Top-Y band.
-        // Missing archive columns intentionally remain black.
+        // Always attempt a Full-Cave merge for visible regions. Existing layer
+        // files can be sparse, so seeding only when the file was absent left large
+        // black holes that never filled while panning an explored map.
         if (region.isLoaded()) scheduleVisibleSeed(layerY, rx, rz, region);
     }
 
@@ -180,10 +176,6 @@ public final class CaveMapManager {
                 created.replacePixels(pending.pixels());
                 created.markLoaded();
             } else if (hasAnyStoredRegion(rx, rz)) {
-                // Do not block live scanning behind asynchronous disk IO. The new
-                // layer region is writable immediately; the cache loader later fills
-                // only untouched zero pixels via mergeMissingPixels().
-                created.markLoaded();
                 loadRegionAsync(created, activeLayerDirectory, legacyLayerDirectory,
                         generation, activeLayerY);
             } else created.markLoaded();
@@ -216,19 +208,14 @@ public final class CaveMapManager {
         surfaceDirectory = null;
     }
 
-    public synchronized void clearCache() {
+    public synchronized void deactivate() {
         saveDirtyRegions();
         layerGeneration.incrementAndGet();
         clearRegions();
         dirtyRegions.clear();
         fileExists.clear();
         seedJobs.clear();
-        projectedArchiveRevisions.clear();
         CaveTextureManager.getInstance().clearCache();
-    }
-
-    public synchronized void deactivate() {
-        clearCache();
         activeLayerDirectory = null;
         legacyLayerDirectory = null;
         activeLayerY = Integer.MIN_VALUE;
@@ -272,10 +259,7 @@ public final class CaveMapManager {
                     }
                 }
                 if (!isLoadTargetCurrent(region, directory, requestedGeneration, requestedLayerY)) return;
-                // Preserve any live columns scanned while this file was loading.
-                // A direct replace here was able to restore stale black pixels after
-                // the user had already selected and scanned the new Top-Y layer.
-                if (pixels != null) region.mergeMissingPixels(pixels);
+                if (pixels != null) region.replacePixels(pixels);
                 region.markLoaded();
                 CaveTextureManager.getInstance().markRegionTextureDirty(
                         requestedLayerY, region.rx, region.rz);
@@ -387,23 +371,24 @@ public final class CaveMapManager {
 
     private void scheduleVisibleSeed(int layerY, int rx, int rz, CaveRegion targetRegion) {
         long generation = layerGeneration.get();
-        String regionKey = key(rx, rz);
-        long archiveRevision = VerticalCaveArchiveManager.getInstance().getRegionRevision(rx, rz);
-        Long appliedRevision = projectedArchiveRevisions.get(regionKey);
-        if (appliedRevision != null && appliedRevision >= archiveRevision) return;
-
         String jobKey = generation + ":" + rx + "," + rz;
         if (!seedJobs.add(jobKey)) return;
         try {
             LOAD_POOL.execute(() -> {
                 try {
-                    VerticalCaveArchiveManager.Projection projection =
-                            VerticalCaveArchiveManager.getInstance().projectRegion(layerY, rx, rz, false);
-                    if (!isLayerGenerationCurrent(generation, layerY)) return;
-
-                    applyVisibleProjection(generation, layerY, rx, rz, targetRegion, projection);
-                    projectedArchiveRevisions.put(regionKey,
-                            Math.max(archiveRevision, projection.revision()));
+                    FullCaveMapManager.FullSnapshot full = FullCaveMapManager.getInstance()
+                            .getLoadedSnapshot(rx, rz);
+                    if (full == null) {
+                        full = FullCaveMapManager.getInstance().readSnapshotFromDisk(rx, rz);
+                    }
+                    if (full == null || !isLayerGenerationCurrent(generation, layerY)) return;
+                    int minimumY = layerY - LAYER_DEPTH + 1;
+                    int[] seeded = new int[PIXELS];
+                    for (int i = 0; i < PIXELS; i++) {
+                        int height = full.heights()[i];
+                        if (height >= minimumY && height <= layerY) seeded[i] = full.pixels()[i];
+                    }
+                    applyVisibleSeed(generation, layerY, rx, rz, targetRegion, seeded);
                 } finally {
                     seedJobs.remove(jobKey);
                 }
@@ -413,29 +398,19 @@ public final class CaveMapManager {
         }
     }
 
-    /**
-     * Archived columns fill untouched parts of the selected 32-block Top-Y band.
-     * Live pixels scanned from currently loaded chunks are authoritative and must
-     * never be replaced by a delayed archive projection. A scanned-but-empty archive
-     * column may still clear stale cache data only when that pixel has not been live-scanned.
-     */
-    private void applyVisibleProjection(long generation, int layerY, int rx, int rz,
-            CaveRegion targetRegion, VerticalCaveArchiveManager.Projection projection) {
+    private void applyVisibleSeed(long generation, int layerY, int rx, int rz,
+            CaveRegion targetRegion, int[] seeded) {
         if (!isLayerGenerationCurrent(generation, layerY)) return;
         synchronized (regions) {
             if (regions.get(key(rx, rz)) != targetRegion || !targetRegion.isLoaded()) return;
         }
-
         boolean changed = false;
         targetRegion.lock();
         try {
             int[] current = targetRegion.getPixelsDirect();
-            int[] projected = projection.colors();
-            byte[] scanned = projection.scanned();
             for (int i = 0; i < current.length; i++) {
-                if (scanned[i] == 0 || targetRegion.isLivePixelLocked(i)) continue;
-                if (current[i] != projected[i]) {
-                    current[i] = projected[i];
+                if (current[i] == 0 && seeded[i] != 0) {
+                    current[i] = seeded[i];
                     changed = true;
                 }
             }

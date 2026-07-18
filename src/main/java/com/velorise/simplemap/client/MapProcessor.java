@@ -24,12 +24,10 @@ public final class MapProcessor {
     private final AtomicLong sequence = new AtomicLong();
 
     private MapProcessor() {
-        for (int i = 0; i < 2; i++) {
-            Thread worker = new Thread(this::runLoop, "SimpleMap-MapProcessor-" + (i + 1));
-            worker.setDaemon(true);
-            worker.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 2));
-            worker.start();
-        }
+        Thread worker = new Thread(this::runLoop, "SimpleMap-MapProcessor");
+        worker.setDaemon(true);
+        worker.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 2));
+        worker.start();
     }
 
     public static MapProcessor getInstance() {

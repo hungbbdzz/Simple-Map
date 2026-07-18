@@ -20,18 +20,15 @@ public final class CaveTextureManager {
     private static final int MAX_TEXTURE_REGIONS = 128;
     private static final int MAX_VISIBLE_HISTORY = MAX_TEXTURE_REGIONS * 4;
     private static final long VISIBLE_TTL_MS = 2_000L;
-    private static final long DIRTY_QUIET_NANOS = 45_000_000L;
-    private static final long DIRTY_MAX_WAIT_NANOS = 220_000_000L;
 
     private final Map<String, TextureInfo> textures = new LinkedHashMap<>(16, 0.75f, true);
     private final Set<String> dirtyTextures = new LinkedHashSet<>();
     private final Map<String, Long> visibleTextures = new LinkedHashMap<>();
     private final Map<String, Long> revisions = new HashMap<>();
-    private final Map<String, Long> firstDirtyNanos = new HashMap<>();
-    private final Map<String, Long> lastDirtyNanos = new HashMap<>();
     private final List<TextureInfo> deferredCloses = new ArrayList<>();
     private int renderBatchDepth;
     private int activeTextureLayerY = Integer.MIN_VALUE;
+    private int previousTextureLayerY = Integer.MIN_VALUE;
     private long lastUploadTime;
 
     private CaveTextureManager() {
@@ -43,12 +40,10 @@ public final class CaveTextureManager {
 
     public void markRegionTextureDirty(int layerY, int rx, int rz) {
         String key = key(layerY, rx, rz);
-        long now = System.nanoTime();
         synchronized (dirtyTextures) {
-            revisions.merge(key, 1L, Long::sum);
-            firstDirtyNanos.putIfAbsent(key, now);
-            lastDirtyNanos.put(key, now);
-            dirtyTextures.add(key);
+            // One revision per queued rebuild is enough. Thousands of changed
+            // columns in the same region now collapse into a single texture job.
+            if (dirtyTextures.add(key)) revisions.merge(key, 1L, Long::sum);
         }
     }
 
@@ -59,9 +54,30 @@ public final class CaveTextureManager {
             return;
         }
         if (activeTextureLayerY == layerY) return;
+        previousTextureLayerY = activeTextureLayerY;
         activeTextureLayerY = layerY;
-        // Old layer textures may remain cached for fast backtracking, but they are
-        // never rendered as a bridge for a different Top-Y selection.
+        // Keep the previous initialized GPU tiles alive. The renderer can use
+        // them as a stable bridge until the new Top-Y layer is prepared.
+    }
+
+    public ResourceLocation getTransitionRegionTexture(int layerY, int rx, int rz) {
+        ResourceLocation current = getRegionTexture(layerY, rx, rz);
+        if (current != null) return current;
+        int previous = previousTextureLayerY;
+        return previous == Integer.MIN_VALUE ? null : getCachedRegionTexture(previous, rx, rz);
+    }
+
+    private ResourceLocation getCachedRegionTexture(int layerY, int rx, int rz) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!minecraft.isSameThread()) return null;
+        String key = key(layerY, rx, rz);
+        TextureInfo info;
+        synchronized (textures) {
+            info = textures.get(key);
+        }
+        if (info == null || !info.initialized) return null;
+        markVisible(key);
+        return info.location;
     }
 
     public void beginRenderBatch() {
@@ -95,8 +111,10 @@ public final class CaveTextureManager {
         markVisible(key);
         CaveRegion region = manager.getRegion(rx, rz, false);
         if (region == null) {
+            FullCaveMapManager fullManager = FullCaveMapManager.getInstance();
             if (manager.hasRegionFile(rx, rz)
-                    || VerticalCaveArchiveManager.getInstance().hasRegionData(rx, rz)) {
+                    || fullManager.hasRegionFile(rx, rz)
+                    || fullManager.isRegionLoaded(rx, rz)) {
                 MapProcessor.getInstance().enqueueCaveLoad(layerY, rx, rz, distancePriority(rx, rz));
             }
             return null;
@@ -116,19 +134,6 @@ public final class CaveTextureManager {
         return info.initialized ? info.location : null;
     }
 
-
-    /** Returns only an already uploaded cave tile; performs no IO or CPU rebuild. */
-    public ResourceLocation peekRegionTexture(int layerY, int rx, int rz) {
-        if (activeTextureLayerY != layerY) return null;
-        String key = key(layerY, rx, rz);
-        synchronized (textures) {
-            TextureInfo info = textures.get(key);
-            if (info == null || !info.initialized) return null;
-            markVisible(key);
-            return info.location;
-        }
-    }
-
     public void uploadDirtyTextures() {
         uploadDirtyTextures(false);
     }
@@ -146,7 +151,7 @@ public final class CaveTextureManager {
 
         int budget = force ? 8 : 3;
         long deadline = System.nanoTime() + (force ? 8_000_000L : 4_000_000L);
-        for (String key : selectDirty(budget, force)) {
+        for (String key : selectDirty(budget)) {
             if (System.nanoTime() > deadline && !force) {
                 requeue(key);
                 continue;
@@ -184,29 +189,14 @@ public final class CaveTextureManager {
             try {
                 MapTextureBuildWorker.PreparedSingle prepared = info.pending.join();
                 if (manager.isLayerGenerationCurrent(info.generation, info.layerY)) {
-                    // Publish the newest complete snapshot even when scanning changed
-                    // the region while this CPU build was running. Rejecting every
-                    // slightly stale build starved a continuously scanned 512x512 cave
-                    // region, so the user only saw an old sparse texture for seconds.
                     applyPrepared(info, prepared);
-
-                    synchronized (dirtyTextures) {
-                        long currentRevision = revisions.getOrDefault(key, 0L);
-                        if (currentRevision > prepared.revision()) {
-                            // Newer columns arrived after the snapshot. Keep the region
-                            // queued so the next coherent snapshot follows immediately.
-                            dirtyTextures.add(key);
-                        } else {
-                            dirtyTextures.remove(key);
-                            firstDirtyNanos.remove(key);
-                            lastDirtyNanos.remove(key);
-                        }
-                    }
                 }
             } catch (RuntimeException ignored) {
-                requeue(key);
             } finally {
                 info.pending = null;
+            }
+            synchronized (dirtyTextures) {
+                if (revisions.getOrDefault(key, 0L) > info.uploadedRevision) dirtyTextures.add(key);
             }
             return;
         }
@@ -215,12 +205,13 @@ public final class CaveTextureManager {
         synchronized (dirtyTextures) {
             revision = revisions.getOrDefault(key, 0L);
         }
-        // Layer pixels are already shaded against their own selected-Y heights
-        // during live scan/archive projection. Full-cave heights belong to a
-        // different projection and must not influence this texture.
+        short[] heights = null;
+        FullCaveMapManager.FullSnapshot fullSnapshot = FullCaveMapManager.getInstance()
+                .getLoadedSnapshot(info.rx, info.rz);
+        if (fullSnapshot != null) heights = fullSnapshot.heights();
         CompletableFuture<MapTextureBuildWorker.PreparedSingle> future =
-                MapTextureBuildWorker.tryBuildCave(region.snapshotPixels(), null,
-                        0, MapConfig.mapColorProfile, revision,
+                MapTextureBuildWorker.tryBuildCave(region.snapshotPixels(), heights,
+                        MapConfig.terrainSlopes, MapConfig.mapColorProfile, revision,
                         () -> manager.isLayerGenerationCurrent(info.generation, info.layerY));
         if (future == null) {
             requeue(key);
@@ -261,11 +252,8 @@ public final class CaveTextureManager {
     public void invalidateStyle() {
         synchronized (textures) {
             synchronized (dirtyTextures) {
-                long now = System.nanoTime();
                 for (String key : textures.keySet()) {
                     revisions.merge(key, 1L, Long::sum);
-                    firstDirtyNanos.putIfAbsent(key, now);
-                    lastDirtyNanos.put(key, now);
                     dirtyTextures.add(key);
                 }
             }
@@ -289,49 +277,36 @@ public final class CaveTextureManager {
             deferredCloses.clear();
             renderBatchDepth = 0;
             activeTextureLayerY = Integer.MIN_VALUE;
+            previousTextureLayerY = Integer.MIN_VALUE;
         }
         for (TextureInfo info : closeNow) info.close();
         synchronized (dirtyTextures) {
             dirtyTextures.clear();
             revisions.clear();
-            firstDirtyNanos.clear();
-            lastDirtyNanos.clear();
         }
         synchronized (visibleTextures) {
             visibleTextures.clear();
         }
     }
 
-    private List<String> selectDirty(int budget, boolean force) {
+    private List<String> selectDirty(int budget) {
         List<String> result = new ArrayList<>(budget);
-        long now = System.nanoTime();
         synchronized (dirtyTextures) {
             synchronized (visibleTextures) {
                 for (String key : visibleTextures.keySet()) {
-                    if (dirtyTextures.contains(key) && isReadyForPublication(key, now, force)) {
-                        result.add(key);
-                    }
+                    if (dirtyTextures.contains(key)) result.add(key);
                     if (result.size() >= budget) break;
                 }
             }
             if (result.size() < budget) {
                 for (String key : dirtyTextures) {
-                    if (!result.contains(key) && isReadyForPublication(key, now, force)) {
-                        result.add(key);
-                    }
+                    if (!result.contains(key)) result.add(key);
                     if (result.size() >= budget) break;
                 }
             }
             dirtyTextures.removeAll(result);
         }
         return result;
-    }
-
-    private boolean isReadyForPublication(String key, long now, boolean force) {
-        if (force) return true;
-        long first = firstDirtyNanos.getOrDefault(key, now);
-        long last = lastDirtyNanos.getOrDefault(key, first);
-        return now - last >= DIRTY_QUIET_NANOS || now - first >= DIRTY_MAX_WAIT_NANOS;
     }
 
     private void markVisible(String key) {
@@ -372,9 +347,6 @@ public final class CaveTextureManager {
 
     private void requeue(String key) {
         synchronized (dirtyTextures) {
-            long now = System.nanoTime();
-            firstDirtyNanos.putIfAbsent(key, now);
-            lastDirtyNanos.putIfAbsent(key, now);
             dirtyTextures.add(key);
         }
     }

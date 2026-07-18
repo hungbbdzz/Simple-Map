@@ -4,10 +4,9 @@ package com.velorise.simplemap.client;
  * Immutable raw data for a single map pixel (one block column).
  *
  * Runtime regions store this value in a packed {@code long[]} instead of one
- * Java object per pixel. Version 2 added a second height used by fluids: topY is
- * the visible fluid surface, while floorY is the solid terrain below it. Version
- * 3 stores the exact per-pixel BlockColors tint alongside this packed value in
- * the region file. For non-fluid pixels floorY equals topY.
+ * Java object per pixel. Version 2 adds a second height used by fluids: topY is
+ * the visible fluid surface, while floorY is the solid terrain below it. For
+ * non-fluid pixels floorY equals topY.
  *
  * Packed layout (low to high bits):
  *   0..15   topY
@@ -23,7 +22,7 @@ public final class MapBlockData {
     public static final short NO_BLOCK = -1;
 
     public static final int FILE_MAGIC   = 0x534D4150; // "SMAP"
-    public static final int FILE_VERSION = 3;
+    public static final int FILE_VERSION = 2;
 
     public static final long EMPTY_PACKED = packRaw(
             EMPTY_Y, NO_BLOCK, NO_BIOME, (byte) 0, EMPTY_Y);

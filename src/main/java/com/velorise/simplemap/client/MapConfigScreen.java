@@ -11,7 +11,6 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.gui.screens.ConfirmScreen;
 import net.minecraft.client.gui.narration.NarrationElementOutput;
 import net.minecraft.network.chat.Component;
 
@@ -61,7 +60,6 @@ public class MapConfigScreen extends Screen {
     private Button mapStyleButton;
     private Button displayFlowersButton;
     private Button cursorBiomeButton;
-    private Button cursorBlockButton;
 
     // Shared color editor: one input and a small reusable saved-color palette.
     private static final String[] COLOR_TARGET_NAMES = { "Arrow", "Ring", "Compass", "Coords" };
@@ -69,7 +67,6 @@ public class MapConfigScreen extends Screen {
     private Button colorTargetButton;
     private Button presetColorButton;
     private Button savePaletteColorButton;
-    private Button customBlockColorsButton;
     private EditBox sharedColorInput;
     private final List<ColorSwatchButton> paletteButtons = new ArrayList<>();
 
@@ -80,28 +77,14 @@ public class MapConfigScreen extends Screen {
     // Require Book toggle button
     private Button requireBookButton;
     private Button autoClearPinButton;
-    private Button deathWaypointButton;
-    private Button deathWaypointLimitButton;
     private Button alwaysRescanButton;
-    private Button reloadAllRegionsButton;
     private Button mapRevealModeButton;
     private Button blockColourModeButton;
     private Button terrainSlopesButton;
-    private Button fastFullscreenButton;
     private Button caveScanButton;
-
-    // Shared responsive panel geometry. Init and render use the same numbers so
-    // controls cannot drift outside the card at different GUI scales.
-    private int panelLeft = 10;
-    private int panelTop = 15;
-    private int panelWidth = 240;
-    private int panelRight = 250;
-    private int panelBottom = 0;
 
     private static final int SCAN_CHUNK_MIN = 4;
     private static final int SCAN_CHUNK_MAX = 390; // 390 represents AUTO/MAX
-    private static final int PALETTE_LABEL_Y = 104;
-    private static final int PALETTE_SWATCH_Y = 116;
 
     public MapConfigScreen(Screen parent) {
         super(Component.literal("Minimap Settings"));
@@ -115,38 +98,25 @@ public class MapConfigScreen extends Screen {
             int btnWidth = 176;
             int btnHeight = 20;
             boolean remoteServer = isRemoteServerSession();
-            boolean remoteExtension = remoteServer && MapConfig.serverExtensionAvailable;
 
             requireBookButton = Button.builder(
-                    getServerRequireBookMessage(remoteServer, remoteExtension),
+                    getServerRequireBookMessage(remoteServer),
                     button -> {
                         ServerConfig.requireMapBook = !ServerConfig.requireMapBook;
                         MapConfig.serverRequireMapBook = ServerConfig.requireMapBook;
                         ServerConfig.save();
                         syncIntegratedServerConfig();
-                        button.setMessage(getServerRequireBookMessage(false, false));
+                        button.setMessage(getServerRequireBookMessage(false));
                     }).bounds((this.width - btnWidth) / 2, this.height / 2 - 30, btnWidth, btnHeight)
                     .tooltip(Tooltip.create(Component.literal(
-                            remoteServer && !remoteExtension
-                                    ? "Map Books require the Simple Map server extension."
-                                    : "Require a learned Map Book before the map can open.")))
+                            "Require a learned Map Book before the map can open.")))
                     .build();
             requireBookButton.active = !remoteServer;
             this.addRenderableWidget(requireBookButton);
 
             caveScanButton = Button.builder(
-                    getServerCaveModeMessage(remoteServer, remoteExtension),
+                    getServerCaveModeMessage(remoteServer),
                     button -> {
-                        if (remoteServer && !remoteExtension) {
-                            MapConfig.localCaveMapMode = (MapConfig.localCaveMapMode + 1) % 3;
-                            if (MapConfig.localCaveMapMode != 2) {
-                                CaveMode.clearManualLayer();
-                                CaveMapManager.getInstance().deactivate();
-                            }
-                            MapConfig.save();
-                            button.setMessage(getServerCaveModeMessage(true, false));
-                            return;
-                        }
                         ServerConfig.caveMapMode = (ServerConfig.caveMapMode + 1) % 3;
                         MapConfig.serverCaveMapMode = ServerConfig.caveMapMode;
                         if (ServerConfig.caveMapMode != 2) {
@@ -155,14 +125,14 @@ public class MapConfigScreen extends Screen {
                         }
                         ServerConfig.save();
                         syncIntegratedServerConfig();
-                        button.setMessage(getServerCaveModeMessage(false, false));
+                        button.setMessage(getServerCaveModeMessage(false));
                     }).bounds((this.width - btnWidth) / 2, this.height / 2, btnWidth, btnHeight)
                     .tooltip(Tooltip.create(Component.literal(
                             "Cave visibility; may feel like cheating.\n"
                                     + "OFF: surface only · AUTO: underground\n"
                                     + "ON: auto plus manual layers")))
                     .build();
-            caveScanButton.active = !remoteExtension;
+            caveScanButton.active = !remoteServer;
             this.addRenderableWidget(caveScanButton);
 
             this.addRenderableWidget(Button.builder(
@@ -176,18 +146,12 @@ public class MapConfigScreen extends Screen {
             return;
         }
 
-        // ==================== RESPONSIVE LEFT PANEL ====================
-        panelLeft = Math.max(4, Math.min(10, this.width / 24));
-        panelTop = 15;
-        panelWidth = Math.min(240, Math.max(180, this.width - panelLeft - 6));
-        panelRight = panelLeft + panelWidth;
-        panelBottom = Math.max(panelTop + 80, this.height - 10);
-
         // ==================== TABS (Top of Left Panel) ====================
+        // Tab buttons are at y = 20, width = 74, spacing = 4
         int tabY = 20;
+        int tabW = 53;
         int tabSpacing = 4;
-        int startX = panelLeft + 4;
-        int tabW = Math.max(38, (panelWidth - 8 - tabSpacing * 3) / 4);
+        int startX = 14;
 
         tabMapButton = Button.builder(
                 Component.literal(activeTab == 0 ? "§6§lMap" : "Map"),
@@ -195,9 +159,7 @@ public class MapConfigScreen extends Screen {
                     activeTab = 0;
                     updateTabButtons();
                     updateWidgetVisibility();
-                }).bounds(startX, tabY, tabW, 20)
-                .tooltip(Tooltip.create(Component.literal("Minimap visibility, size, orientation and markers.")))
-                .build();
+                }).bounds(startX, tabY, tabW, 20).build();
         this.addRenderableWidget(tabMapButton);
 
         tabCoordsButton = Button.builder(
@@ -206,9 +168,7 @@ public class MapConfigScreen extends Screen {
                     activeTab = 1;
                     updateTabButtons();
                     updateWidgetVisibility();
-                }).bounds(startX + tabW + tabSpacing, tabY, tabW, 20)
-                .tooltip(Tooltip.create(Component.literal("Coordinate overlay and cursor information.")))
-                .build();
+                }).bounds(startX + tabW + tabSpacing, tabY, tabW, 20).build();
         this.addRenderableWidget(tabCoordsButton);
 
         tabColorsButton = Button.builder(
@@ -217,9 +177,7 @@ public class MapConfigScreen extends Screen {
                     activeTab = 2;
                     updateTabButtons();
                     updateWidgetVisibility();
-                }).bounds(startX + (tabW + tabSpacing) * 2, tabY, tabW, 20)
-                .tooltip(Tooltip.create(Component.literal("HUD colors, saved palette and block overrides.")))
-                .build();
+                }).bounds(startX + (tabW + tabSpacing) * 2, tabY, tabW, 20).build();
         this.addRenderableWidget(tabColorsButton);
 
         tabSystemButton = Button.builder(
@@ -228,17 +186,13 @@ public class MapConfigScreen extends Screen {
                     activeTab = 3;
                     updateTabButtons();
                     updateWidgetVisibility();
-                }).bounds(startX + (tabW + tabSpacing) * 3, tabY, tabW, 20)
-                .tooltip(Tooltip.create(Component.literal("Scanning, performance, pins and recovery settings.")))
-                .build();
+                }).bounds(startX + (tabW + tabSpacing) * 3, tabY, tabW, 20).build();
         this.addRenderableWidget(tabSystemButton);
 
         // ==================== CONTROLS GRID ====================
-        int col1X = panelLeft + 6;
-        int columnGap = 8;
-        int colW = Math.max(78, (panelWidth - 12 - columnGap) / 2);
-        int col2X = col1X + colW + columnGap;
-        int gridWidth = colW * 2 + columnGap;
+        int col1X = 16;
+        int col2X = 132;
+        int colW = 108;
 
         // Row 1 (y = 52)
         minimapToggleButton = Button.builder(
@@ -246,9 +200,7 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     MapConfig.minimapEnabled = !MapConfig.minimapEnabled;
                     button.setMessage(getToggleMessage());
-                }).bounds(col1X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Show or hide the minimap HUD without disabling map recording.")))
-                .build();
+                }).bounds(col1X, 52, colW, 20).build();
         this.addRenderableWidget(minimapToggleButton);
 
         double initialSizeVal = (double) (MapConfig.minimapSize - 16) / (150 - 16);
@@ -257,8 +209,6 @@ public class MapConfigScreen extends Screen {
                 initialSizeVal,
                 val -> String.format("Size: %dpx", 16 + (int) (val * (150 - 16))),
                 val -> MapConfig.minimapSize = 16 + (int) (val * (150 - 16)));
-        minimapSizeSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes the minimap's on-screen size. Drag the preview to reposition it.")));
         this.addRenderableWidget(minimapSizeSlider);
 
         // Row 2 (y = 77)
@@ -267,9 +217,7 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     MapConfig.minimapCircle = !MapConfig.minimapCircle;
                     button.setMessage(getShapeMessage());
-                }).bounds(col1X, 77, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Switch between a square and circular minimap frame.")))
-                .build();
+                }).bounds(col1X, 77, colW, 20).build();
         this.addRenderableWidget(minimapShapeButton);
 
         double initialZoomVal = (MapConfig.minimapZoom - 0.05) / (2.0 - 0.05);
@@ -278,8 +226,6 @@ public class MapConfigScreen extends Screen {
                 initialZoomVal,
                 val -> String.format("Zoom: %.2fx", 0.05 + val * (2.0 - 0.05)),
                 val -> MapConfig.minimapZoom = (float) (0.05 + val * (2.0 - 0.05)));
-        minimapZoomSlider.setTooltip(Tooltip.create(Component.literal(
-                "Controls how much world area fits inside the minimap.")));
         this.addRenderableWidget(minimapZoomSlider);
 
         // Row 3 (y = 102)
@@ -288,10 +234,7 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     MapConfig.minimapRotate = !MapConfig.minimapRotate;
                     button.setMessage(getRotateMessage());
-                }).bounds(col1X, 102, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "ROTATING follows player direction. NORTH UP keeps north fixed at the top.")))
-                .build();
+                }).bounds(col1X, 102, colW, 20).build();
         this.addRenderableWidget(minimapRotateButton);
 
         double initialPointerScaleVal = (MapConfig.playerMarkerScale - 0.1) / (1.0 - 0.1);
@@ -300,8 +243,6 @@ public class MapConfigScreen extends Screen {
                 initialPointerScaleVal,
                 val -> String.format("Pointer: %.2fx", 0.1 + val * (1.0 - 0.1)),
                 val -> MapConfig.playerMarkerScale = (float) (0.1 + val * (1.0 - 0.1)));
-        pointerScaleSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes the size of the player marker at the center of the minimap.")));
         this.addRenderableWidget(pointerScaleSlider);
 
         // Row 4 (y = 127)
@@ -310,10 +251,7 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     MapConfig.playerMarkerMode = (MapConfig.playerMarkerMode + 1) % 2;
                     button.setMessage(getPointerModeMessage());
-                }).bounds(col1X, 127, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Choose either a compact direction arrow or the player head skin.")))
-                .build();
+                }).bounds(col1X, 127, colW, 20).build();
         this.addRenderableWidget(pointerModeButton);
 
         double initialPinScaleVal = (MapConfig.pinScale - 0.1) / (1.0 - 0.1);
@@ -325,8 +263,6 @@ public class MapConfigScreen extends Screen {
                     MapConfig.pinScale = (float) (0.1 + val * (1.0 - 0.1));
                     MapConfig.save();
                 });
-        pinScaleSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes the size of the temporary navigation pin and its map marker.")));
         this.addRenderableWidget(pinScaleSlider);
 
         // ==================== SHARED COLOR EDITOR ====================
@@ -336,10 +272,7 @@ public class MapConfigScreen extends Screen {
                     selectedColorTarget = (selectedColorTarget + 1) % COLOR_TARGET_NAMES.length;
                     button.setMessage(getColorTargetMessage());
                     syncSharedColorInput();
-                }).bounds(col1X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Select which HUD element receives the edited color.")))
-                .build();
+                }).bounds(col1X, 52, colW, 20).build();
         this.addRenderableWidget(colorTargetButton);
 
         presetColorButton = Button.builder(
@@ -347,64 +280,38 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     setSelectedTargetColor(nextPresetColor(getSelectedTargetColor()));
                     syncSharedColorInput();
-                }).bounds(col2X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Cycle through built-in readable colors for the selected target.")))
-                .build();
+                }).bounds(col2X, 52, colW, 20).build();
         this.addRenderableWidget(presetColorButton);
 
-        int saveButtonWidth = Math.max(44, Math.min(56, colW / 2));
-        int colorInputWidth = Math.max(72, gridWidth - saveButtonWidth - columnGap);
-        int saveButtonX = col1X + colorInputWidth + columnGap;
-        sharedColorInput = new EditBox(this.font, col1X, 77, colorInputWidth, 20,
-                Component.literal("Shared hex color"));
+        sharedColorInput = new EditBox(this.font, col1X, 77, 150, 20, Component.literal("Shared hex color"));
         sharedColorInput.setMaxLength(9);
         sharedColorInput.setValue(ColorCode.format(getSelectedTargetColor()));
         sharedColorInput.setHint(Component.literal("#RRGGBB"));
         sharedColorInput.setResponder(this::previewSharedColor);
-        sharedColorInput.setTooltip(Tooltip.create(Component.literal(
-                "Enter #RRGGBB or #AARRGGBB. Valid input previews immediately.")));
         this.addRenderableWidget(sharedColorInput);
 
         savePaletteColorButton = Button.builder(
                 Component.literal("Save"),
                 button -> saveSharedColor())
-                .bounds(saveButtonX, 77, saveButtonWidth, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Save the current color to the reusable palette below.")))
-                .build();
+                .bounds(172, 77, 68, 20).build();
         this.addRenderableWidget(savePaletteColorButton);
 
         paletteButtons.clear();
-        int swatchGap = 4;
-        int swatchWidth = Math.max(28, (gridWidth - swatchGap * 3) / 4);
         for (int i = 0; i < 8; i++) {
-            int swatchX = col1X + (i % 4) * (swatchWidth + swatchGap);
-            int swatchY = PALETTE_SWATCH_Y + (i / 4) * 25;
-            ColorSwatchButton swatch = new ColorSwatchButton(swatchX, swatchY, swatchWidth, 20, i);
+            int swatchX = col1X + (i % 4) * 56;
+            int swatchY = 105 + (i / 4) * 25;
+            ColorSwatchButton swatch = new ColorSwatchButton(swatchX, swatchY, 52, 20, i);
             paletteButtons.add(swatch);
             this.addRenderableWidget(swatch);
         }
 
         // Row 5, col 2 (y = 152)
-        customBlockColorsButton = Button.builder(
-                Component.literal("Block Overrides: " + MapConfig.blockColorOverrides.size()),
-                b -> {
-                    if (this.minecraft != null) this.minecraft.setScreen(new BlockColorManagerScreen(this));
-                }).bounds(col1X, 166, gridWidth, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Search, edit, reset or remove per-block map colors.")))
-                .build();
-        this.addRenderableWidget(customBlockColorsButton);
-
         compassLettersToggleButton = Button.builder(
                 getCompassLettersMessage(),
                 button -> {
                     MapConfig.compassLettersVisible = !MapConfig.compassLettersVisible;
                     button.setMessage(getCompassLettersMessage());
-                }).bounds(col2X, 152, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Show N, E, S and W around the minimap frame.")))
-                .build();
+                }).bounds(col2X, 152, colW, 20).build();
         this.addRenderableWidget(compassLettersToggleButton);
 
         mapStyleButton = Button.builder(
@@ -415,9 +322,7 @@ public class MapConfigScreen extends Screen {
                     MapTextureManager.getInstance().invalidateStyle();
                     CaveTextureManager.getInstance().invalidateStyle();
                     FullCaveTextureManager.getInstance().invalidateStyle();
-                }).bounds(col1X, 152, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Cycle the overall map color profile.")))
-                .build();
+                }).bounds(col1X, 152, colW, 20).build();
         this.addRenderableWidget(mapStyleButton);
 
         showInScreensButton = Button.builder(
@@ -425,10 +330,7 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     MapConfig.showMinimapInScreens = !MapConfig.showMinimapInScreens;
                     button.setMessage(getShowInScreensMessage());
-                }).bounds(col1X, 177, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Keep the minimap visible while inventory, containers, chat or pause screens are open.")))
-                .build();
+                }).bounds(col2X, 177, colW, 20).build();
         this.addRenderableWidget(showInScreensButton);
 
         // ==================== COORDS CONTROLS ====================
@@ -437,9 +339,7 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     MapConfig.coordsEnabled = !MapConfig.coordsEnabled;
                     button.setMessage(getCoordsToggleMessage());
-                }).bounds(col1X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Show the movable player coordinate overlay.")))
-                .build();
+                }).bounds(col1X, 52, colW, 20).build();
         this.addRenderableWidget(coordsToggleButton);
 
         double initialCoordsScaleVal = (MapConfig.coordsScale - 0.1) / (2.0 - 0.1);
@@ -448,8 +348,6 @@ public class MapConfigScreen extends Screen {
                 initialCoordsScaleVal,
                 val -> String.format("Coords: %.2fx", 0.1 + val * (2.0 - 0.1)),
                 val -> MapConfig.coordsScale = (float) (0.1 + val * (2.0 - 0.1)));
-        coordsScaleSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes coordinate text size. Drag the preview text to reposition it.")));
         this.addRenderableWidget(coordsScaleSlider);
 
         cursorBiomeButton = Button.builder(
@@ -458,23 +356,8 @@ public class MapConfigScreen extends Screen {
                     MapConfig.cursorBiomeEnabled = !MapConfig.cursorBiomeEnabled;
                     MapConfig.save();
                     button.setMessage(getCursorBiomeMessage());
-                }).bounds(col1X, 77, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Show the live biome name below cursor coordinates when the chunk is loaded.")))
-                .build();
+                }).bounds(col1X, 77, colW, 20).build();
         this.addRenderableWidget(cursorBiomeButton);
-
-        cursorBlockButton = Button.builder(
-                getCursorBlockMessage(),
-                button -> {
-                    MapConfig.cursorBlockEnabled = !MapConfig.cursorBlockEnabled;
-                    MapConfig.save();
-                    button.setMessage(getCursorBlockMessage());
-                }).bounds(col2X, 77, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Show the block under the cursor between the coordinate and biome readouts.")))
-                .build();
-        this.addRenderableWidget(cursorBlockButton);
 
         // ==================== SYSTEM CONTROLS ====================
         mapRevealModeButton = Button.builder(
@@ -497,10 +380,7 @@ public class MapConfigScreen extends Screen {
                     MapConfig.autoClearPin = !MapConfig.autoClearPin;
                     MapConfig.save();
                     button.setMessage(getAutoClearPinMessage());
-                }).bounds(col1X, 102, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Automatically remove the temporary navigation pin within 5 blocks of it.")))
-                .build();
+                }).bounds(col1X, 102, colW, 20).build();
         this.addRenderableWidget(autoClearPinButton);
 
         int initialChunks = pointsToChunkBudget(MapConfig.scanPointsPerTick);
@@ -532,9 +412,7 @@ public class MapConfigScreen extends Screen {
                     button.setMessage(getAlwaysRescanMessage());
                 }).bounds(col1X, 77, colW, 20)
                 .tooltip(Tooltip.create(Component.literal(
-                        "Continuously rescan loaded client chunks.\n"
-                        + "OFF (Default): Scans explored blocks once for max performance.\n"
-                        + "ON: Keeps re-scanning live loaded chunks to pick up world changes.")))
+                        "Always refresh explored chunks.\nWarning: Can impact performance.")))
                 .build();
         this.addRenderableWidget(alwaysRescanButton);
 
@@ -574,72 +452,57 @@ public class MapConfigScreen extends Screen {
         });
         this.addRenderableWidget(scanInputBox);
 
-        fastFullscreenButton = Button.builder(
-                getFastFullscreenMessage(),
-                b -> {
-                    MapConfig.fastFullscreenLoading = !MapConfig.fastFullscreenLoading;
-                    b.setMessage(getFastFullscreenMessage());
-                    MapConfig.save();
-                }).bounds(col2X, 152, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Temporarily gives the open full map a larger bounded scan/upload budget.")))
-                .build();
-        this.addRenderableWidget(fastFullscreenButton);
-
-        deathWaypointButton = Button.builder(
-                getDeathWaypointMessage(),
-                b -> {
-                    MapConfig.createDeathWaypoint = !MapConfig.createDeathWaypoint;
-                    b.setMessage(getDeathWaypointMessage());
-                    if (deathWaypointLimitButton != null) deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
-                    MapConfig.save();
-                }).bounds(col1X, 177, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Create a local waypoint at the player's position on death.")))
-                .build();
-        this.addRenderableWidget(deathWaypointButton);
-
-        deathWaypointLimitButton = Button.builder(
-                getDeathWaypointLimitMessage(),
-                b -> {
-                    MapConfig.maxDeathWaypoints = switch (MapConfig.maxDeathWaypoints) {
-                        case 0 -> 1;
-                        case 1 -> 3;
-                        case 3 -> 5;
-                        case 5 -> 10;
-                        default -> 0;
-                    };
-                    b.setMessage(getDeathWaypointLimitMessage());
-                    MapConfig.save();
-                }).bounds(col2X, 177, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Maximum retained death waypoints per dimension.")))
-                .build();
-        deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
-        this.addRenderableWidget(deathWaypointLimitButton);
-
         resetToDefaultButton = Button.builder(
-                Component.literal("Restore Defaults..."),
-                button -> openResetConfirmation())
-                .bounds(col1X, 202, gridWidth, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Restore HUD, color, performance and waypoint preferences."
-                                + "\nA confirmation screen appears first."
-                                + "\nWaypoints, explored map data and block overrides are kept.")))
-                .build();
-        this.addRenderableWidget(resetToDefaultButton);
-
-        reloadAllRegionsButton = Button.builder(
-                Component.literal("Reload All Regions"),
+                Component.literal("Reset Default"),
                 button -> {
-                    MapManager.getInstance().reloadAllRegions();
-                    button.setMessage(Component.literal("Reloading..."));
-                }).bounds(col2X, 102, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Re-color and reload all saved map regions in the background.\n"
-                        + "Runs in the background and updates textures automatically when finished.")))
-                .build();
-        this.addRenderableWidget(reloadAllRegionsButton);
+                    MapConfig.minimapEnabled = true;
+                    MapConfig.minimapXPercent = 0.82f;
+                    MapConfig.minimapYPercent = 0.05f;
+                    MapConfig.minimapAnchor = "TOP_RIGHT";
+                    MapConfig.minimapOffsetX = -8;
+                    MapConfig.minimapOffsetY = 8;
+                    MapConfig.legacyMinimapPositionPending = false;
+                    MapConfig.minimapSize = 64;
+                    MapConfig.minimapZoom = 1.0f;
+                    MapConfig.scanPointsPerTick = MapConfig.calculateDefaultScanPoints();
+                    MapConfig.mapRevealMode = 1;
+                    MapConfig.blockColourMode = 0;
+                    MapConfig.displayFlowers = false;
+                    MapConfig.terrainSlopes = 2;
+                    MapConfig.cursorBiomeEnabled = true;
+                    ChunkScanner.getInstance().reset();
+                    MapConfig.playerMarkerScale = 0.5f;
+                    MapConfig.playerMarkerMode = 1;
+                    MapConfig.playerPointerColor = 0xFFFF0000;
+                    MapConfig.pinScale = 0.5f;
+                    MapConfig.waypointsVisible = true;
+                    MapConfig.minimapRotate = true;
+                    MapConfig.minimapCircle = false;
+                    MapConfig.showMinimapInScreens = true;
+                    MapConfig.minimapNightMode = 1;
+                    MapConfig.minimapRingColor = 0xFF2D3033;
+                    MapConfig.mapColorProfile = 0;
+                    MapTextureManager.getInstance().invalidateStyle();
+                    CaveTextureManager.getInstance().invalidateStyle();
+                    FullCaveTextureManager.getInstance().invalidateStyle();
+                    MapConfig.coordsEnabled = true;
+                    MapConfig.coordsXPercent = -1.0f;
+                    MapConfig.coordsYPercent = -1.0f;
+                    MapConfig.coordsScale = 0.64f;
+                    MapConfig.coordsTextColor = 0xFFFFFFFF;
+                    MapConfig.compassLettersVisible = true;
+                    MapConfig.compassLetterColor = 0xFFFFFFFF;
+                    MapConfig.autoClearPin = true;
+                    MapConfig.alwaysRescanExplored = false;
+
+                    selectedMinimap = false;
+                    selectedCoords = false;
+
+                    if (this.minecraft != null) {
+                        this.init(this.minecraft, this.width, this.height);
+                    }
+                }).bounds(col2X, 102, colW, 20).build();
+        this.addRenderableWidget(resetToDefaultButton);
 
         displayFlowersButton = Button.builder(
                 getDisplayFlowersMessage(),
@@ -647,10 +510,7 @@ public class MapConfigScreen extends Screen {
                     MapConfig.displayFlowers = !MapConfig.displayFlowers;
                     button.setMessage(getDisplayFlowersMessage());
                     refreshLoadedMapData();
-                }).bounds(col1X, 127, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Draw small flower blocks on the map. Disabling can reduce visual noise.")))
-                .build();
+                }).bounds(col1X, 127, colW, 20).build();
         this.addRenderableWidget(displayFlowersButton);
 
         blockColourModeButton = Button.builder(
@@ -686,42 +546,11 @@ public class MapConfigScreen extends Screen {
                     MapConfig.save();
                     if (this.minecraft != null)
                         this.minecraft.setScreen(this.parent);
-                }).bounds(col1X, this.height - 30, gridWidth, 20)
-                .tooltip(Tooltip.create(Component.literal("Save settings and return to the full map.")))
-                .build();
+                }).bounds(col1X, this.height - 30, colW * 2 + 8, 20).build();
         this.addRenderableWidget(doneButton);
 
         // Sync visibility at startup
         updateWidgetVisibility();
-    }
-
-    private void openResetConfirmation() {
-        if (this.minecraft == null) return;
-        this.minecraft.setScreen(new ConfirmScreen(confirmed -> {
-            if (confirmed) {
-                applyDefaultPreferences();
-            }
-            if (this.minecraft != null) {
-                this.minecraft.setScreen(this);
-            }
-        }, Component.literal("Restore Simple Map Defaults?"),
-                Component.literal("This restores HUD, colors, scanning and waypoint preferences. "
-                        + "Saved palette colors, block overrides, waypoints and explored map data are preserved."),
-                Component.literal("Restore"), Component.literal("Cancel")));
-    }
-
-    private void applyDefaultPreferences() {
-        MapConfig.resetPreferencesToDefaults();
-        selectedMinimap = false;
-        selectedCoords = false;
-        isDraggingMinimap = false;
-        isDraggingCoords = false;
-        CaveMode.clearManualLayer();
-        CaveMapManager.getInstance().deactivate();
-        ChunkScanner.getInstance().reset();
-        MapTextureManager.getInstance().invalidateStyle();
-        CaveTextureManager.getInstance().invalidateStyle();
-        FullCaveTextureManager.getInstance().invalidateStyle();
     }
 
     private void updateTabButtons() {
@@ -736,17 +565,10 @@ public class MapConfigScreen extends Screen {
     }
 
     private void updateWidgetVisibility() {
-        boolean hideAll = selectedMinimap || selectedCoords;
-        boolean showMap = activeTab == 0 && !hideAll;
-        boolean showCoords = activeTab == 1 && !hideAll;
-        boolean showColors = activeTab == 2 && !hideAll;
-        boolean showSystem = activeTab == 3 && !hideAll;
-
-        if (tabMapButton != null) tabMapButton.visible = !hideAll;
-        if (tabCoordsButton != null) tabCoordsButton.visible = !hideAll;
-        if (tabColorsButton != null) tabColorsButton.visible = !hideAll;
-        if (tabSystemButton != null) tabSystemButton.visible = !hideAll;
-        if (doneButton != null) doneButton.visible = !hideAll;
+        boolean showMap = activeTab == 0;
+        boolean showCoords = activeTab == 1;
+        boolean showColors = activeTab == 2;
+        boolean showSystem = activeTab == 3;
 
         if (minimapToggleButton != null)
             minimapToggleButton.visible = showMap;
@@ -772,11 +594,6 @@ public class MapConfigScreen extends Screen {
             sharedColorInput.visible = showColors;
         if (savePaletteColorButton != null)
             savePaletteColorButton.visible = showColors;
-        if (customBlockColorsButton != null) {
-            customBlockColorsButton.visible = showColors;
-            customBlockColorsButton.setMessage(Component.literal(
-                    "Block Overrides: " + MapConfig.blockColorOverrides.size()));
-        }
         refreshPaletteButtons();
         if (compassLettersToggleButton != null)
             compassLettersToggleButton.visible = showMap;
@@ -791,15 +608,11 @@ public class MapConfigScreen extends Screen {
             coordsScaleSlider.visible = showCoords;
         if (cursorBiomeButton != null)
             cursorBiomeButton.visible = showCoords;
-        if (cursorBlockButton != null)
-            cursorBlockButton.visible = showCoords;
 
         if (autoClearPinButton != null)
             autoClearPinButton.visible = showSystem;
         if (alwaysRescanButton != null)
             alwaysRescanButton.visible = showSystem;
-        if (reloadAllRegionsButton != null)
-            reloadAllRegionsButton.visible = showSystem;
         if (mapRevealModeButton != null)
             mapRevealModeButton.visible = showSystem;
         if (resetToDefaultButton != null)
@@ -814,14 +627,6 @@ public class MapConfigScreen extends Screen {
             blockColourModeButton.visible = showSystem;
         if (terrainSlopesButton != null)
             terrainSlopesButton.visible = showSystem;
-        if (fastFullscreenButton != null)
-            fastFullscreenButton.visible = showSystem;
-        if (deathWaypointButton != null)
-            deathWaypointButton.visible = showSystem;
-        if (deathWaypointLimitButton != null) {
-            deathWaypointLimitButton.visible = showSystem;
-            deathWaypointLimitButton.active = showSystem && MapConfig.createDeathWaypoint;
-        }
     }
 
     private Component getToggleMessage() {
@@ -829,7 +634,7 @@ public class MapConfigScreen extends Screen {
     }
 
     private Component getRotateMessage() {
-        return Component.literal("North Lock: " + (MapConfig.minimapRotate ? "OFF" : "ON"));
+        return Component.literal("Map Rotate: " + (MapConfig.minimapRotate ? "ON" : "OFF"));
     }
 
     private Component getShapeMessage() {
@@ -837,31 +642,23 @@ public class MapConfigScreen extends Screen {
     }
 
     private Component getCoordsToggleMessage() {
-        return Component.literal("Coordinates: " + (MapConfig.coordsEnabled ? "ON" : "OFF"));
-    }
-
-    private Component getDeathWaypointMessage() {
-        return Component.literal("Death Points: " + (MapConfig.createDeathWaypoint ? "ON" : "OFF"));
-    }
-
-    private Component getDeathWaypointLimitMessage() {
-        return Component.literal("Death Limit: " + MapConfig.maxDeathWaypoints);
+        return Component.literal("Coords: " + (MapConfig.coordsEnabled ? "ENABLED" : "DISABLED"));
     }
 
     private Component getAutoClearPinMessage() {
-        return Component.literal("Auto-Clear Pin: " + (MapConfig.autoClearPin ? "ON" : "OFF"));
+        return Component.literal("Auto Clear Pin: " + (MapConfig.autoClearPin ? "ON" : "OFF"));
     }
 
     private Component getPointerModeMessage() {
-        return Component.literal("Marker: " + (MapConfig.playerMarkerMode == 1 ? "ARROW" : "SKIN"));
+        return Component.literal("Pointer: " + (MapConfig.playerMarkerMode == 1 ? "ARROW ONLY" : "SKIN + ARROW"));
     }
 
     private Component getCompassLettersMessage() {
-        return Component.literal("Compass Labels: " + (MapConfig.compassLettersVisible ? "ON" : "OFF"));
+        return Component.literal("Compass Letters: " + (MapConfig.compassLettersVisible ? "ON" : "OFF"));
     }
 
     private Component getShowInScreensMessage() {
-        return Component.literal("Show in Screens: " + (MapConfig.showMinimapInScreens ? "ON" : "OFF"));
+        return Component.literal("In Menus: " + (MapConfig.showMinimapInScreens ? "ON" : "OFF"));
     }
 
     private Component getMapStyleMessage() {
@@ -870,11 +667,11 @@ public class MapConfigScreen extends Screen {
     }
 
     private Component getColorTargetMessage() {
-        return Component.literal("Edit Color: " + COLOR_TARGET_NAMES[selectedColorTarget]);
+        return Component.literal("Target: " + COLOR_TARGET_NAMES[selectedColorTarget]);
     }
 
     private Component getSelectedPresetMessage() {
-        return Component.literal("Color: " + getPresetColorName(getSelectedTargetColor()));
+        return Component.literal("Preset: " + getPresetColorName(getSelectedTargetColor()));
     }
 
     private int getSelectedTargetColor() {
@@ -960,13 +757,8 @@ public class MapConfigScreen extends Screen {
         return "Custom";
     }
 
-    private Component getFastFullscreenMessage() {
-        return Component.literal("Loading: "
-                + (MapConfig.fastFullscreenLoading ? "FAST" : "BALANCED"));
-    }
-
     private Component getAlwaysRescanMessage() {
-        return Component.literal("Rescan Loaded: " + (MapConfig.alwaysRescanExplored ? "ON" : "OFF"));
+        return Component.literal("Always Rescan: " + (MapConfig.alwaysRescanExplored ? "ON" : "OFF"));
     }
 
     private static int pointsToChunkBudget(int points) {
@@ -990,15 +782,15 @@ public class MapConfigScreen extends Screen {
     }
 
     private Component getMapRevealModeMessage() {
-        return Component.literal("Mapping: STREAM");
+        return Component.literal("Mapping: CHUNK STREAM");
     }
 
     private Component getDisplayFlowersMessage() {
-        return Component.literal("Map Flowers: " + (MapConfig.displayFlowers ? "ON" : "OFF"));
+        return Component.literal("Flowers: " + (MapConfig.displayFlowers ? "ON" : "OFF"));
     }
 
     private Component getBlockColourModeMessage() {
-        return Component.literal("Block Colors: " + (MapConfig.blockColourMode == 1 ? "VANILLA" : "ACCURATE"));
+        return Component.literal("Colours: " + (MapConfig.blockColourMode == 1 ? "VANILLA" : "ACCURATE"));
     }
 
     private Component getTerrainSlopesMessage() {
@@ -1007,15 +799,11 @@ public class MapConfigScreen extends Screen {
             case 1 -> "2D";
             default -> "3D";
         };
-        return Component.literal("Terrain Shading: " + mode);
+        return Component.literal("Slopes: " + mode);
     }
 
     private Component getCursorBiomeMessage() {
         return Component.literal("Cursor Biome: " + (MapConfig.cursorBiomeEnabled ? "ON" : "OFF"));
-    }
-
-    private Component getCursorBlockMessage() {
-        return Component.literal("Cursor Block: " + (MapConfig.cursorBlockEnabled ? "ON" : "OFF"));
     }
 
     private void refreshLoadedMapData() {
@@ -1043,26 +831,20 @@ public class MapConfigScreen extends Screen {
         });
     }
 
-    private Component getServerRequireBookMessage(boolean remoteServer, boolean remoteExtension) {
-        if (remoteServer && !remoteExtension) {
-            return Component.literal("Book: SERVER MOD REQUIRED");
-        }
+    private Component getServerRequireBookMessage(boolean remoteServer) {
         boolean enabled = remoteServer ? MapConfig.serverRequireMapBook : ServerConfig.requireMapBook;
         return Component.literal("Book: " + (enabled ? "REQUIRED" : "OPTIONAL")
                 + (remoteServer ? " · SERVER" : ""));
     }
 
-    private Component getServerCaveModeMessage(boolean remoteServer, boolean remoteExtension) {
-        int mode = remoteServer
-                ? (remoteExtension ? MapConfig.serverCaveMapMode : MapConfig.localCaveMapMode)
-                : ServerConfig.caveMapMode;
+    private Component getServerCaveModeMessage(boolean remoteServer) {
+        int mode = remoteServer ? MapConfig.serverCaveMapMode : ServerConfig.caveMapMode;
         String name = switch (mode) {
             case 1 -> "AUTO";
             case 2 -> "ON";
             default -> "OFF";
         };
-        String authority = remoteServer ? (remoteExtension ? " · SERVER" : " · LOCAL") : "";
-        return Component.literal("Cave Scan: " + name + authority);
+        return Component.literal("Cave Scan: " + name + (remoteServer ? " · SERVER" : ""));
     }
 
     @Override
@@ -1091,19 +873,13 @@ public class MapConfigScreen extends Screen {
             return;
         }
 
-        if (!selectedMinimap && !selectedCoords) {
-            // Semi-transparent dark overlay — game view shows through behind
-            guiGraphics.fill(0, 0, this.width, this.height, 0xAA000000);
+        // Semi-transparent dark overlay — game view shows through behind
+        guiGraphics.fill(0, 0, this.width, this.height, 0xAA000000);
 
-            // Draw the same responsive card geometry used by init().
-            panelBottom = Math.max(panelTop + 80, this.height - 10);
-            guiGraphics.fill(panelLeft, panelTop, panelRight, panelBottom, 0xDD111215);
-            guiGraphics.renderOutline(panelLeft - 1, panelTop - 1,
-                    panelWidth + 2, panelBottom - panelTop + 2, 0xFF2D3033);
-            guiGraphics.fill(panelLeft, 58, panelRight, 59, 0xFF2D3033);
-        } else {
-            guiGraphics.fill(0, 0, this.width, this.height, 0x30000000);
-        }
+        // Draw Left Settings Panel Card Background & Borders
+        guiGraphics.fill(10, 15, 250, this.height - 10, 0xDD111215); // Dark slate card body
+        guiGraphics.renderOutline(9, 14, 242, this.height - 23, 0xFF2D3033); // Card border outline
+        guiGraphics.fill(10, 58, 250, 59, 0xFF2D3033); // Divider line under tabs
 
         int size = MapConfig.minimapSize;
         int[] minimapPosition = MinimapPosition.resolve(this.width, this.height, size);
@@ -1152,11 +928,9 @@ public class MapConfigScreen extends Screen {
                 org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
 
                 // Draw circular mask using scanlines of fillFloat (precise float coordinates)
-                float maskRadius = clipRadius + 1.5f; // Overlap slightly under the border
-                for (int dy = -(int) Math.ceil(maskRadius); dy <= (int) Math.ceil(maskRadius); dy++) {
-                    float squared = maskRadius * maskRadius - dy * dy;
-                    if (squared < 0.0f) continue;
-                    float dx = (float) Math.sqrt(squared);
+                float maskRadius = clipRadius + 0.5f; // Overlap slightly under the border
+                for (int dy = -(int) maskRadius; dy <= (int) maskRadius; dy++) {
+                    float dx = (float) Math.sqrt(maskRadius * maskRadius - dy * dy);
                     fillFloat(guiGraphics, cx - dx, cy + dy, cx + dx, cy + dy + 1.0f, 0xFFFFFFFF);
                 }
 
@@ -1336,8 +1110,7 @@ public class MapConfigScreen extends Screen {
             String paletteLabel = MapConfig.savedColors.isEmpty()
                     ? "Save a color to reuse it"
                     : "Saved colors (Shift-click removes)";
-            guiGraphics.drawString(this.font, paletteLabel, panelLeft + 6,
-                    PALETTE_LABEL_Y, 0xFFB0B0B0, false);
+            guiGraphics.drawString(this.font, paletteLabel, 16, 98, 0xFF9A9A9A, false);
         }
 
         // Draw widgets (sliders, buttons, editbox)
@@ -1348,9 +1121,7 @@ public class MapConfigScreen extends Screen {
         int hintY = doneButton.getY() - 18;
 
         String hint = activeTab == 2 ? "Choose target, then apply a saved color"
-                : ((selectedMinimap || selectedCoords)
-                        ? "Drag to move, click outside to save"
-                        : (activeTab <= 1 ? "Click & Drag" : ""));
+                : (activeTab <= 1 ? "Click & Drag" : "");
         if (!hint.isEmpty()) {
             guiGraphics.drawCenteredString(this.font, hint, panelCenterX, hintY, 0x808080);
         }
@@ -1362,48 +1133,12 @@ public class MapConfigScreen extends Screen {
             return super.mouseClicked(mouseX, mouseY, button);
         }
         if (button == 0) {
+            // 1. Check Minimap click
             int size = MapConfig.minimapSize;
             int[] minimapPosition = MinimapPosition.resolve(this.width, this.height, size);
             int x = minimapPosition[0];
             int y = minimapPosition[1];
-
-            String coords = MapConfig.coordsEnabled ? "0, 80, 0" : "Coords Disabled";
-            if (MapConfig.coordsEnabled && this.minecraft != null && this.minecraft.player != null) {
-                coords = String.format("%d, %d, %d",
-                        (int) Math.floor(this.minecraft.player.getX()),
-                        (int) Math.floor(this.minecraft.player.getY()),
-                        (int) Math.floor(this.minecraft.player.getZ()));
-            }
-            int textWidth = (int) (this.font.width(coords) * MapConfig.coordsScale);
-            int textHeight = (int) (9 * MapConfig.coordsScale);
-            int cx;
-            int cy;
-            if (MapConfig.coordsXPercent < 0 || MapConfig.coordsYPercent < 0) {
-                cx = x + (size - textWidth) / 2;
-                cy = y + size + 4;
-            } else {
-                cx = (int) (this.width * MapConfig.coordsXPercent);
-                cy = (int) (this.height * MapConfig.coordsYPercent);
-            }
-            cx = Math.max(2, Math.min(cx, this.width - textWidth - 2));
-            cy = Math.max(2, Math.min(cy, this.height - textHeight - 2));
-
-            boolean insideMinimap = mouseX >= x && mouseX < x + size && mouseY >= y && mouseY < y + size;
-            boolean insideCoords = mouseX >= cx - 3 && mouseX < cx + textWidth + 3
-                    && mouseY >= cy - 2 && mouseY < cy + textHeight + 2;
-
-            if ((selectedMinimap && !insideMinimap) || (selectedCoords && !insideCoords)) {
-                selectedMinimap = false;
-                selectedCoords = false;
-                isDraggingMinimap = false;
-                isDraggingCoords = false;
-                MapConfig.save();
-                updateWidgetVisibility();
-                return true;
-            }
-
-            // 1. Check Minimap click
-            if (insideMinimap) {
+            if (mouseX >= x && mouseX < x + size && mouseY >= y && mouseY < y + size) {
                 this.selectedMinimap = true;
                 this.selectedCoords = false;
                 updateWidgetVisibility();
@@ -1416,7 +1151,29 @@ public class MapConfigScreen extends Screen {
             }
 
             // 2. Check Coords click
-            if (insideCoords) {
+            String coords = MapConfig.coordsEnabled ? "0, 80, 0" : "Coords Disabled";
+            if (MapConfig.coordsEnabled && this.minecraft != null && this.minecraft.player != null) {
+                coords = String.format("%d, %d, %d",
+                        (int) Math.floor(this.minecraft.player.getX()),
+                        (int) Math.floor(this.minecraft.player.getY()),
+                        (int) Math.floor(this.minecraft.player.getZ()));
+            }
+            int textWidth = (int) (this.font.width(coords) * MapConfig.coordsScale);
+            int textHeight = (int) (9 * MapConfig.coordsScale);
+
+            int cx, cy;
+            if (MapConfig.coordsXPercent < 0 || MapConfig.coordsYPercent < 0) {
+                cx = x + (size - textWidth) / 2;
+                cy = y + size + 4;
+            } else {
+                cx = (int) (this.width * MapConfig.coordsXPercent);
+                cy = (int) (this.height * MapConfig.coordsYPercent);
+            }
+
+            cx = Math.max(2, Math.min(cx, this.width - textWidth - 2));
+            cy = Math.max(2, Math.min(cy, this.height - textHeight - 2));
+
+            if (mouseX >= cx - 3 && mouseX < cx + textWidth + 3 && mouseY >= cy - 2 && mouseY < cy + textHeight + 2) {
                 this.selectedCoords = true;
                 this.selectedMinimap = false;
                 updateWidgetVisibility();
@@ -1486,10 +1243,7 @@ public class MapConfigScreen extends Screen {
 
         void setColor(int color) {
             this.color = color;
-            String formatted = ColorCode.format(color);
-            setMessage(Component.literal("Use " + formatted));
-            setTooltip(Tooltip.create(Component.literal(
-                    formatted + "\nClick: apply to selected target\nShift-click: remove from saved colors")));
+            setMessage(Component.literal("Use " + ColorCode.format(color)));
         }
 
         @Override

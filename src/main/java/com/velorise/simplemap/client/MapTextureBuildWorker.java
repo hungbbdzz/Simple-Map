@@ -36,32 +36,28 @@ final class MapTextureBuildWorker {
      */
     static CompletableFuture<PreparedPair> tryBuildSurface(
             long[] pixels,
-            int[] tints,
             List<String> biomePalette,
             List<String> blockPalette,
             IntFunction<Biome> biomeLookup,
             java.util.Map<String, Integer> blockColors,
             java.util.Map<String, BlockTintPolicy> tintPolicies,
-            java.util.Set<String> tintDisabledBlocks,
             int colourMode,
             boolean showFlowers,
             int terrainSlopes,
             byte[] light,
             int profile,
             long revision) {
-        return tryBuildSurface(pixels, tints, biomePalette, blockPalette, biomeLookup, blockColors,
-                tintPolicies, tintDisabledBlocks, colourMode, showFlowers, terrainSlopes, light, profile, revision, () -> true);
+        return tryBuildSurface(pixels, biomePalette, blockPalette, biomeLookup, blockColors,
+                tintPolicies, colourMode, showFlowers, terrainSlopes, light, profile, revision, () -> true);
     }
 
     static CompletableFuture<PreparedPair> tryBuildSurface(
             long[] pixels,
-            int[] tints,
             List<String> biomePalette,
             List<String> blockPalette,
             IntFunction<Biome> biomeLookup,
             java.util.Map<String, Integer> blockColors,
             java.util.Map<String, BlockTintPolicy> tintPolicies,
-            java.util.Set<String> tintDisabledBlocks,
             int colourMode,
             boolean showFlowers,
             int terrainSlopes,
@@ -77,9 +73,8 @@ final class MapTextureBuildWorker {
                     BooleanSupplier valid = () -> !future.isCancelled() && stillValid.getAsBoolean();
                     if (!valid.getAsBoolean()) throw new java.util.concurrent.CancellationException();
                     int[] styled = SurfaceColorizer.colorize(
-                            pixels, tints, biomePalette, blockPalette, biomeLookup,
-                            blockColors, tintPolicies, tintDisabledBlocks, colourMode,
-                            showFlowers, terrainSlopes, profile, valid);
+                            pixels, biomePalette, blockPalette, biomeLookup,
+                            blockColors, tintPolicies, colourMode, showFlowers, terrainSlopes, profile, valid);
 
                     // 2. Generate the glow layer. The old implementation walked a
                     // full 3x3 neighbourhood for every pixel. The same [1 2 1] x

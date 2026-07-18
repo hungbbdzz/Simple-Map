@@ -74,12 +74,6 @@ final class BlockTextureColorSampler {
         return null;
     }
 
-    static void invalidate(ResourceLocation blockId) {
-        if (blockId == null) return;
-        CACHE.remove(blockId);
-        FAILED.remove(blockId);
-    }
-
     static void clearCache() {
         CACHE.clear();
         FAILED.clear();

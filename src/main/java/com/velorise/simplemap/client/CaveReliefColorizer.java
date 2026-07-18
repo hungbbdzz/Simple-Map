@@ -53,28 +53,7 @@ final class CaveReliefColorizer {
         float ridge = Math.min(0.10f, Math.max(0, center - floor) * 0.018f);
         float edge = Math.min(0.18f,
                 (Math.abs(west - east) + Math.abs(north - south)) * 0.012f);
-        float depthOcclusion = multiScaleDepthOcclusion(heights, x, z, center);
-        return clamp(1.0f + directional + ridge - pit - edge - depthOcclusion, 0.46f, 1.24f);
-    }
-
-    private static float multiScaleDepthOcclusion(short[] heights, int x, int z, int center) {
-        float shadow = depthAtRadius(heights, x, z, center, 2, 0.018f)
-                + depthAtRadius(heights, x, z, center, 8, 0.010f)
-                + depthAtRadius(heights, x, z, center, 24, 0.0035f);
-        return Math.min(0.24f, shadow);
-    }
-
-    private static float depthAtRadius(short[] heights, int x, int z,
-            int center, int radius, float weight) {
-        int sum = Math.max(0, height(heights, x - radius, z, center) - center)
-                + Math.max(0, height(heights, x + radius, z, center) - center)
-                + Math.max(0, height(heights, x, z - radius, center) - center)
-                + Math.max(0, height(heights, x, z + radius, center) - center)
-                + Math.max(0, height(heights, x - radius, z - radius, center) - center)
-                + Math.max(0, height(heights, x + radius, z - radius, center) - center)
-                + Math.max(0, height(heights, x - radius, z + radius, center) - center)
-                + Math.max(0, height(heights, x + radius, z + radius, center) - center);
-        return Math.min(0.16f, (sum * 0.125f) * weight);
+        return clamp(1.0f + directional + ridge - pit - edge, 0.48f, 1.24f);
     }
 
     private static int height(short[] heights, int x, int z, int fallback) {
