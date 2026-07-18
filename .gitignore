@@ -18,3 +18,12 @@ run/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Project temporary and IDE internal files
+.gemini/
+dev-audit/
+img/
+*.patch
+COMMIT_COMMANDS.txt
+gradle copy.properties
+
