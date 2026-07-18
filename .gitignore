@@ -23,7 +23,9 @@ Thumbs.db
 .gemini/
 dev-audit/
 img/
+analysis_xaero_and_our_simplemap/
 *.patch
 COMMIT_COMMANDS.txt
 gradle copy.properties
+
 
