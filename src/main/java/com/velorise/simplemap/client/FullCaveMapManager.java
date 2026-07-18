@@ -41,7 +41,7 @@ public final class FullCaveMapManager {
     private static final int MAX_REGIONS = 144;
     private static final int PIXELS = 512 * 512;
     private static final int FILE_MAGIC = 0x534D4643; // SMFC
-    private static final int FILE_VERSION = 1;
+    private static final int FILE_VERSION = 2;
     private static final int LEGACY_HEIGHT_MAGIC = 0x534D4659;
     private static final int LEGACY_HEIGHT_VERSION = 1;
     private static final int MAX_BINARY_FILE_BYTES = 8 * 1024 * 1024;
@@ -92,7 +92,7 @@ public final class FullCaveMapManager {
 
     public synchronized void setCacheDirectory(File directory) {
         if (sameFile(cacheDirectory, directory)) return;
-        flushAndClear();
+        flushDataForDimensionSwitch();
         cacheDirectory = directory;
         if (cacheDirectory != null && !cacheDirectory.exists() && !cacheDirectory.mkdirs()) {
             LOGGER.warn("Could not create full cave cache directory {}", cacheDirectory);
@@ -144,10 +144,13 @@ public final class FullCaveMapManager {
         if (directory == null) return false;
         if (latestSave(directory, rx, rz) != null) return true;
         String key = key(rx, rz);
-        return fileExists.computeIfAbsent(key, ignored ->
-                new File(directory, fileName(rx, rz)).isFile()
-                        || new File(directory, legacyColorFileName(rx, rz)).isFile()
-                        || new File(directory, legacyHeightFileName(rx, rz)).isFile());
+        Boolean cached = fileExists.get(key);
+        if (cached != null) return cached;
+        boolean exists = new File(directory, fileName(rx, rz)).isFile()
+                || new File(directory, legacyColorFileName(rx, rz)).isFile()
+                || new File(directory, legacyHeightFileName(rx, rz)).isFile();
+        fileExists.put(key, exists);
+        return exists;
     }
 
     public boolean isRegionLoaded(int rx, int rz) {
@@ -203,11 +206,17 @@ public final class FullCaveMapManager {
     }
 
     public synchronized void flushAndClear() {
+        flushDataForDimensionSwitch();
+        FullCaveTextureManager.getInstance().clearCache();
+    }
+
+    /** Clears dimension-bound full-cave data while retaining warm GPU tiles. */
+    public synchronized void flushDataForDimensionSwitch() {
         saveDirtyRegions();
         generation.incrementAndGet();
         clearRegions();
+        dirtyRegions.clear();
         fileExists.clear();
-        FullCaveTextureManager.getInstance().clearCache();
         cacheDirectory = null;
     }
 
@@ -620,6 +629,12 @@ public final class FullCaveMapManager {
         public int getSurfaceY(int px, int pz) {
             lock.lock();
             try { return heights[pz * 512 + px]; }
+            finally { lock.unlock(); }
+        }
+
+        public int[] snapshotPixels() {
+            lock.lock();
+            try { return Arrays.copyOf(pixels, pixels.length); }
             finally { lock.unlock(); }
         }
 

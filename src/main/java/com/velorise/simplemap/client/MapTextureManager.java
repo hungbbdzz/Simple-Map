@@ -28,14 +28,23 @@ public class MapTextureManager {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final MapTextureManager INSTANCE = new MapTextureManager();
     private static final int MAX_TEXTURE_REGIONS = 128;
+    private static final int MAX_TEXTURE_PAGES = 1024;
     private static final int MAX_VISIBLE_HISTORY = MAX_TEXTURE_REGIONS * 4;
     private static final long VISIBLE_TTL_MS = 2_000L;
+    /** Wait for a brief quiet period before rebuilding a 512x512 region. */
+    private static final long DIRTY_QUIET_NANOS = 60_000_000L;
+    /** Publish progressive snapshots frequently while a region is still scanning. */
+    private static final long DIRTY_MAX_WAIT_NANOS = 350_000_000L;
 
     private final Map<String, RegionTextureInfo> textureCache = new LinkedHashMap<>(16, 0.75f, true);
+    private final Map<String, PageTextureInfo> pageCache = new LinkedHashMap<>(128, 0.75f, true);
     private final Set<String> dirtyTextures = new LinkedHashSet<>();
     private final Map<String, Long> visibleTextures = new LinkedHashMap<>();
     private final Map<String, Long> revisions = new HashMap<>();
+    private final Map<String, Long> firstDirtyNanos = new HashMap<>();
+    private final Map<String, Long> lastDirtyNanos = new HashMap<>();
     private final List<RegionTextureInfo> deferredCloses = new ArrayList<>();
+    private final List<PageTextureInfo> deferredPageCloses = new ArrayList<>();
     private int renderBatchDepth;
     private final Map<String, Integer> blockColorsCache = new ConcurrentHashMap<>();
     private final Map<String, Integer> vanillaBlockColorsCache = new ConcurrentHashMap<>();
@@ -74,11 +83,7 @@ public class MapTextureManager {
             var block = net.minecraft.core.registries.BuiltInRegistries.BLOCK.get(blockId);
             var state = block.defaultBlockState();
             String path = blockId.getPath();
-            if (path.equals("spruce_leaves")) {
-                resolved = BlockTintPolicy.SPRUCE;
-            } else if (path.equals("birch_leaves")) {
-                resolved = BlockTintPolicy.BIRCH;
-            } else if (BlockTextureColorSampler.modelUsesTint(blockId)) {
+            if (BlockTextureColorSampler.modelUsesTint(blockId)) {
                 boolean leaves = state.is(net.minecraft.tags.BlockTags.LEAVES)
                         || path.endsWith("_leaves") || path.contains("foliage");
                 if (leaves || path.contains("vine")) resolved = BlockTintPolicy.FOLIAGE;
@@ -107,13 +112,62 @@ public class MapTextureManager {
         return resolved;
     }
 
+    /** Resolves the automatic color while deliberately ignoring a saved override. */
+    public int resolveAutomaticBlockColor(String blockId) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!minecraft.isSameThread()) return 0xFFFFFFFF;
+        return resolveDefaultBlockColor(blockId, MapConfig.blockColourMode);
+    }
+
+    /** Invalidates one block's derived color, then rebuilds every cached surface tile. */
+    public void invalidateBlockColor(String blockId) {
+        if (blockId != null) {
+            blockColorsCache.remove(blockId);
+            vanillaBlockColorsCache.remove(blockId);
+            tintPolicyCache.remove(blockId);
+            try {
+                BlockTextureColorSampler.invalidate(ResourceLocation.parse(blockId));
+            } catch (RuntimeException ignored) {
+                BlockTextureColorSampler.clearCache();
+            }
+        }
+        invalidateStyle();
+    }
+
     public void markRegionDirty(int regionX, int regionZ) {
         String key = key(regionX, regionZ);
+        long now = System.nanoTime();
         synchronized (dirtyTextures) {
-            // One revision per queued rebuild is enough. Thousands of changed
-            // columns in the same region now collapse into a single texture job.
-            if (dirtyTextures.add(key)) revisions.merge(key, 1L, Long::sum);
+            // Every changed column advances the revision. Prepared images are complete
+            // immutable region snapshots; a slightly older snapshot may still be
+            // published, then immediately followed by the newest queued revision.
+            revisions.merge(key, 1L, Long::sum);
+            firstDirtyNanos.putIfAbsent(key, now);
+            lastDirtyNanos.put(key, now);
+            dirtyTextures.add(key);
         }
+    }
+
+    /**
+     * Marks the regions covering the given world-coordinate viewport as visible
+     * so the upload prioritiser includes them in the next upload cycle.
+     * Called from the client tick via MapViewportCoordinator.
+     * Never triggers disk loads or CPU builds; those happen in uploadDirtyTextures().
+     */
+    public void requestVisiblePages(double minX, double maxX, double minZ, double maxZ) {
+        int minRx = (int) Math.floor(minX - 1.0) >> 9;
+        int maxRx = (int) Math.floor(maxX + 1.0) >> 9;
+        int minRz = (int) Math.floor(minZ - 1.0) >> 9;
+        int maxRz = (int) Math.floor(maxZ + 1.0) >> 9;
+        for (int rz = minRz; rz <= maxRz; rz++) {
+            for (int rx = minRx; rx <= maxRx; rx++) {
+                markRegionVisible(key(rx, rz));
+            }
+        }
+    }
+
+    public void requestVisibleRegion(int regionX, int regionZ) {
+        markRegionVisible(key(regionX, regionZ));
     }
 
     public ResourceLocation getRegionTexture(int regionX, int regionZ) {
@@ -144,6 +198,10 @@ public class MapTextureManager {
                 textureCache.put(key, info);
                 trimTextureCache();
                 schedulePreparation(key, info, region, regionX, regionZ);
+            } else if (info.generation != manager.getGeneration()) {
+                if (info.pending != null) info.pending.cancel(false);
+                info.pending = null;
+                info.generation = manager.getGeneration();
             }
         }
         return info.initialized ? info.location : null;
@@ -158,6 +216,58 @@ public class MapTextureManager {
     }
 
 
+    /** Returns only an already uploaded GPU tile; never loads, rebuilds or allocates. */
+    public ResourceLocation peekRegionTexture(int regionX, int regionZ) {
+        String key = key(regionX, regionZ);
+        synchronized (textureCache) {
+            RegionTextureInfo info = textureCache.get(key);
+            if (info == null || !info.initialized) return null;
+            markRegionVisible(key);
+            return info.location;
+        }
+    }
+
+    /** Cached-only counterpart for the emissive overlay. */
+    public ResourceLocation peekGlowRegionTexture(int regionX, int regionZ) {
+        String key = key(regionX, regionZ);
+        synchronized (textureCache) {
+            RegionTextureInfo info = textureCache.get(key);
+            if (info == null || !info.initialized) return null;
+            markRegionVisible(key);
+            return info.glowLocation;
+        }
+    }
+
+    /** Cached-only counterpart for 64x64 sub-page texture. */
+    public ResourceLocation peekPageTexture(int regionX, int regionZ, int pageX, int pageZ) {
+        String key = pageKey(regionX, regionZ, pageX, pageZ);
+        synchronized (pageCache) {
+            PageTextureInfo info = pageCache.get(key);
+            if (info == null || !info.initialized) return null;
+            markRegionVisible(key(regionX, regionZ));
+            return info.location;
+        }
+    }
+
+    public ResourceLocation peekGlowPageTexture(int regionX, int regionZ, int pageX, int pageZ) {
+        String key = pageKey(regionX, regionZ, pageX, pageZ);
+        synchronized (pageCache) {
+            PageTextureInfo info = pageCache.get(key);
+            if (info == null || !info.initialized) return null;
+            return info.glowLocation;
+        }
+    }
+    public boolean hasAnyPageTexture(int regionX, int regionZ) {
+        String prefix = key(regionX, regionZ) + ":";
+        synchronized (pageCache) {
+            for (String key : pageCache.keySet()) {
+                if (key.startsWith(prefix)) return true;
+            }
+        }
+        return false;
+    }
+
+
     public void beginRenderBatch() {
         synchronized (textureCache) {
             renderBatchDepth++;
@@ -166,14 +276,22 @@ public class MapTextureManager {
 
     public void endRenderBatch() {
         List<RegionTextureInfo> closeNow = null;
+        List<PageTextureInfo> closePagesNow = null;
         synchronized (textureCache) {
             if (renderBatchDepth > 0) renderBatchDepth--;
-            if (renderBatchDepth == 0 && !deferredCloses.isEmpty()) {
-                closeNow = new ArrayList<>(deferredCloses);
-                deferredCloses.clear();
+            if (renderBatchDepth == 0) {
+                if (!deferredCloses.isEmpty()) {
+                    closeNow = new ArrayList<>(deferredCloses);
+                    deferredCloses.clear();
+                }
+                if (!deferredPageCloses.isEmpty()) {
+                    closePagesNow = new ArrayList<>(deferredPageCloses);
+                    deferredPageCloses.clear();
+                }
             }
         }
         if (closeNow != null) for (RegionTextureInfo info : closeNow) info.close();
+        if (closePagesNow != null) for (PageTextureInfo info : closePagesNow) info.close();
     }
 
     public void uploadDirtyTextures() {
@@ -194,14 +312,15 @@ public class MapTextureManager {
 
         int countBudget = force ? 6 : 2;
         long deadline = System.nanoTime() + (force ? 8_000_000L : 4_000_000L);
-        List<String> work = selectDirty(countBudget);
+        List<String> work = selectDirty(countBudget, force);
         for (String key : work) {
             if (System.nanoTime() > deadline && !force) {
                 requeue(key);
                 continue;
             }
-            int comma = key.indexOf(',');
-            int regionX = Integer.parseInt(key.substring(0, comma));
+            int separator = key.lastIndexOf('|');
+            int comma = key.indexOf(',', separator + 1);
+            int regionX = Integer.parseInt(key.substring(separator + 1, comma));
             int regionZ = Integer.parseInt(key.substring(comma + 1));
             MapManager.Region region = MapManager.getInstance().getRegion(regionX, regionZ, false);
             if (region == null || !region.isLoaded()) {
@@ -217,19 +336,24 @@ public class MapTextureManager {
                     info = createTextureInfo(regionX, regionZ, MapManager.getInstance().getGeneration());
                     textureCache.put(key, info);
                     trimTextureCache();
+                } else if (info.generation != MapManager.getInstance().getGeneration()) {
+                    if (info.pending != null) info.pending.cancel(false);
+                    info.pending = null;
+                    info.generation = MapManager.getInstance().getGeneration();
                 }
             }
             schedulePreparation(key, info, region, regionX, regionZ);
         }
     }
 
-    private List<String> selectDirty(int budget) {
+    private List<String> selectDirty(int budget, boolean force) {
         List<String> selected = new ArrayList<>(budget);
+        long now = System.nanoTime();
         synchronized (dirtyTextures) {
             if (dirtyTextures.isEmpty()) return selected;
             synchronized (visibleTextures) {
                 for (String key : visibleTextures.keySet()) {
-                    if (dirtyTextures.contains(key)) {
+                    if (isCurrentDimensionKey(key) && dirtyTextures.contains(key) && isReadyForPublication(key, now, force)) {
                         selected.add(key);
                         if (selected.size() >= budget) break;
                     }
@@ -237,13 +361,22 @@ public class MapTextureManager {
             }
             if (selected.size() < budget) {
                 for (String key : dirtyTextures) {
-                    if (!selected.contains(key)) selected.add(key);
+                    if (isCurrentDimensionKey(key) && !selected.contains(key) && isReadyForPublication(key, now, force)) {
+                        selected.add(key);
+                    }
                     if (selected.size() >= budget) break;
                 }
             }
             dirtyTextures.removeAll(selected);
         }
         return selected;
+    }
+
+    private boolean isReadyForPublication(String key, long now, boolean force) {
+        if (force) return true;
+        long first = firstDirtyNanos.getOrDefault(key, now);
+        long last = lastDirtyNanos.getOrDefault(key, first);
+        return now - last >= DIRTY_QUIET_NANOS || now - first >= DIRTY_MAX_WAIT_NANOS;
     }
 
     private void schedulePreparation(String key, RegionTextureInfo info,
@@ -254,20 +387,35 @@ public class MapTextureManager {
             try {
                 MapTextureBuildWorker.PreparedPair prepared = info.pending.join();
                 if (MapManager.getInstance().isGenerationCurrent(info.generation)) {
+                    // The worker always builds from one immutable 512x512 snapshot, so
+                    // the result is internally coherent even if newer columns arrived
+                    // while it was being colorized. Publishing that complete snapshot
+                    // prevents a continuously scanned region from remaining black.
                     applyPrepared(info, prepared);
+
+                    synchronized (dirtyTextures) {
+                        long currentRevision = revisions.getOrDefault(key, 0L);
+                        if (currentRevision > prepared.revision()) {
+                            // A newer coherent snapshot is required; keep it queued.
+                            dirtyTextures.add(key);
+                        } else {
+                            dirtyTextures.remove(key);
+                            firstDirtyNanos.remove(key);
+                            lastDirtyNanos.remove(key);
+                        }
+                    }
                 }
             } catch (RuntimeException exception) {
                 LOGGER.debug("Discarded failed/stale surface texture job {}", key, exception);
+                requeue(key);
             } finally {
                 info.pending = null;
-            }
-            synchronized (dirtyTextures) {
-                if (revisions.getOrDefault(key, 0L) > info.uploadedRevision) dirtyTextures.add(key);
             }
             return;
         }
 
         long[] pixels = region.snapshotPackedPixels();
+        int[] tints = region.snapshotTints();
         List<String> biomePalette = region.snapshotBiomePalette();
         List<String> blockPalette = region.snapshotBlockPalette();
         long revision;
@@ -298,6 +446,7 @@ public class MapTextureManager {
         }
         Map<String, Integer> blockColors = new HashMap<>(selectedColorCache);
         Map<String, BlockTintPolicy> tintPolicies = new HashMap<>(tintPolicyCache);
+        Set<String> tintDisabledBlocks = Set.copyOf(MapConfig.blockColorOverrides.keySet());
 
         byte[] light = null;
         MapLightManager.LightRegion lightRegion = MapLightManager.getInstance().getRegion(
@@ -313,8 +462,8 @@ public class MapTextureManager {
         }
 
         CompletableFuture<MapTextureBuildWorker.PreparedPair> future =
-                MapTextureBuildWorker.tryBuildSurface(pixels, biomePalette, blockPalette,
-                        biomeLookup, blockColors, tintPolicies, MapConfig.blockColourMode,
+                MapTextureBuildWorker.tryBuildSurface(pixels, tints, biomePalette, blockPalette,
+                        biomeLookup, blockColors, tintPolicies, tintDisabledBlocks, MapConfig.blockColourMode,
                         MapConfig.displayFlowers, MapConfig.terrainSlopes, light,
                         MapConfig.mapColorProfile, revision,
                         () -> MapManager.getInstance().isGenerationCurrent(info.generation));
@@ -334,14 +483,15 @@ public class MapTextureManager {
     private RegionTextureInfo createTextureInfo(int regionX, int regionZ, long generation) {
         DynamicTexture texture = new DynamicTexture(512, 512, false);
         texture.setFilter(false, false);
+        String dimension = texturePathDimension();
         ResourceLocation location = ResourceLocation.fromNamespaceAndPath("simplemap",
-                "regions/r_" + regionX + '_' + regionZ);
+                "regions/" + dimension + "/r_" + regionX + '_' + regionZ);
         Minecraft.getInstance().getTextureManager().register(location, texture);
 
         DynamicTexture glowTexture = new DynamicTexture(512, 512, false);
         glowTexture.setFilter(false, false);
         ResourceLocation glowLocation = ResourceLocation.fromNamespaceAndPath("simplemap",
-                "regions/glow_" + regionX + '_' + regionZ);
+                "regions/" + dimension + "/glow_" + regionX + '_' + regionZ);
         Minecraft.getInstance().getTextureManager().register(glowLocation, glowTexture);
         return new RegionTextureInfo(texture, location, glowTexture, glowLocation, generation);
     }
@@ -413,11 +563,21 @@ public class MapTextureManager {
         }
     }
 
+    public void clearDerivedColorCaches() {
+        blockColorsCache.clear();
+        vanillaBlockColorsCache.clear();
+        tintPolicyCache.clear();
+        BlockTextureColorSampler.clearCache();
+    }
+
     public void invalidateStyle() {
         synchronized (textureCache) {
             synchronized (dirtyTextures) {
+                long now = System.nanoTime();
                 for (String key : textureCache.keySet()) {
                     revisions.merge(key, 1L, Long::sum);
+                    firstDirtyNanos.putIfAbsent(key, now);
+                    lastDirtyNanos.put(key, now);
                     dirtyTextures.add(key);
                 }
             }
@@ -439,9 +599,20 @@ public class MapTextureManager {
             renderBatchDepth = 0;
         }
         for (RegionTextureInfo info : closeNow) info.close();
+
+        List<PageTextureInfo> closePagesNow = new ArrayList<>();
+        synchronized (pageCache) {
+            closePagesNow.addAll(pageCache.values());
+            closePagesNow.addAll(deferredPageCloses);
+            pageCache.clear();
+            deferredPageCloses.clear();
+        }
+        for (PageTextureInfo info : closePagesNow) info.close();
         synchronized (dirtyTextures) {
             dirtyTextures.clear();
             revisions.clear();
+            firstDirtyNanos.clear();
+            lastDirtyNanos.clear();
         }
         synchronized (visibleTextures) {
             visibleTextures.clear();
@@ -490,6 +661,9 @@ public class MapTextureManager {
 
     private void requeue(String key) {
         synchronized (dirtyTextures) {
+            long now = System.nanoTime();
+            firstDirtyNanos.putIfAbsent(key, now);
+            lastDirtyNanos.putIfAbsent(key, now);
             dirtyTextures.add(key);
         }
     }
@@ -504,7 +678,20 @@ public class MapTextureManager {
     }
 
     private static String key(int regionX, int regionZ) {
-        return regionX + "," + regionZ;
+        return MapManager.getInstance().getDimensionCacheKey() + "|" + regionX + "," + regionZ;
+    }
+
+    private static String pageKey(int regionX, int regionZ, int pageX, int pageZ) {
+        return key(regionX, regionZ) + ":" + pageX + "," + pageZ;
+    }
+
+    private static boolean isCurrentDimensionKey(String key) {
+        return key != null && key.startsWith(MapManager.getInstance().getDimensionCacheKey() + "|");
+    }
+
+    private static String texturePathDimension() {
+        return MapManager.getInstance().getDimensionCacheKey().toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("[^a-z0-9/._-]", "_");
     }
 
     private static final class RegionTextureInfo {
@@ -512,12 +699,38 @@ public class MapTextureManager {
         private final ResourceLocation location;
         private final DynamicTexture glowTexture;
         private final ResourceLocation glowLocation;
-        private final long generation;
+        private long generation;
         private CompletableFuture<MapTextureBuildWorker.PreparedPair> pending;
         private long uploadedRevision = Long.MIN_VALUE;
         private boolean initialized;
 
         private RegionTextureInfo(DynamicTexture texture, ResourceLocation location,
+                DynamicTexture glowTexture, ResourceLocation glowLocation, long generation) {
+            this.texture = texture;
+            this.location = location;
+            this.glowTexture = glowTexture;
+            this.glowLocation = glowLocation;
+            this.generation = generation;
+        }
+
+        private void close() {
+            if (pending != null) pending.cancel(false);
+            Minecraft.getInstance().getTextureManager().release(location);
+            Minecraft.getInstance().getTextureManager().release(glowLocation);
+        }
+    }
+
+    private static final class PageTextureInfo {
+        private final DynamicTexture texture;
+        private final ResourceLocation location;
+        private final DynamicTexture glowTexture;
+        private final ResourceLocation glowLocation;
+        private long generation;
+        private CompletableFuture<MapTextureBuildWorker.PreparedPair> pending;
+        private long uploadedRevision = Long.MIN_VALUE;
+        private boolean initialized;
+
+        private PageTextureInfo(DynamicTexture texture, ResourceLocation location,
                 DynamicTexture glowTexture, ResourceLocation glowLocation, long generation) {
             this.texture = texture;
             this.location = location;

@@ -8,12 +8,73 @@ import org.joml.Matrix4f;
 
 public class MinimapRenderer {
     private static final MinimapRenderer INSTANCE = new MinimapRenderer();
+    private static final long CAVE_ZOOM_ANIMATION_NANOS = 1_000_000_000L;
+    private static final float CAVE_ZOOM_MULTIPLIER = 1.55f;
+
+    private boolean caveAnimationInitialized;
+    private boolean lastCaveActive;
+    private long caveAnimationStartNanos;
+    private float caveZoomFrom = 1.0f;
+    private float caveZoomTo = 1.0f;
+    private float caveZoomMultiplier = 1.0f;
+
+    private long worldJoinTimeNanos;
 
     public static MinimapRenderer getInstance() {
         return INSTANCE;
     }
 
     private MinimapRenderer() {
+    }
+
+    public void onWorldJoin() {
+        this.worldJoinTimeNanos = System.nanoTime();
+    }
+
+    public static boolean isAllowedScreenForMinimap(net.minecraft.client.gui.screens.Screen screen) {
+        if (screen == null) return false;
+        // Hide minimap on the mod's own full-screen views
+        if (screen instanceof MapScreen || screen instanceof MapConfigScreen
+                || screen instanceof AddWaypointScreen || screen instanceof BlockColorScreen
+                || screen instanceof BlockColorManagerScreen) {
+            return false;
+        }
+        // Hide minimap on Minecraft system screens (loading, saving, title, connecting...)
+        String className = screen.getClass().getSimpleName();
+        return !className.contains("Loading") && !className.contains("Saving")
+                && !className.contains("Progress") && !className.contains("Receiving")
+                && !className.contains("Connect") && !className.contains("Title")
+                && !className.contains("WorldSelection") && !className.contains("DirtMessage")
+                && !className.contains("Win");
+    }
+
+    private float getAnimatedZoom(Minecraft mc) {
+        boolean caveActive = CaveMode.isActive(mc);
+        long now = System.nanoTime();
+        if (!caveAnimationInitialized) {
+            caveAnimationInitialized = true;
+            lastCaveActive = caveActive;
+            caveZoomMultiplier = caveActive ? CAVE_ZOOM_MULTIPLIER : 1.0f;
+            caveZoomFrom = caveZoomMultiplier;
+            caveZoomTo = caveZoomMultiplier;
+        } else if (caveActive != lastCaveActive) {
+            caveZoomMultiplier = evaluateCaveZoom(now);
+            caveZoomFrom = caveZoomMultiplier;
+            caveZoomTo = caveActive ? CAVE_ZOOM_MULTIPLIER : 1.0f;
+            caveAnimationStartNanos = now;
+            lastCaveActive = caveActive;
+        }
+        caveZoomMultiplier = evaluateCaveZoom(now);
+        return MapConfig.minimapZoom * caveZoomMultiplier;
+    }
+
+    private float evaluateCaveZoom(long now) {
+        if (caveAnimationStartNanos == 0L || caveZoomFrom == caveZoomTo) return caveZoomTo;
+        float progress = Math.min(1.0f,
+                (now - caveAnimationStartNanos) / (float) CAVE_ZOOM_ANIMATION_NANOS);
+        float eased = progress * progress * (3.0f - 2.0f * progress);
+        if (progress >= 1.0f) caveAnimationStartNanos = 0L;
+        return caveZoomFrom + (caveZoomTo - caveZoomFrom) * eased;
     }
 
     /**
@@ -26,11 +87,17 @@ public class MinimapRenderer {
     public void renderHUD(GuiGraphics guiGraphics, float partialTick, boolean screenOverlay) {
         Minecraft mc = Minecraft.getInstance();
 
+        long now = System.nanoTime();
+        if (worldJoinTimeNanos != 0L && now - worldJoinTimeNanos < 1_500_000_000L) {
+            return;
+        }
+
         // Normal HUD rendering and screen-overlay rendering are dispatched separately to
         // avoid drawing the minimap twice while a menu is open.
         if (!MapConfig.minimapEnabled || mc.level == null || mc.player == null || mc.options.hideGui
+                || mc.getOverlay() != null || mc.player.tickCount < 20
                 || (!screenOverlay && mc.screen != null)
-                || (screenOverlay && (mc.screen == null || !MapConfig.showMinimapInScreens))) {
+                || (screenOverlay && (mc.screen == null || !MapConfig.showMinimapInScreens || !isAllowedScreenForMinimap(mc.screen)))) {
             return;
         }
 
@@ -41,6 +108,7 @@ public class MinimapRenderer {
         }
 
         Player player = mc.player;
+        float effectiveZoom = getAnimatedZoom(mc);
         int screenWidth = mc.getWindow().getGuiScaledWidth();
         int screenHeight = mc.getWindow().getGuiScaledHeight();
 
@@ -56,85 +124,8 @@ public class MinimapRenderer {
         double interpZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
 
         if (MapConfig.minimapCircle) {
-            // ==========================================
-            // CIRCULAR MINIMAP (OpenGL Stencil Masking)
-            // ==========================================
-            float radius = size / 2.0f;
-            float cx = x + radius;
-            float cy = y + radius;
-            float clipRadius = radius - tHalf;
-
-            // Ensure stencil buffer is enabled on the main framebuffer
-            mc.getMainRenderTarget().enableStencil();
-            boolean depthTestWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-
-            // 1. Enable stencil test and clear stencil buffer
-            org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-            org.lwjgl.opengl.GL11.glStencilMask(0xFF); // Enable writes for clearing!
-            org.lwjgl.opengl.GL11.glClear(org.lwjgl.opengl.GL11.GL_STENCIL_BUFFER_BIT);
-
-            // 2. Configure stencil to write 1 on circle area
-            org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_ALWAYS, 1, 0xFF);
-            org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_REPLACE, org.lwjgl.opengl.GL11.GL_REPLACE,
-                    org.lwjgl.opengl.GL11.GL_REPLACE);
-
-            // Disable color writes and depth test so the clipping circle writes purely to
-            // stencil
-            org.lwjgl.opengl.GL11.glColorMask(false, false, false, false);
-            org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-
-            // Draw circular mask using scanlines of fillFloat (precise float coordinates)
-            float maskRadius = clipRadius + 0.5f; // Overlap slightly under the border
-            for (int dy = -(int) maskRadius; dy <= (int) maskRadius; dy++) {
-                float dx = (float) Math.sqrt(maskRadius * maskRadius - dy * dy);
-                fillFloat(guiGraphics, cx - dx, cy + dy, cx + dx, cy + dy + 1.0f, 0xFFFFFFFF);
-            }
-
-            // Flush the stencil write while color mask and depth test are disabled
-            guiGraphics.flush();
-
-            // Restore color mask
-            org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
-
-            // 3. Configure stencil to only draw inside the circle (where stencil is 1)
-            org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_EQUAL, 1, 0xFF);
-            org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_KEEP, org.lwjgl.opengl.GL11.GL_KEEP,
-                    org.lwjgl.opengl.GL11.GL_KEEP);
-            org.lwjgl.opengl.GL11.glStencilMask(0x00);
-
-            // Draw the map directly (it will be clipped to the circle!)
-            MapRenderer.getInstance().drawMap(
-                    guiGraphics,
-                    x, y, size, size,
-                    interpX, interpZ,
-                    MapConfig.minimapZoom,
-                    true,
-                    MapConfig.minimapRotate,
-                    true, 0, 0,
-                    partialTick);
-
-            // Flush the map draw call
-            guiGraphics.flush();
-
-            // 4. Disable stencil test for the rest of HUD rendering
-            org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-            org.lwjgl.opengl.GL11.glStencilMask(0xFF);
-            if (depthTestWasEnabled) {
-                org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-            }
-
-            // 5. Draw the bezel overlay (borders) always on top using vector rings
-            drawCircleRing(guiGraphics, cx, cy, clipRadius, radius, 64, MapConfig.minimapRingColor);
-            drawCircleRing(guiGraphics, cx, cy, radius, radius + borderThickness, 64, MapConfig.minimapRingColor);
-            drawCircleRing(guiGraphics, cx, cy, radius + borderThickness, radius + borderThickness + 1, 64,
-                    0xFF000000); // Thin outer shadow
-
-            // Flush the bezel mask draw call
-            guiGraphics.flush();
-
-            // 6. Draw Compass Directions (N, E, S, W) on the borders
-            drawCompassDirections(guiGraphics, mc, cx, cy, radius, borderThickness, player, true, partialTick);
-
+            renderCircularMinimap(guiGraphics, mc, player, x, y, size, borderThickness, tHalf,
+                    interpX, interpZ, effectiveZoom, partialTick);
         } else {
             // ==========================================
             // SQUARE MINIMAP (Original Sleek Borders)
@@ -162,7 +153,7 @@ public class MinimapRenderer {
                     guiGraphics,
                     x, y, size, size,
                     interpX, interpZ,
-                    MapConfig.minimapZoom,
+                    effectiveZoom,
                     true,
                     MapConfig.minimapRotate,
                     true, 0, 0,
@@ -209,8 +200,83 @@ public class MinimapRenderer {
 
         // 4. Draw pin navigation marker on minimap
         if (MapConfig.pinActive) {
-            drawPinOnMinimap(guiGraphics, player, x, y, size, borderThickness, partialTick);
+            drawPinOnMinimap(guiGraphics, player, x, y, size, borderThickness,
+                    effectiveZoom, partialTick);
         }
+    }
+
+    private void renderCircularMinimap(GuiGraphics guiGraphics, Minecraft mc, Player player,
+            int x, int y, int size, int borderThickness, int tHalf,
+            double interpX, double interpZ, float effectiveZoom, float partialTick) {
+        float radius = size / 2.0f;
+        float cx = x + radius;
+        float cy = y + radius;
+        float clipRadius = radius - tHalf;
+        boolean depthWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        boolean stencilWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+        int previousStencilFunc = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_FUNC);
+        int previousStencilRef = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_REF);
+        int previousStencilValueMask = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_VALUE_MASK);
+        int previousStencilWriteMask = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_WRITEMASK);
+        int previousStencilFail = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_FAIL);
+        int previousStencilDepthFail = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_FAIL);
+        int previousStencilDepthPass = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_PASS);
+
+        mc.getMainRenderTarget().enableStencil();
+        try {
+            org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+            org.lwjgl.opengl.GL11.glStencilMask(0xFF);
+            org.lwjgl.opengl.GL11.glClear(org.lwjgl.opengl.GL11.GL_STENCIL_BUFFER_BIT);
+            org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_ALWAYS, 1, 0xFF);
+            org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_REPLACE,
+                    org.lwjgl.opengl.GL11.GL_REPLACE, org.lwjgl.opengl.GL11.GL_REPLACE);
+            org.lwjgl.opengl.GL11.glColorMask(false, false, false, false);
+            org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+
+            float maskRadius = clipRadius + 1.5f;
+            for (int dy = -(int) Math.ceil(maskRadius); dy <= (int) Math.ceil(maskRadius); dy++) {
+                float squared = maskRadius * maskRadius - dy * dy;
+                if (squared < 0.0f) continue;
+                float dx = (float) Math.sqrt(squared);
+                fillFloat(guiGraphics, cx - dx, cy + dy, cx + dx, cy + dy + 1.0f, 0xFFFFFFFF);
+            }
+            guiGraphics.flush();
+
+            org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
+            org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_EQUAL, 1, 0xFF);
+            org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_KEEP,
+                    org.lwjgl.opengl.GL11.GL_KEEP, org.lwjgl.opengl.GL11.GL_KEEP);
+            org.lwjgl.opengl.GL11.glStencilMask(0x00);
+
+            MapRenderer.getInstance().drawMap(
+                    guiGraphics,
+                    x, y, size, size,
+                    interpX, interpZ,
+                    effectiveZoom,
+                    true,
+                    MapConfig.minimapRotate,
+                    true, 0, 0,
+                    partialTick);
+            guiGraphics.flush();
+        } finally {
+            // A render exception must never leave Minecraft with color writes, depth or
+            // stencil state disabled for the rest of the HUD frame.
+            org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
+            org.lwjgl.opengl.GL11.glStencilFunc(previousStencilFunc, previousStencilRef, previousStencilValueMask);
+            org.lwjgl.opengl.GL11.glStencilOp(previousStencilFail, previousStencilDepthFail, previousStencilDepthPass);
+            org.lwjgl.opengl.GL11.glStencilMask(previousStencilWriteMask);
+            if (stencilWasEnabled) org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+            else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+            if (depthWasEnabled) org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+            else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        }
+
+        drawCircleRing(guiGraphics, cx, cy, clipRadius, radius, 64, MapConfig.minimapRingColor);
+        drawCircleRing(guiGraphics, cx, cy, radius, radius + borderThickness, 64, MapConfig.minimapRingColor);
+        drawCircleRing(guiGraphics, cx, cy, radius + borderThickness, radius + borderThickness + 1, 64,
+                0xFF000000);
+        guiGraphics.flush();
+        drawCompassDirections(guiGraphics, mc, cx, cy, radius, borderThickness, player, true, partialTick);
     }
 
     private void drawCompassDirections(GuiGraphics guiGraphics, Minecraft mc, float cx, float cy, float radius,
@@ -277,11 +343,11 @@ public class MinimapRenderer {
     /**
      * Draws the pin navigation marker on the minimap
      */
-    private void drawPinOnMinimap(GuiGraphics guiGraphics, Player player, int mx, int my, int size, int borderThickness,
-            float partialTick) {
+    private void drawPinOnMinimap(GuiGraphics guiGraphics, Player player, int mx, int my,
+            int size, int borderThickness, float effectiveZoom, float partialTick) {
         double playerX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX());
         double playerZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
-        double zoom = MapConfig.minimapZoom;
+        double zoom = effectiveZoom;
 
         // Center of minimap
         float cx = mx + size / 2.0f;

@@ -8,18 +8,13 @@ import com.mojang.math.Axis;
 import com.mojang.blaze3d.systems.RenderSystem;
 import org.lwjgl.opengl.GL11;
 
+import java.util.LinkedHashSet;
+import java.util.Set;
+
 public class MapRenderer {
     private static final MapRenderer INSTANCE = new MapRenderer();
     private static final float NIGHT_MIN_BRIGHTNESS = 0.22f;
-    private static final long REGION_REQUEST_INTERVAL_NANOS = 100_000_000L;
 
-    private long lastRegionRequestNanos;
-    private int lastRequestMinRx = Integer.MIN_VALUE;
-    private int lastRequestMaxRx = Integer.MIN_VALUE;
-    private int lastRequestMinRz = Integer.MIN_VALUE;
-    private int lastRequestMaxRz = Integer.MIN_VALUE;
-    private int lastRequestMode = Integer.MIN_VALUE;
-    private int lastRequestLayerY = Integer.MIN_VALUE;
 
     public static MapRenderer getInstance() {
         return INSTANCE;
@@ -45,6 +40,20 @@ public class MapRenderer {
     public void drawMap(GuiGraphics guiGraphics, int viewportX, int viewportY, int width, int height,
             double centerX, double centerZ, float scale, boolean drawPlayer, boolean rotateWithPlayer,
             boolean isMinimap, double mouseWorldX, double mouseWorldZ, float partialTick) {
+        drawMap(guiGraphics, viewportX, viewportY, width, height, centerX, centerZ, scale,
+                drawPlayer, rotateWithPlayer, isMinimap, mouseWorldX, mouseWorldZ,
+                partialTick, false);
+    }
+
+    /**
+     * cachedOnly keeps interaction frames strictly render-only: uploaded region
+     * textures are translated/scaled like one printed image while IO, scans and GPU
+     * publication wait until the camera settles.
+     */
+    public void drawMap(GuiGraphics guiGraphics, int viewportX, int viewportY, int width, int height,
+            double centerX, double centerZ, float scale, boolean drawPlayer, boolean rotateWithPlayer,
+            boolean isMinimap, double mouseWorldX, double mouseWorldZ, float partialTick,
+            boolean cachedOnly) {
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null)
@@ -53,17 +62,10 @@ public class MapRenderer {
         boolean caveMode = CaveMode.isActive(mc);
         boolean fullCaveView = caveMode && CaveMode.isFullView(mc);
         int caveLayerY = caveMode ? CaveMode.getLayerY(mc) : Integer.MIN_VALUE;
-        // GPU publication stays time-bounded even on the fullscreen map. The old
-        // fast-refresh path bypassed throttling every rendered frame and could
-        // upload several 512x512 textures at once, causing visible frame spikes.
-        if (fullCaveView) {
-            FullCaveTextureManager.getInstance().uploadDirtyTextures(false);
-        } else if (caveMode) {
+        // Renderer is strictly cache-only. Scans, IO, CPU builds and GPU
+        // publication are scheduled from MapViewportCoordinator on client tick.
+        if (caveMode && !fullCaveView) {
             CaveMapManager.getInstance().setActiveLayer(caveLayerY);
-            FullCaveTextureManager.getInstance().uploadDirtyTextures(false);
-            CaveTextureManager.getInstance().uploadDirtyTextures(false);
-        } else {
-            MapTextureManager.getInstance().uploadDirtyTextures(false);
         }
 
         // Reset shader color to prevent other GUI elements from tinting the map
@@ -109,55 +111,15 @@ public class MapRenderer {
         int minRegionZ = (int) Math.floor(minZ - 1.0) >> 9;
         int maxRegionZ = (int) Math.floor(maxZ + 1.0) >> 9;
 
-        // Prioritize the map viewport itself, but do not rebuild the same request
-        // set every rendered frame. Bounds changes trigger immediately; stationary
-        // views refresh at 10 Hz and individual texture lookups still self-enqueue.
-        int requestMode = caveMode ? (fullCaveView ? 2 : 1) : 0;
-        long requestNow = System.nanoTime();
-        boolean requestChanged = minRegionX != lastRequestMinRx || maxRegionX != lastRequestMaxRx
-                || minRegionZ != lastRequestMinRz || maxRegionZ != lastRequestMaxRz
-                || requestMode != lastRequestMode || caveLayerY != lastRequestLayerY;
-        if (requestChanged || requestNow - lastRegionRequestNanos >= REGION_REQUEST_INTERVAL_NANOS) {
-            lastRegionRequestNanos = requestNow;
-            lastRequestMinRx = minRegionX;
-            lastRequestMaxRx = maxRegionX;
-            lastRequestMinRz = minRegionZ;
-            lastRequestMaxRz = maxRegionZ;
-            lastRequestMode = requestMode;
-            lastRequestLayerY = caveLayerY;
-
-            int centerRegionX = ((int) Math.floor(centerX)) >> 9;
-            int centerRegionZ = ((int) Math.floor(centerZ)) >> 9;
-            MapManager surfaceManager = MapManager.getInstance();
-            FullCaveMapManager fullManager = FullCaveMapManager.getInstance();
-            CaveMapManager layerManager = CaveMapManager.getInstance();
-            for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
-                for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                    int priority = 100_000
-                            - (Math.abs(rx - centerRegionX) + Math.abs(rz - centerRegionZ)) * 100;
-                    boolean hasSurfaceSource = surfaceManager.hasRegionFile(rx, rz)
-                            || surfaceManager.isRegionLoadedInCache(rx, rz);
-                    if (!caveMode && hasSurfaceSource) {
-                        MapProcessor.getInstance().enqueueSurfaceLoad(rx, rz, priority);
-                    }
-                    if (fullCaveView) {
-                        if (fullManager.hasRegionFile(rx, rz) || fullManager.isRegionLoaded(rx, rz)) {
-                            MapProcessor.getInstance().enqueueFullCaveLoad(rx, rz, priority + 20);
-                        }
-                    } else if (caveMode) {
-                        boolean hasFullSource = fullManager.hasRegionFile(rx, rz)
-                                || fullManager.isRegionLoaded(rx, rz);
-                        if (hasFullSource) {
-                            MapProcessor.getInstance().enqueueFullCaveLoad(rx, rz, priority + 10);
-                        }
-                        if (hasSurfaceSource || hasFullSource || layerManager.hasRegionFile(rx, rz)
-                                || layerManager.isRegionLoaded(rx, rz)) {
-                            MapProcessor.getInstance().enqueueCaveLoad(caveLayerY, rx, rz, priority + 20);
-                        }
-                    }
-                }
-            }
+        // Publish viewport to coordinator (tick-side scan/upload, not render-side).
+        if (isMinimap) {
+            MapViewportCoordinator.getInstance().submitMinimap(minX, maxX, minZ, maxZ, scale);
+        } else {
+            MapViewportCoordinator.getInstance().submitFullscreen(minX, maxX, minZ, maxZ, scale, cachedOnly);
         }
+
+        // Visible data requests are handled by MapViewportCoordinator. Keeping
+        // this path free of enqueue loops is what makes dragging/zooming stable.
 
         // 6. Draw the visible tiles in one retained render batch. Evicted GPU
         // textures are released only after GuiGraphics.flush(), so changing the
@@ -178,35 +140,55 @@ public class MapRenderer {
             }
             try {
                 if (caveMode) {
-                    // Never expose the surface texture while a new automatic cave
-                    // layer is activating. Unknown tiles remain black; known full-
-                    // cave data and the previous initialized Top-Y layer bridge the
-                    // transition until the replacement tile is ready.
+                    // Strict layer rendering: unavailable or empty columns stay black.
+                    // Never blend a selected Top-Y layer with surface, full-cave, or a
+                    // previously selected layer, since those pixels describe different Y.
                     RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
                     guiGraphics.fill(minRegionX * 512, minRegionZ * 512,
                             (maxRegionX + 1) * 512, (maxRegionZ + 1) * 512, 0xFF080A0C);
 
                     RenderSystem.setShaderColor(caveBrightness, caveBrightness, caveBrightness, 1.0F);
-                    for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
-                        for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                            drawRegion(guiGraphics, fullCaveTextures.getRegionTexture(rx, rz), rx, rz);
-                        }
-                    }
-                    if (!fullCaveView) {
+                    Set<Long> pendingRegions = isMinimap ? null : new LinkedHashSet<>();
+                    if (fullCaveView) {
+                        FullCaveMapManager manager = FullCaveMapManager.getInstance();
                         for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                             for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                                drawRegion(guiGraphics,
-                                        caveTextures.getTransitionRegionTexture(caveLayerY, rx, rz), rx, rz);
+                                boolean drawn = drawFullCaveRegionWithPages(
+                                        guiGraphics, fullCaveTextures, rx, rz, scale);
+                                boolean hasSource = manager.hasRegionFile(rx, rz)
+                                        || manager.isRegionLoaded(rx, rz);
+                                if (!drawn && hasSource) collectPendingRegion(pendingRegions, rx, rz);
+                            }
+                        }
+                    } else {
+                        CaveMapManager manager = CaveMapManager.getInstance();
+                        VerticalCaveArchiveManager archive = VerticalCaveArchiveManager.getInstance();
+                        for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
+                            for (int rx = minRegionX; rx <= maxRegionX; rx++) {
+                                boolean drawn = drawLayerCaveRegionWithPages(
+                                        guiGraphics, caveTextures, caveLayerY, rx, rz, scale);
+                                boolean hasSource = manager.hasRegionFile(rx, rz)
+                                        || manager.isRegionLoaded(rx, rz)
+                                        || archive.hasRegionData(rx, rz);
+                                if (!drawn && hasSource) collectPendingRegion(pendingRegions, rx, rz);
                             }
                         }
                     }
+                    drawLoadingIndicators(guiGraphics, pendingRegions, scale);
                 } else {
                     RenderSystem.setShaderColor(mapBrightness, mapBrightness, mapBrightness, 1.0F);
+                    Set<Long> pendingRegions = isMinimap ? null : new LinkedHashSet<>();
+                    MapManager manager = MapManager.getInstance();
                     for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                         for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                            drawRegion(guiGraphics, surfaceTextures.getRegionTexture(rx, rz), rx, rz);
+                            boolean drawn = drawSurfaceRegionWithPages(
+                                    guiGraphics, surfaceTextures, rx, rz, scale);
+                            boolean hasSource = manager.hasRegionFile(rx, rz)
+                                    || manager.isRegionLoadedInCache(rx, rz);
+                            if (!drawn && hasSource) collectPendingRegion(pendingRegions, rx, rz);
                         }
                     }
+                    drawLoadingIndicators(guiGraphics, pendingRegions, scale);
                 }
             } finally {
                 RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
@@ -227,13 +209,7 @@ public class MapRenderer {
                 try {
                     for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                         for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                            ResourceLocation glowTexture = surfaceTextures.getGlowRegionTexture(rx, rz);
-                            if (glowTexture == null) continue;
-                            RenderSystem.setShaderTexture(0, glowTexture);
-                            RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
-                            RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
-                            guiGraphics.blit(glowTexture, rx * 512, rz * 512, 512, 512,
-                                    0f, 0f, 512, 512, 512, 512);
+                            drawSurfaceGlowRegionWithPages(guiGraphics, surfaceTextures, rx, rz);
                         }
                     }
                 } finally {
@@ -340,10 +316,220 @@ public class MapRenderer {
     private void drawRegion(GuiGraphics guiGraphics, ResourceLocation texture, int regionX, int regionZ) {
         if (texture == null) return;
         RenderSystem.setShaderTexture(0, texture);
-        RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
-        RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         guiGraphics.blit(texture, regionX * 512, regionZ * 512, 512, 512,
                 0f, 0f, 512, 512, 512, 512);
+    }
+
+    private void drawPage(GuiGraphics guiGraphics, ResourceLocation texture, int regionX, int regionZ, int pageX, int pageZ) {
+        if (texture == null) return;
+        RenderSystem.setShaderTexture(0, texture);
+        int x = regionX * 512 + pageX * 64;
+        int z = regionZ * 512 + pageZ * 64;
+        guiGraphics.blit(texture, x, z, 64, 64, 0f, 0f, 64, 64, 64, 64);
+    }
+
+    private boolean drawFullCaveRegionWithPages(GuiGraphics guiGraphics,
+            FullCaveTextureManager fullCaveTextures, int rx, int rz, float scale) {
+        ResourceLocation regionTex = fullCaveTextures.peekRegionTexture(rx, rz);
+        if (regionTex != null) {
+            if (!fullCaveTextures.hasAnyPageTexture(rx, rz)) {
+                drawRegion(guiGraphics, regionTex, rx, rz);
+                return true;
+            }
+            for (int pz = 0; pz < MapPageLayout.PAGES_PER_REGION; pz++) {
+                for (int px = 0; px < MapPageLayout.PAGES_PER_REGION; px++) {
+                    ResourceLocation pageTex = fullCaveTextures.peekPageTexture(rx, rz, px, pz);
+                    if (pageTex != null) {
+                        drawPage(guiGraphics, pageTex, rx, rz, px, pz);
+                    } else {
+                        RenderSystem.setShaderTexture(0, regionTex);
+                        guiGraphics.blit(regionTex, rx * 512 + px * 64,
+                                rz * 512 + pz * 64, 64, 64,
+                                px * 64, pz * 64, 64, 64, 512, 512);
+                    }
+                }
+            }
+            return true;
+        }
+        ResourceLocation overviewTex = MapOverviewTextureManager.getInstance()
+                .getFull(rx, rz, scale < 0.18f ? 8 : 4, true);
+        if (overviewTex != null) {
+            drawRegion(guiGraphics, overviewTex, rx, rz);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean drawLayerCaveRegionWithPages(GuiGraphics guiGraphics,
+            CaveTextureManager caveTextures, int caveLayerY,
+            int rx, int rz, float scale) {
+        // Preserve the original sharp selected-Y cave image at every zoom. There is
+        // deliberately no 64/128 overview fallback here because it erases thin
+        // tunnels and makes the layer look blurred.
+        ResourceLocation regionTex = caveTextures.peekRegionTexture(caveLayerY, rx, rz);
+        if (regionTex == null) return false;
+        if (!caveTextures.hasAnyPageTexture(caveLayerY, rx, rz)) {
+            drawRegion(guiGraphics, regionTex, rx, rz);
+            return true;
+        }
+        for (int pz = 0; pz < MapPageLayout.PAGES_PER_REGION; pz++) {
+            for (int px = 0; px < MapPageLayout.PAGES_PER_REGION; px++) {
+                ResourceLocation pageTex = caveTextures.peekPageTexture(
+                        caveLayerY, rx, rz, px, pz);
+                if (pageTex != null) {
+                    drawPage(guiGraphics, pageTex, rx, rz, px, pz);
+                } else {
+                    RenderSystem.setShaderTexture(0, regionTex);
+                    guiGraphics.blit(regionTex, rx * 512 + px * 64,
+                            rz * 512 + pz * 64, 64, 64,
+                            px * 64, pz * 64, 64, 64, 512, 512);
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean drawSurfaceRegionWithPages(GuiGraphics guiGraphics,
+            MapTextureManager surfaceTextures, int rx, int rz, float scale) {
+        ResourceLocation regionTex = surfaceTextures.peekRegionTexture(rx, rz);
+        if (regionTex != null) {
+            if (!surfaceTextures.hasAnyPageTexture(rx, rz)) {
+                drawRegion(guiGraphics, regionTex, rx, rz);
+                return true;
+            }
+            for (int pz = 0; pz < MapPageLayout.PAGES_PER_REGION; pz++) {
+                for (int px = 0; px < MapPageLayout.PAGES_PER_REGION; px++) {
+                    ResourceLocation pageTex = surfaceTextures.peekPageTexture(rx, rz, px, pz);
+                    if (pageTex != null) {
+                        drawPage(guiGraphics, pageTex, rx, rz, px, pz);
+                    } else {
+                        RenderSystem.setShaderTexture(0, regionTex);
+                        guiGraphics.blit(regionTex, rx * 512 + px * 64,
+                                rz * 512 + pz * 64, 64, 64,
+                                px * 64, pz * 64, 64, 64, 512, 512);
+                    }
+                }
+            }
+            return true;
+        }
+
+        // Static dimensions use black for pending/unloaded data. The old grey
+        // parent image looked like map content and often remained until zooming.
+        if (!MapManager.getInstance().isViewingLiveDimension()) return false;
+        ResourceLocation overviewTex = MapOverviewTextureManager.getInstance()
+                .getSurface(rx, rz, scale < 0.18f ? 8 : 4, true);
+        if (overviewTex != null) {
+            drawRegion(guiGraphics, overviewTex, rx, rz);
+            return true;
+        }
+        return false;
+    }
+
+    private static void collectPendingRegion(Set<Long> pending, int regionX, int regionZ) {
+        if (pending == null || pending.size() >= 256) return;
+        pending.add(((long) regionX << 32) ^ (regionZ & 0xFFFFFFFFL));
+    }
+
+    /**
+     * Loading granularity follows zoom: close views use 128/256-block cells,
+     * normal views use one region, and far views group 2x2 or 4x4 regions.
+     */
+    private void drawLoadingIndicators(GuiGraphics guiGraphics,
+            Set<Long> pendingRegions, float mapScale) {
+        if (pendingRegions == null || pendingRegions.isEmpty() || mapScale <= 0.0f) return;
+        int cellBlocks = loadingCellBlocks(mapScale);
+        Set<Long> cells = new LinkedHashSet<>();
+        for (long packed : pendingRegions) {
+            int rx = (int) (packed >> 32);
+            int rz = (int) packed;
+            int regionX = rx * 512;
+            int regionZ = rz * 512;
+            if (cellBlocks < 512) {
+                for (int z = regionZ; z < regionZ + 512 && cells.size() < 24; z += cellBlocks) {
+                    for (int x = regionX; x < regionX + 512 && cells.size() < 24; x += cellBlocks) {
+                        cells.add(packCell(x, z));
+                    }
+                }
+            } else {
+                int cellX = Math.floorDiv(regionX, cellBlocks) * cellBlocks;
+                int cellZ = Math.floorDiv(regionZ, cellBlocks) * cellBlocks;
+                cells.add(packCell(cellX, cellZ));
+            }
+            if (cells.size() >= 24) break;
+        }
+
+        float screenCell = Math.max(1.0f, cellBlocks * mapScale);
+        int radius = Math.max(4, Math.min(9, Math.round(screenCell * 0.08f)));
+        for (long packed : cells) {
+            int cellX = (int) (packed >> 32);
+            int cellZ = (int) packed;
+            drawLoadingSpinner(guiGraphics,
+                    cellX + cellBlocks * 0.5,
+                    cellZ + cellBlocks * 0.5,
+                    mapScale, radius);
+        }
+    }
+
+    private static int loadingCellBlocks(float scale) {
+        if (scale >= 1.0f) return 128;
+        if (scale >= 0.45f) return 256;
+        if (scale >= 0.18f) return 512;
+        if (scale >= 0.10f) return 1024;
+        return 2048;
+    }
+
+    private static long packCell(int x, int z) {
+        return ((long) x << 32) ^ (z & 0xFFFFFFFFL);
+    }
+
+    private void drawLoadingSpinner(GuiGraphics guiGraphics,
+            double worldX, double worldZ, float mapScale, int radius) {
+        PoseStack pose = guiGraphics.pose();
+        pose.pushPose();
+        pose.translate(worldX, worldZ, 20.0);
+        float inverseScale = 1.0f / mapScale;
+        pose.scale(inverseScale, inverseScale, 1.0f);
+        int diagonal = Math.max(3, Math.round(radius * 0.70f));
+        int[][] points = {
+                { 0, -radius }, { diagonal, -diagonal }, { radius, 0 },
+                { diagonal, diagonal }, { 0, radius }, { -diagonal, diagonal },
+                { -radius, 0 }, { -diagonal, -diagonal }
+        };
+        int phase = (int) ((System.currentTimeMillis() / 90L) & 7L);
+        for (int i = 0; i < points.length; i++) {
+            int distance = (i - phase + 8) & 7;
+            int alpha = distance == 0 ? 0xFF : distance <= 2 ? 0xA0 : 0x48;
+            int color = (alpha << 24) | 0x00D8D8D8;
+            int x = points[i][0];
+            int y = points[i][1];
+            guiGraphics.fill(x - 1, y - 1, x + 1, y + 1, color);
+        }
+        pose.popPose();
+    }
+
+    private void drawSurfaceGlowRegionWithPages(GuiGraphics guiGraphics,
+            MapTextureManager surfaceTextures, int rx, int rz) {
+        ResourceLocation glowTexture = surfaceTextures.peekGlowRegionTexture(rx, rz);
+        if (glowTexture != null) {
+            if (!surfaceTextures.hasAnyPageTexture(rx, rz)) {
+                RenderSystem.setShaderTexture(0, glowTexture);
+                guiGraphics.blit(glowTexture, rx * 512, rz * 512, 512, 512, 0f, 0f, 512, 512, 512, 512);
+                return;
+            }
+            for (int pz = 0; pz < MapPageLayout.PAGES_PER_REGION; pz++) {
+                for (int px = 0; px < MapPageLayout.PAGES_PER_REGION; px++) {
+                    ResourceLocation pageGlow = surfaceTextures.peekGlowPageTexture(rx, rz, px, pz);
+                    if (pageGlow != null) {
+                        RenderSystem.setShaderTexture(0, pageGlow);
+                        guiGraphics.blit(pageGlow, rx * 512 + px * 64, rz * 512 + pz * 64, 64, 64, 0f, 0f, 64, 64, 64, 64);
+                    } else {
+                        RenderSystem.setShaderTexture(0, glowTexture);
+                        guiGraphics.blit(glowTexture, rx * 512 + px * 64, rz * 512 + pz * 64, 64, 64,
+                                px * 64, pz * 64, 64, 64, 512, 512);
+                    }
+                }
+            }
+        }
     }
 
 
