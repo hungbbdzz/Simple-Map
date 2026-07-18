@@ -30,17 +30,11 @@ public class MapTextureManager {
     private static final int MAX_TEXTURE_REGIONS = 128;
     private static final int MAX_VISIBLE_HISTORY = MAX_TEXTURE_REGIONS * 4;
     private static final long VISIBLE_TTL_MS = 2_000L;
-    /** Wait for a brief quiet period before rebuilding a 512x512 region. */
-    private static final long DIRTY_QUIET_NANOS = 60_000_000L;
-    /** Publish progressive snapshots frequently while a region is still scanning. */
-    private static final long DIRTY_MAX_WAIT_NANOS = 350_000_000L;
 
     private final Map<String, RegionTextureInfo> textureCache = new LinkedHashMap<>(16, 0.75f, true);
     private final Set<String> dirtyTextures = new LinkedHashSet<>();
     private final Map<String, Long> visibleTextures = new LinkedHashMap<>();
     private final Map<String, Long> revisions = new HashMap<>();
-    private final Map<String, Long> firstDirtyNanos = new HashMap<>();
-    private final Map<String, Long> lastDirtyNanos = new HashMap<>();
     private final List<RegionTextureInfo> deferredCloses = new ArrayList<>();
     private int renderBatchDepth;
     private final Map<String, Integer> blockColorsCache = new ConcurrentHashMap<>();
@@ -80,7 +74,11 @@ public class MapTextureManager {
             var block = net.minecraft.core.registries.BuiltInRegistries.BLOCK.get(blockId);
             var state = block.defaultBlockState();
             String path = blockId.getPath();
-            if (BlockTextureColorSampler.modelUsesTint(blockId)) {
+            if (path.equals("spruce_leaves")) {
+                resolved = BlockTintPolicy.SPRUCE;
+            } else if (path.equals("birch_leaves")) {
+                resolved = BlockTintPolicy.BIRCH;
+            } else if (BlockTextureColorSampler.modelUsesTint(blockId)) {
                 boolean leaves = state.is(net.minecraft.tags.BlockTags.LEAVES)
                         || path.endsWith("_leaves") || path.contains("foliage");
                 if (leaves || path.contains("vine")) resolved = BlockTintPolicy.FOLIAGE;
@@ -109,39 +107,12 @@ public class MapTextureManager {
         return resolved;
     }
 
-    /** Resolves the automatic color while deliberately ignoring a saved override. */
-    public int resolveAutomaticBlockColor(String blockId) {
-        Minecraft minecraft = Minecraft.getInstance();
-        if (!minecraft.isSameThread()) return 0xFFFFFFFF;
-        return resolveDefaultBlockColor(blockId, MapConfig.blockColourMode);
-    }
-
-    /** Invalidates one block's derived color, then rebuilds every cached surface tile. */
-    public void invalidateBlockColor(String blockId) {
-        if (blockId != null) {
-            blockColorsCache.remove(blockId);
-            vanillaBlockColorsCache.remove(blockId);
-            tintPolicyCache.remove(blockId);
-            try {
-                BlockTextureColorSampler.invalidate(ResourceLocation.parse(blockId));
-            } catch (RuntimeException ignored) {
-                BlockTextureColorSampler.clearCache();
-            }
-        }
-        invalidateStyle();
-    }
-
     public void markRegionDirty(int regionX, int regionZ) {
         String key = key(regionX, regionZ);
-        long now = System.nanoTime();
         synchronized (dirtyTextures) {
-            // Every changed column advances the revision. Prepared images are complete
-            // immutable region snapshots; a slightly older snapshot may still be
-            // published, then immediately followed by the newest queued revision.
-            revisions.merge(key, 1L, Long::sum);
-            firstDirtyNanos.putIfAbsent(key, now);
-            lastDirtyNanos.put(key, now);
-            dirtyTextures.add(key);
+            // One revision per queued rebuild is enough. Thousands of changed
+            // columns in the same region now collapse into a single texture job.
+            if (dirtyTextures.add(key)) revisions.merge(key, 1L, Long::sum);
         }
     }
 
@@ -187,29 +158,6 @@ public class MapTextureManager {
     }
 
 
-    /** Returns only an already uploaded GPU tile; never loads, rebuilds or allocates. */
-    public ResourceLocation peekRegionTexture(int regionX, int regionZ) {
-        String key = key(regionX, regionZ);
-        synchronized (textureCache) {
-            RegionTextureInfo info = textureCache.get(key);
-            if (info == null || !info.initialized) return null;
-            markRegionVisible(key);
-            return info.location;
-        }
-    }
-
-    /** Cached-only counterpart for the emissive overlay. */
-    public ResourceLocation peekGlowRegionTexture(int regionX, int regionZ) {
-        String key = key(regionX, regionZ);
-        synchronized (textureCache) {
-            RegionTextureInfo info = textureCache.get(key);
-            if (info == null || !info.initialized) return null;
-            markRegionVisible(key);
-            return info.glowLocation;
-        }
-    }
-
-
     public void beginRenderBatch() {
         synchronized (textureCache) {
             renderBatchDepth++;
@@ -246,7 +194,7 @@ public class MapTextureManager {
 
         int countBudget = force ? 6 : 2;
         long deadline = System.nanoTime() + (force ? 8_000_000L : 4_000_000L);
-        List<String> work = selectDirty(countBudget, force);
+        List<String> work = selectDirty(countBudget);
         for (String key : work) {
             if (System.nanoTime() > deadline && !force) {
                 requeue(key);
@@ -275,14 +223,13 @@ public class MapTextureManager {
         }
     }
 
-    private List<String> selectDirty(int budget, boolean force) {
+    private List<String> selectDirty(int budget) {
         List<String> selected = new ArrayList<>(budget);
-        long now = System.nanoTime();
         synchronized (dirtyTextures) {
             if (dirtyTextures.isEmpty()) return selected;
             synchronized (visibleTextures) {
                 for (String key : visibleTextures.keySet()) {
-                    if (dirtyTextures.contains(key) && isReadyForPublication(key, now, force)) {
+                    if (dirtyTextures.contains(key)) {
                         selected.add(key);
                         if (selected.size() >= budget) break;
                     }
@@ -290,22 +237,13 @@ public class MapTextureManager {
             }
             if (selected.size() < budget) {
                 for (String key : dirtyTextures) {
-                    if (!selected.contains(key) && isReadyForPublication(key, now, force)) {
-                        selected.add(key);
-                    }
+                    if (!selected.contains(key)) selected.add(key);
                     if (selected.size() >= budget) break;
                 }
             }
             dirtyTextures.removeAll(selected);
         }
         return selected;
-    }
-
-    private boolean isReadyForPublication(String key, long now, boolean force) {
-        if (force) return true;
-        long first = firstDirtyNanos.getOrDefault(key, now);
-        long last = lastDirtyNanos.getOrDefault(key, first);
-        return now - last >= DIRTY_QUIET_NANOS || now - first >= DIRTY_MAX_WAIT_NANOS;
     }
 
     private void schedulePreparation(String key, RegionTextureInfo info,
@@ -316,35 +254,20 @@ public class MapTextureManager {
             try {
                 MapTextureBuildWorker.PreparedPair prepared = info.pending.join();
                 if (MapManager.getInstance().isGenerationCurrent(info.generation)) {
-                    // The worker always builds from one immutable 512x512 snapshot, so
-                    // the result is internally coherent even if newer columns arrived
-                    // while it was being colorized. Publishing that complete snapshot
-                    // prevents a continuously scanned region from remaining black.
                     applyPrepared(info, prepared);
-
-                    synchronized (dirtyTextures) {
-                        long currentRevision = revisions.getOrDefault(key, 0L);
-                        if (currentRevision > prepared.revision()) {
-                            // A newer coherent snapshot is required; keep it queued.
-                            dirtyTextures.add(key);
-                        } else {
-                            dirtyTextures.remove(key);
-                            firstDirtyNanos.remove(key);
-                            lastDirtyNanos.remove(key);
-                        }
-                    }
                 }
             } catch (RuntimeException exception) {
                 LOGGER.debug("Discarded failed/stale surface texture job {}", key, exception);
-                requeue(key);
             } finally {
                 info.pending = null;
+            }
+            synchronized (dirtyTextures) {
+                if (revisions.getOrDefault(key, 0L) > info.uploadedRevision) dirtyTextures.add(key);
             }
             return;
         }
 
         long[] pixels = region.snapshotPackedPixels();
-        int[] tints = region.snapshotTints();
         List<String> biomePalette = region.snapshotBiomePalette();
         List<String> blockPalette = region.snapshotBlockPalette();
         long revision;
@@ -375,7 +298,6 @@ public class MapTextureManager {
         }
         Map<String, Integer> blockColors = new HashMap<>(selectedColorCache);
         Map<String, BlockTintPolicy> tintPolicies = new HashMap<>(tintPolicyCache);
-        Set<String> tintDisabledBlocks = Set.copyOf(MapConfig.blockColorOverrides.keySet());
 
         byte[] light = null;
         MapLightManager.LightRegion lightRegion = MapLightManager.getInstance().getRegion(
@@ -391,8 +313,8 @@ public class MapTextureManager {
         }
 
         CompletableFuture<MapTextureBuildWorker.PreparedPair> future =
-                MapTextureBuildWorker.tryBuildSurface(pixels, tints, biomePalette, blockPalette,
-                        biomeLookup, blockColors, tintPolicies, tintDisabledBlocks, MapConfig.blockColourMode,
+                MapTextureBuildWorker.tryBuildSurface(pixels, biomePalette, blockPalette,
+                        biomeLookup, blockColors, tintPolicies, MapConfig.blockColourMode,
                         MapConfig.displayFlowers, MapConfig.terrainSlopes, light,
                         MapConfig.mapColorProfile, revision,
                         () -> MapManager.getInstance().isGenerationCurrent(info.generation));
@@ -491,21 +413,11 @@ public class MapTextureManager {
         }
     }
 
-    public void clearDerivedColorCaches() {
-        blockColorsCache.clear();
-        vanillaBlockColorsCache.clear();
-        tintPolicyCache.clear();
-        BlockTextureColorSampler.clearCache();
-    }
-
     public void invalidateStyle() {
         synchronized (textureCache) {
             synchronized (dirtyTextures) {
-                long now = System.nanoTime();
                 for (String key : textureCache.keySet()) {
                     revisions.merge(key, 1L, Long::sum);
-                    firstDirtyNanos.putIfAbsent(key, now);
-                    lastDirtyNanos.put(key, now);
                     dirtyTextures.add(key);
                 }
             }
@@ -530,8 +442,6 @@ public class MapTextureManager {
         synchronized (dirtyTextures) {
             dirtyTextures.clear();
             revisions.clear();
-            firstDirtyNanos.clear();
-            lastDirtyNanos.clear();
         }
         synchronized (visibleTextures) {
             visibleTextures.clear();
@@ -580,9 +490,6 @@ public class MapTextureManager {
 
     private void requeue(String key) {
         synchronized (dirtyTextures) {
-            long now = System.nanoTime();
-            firstDirtyNanos.putIfAbsent(key, now);
-            lastDirtyNanos.putIfAbsent(key, now);
             dirtyTextures.add(key);
         }
     }

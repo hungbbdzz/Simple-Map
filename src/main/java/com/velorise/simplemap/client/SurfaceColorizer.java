@@ -4,7 +4,6 @@ import net.minecraft.world.level.biome.Biome;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntFunction;
 
@@ -16,36 +15,31 @@ public final class SurfaceColorizer {
     private SurfaceColorizer() {
     }
 
-    public static int[] colorize(long[] pixels, int[] tints,
+    public static int[] colorize(long[] pixels,
             List<String> biomePalette,
             List<String> blockPalette,
             IntFunction<Biome> biomeLookup,
             Map<String, Integer> blockColors,
             Map<String, BlockTintPolicy> tintPolicies,
-            Set<String> tintDisabledBlocks,
             int colourMode,
             boolean showFlowers,
             int terrainSlopes,
             int profile) {
-        return colorize(pixels, tints, biomePalette, blockPalette, biomeLookup, blockColors,
-                tintPolicies, tintDisabledBlocks, colourMode, showFlowers, terrainSlopes, profile, () -> true);
+        return colorize(pixels, biomePalette, blockPalette, biomeLookup, blockColors,
+                tintPolicies, colourMode, showFlowers, terrainSlopes, profile, () -> true);
     }
 
-    public static int[] colorize(long[] pixels, int[] tints,
+    public static int[] colorize(long[] pixels,
             List<String> biomePalette,
             List<String> blockPalette,
             IntFunction<Biome> biomeLookup,
             Map<String, Integer> blockColors,
             Map<String, BlockTintPolicy> tintPolicies,
-            Set<String> tintDisabledBlocks,
             int colourMode,
             boolean showFlowers,
             int terrainSlopes,
             int profile,
             BooleanSupplier stillValid) {
-        if (tints == null || tints.length != pixels.length) {
-            throw new IllegalArgumentException("Surface tint snapshot must match pixel snapshot");
-        }
         int[] output = new int[SIZE * SIZE];
         for (int pz = 0; pz < SIZE; pz++) {
             if ((pz & 31) == 0 && !stillValid.getAsBoolean()) {
@@ -54,31 +48,19 @@ public final class SurfaceColorizer {
             for (int px = 0; px < SIZE; px++) {
                 int index = pz * SIZE + px;
                 long packed = pixels[index];
-                if (MapBlockData.isEmpty(packed))
-                    continue;
-                if (MapBlockData.isFlower(packed) && !showFlowers)
-                    continue;
+                if (MapBlockData.isEmpty(packed)) continue;
+                if (MapBlockData.isFlower(packed) && !showFlowers) continue;
 
-                int baseColor = resolveBaseColor(packed, tints[index], blockPalette, blockColors, tintPolicies,
-                        tintDisabledBlocks, biomeLookup, pixels, px, pz, colourMode);
-                if (baseColor == 0)
-                    continue;
+                int baseColor = resolveBaseColor(packed, blockPalette, blockColors, tintPolicies,
+                        biomeLookup, pixels, px, pz, colourMode);
+                if (baseColor == 0) continue;
 
                 int red = (baseColor >>> 16) & 0xFF;
                 int green = (baseColor >>> 8) & 0xFF;
                 int blue = baseColor & 0xFF;
                 int reliefY = MapBlockData.reliefY(packed);
-                boolean fluidPixel = MapBlockData.isFluid(packed);
 
-                /*
-                 * Water depth and bottom colour are already handled in resolveBaseColor().
-                 * Applying terrain relief to floorY made a flat ocean inherit seabed steps
-                 * and region/chunk boundaries as false rectangular shadows. Fluids therefore
-                 * keep a flat lighting layer; land and cave terrain retain full relief.
-                 */
-                float shade = fluidPixel
-                        ? 1.0f
-                        : calculateShade(pixels, px, pz, reliefY, terrainSlopes);
+                float shade = calculateShade(pixels, px, pz, reliefY, terrainSlopes);
                 shade *= 1.0f + microNoise(index, packed, reliefY);
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
@@ -99,11 +81,10 @@ public final class SurfaceColorizer {
         return output;
     }
 
-    private static int resolveBaseColor(long packed, int storedTint,
+    private static int resolveBaseColor(long packed,
             List<String> blockPalette,
             Map<String, Integer> blockColors,
             Map<String, BlockTintPolicy> tintPolicies,
-            Set<String> tintDisabledBlocks,
             IntFunction<Biome> biomeLookup,
             long[] allPixels,
             int px, int pz,
@@ -111,28 +92,13 @@ public final class SurfaceColorizer {
         String blockName = blockId(packed, blockPalette);
 
         if (MapBlockData.isFluid(packed)) {
-            // Fluid + glowing is the compact representation used for lava. Accurate
-            // mode uses the sampled lava texture; the orange value is only a failure
-            // fallback, not a normal hardcoded palette override.
-            if (MapBlockData.isGlowing(packed)) {
-                int sampledLava = blockName == null ? 0 : blockColors.getOrDefault(blockName, 0);
-                return sampledLava != 0 ? sampledLava : 0xFFFF6A00;
-            }
+            // Fluid + glowing is the compact representation used for lava.
+            if (MapBlockData.isGlowing(packed)) return 0xFFF3A52B;
 
-            /*
-             * Never use the scan-time BlockColors result for water. Minecraft's
-             * water provider performs biome blending against neighbouring chunks;
-             * while a new chunk is arriving those neighbours can still be absent.
-             * Persisting that transient result bakes an entire 16x16 chunk with a
-             * different blue value and creates the rectangular bands seen on the
-             * map. Rebuild water tint only from the region's stored biome IDs, which
-             * are stable and are re-blended whenever adjacent map pixels arrive.
-             */
             int waterTint = colourMode == 0
                     ? BiomeBlend.blendWater(allPixels, biomeLookup, px, pz)
                     : VANILLA_WATER;
-            if (waterTint == -1)
-                waterTint = VANILLA_WATER;
+            if (waterTint == -1) waterTint = VANILLA_WATER;
 
             // For water pixels blockId points at the solid floor, not the water
             // block. This lets shallow water reveal sand/stone/grass instead of
@@ -161,35 +127,20 @@ public final class SurfaceColorizer {
         BlockTintPolicy policy = blockName == null
                 ? BlockTintPolicy.NONE
                 : tintPolicies.getOrDefault(blockName, BlockTintPolicy.NONE);
-        boolean tintDisabled = blockName != null && tintDisabledBlocks.contains(blockName);
-
-        // Version-3 surface regions preserve the exact value returned by the
-        // registered BlockColors provider at scan time. This is authoritative for
-        // modded foliage: a tinted model can still deliberately return no tint, or
-        // return a fixed/custom tint that is not the biome foliage colour.
-        if (colourMode == 0 && texture != 0 && !tintDisabled) {
-            if (SurfaceTintData.hasColor(storedTint)) {
-                return applyBiomeTint(texture, 0xFF000000 | SurfaceTintData.rgb(storedTint), 1.0f);
-            }
-            if (storedTint == SurfaceTintData.NONE)
-                return texture;
-        }
-        if (tintDisabled)
-            return texture;
 
         if (MapBlockData.isLeaves(packed)) {
-            if (texture == 0)
-                texture = 0xFF71845F;
-            if (colourMode != 0)
-                return texture;
+            if (texture == 0) texture = 0xFF71845F;
+            if (colourMode != 0) return texture;
             return switch (policy) {
-                case SPRUCE, BIRCH, FOLIAGE -> {
+                case SPRUCE -> applyTintPreservingTexture(texture, 0xFF619961, 0.82f);
+                case BIRCH -> applyTintPreservingTexture(texture, 0xFF80A755, 0.82f);
+                case FOLIAGE -> {
                     int tint = BiomeBlend.blendFoliage(allPixels, biomeLookup, px, pz);
-                    yield tint == -1 ? texture : applyBiomeTint(texture, tint, 0.95f);
+                    yield tint == -1 ? texture : applyTintPreservingTexture(texture, tint, 0.88f);
                 }
                 case GRASS -> {
                     int tint = BiomeBlend.blendGrass(allPixels, biomeLookup, px, pz);
-                    yield tint == -1 ? texture : applyBiomeTint(texture, tint, 0.90f);
+                    yield tint == -1 ? texture : applyTintPreservingTexture(texture, tint, 0.84f);
                 }
                 case NONE -> texture;
             };
@@ -202,11 +153,11 @@ public final class SurfaceColorizer {
         if (colourMode == 0 && texture != 0) {
             if (policy == BlockTintPolicy.GRASS) {
                 int tint = BiomeBlend.blendGrass(allPixels, biomeLookup, px, pz);
-                return tint == -1 ? texture : applyBiomeTint(texture, tint, 0.90f);
+                return tint == -1 ? texture : applyTintPreservingTexture(texture, tint, 0.88f);
             }
             if (policy == BlockTintPolicy.FOLIAGE) {
                 int tint = BiomeBlend.blendFoliage(allPixels, biomeLookup, px, pz);
-                return tint == -1 ? texture : applyBiomeTint(texture, tint, 0.92f);
+                return tint == -1 ? texture : applyTintPreservingTexture(texture, tint, 0.84f);
             }
         }
 
@@ -220,8 +171,7 @@ public final class SurfaceColorizer {
      */
     private static float calculateShade(long[] pixels, int px, int pz,
             int centerY, int terrainSlopes) {
-        if (terrainSlopes <= 0)
-            return 1.0f;
+        if (terrainSlopes <= 0) return 1.0f;
         int north = neighborY(pixels, px, pz - 1, centerY);
         if (terrainSlopes == 1) {
             int delta = centerY - north;
@@ -247,76 +197,60 @@ public final class SurfaceColorizer {
 
         float roughness = Math.min(0.22f,
                 (Math.abs(west - east) + Math.abs(north - south)) * 0.014f);
-        /*
-         * Keep depth shading local. The old 2/8/24-block samples treated tall
-         * buildings as terrain occluders, so square structures such as End Cities
-         * projected large rectangular halos onto otherwise flat ground. Immediate
-         * gradients already describe cliffs and building edges; a restrained
-         * two-block sample is enough to retain crater/ravine depth without creating
-         * artificial structure-shaped shadows.
-         */
-        float depthOcclusion = localDepthOcclusion(pixels, px, pz, centerY);
-        float shade = 1.0f + directional + ridgeLight - pitShadow - roughness - depthOcclusion;
+        float shade = 1.0f + directional + ridgeLight - pitShadow - roughness;
         return clamp(shade, 0.42f, 1.28f);
     }
 
-    private static float localDepthOcclusion(long[] pixels, int px, int pz, int centerY) {
-        return Math.min(0.12f, depthAtRadius(pixels, px, pz, centerY, 2, 0.012f));
-    }
-
-    private static float depthAtRadius(long[] pixels, int px, int pz,
-            int centerY, int radius, float weight) {
-        int sum = Math.max(0, neighborY(pixels, px - radius, pz, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px + radius, pz, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px, pz - radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px, pz + radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px - radius, pz - radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px + radius, pz - radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px - radius, pz + radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px + radius, pz + radius, centerY) - centerY);
-        return Math.min(0.16f, (sum * 0.125f) * weight);
-    }
-
     private static int neighborY(long[] pixels, int px, int pz, int fallback) {
-        if (px < 0 || px >= SIZE || pz < 0 || pz >= SIZE)
-            return fallback;
+        if (px < 0 || px >= SIZE || pz < 0 || pz >= SIZE) return fallback;
         long packed = pixels[pz * SIZE + px];
         return MapBlockData.isEmpty(packed) ? fallback : MapBlockData.reliefY(packed);
     }
 
     private static float microNoise(int linearIndex, long packed, int y) {
-        if (MapBlockData.isFluid(packed)) return 0.0f;
         long hash = ((long) linearIndex * 312251L) ^ ((long) y * 4390321L);
         hash = (hash ^ (hash >>> 16)) * 0x85ebca6bL;
         hash = (hash ^ (hash >>> 13)) * 0xc2b2ae35L;
         float noise = ((hash & 0xFFFFL) / 65535.0f) * 2.0f - 1.0f;
-        if (MapBlockData.isLeaves(packed))
-            return noise * 0.075f;
+        if (MapBlockData.isLeaves(packed)) return noise * 0.075f;
+        if (MapBlockData.isFluid(packed)) return noise * 0.012f;
         return noise * 0.022f;
     }
 
     /**
-     * Mirrors Minecraft's tinted-face principle: sampled texture RGB is multiplied
-     * by the biome tint and then blended by strength. Unlike luminance-normalized
-     * tinting this allows vanilla foliage to become naturally dark and saturated.
+     * Colours a texture without replacing its luminance with a bright flat tint.
+     * The previous implementation divided texture luminance by 150, which pushed
+     * many leaves above 1.0 and caused the pale/white film visible in Accurate.
      */
-    static int applyBiomeTint(int textureArgb, int tintArgb, float strength) {
-        float baseR = ((textureArgb >>> 16) & 0xFF) / 255.0f;
-        float baseG = ((textureArgb >>> 8) & 0xFF) / 255.0f;
-        float baseB = (textureArgb & 0xFF) / 255.0f;
+    static int applyTintPreservingTexture(int textureArgb, int tintArgb, float strength) {
+        float baseR = ((textureArgb >>> 16) & 0xFF);
+        float baseG = ((textureArgb >>> 8) & 0xFF);
+        float baseB = (textureArgb & 0xFF);
         float tintR = ((tintArgb >>> 16) & 0xFF) / 255.0f;
         float tintG = ((tintArgb >>> 8) & 0xFF) / 255.0f;
         float tintB = (tintArgb & 0xFF) / 255.0f;
-        float amount = clamp(strength, 0.0f, 1.0f);
+        float tintLuma = Math.max(0.18f, tintR * 0.2126f + tintG * 0.7152f + tintB * 0.0722f);
 
-        float outR = baseR + (baseR * tintR - baseR) * amount;
-        float outG = baseG + (baseG * tintG - baseG) * amount;
-        float outB = baseB + (baseB * tintB - baseB) * amount;
-        int r = clamp(Math.round(clamp01(outR) * 255.0f));
-        int g = clamp(Math.round(clamp01(outG) * 255.0f));
-        int b = clamp(Math.round(clamp01(outB) * 255.0f));
+        float factorR = clamp(tintR / tintLuma, 0.42f, 1.58f);
+        float factorG = clamp(tintG / tintLuma, 0.42f, 1.58f);
+        float factorB = clamp(tintB / tintLuma, 0.42f, 1.58f);
+        float modR = baseR * factorR;
+        float modG = baseG * factorG;
+        float modB = baseB * factorB;
+        float amount = clamp(strength, 0.0f, 1.0f);
+        float outR = baseR + (modR - baseR) * amount;
+        float outG = baseG + (modG - baseG) * amount;
+        float outB = baseB + (modB - baseB) * amount;
+
+        float baseLuma = baseR * 0.2126f + baseG * 0.7152f + baseB * 0.0722f;
+        float outLuma = Math.max(1.0f, outR * 0.2126f + outG * 0.7152f + outB * 0.0722f);
+        float preserve = clamp(baseLuma / outLuma, 0.70f, 1.00f);
+        int r = clamp(Math.round(outR * preserve));
+        int g = clamp(Math.round(outG * preserve));
+        int b = clamp(Math.round(outB * preserve));
         return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
+
 
     /**
      * Accurate mode should stay slightly darker and more grounded than vanilla,
@@ -371,8 +305,7 @@ public final class SurfaceColorizer {
     private static String blockId(long packed, List<String> palette) {
         int index = MapBlockData.blockId(packed) & 0xFFFF;
         return index == (MapBlockData.NO_BLOCK & 0xFFFF) || index >= palette.size()
-                ? null
-                : palette.get(index);
+                ? null : palette.get(index);
     }
 
     private static int clamp(int value) {

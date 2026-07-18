@@ -38,8 +38,7 @@ public final class RegionDataStore {
     public static final int REGION_SIZE = 512;
     public static final int PIXEL_COUNT = REGION_SIZE * REGION_SIZE;
     private static final int LEGACY_BYTES_PER_PIXEL = 6;
-    private static final int VERSION_2_BYTES_PER_PIXEL = 8;
-    private static final int VERSION_3_BYTES_PER_PIXEL = 12;
+    private static final int BYTES_PER_PIXEL = 8;
     private static final int MAX_PALETTE_ENTRIES = 65_535;
     private static final int MAX_COMPRESSED_FILE_BYTES = 8 * 1024 * 1024;
 
@@ -60,53 +59,31 @@ public final class RegionDataStore {
     private RegionDataStore() {
     }
 
-    public record StoredRegion(long[] pixels, int[] tints, String[] biomePalette, String[] blockPalette) {
+    public record StoredRegion(long[] pixels, String[] biomePalette, String[] blockPalette) {
         public StoredRegion {
             if (pixels == null || pixels.length != PIXEL_COUNT) {
                 throw new IllegalArgumentException("A SimpleMap region must contain exactly " + PIXEL_COUNT + " pixels");
-            }
-            if (tints == null || tints.length != PIXEL_COUNT) {
-                throw new IllegalArgumentException("A SimpleMap region must contain exactly " + PIXEL_COUNT + " tint values");
             }
             biomePalette = biomePalette == null ? new String[0] : biomePalette;
             blockPalette = blockPalette == null ? new String[0] : blockPalette;
         }
 
-        /** Backwards-compatible constructor for callers without tint metadata. */
-        public StoredRegion(long[] pixels, String[] biomePalette, String[] blockPalette) {
-            this(pixels, unknownTints(), biomePalette, blockPalette);
-        }
-
         public StoredRegion deepCopy() {
             return new StoredRegion(Arrays.copyOf(pixels, pixels.length),
-                    Arrays.copyOf(tints, tints.length),
                     Arrays.copyOf(biomePalette, biomePalette.length),
                     Arrays.copyOf(blockPalette, blockPalette.length));
         }
     }
 
-    private static int[] unknownTints() {
-        int[] tints = new int[PIXEL_COUNT];
-        Arrays.fill(tints, SurfaceTintData.UNKNOWN);
-        return tints;
-    }
-
-    public static void saveAsync(File directory, int rx, int rz, long[] packedPixels, int[] tints,
+    public static void saveAsync(File directory, int rx, int rz, long[] packedPixels,
             String[] biomePalette, String[] blockPalette) {
-        if (directory == null || packedPixels == null || packedPixels.length != PIXEL_COUNT
-                || tints == null || tints.length != PIXEL_COUNT) return;
+        if (directory == null || packedPixels == null || packedPixels.length != PIXEL_COUNT) return;
         SaveRequest request = new SaveRequest(directory, rx, rz,
                 Arrays.copyOf(packedPixels, packedPixels.length),
-                Arrays.copyOf(tints, tints.length),
                 Arrays.copyOf(biomePalette, biomePalette.length),
                 Arrays.copyOf(blockPalette, blockPalette.length));
         PENDING_SAVES.put(request.key(), request);
         scheduleSaveDrain();
-    }
-
-    public static void saveAsync(File directory, int rx, int rz, long[] packedPixels,
-            String[] biomePalette, String[] blockPalette) {
-        saveAsync(directory, rx, rz, packedPixels, unknownTints(), biomePalette, blockPalette);
     }
 
     /** Compatibility overload for callers that still expose object pixels at an API boundary. */
@@ -143,17 +120,15 @@ public final class RegionDataStore {
         });
     }
 
-    public static boolean load(File directory, int rx, int rz, long[] outPixels, int[] outTints,
+    public static boolean load(File directory, int rx, int rz, long[] outPixels,
             List<String> outBiomePalette, List<String> outBlockPalette) {
         Arrays.fill(outPixels, MapBlockData.EMPTY_PACKED);
-        Arrays.fill(outTints, SurfaceTintData.UNKNOWN);
         File file = new File(directory, fileName(rx, rz));
         StoredRegion pending = latestPending(directory, rx, rz);
         if (pending == null && !file.isFile()) return false;
         try {
             StoredRegion stored = pending != null ? pending : read(file);
             System.arraycopy(stored.pixels(), 0, outPixels, 0, outPixels.length);
-            System.arraycopy(stored.tints(), 0, outTints, 0, outTints.length);
             outBiomePalette.clear();
             outBiomePalette.addAll(Arrays.asList(stored.biomePalette()));
             outBlockPalette.clear();
@@ -162,16 +137,10 @@ public final class RegionDataStore {
         } catch (IOException | RuntimeException exception) {
             LOGGER.error("Failed to load region {},{}", rx, rz, exception);
             Arrays.fill(outPixels, MapBlockData.EMPTY_PACKED);
-            Arrays.fill(outTints, SurfaceTintData.UNKNOWN);
             outBiomePalette.clear();
             outBlockPalette.clear();
             return false;
         }
-    }
-
-    public static boolean load(File directory, int rx, int rz, long[] outPixels,
-            List<String> outBiomePalette, List<String> outBlockPalette) {
-        return load(directory, rx, rz, outPixels, unknownTints(), outBiomePalette, outBlockPalette);
     }
 
     /** Compatibility overload for legacy callers. */
@@ -211,22 +180,20 @@ public final class RegionDataStore {
         try (DataInputStream input = new DataInputStream(new BufferedInputStream(rawInput))) {
             int magic = input.readInt();
             int version = input.readInt();
-            if (magic != MapBlockData.FILE_MAGIC || (version < 1 || version > MapBlockData.FILE_VERSION)) {
+            if (magic != MapBlockData.FILE_MAGIC || (version != 1 && version != MapBlockData.FILE_VERSION)) {
                 throw new IOException("Unsupported region format (magic=" + Integer.toHexString(magic)
                         + ", version=" + version + ")");
             }
 
             String[] biomePalette = readPalette(input);
             String[] blockPalette = readPalette(input);
-            int bytesPerPixel = version >= 3 ? VERSION_3_BYTES_PER_PIXEL
-                    : (version >= 2 ? VERSION_2_BYTES_PER_PIXEL : LEGACY_BYTES_PER_PIXEL);
+            int bytesPerPixel = version >= 2 ? BYTES_PER_PIXEL : LEGACY_BYTES_PER_PIXEL;
             byte[] raw = readCompressedPayload(input, PIXEL_COUNT * bytesPerPixel);
             if (raw.length != PIXEL_COUNT * bytesPerPixel) {
                 throw new EOFException("Unexpected pixel payload length " + raw.length);
             }
 
             long[] pixels = new long[PIXEL_COUNT];
-            int[] tints = unknownTints();
             int pointer = 0;
             for (int i = 0; i < pixels.length; i++) {
                 short topY = (short) (((raw[pointer++] & 0xFF) << 8) | (raw[pointer++] & 0xFF));
@@ -237,15 +204,9 @@ public final class RegionDataStore {
                         ? (short) (((raw[pointer++] & 0xFF) << 8) | (raw[pointer++] & 0xFF))
                         : topY;
                 pixels[i] = MapBlockData.packRaw(topY, blockId, biomeId, flags, floorY);
-                if (version >= 3) {
-                    tints[i] = ((raw[pointer++] & 0xFF) << 24)
-                            | ((raw[pointer++] & 0xFF) << 16)
-                            | ((raw[pointer++] & 0xFF) << 8)
-                            | (raw[pointer++] & 0xFF);
-                }
             }
             validatePaletteReferences(pixels, biomePalette.length, blockPalette.length);
-            return new StoredRegion(pixels, tints, biomePalette, blockPalette);
+            return new StoredRegion(pixels, biomePalette, blockPalette);
         }
     }
 
@@ -283,10 +244,9 @@ public final class RegionDataStore {
         writePalette(output, region.biomePalette());
         writePalette(output, region.blockPalette());
 
-        byte[] raw = new byte[PIXEL_COUNT * VERSION_3_BYTES_PER_PIXEL];
+        byte[] raw = new byte[PIXEL_COUNT * BYTES_PER_PIXEL];
         int pointer = 0;
-        for (int i = 0; i < region.pixels().length; i++) {
-            long packed = region.pixels()[i];
+        for (long packed : region.pixels()) {
             short topY = MapBlockData.topY(packed);
             short blockId = MapBlockData.blockId(packed);
             raw[pointer++] = (byte) (topY >>> 8);
@@ -298,11 +258,6 @@ public final class RegionDataStore {
             short floorY = MapBlockData.floorY(packed);
             raw[pointer++] = (byte) (floorY >>> 8);
             raw[pointer++] = (byte) floorY;
-            int tint = region.tints()[i];
-            raw[pointer++] = (byte) (tint >>> 24);
-            raw[pointer++] = (byte) (tint >>> 16);
-            raw[pointer++] = (byte) (tint >>> 8);
-            raw[pointer++] = (byte) tint;
         }
         try (GZIPOutputStream gzip = new GZIPOutputStream(output, 64 * 1024)) {
             gzip.write(raw);
@@ -326,7 +281,6 @@ public final class RegionDataStore {
         int[] blockRemap = buildRemap(overlay.blockPalette(), outputBlocks, blockIds, 65_534, "block");
 
         long[] merged = Arrays.copyOf(base.pixels(), PIXEL_COUNT);
-        int[] mergedTints = Arrays.copyOf(base.tints(), PIXEL_COUNT);
         for (int i = 0; i < PIXEL_COUNT; i++) {
             long incoming = overlay.pixels()[i];
             if (MapBlockData.isEmpty(incoming)) continue;
@@ -352,10 +306,8 @@ public final class RegionDataStore {
             }
             merged[i] = MapBlockData.packRaw(MapBlockData.topY(incoming), outputBlock,
                     outputBiome, MapBlockData.flags(incoming), MapBlockData.floorY(incoming));
-            mergedTints[i] = overlay.tints()[i];
         }
-        return new StoredRegion(merged, mergedTints,
-                outputBiomes.toArray(String[]::new), outputBlocks.toArray(String[]::new));
+        return new StoredRegion(merged, outputBiomes.toArray(String[]::new), outputBlocks.toArray(String[]::new));
     }
 
     /** Merges a validated incoming packet into a local file atomically. */
@@ -485,7 +437,7 @@ public final class RegionDataStore {
         return new File(directory, fileName(rx, rz)).toPath().toAbsolutePath().normalize().toString();
     }
 
-    private record SaveRequest(File directory, int rx, int rz, long[] packedPixels, int[] tints,
+    private record SaveRequest(File directory, int rx, int rz, long[] packedPixels,
             String[] biomePalette, String[] blockPalette) {
         private String key() {
             return saveKey(directory, rx, rz);
@@ -493,7 +445,6 @@ public final class RegionDataStore {
 
         private StoredRegion storedRegion() {
             return new StoredRegion(Arrays.copyOf(packedPixels, packedPixels.length),
-                    Arrays.copyOf(tints, tints.length),
                     Arrays.copyOf(biomePalette, biomePalette.length),
                     Arrays.copyOf(blockPalette, blockPalette.length));
         }

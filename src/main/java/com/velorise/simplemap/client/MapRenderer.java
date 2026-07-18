@@ -12,10 +12,8 @@ public class MapRenderer {
     private static final MapRenderer INSTANCE = new MapRenderer();
     private static final float NIGHT_MIN_BRIGHTNESS = 0.22f;
     private static final long REGION_REQUEST_INTERVAL_NANOS = 100_000_000L;
-    private static final long MINIMAP_UPLOAD_INTERVAL_NANOS = 100_000_000L;
 
     private long lastRegionRequestNanos;
-    private long lastMinimapUploadNanos;
     private int lastRequestMinRx = Integer.MIN_VALUE;
     private int lastRequestMaxRx = Integer.MIN_VALUE;
     private int lastRequestMinRz = Integer.MIN_VALUE;
@@ -47,20 +45,6 @@ public class MapRenderer {
     public void drawMap(GuiGraphics guiGraphics, int viewportX, int viewportY, int width, int height,
             double centerX, double centerZ, float scale, boolean drawPlayer, boolean rotateWithPlayer,
             boolean isMinimap, double mouseWorldX, double mouseWorldZ, float partialTick) {
-        drawMap(guiGraphics, viewportX, viewportY, width, height, centerX, centerZ, scale,
-                drawPlayer, rotateWithPlayer, isMinimap, mouseWorldX, mouseWorldZ,
-                partialTick, false);
-    }
-
-    /**
-     * cachedOnly keeps interaction frames strictly render-only: uploaded region
-     * textures are translated/scaled like one printed image while IO, scans and GPU
-     * publication wait until the camera settles.
-     */
-    public void drawMap(GuiGraphics guiGraphics, int viewportX, int viewportY, int width, int height,
-            double centerX, double centerZ, float scale, boolean drawPlayer, boolean rotateWithPlayer,
-            boolean isMinimap, double mouseWorldX, double mouseWorldZ, float partialTick,
-            boolean cachedOnly) {
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null)
@@ -72,25 +56,14 @@ public class MapRenderer {
         // GPU publication stays time-bounded even on the fullscreen map. The old
         // fast-refresh path bypassed throttling every rendered frame and could
         // upload several 512x512 textures at once, causing visible frame spikes.
-        boolean focusUpload = !isMinimap && MapConfig.fastFullscreenLoading && scale >= 0.35f;
-        // At overview zoom, forcing up to eight 512x512 uploads every rendered
-        // frame is more expensive than drawing the map itself. Let the normal
-        // 50 ms publication throttle stream those regions progressively.
-        long renderNow = System.nanoTime();
-        boolean allowPublication = !cachedOnly
-                && (!isMinimap || renderNow - lastMinimapUploadNanos >= MINIMAP_UPLOAD_INTERVAL_NANOS);
-        if (allowPublication) {
-            if (isMinimap) lastMinimapUploadNanos = renderNow;
-            if (fullCaveView) {
-                FullCaveTextureManager.getInstance().uploadDirtyTextures(focusUpload);
-            } else if (caveMode) {
-                CaveMapManager.getInstance().setActiveLayer(caveLayerY);
-                CaveTextureManager.getInstance().uploadDirtyTextures(focusUpload);
-            } else {
-                MapTextureManager.getInstance().uploadDirtyTextures(focusUpload);
-            }
-        } else if (caveMode && !fullCaveView) {
+        if (fullCaveView) {
+            FullCaveTextureManager.getInstance().uploadDirtyTextures(false);
+        } else if (caveMode) {
             CaveMapManager.getInstance().setActiveLayer(caveLayerY);
+            FullCaveTextureManager.getInstance().uploadDirtyTextures(false);
+            CaveTextureManager.getInstance().uploadDirtyTextures(false);
+        } else {
+            MapTextureManager.getInstance().uploadDirtyTextures(false);
         }
 
         // Reset shader color to prevent other GUI elements from tinting the map
@@ -144,8 +117,7 @@ public class MapRenderer {
         boolean requestChanged = minRegionX != lastRequestMinRx || maxRegionX != lastRequestMaxRx
                 || minRegionZ != lastRequestMinRz || maxRegionZ != lastRequestMaxRz
                 || requestMode != lastRequestMode || caveLayerY != lastRequestLayerY;
-        if (!cachedOnly && (requestChanged
-                || requestNow - lastRegionRequestNanos >= REGION_REQUEST_INTERVAL_NANOS)) {
+        if (requestChanged || requestNow - lastRegionRequestNanos >= REGION_REQUEST_INTERVAL_NANOS) {
             lastRegionRequestNanos = requestNow;
             lastRequestMinRx = minRegionX;
             lastRequestMaxRx = maxRegionX;
@@ -159,7 +131,6 @@ public class MapRenderer {
             MapManager surfaceManager = MapManager.getInstance();
             FullCaveMapManager fullManager = FullCaveMapManager.getInstance();
             CaveMapManager layerManager = CaveMapManager.getInstance();
-            VerticalCaveArchiveManager verticalArchive = VerticalCaveArchiveManager.getInstance();
             for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                 for (int rx = minRegionX; rx <= maxRegionX; rx++) {
                     int priority = 100_000
@@ -174,8 +145,12 @@ public class MapRenderer {
                             MapProcessor.getInstance().enqueueFullCaveLoad(rx, rz, priority + 20);
                         }
                     } else if (caveMode) {
-                        boolean hasVerticalSource = verticalArchive.hasRegionData(rx, rz);
-                        if (hasVerticalSource || layerManager.hasRegionFile(rx, rz)
+                        boolean hasFullSource = fullManager.hasRegionFile(rx, rz)
+                                || fullManager.isRegionLoaded(rx, rz);
+                        if (hasFullSource) {
+                            MapProcessor.getInstance().enqueueFullCaveLoad(rx, rz, priority + 10);
+                        }
+                        if (hasSurfaceSource || hasFullSource || layerManager.hasRegionFile(rx, rz)
                                 || layerManager.isRegionLoaded(rx, rz)) {
                             MapProcessor.getInstance().enqueueCaveLoad(caveLayerY, rx, rz, priority + 20);
                         }
@@ -203,24 +178,25 @@ public class MapRenderer {
             }
             try {
                 if (caveMode) {
-                    // Strict layer rendering: unavailable or empty columns stay black.
-                    // Never blend a selected Top-Y layer with surface, full-cave, or a
-                    // previously selected layer, since those pixels describe different Y.
+                    // Never expose the surface texture while a new automatic cave
+                    // layer is activating. Unknown tiles remain black; known full-
+                    // cave data and the previous initialized Top-Y layer bridge the
+                    // transition until the replacement tile is ready.
                     RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
                     guiGraphics.fill(minRegionX * 512, minRegionZ * 512,
                             (maxRegionX + 1) * 512, (maxRegionZ + 1) * 512, 0xFF080A0C);
 
                     RenderSystem.setShaderColor(caveBrightness, caveBrightness, caveBrightness, 1.0F);
-                    if (fullCaveView) {
-                        for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
-                            for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                                drawRegion(guiGraphics, (cachedOnly ? fullCaveTextures.peekRegionTexture(rx, rz) : fullCaveTextures.getRegionTexture(rx, rz)), rx, rz);
-                            }
+                    for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
+                        for (int rx = minRegionX; rx <= maxRegionX; rx++) {
+                            drawRegion(guiGraphics, fullCaveTextures.getRegionTexture(rx, rz), rx, rz);
                         }
-                    } else {
+                    }
+                    if (!fullCaveView) {
                         for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                             for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                                drawRegion(guiGraphics, (cachedOnly ? caveTextures.peekRegionTexture(caveLayerY, rx, rz) : caveTextures.getRegionTexture(caveLayerY, rx, rz)), rx, rz);
+                                drawRegion(guiGraphics,
+                                        caveTextures.getTransitionRegionTexture(caveLayerY, rx, rz), rx, rz);
                             }
                         }
                     }
@@ -228,7 +204,7 @@ public class MapRenderer {
                     RenderSystem.setShaderColor(mapBrightness, mapBrightness, mapBrightness, 1.0F);
                     for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                         for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                            drawRegion(guiGraphics, (cachedOnly ? surfaceTextures.peekRegionTexture(rx, rz) : surfaceTextures.getRegionTexture(rx, rz)), rx, rz);
+                            drawRegion(guiGraphics, surfaceTextures.getRegionTexture(rx, rz), rx, rz);
                         }
                     }
                 }
@@ -239,11 +215,6 @@ public class MapRenderer {
 
             // Restore lit surface colours over the dark ambient base. Night mode
             // is shader-only and therefore no longer rebuilds the full map cache.
-            // Keep emissive/light sources visible at every zoom level. Earlier builds
-            // disabled this pass below 0.32 px/block on the fullscreen map, which made
-            // torches, lava and other lights appear to switch off while zooming out.
-            // The pass reuses already prepared per-region glow textures, so zoom only
-            // changes composition; it does not rebuild light data.
             if (!caveMode && MapConfig.minimapNightMode != 0) {
                 boolean blendWasEnabled = GL11.glIsEnabled(GL11.GL_BLEND);
                 RenderSystem.enableBlend();
@@ -256,10 +227,11 @@ public class MapRenderer {
                 try {
                     for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                         for (int rx = minRegionX; rx <= maxRegionX; rx++) {
-                            ResourceLocation glowTexture = cachedOnly ? surfaceTextures.peekGlowRegionTexture(rx, rz)
-                                    : surfaceTextures.getGlowRegionTexture(rx, rz);
+                            ResourceLocation glowTexture = surfaceTextures.getGlowRegionTexture(rx, rz);
                             if (glowTexture == null) continue;
                             RenderSystem.setShaderTexture(0, glowTexture);
+                            RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+                            RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
                             guiGraphics.blit(glowTexture, rx * 512, rz * 512, 512, 512,
                                     0f, 0f, 512, 512, 512, 512);
                         }
@@ -368,9 +340,8 @@ public class MapRenderer {
     private void drawRegion(GuiGraphics guiGraphics, ResourceLocation texture, int regionX, int regionZ) {
         if (texture == null) return;
         RenderSystem.setShaderTexture(0, texture);
-        // DynamicTexture filtering is configured when the texture is created.
-        // Re-applying glTexParameter for every visible region caused hundreds of
-        // redundant driver calls in heavily zoomed-out fullscreen views.
+        RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+        RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         guiGraphics.blit(texture, regionX * 512, regionZ * 512, 512, 512,
                 0f, 0f, 512, 512, 512, 512);
     }

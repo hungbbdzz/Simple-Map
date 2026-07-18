@@ -1,6 +1,11 @@
 package com.velorise.simplemap.network;
 
 import com.velorise.simplemap.ModItems;
+import com.velorise.simplemap.client.CaveMapManager;
+import com.velorise.simplemap.client.CaveMode;
+import com.velorise.simplemap.client.MapConfig;
+import com.velorise.simplemap.client.MapManager;
+import com.velorise.simplemap.client.MapTextureManager;
 import com.velorise.simplemap.client.RegionDataStore;
 import com.velorise.simplemap.network.payload.AckLearnRegionPayload;
 import com.velorise.simplemap.network.payload.InitSaveBookPayload;
@@ -11,6 +16,7 @@ import com.velorise.simplemap.network.payload.SaveBookCompletePayload;
 import com.velorise.simplemap.network.payload.SendLearnRegionPayload;
 import com.velorise.simplemap.network.payload.SendRegionFilePayload;
 import com.velorise.simplemap.network.payload.SyncConfigPayload;
+import net.minecraft.client.Minecraft;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
@@ -48,12 +54,10 @@ import java.util.concurrent.Executors;
 public final class NetworkHandler {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final int MAX_REGIONS_PER_BOOK = 4096;
-    static final int MAX_REGION_FILE_BYTES = 4 * 1024 * 1024;
+    private static final int MAX_REGION_FILE_BYTES = 4 * 1024 * 1024;
     private static final long SESSION_TIMEOUT_MS = 2 * 60 * 1000L;
-    /** Protocol 4 separates the client-only map core from the optional server extension. */
-    public static final String PROTOCOL_VERSION = "5";
 
-    static final ExecutorService BOOK_IO_POOL = Executors.newFixedThreadPool(2, runnable -> {
+    private static final ExecutorService BOOK_IO_POOL = Executors.newFixedThreadPool(2, runnable -> {
         Thread thread = new Thread(runnable, "SimpleMap-BookIO");
         thread.setDaemon(true);
         thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
@@ -67,9 +71,7 @@ public final class NetworkHandler {
     }
 
     public static void register(RegisterPayloadHandlersEvent event) {
-        // Public servers are allowed to omit Simple Map entirely. Map Book/config
-        // packets become available only when the remote side advertises the channel.
-        PayloadRegistrar registrar = event.registrar(PROTOCOL_VERSION).optional();
+        PayloadRegistrar registrar = event.registrar("3");
         registrar.playToClient(SyncConfigPayload.TYPE, SyncConfigPayload.STREAM_CODEC,
                 NetworkHandler::handleSyncConfigOnClient);
         registrar.playToServer(InitSaveBookPayload.TYPE, InitSaveBookPayload.STREAM_CODEC,
@@ -90,16 +92,25 @@ public final class NetworkHandler {
                 NetworkHandler::handleAckLearnRegionOnServer);
     }
 
-    /** Server-side counterpart; silently skips clients without the optional channel. */
-    public static boolean sendToPlayer(ServerPlayer player, CustomPacketPayload payload) {
-        if (player == null || player.connection == null || payload == null
-                || !player.connection.hasChannel(payload)) return false;
+    public static void sendToServer(CustomPacketPayload payload) {
+        PacketDistributor.sendToServer(payload);
+    }
+
+    public static void sendToPlayer(ServerPlayer player, CustomPacketPayload payload) {
         PacketDistributor.sendToPlayer(player, payload);
-        return true;
     }
 
     private static void handleSyncConfigOnClient(SyncConfigPayload payload, IPayloadContext context) {
-        ClientPayloadHooks.handleSyncConfig(payload, context);
+        context.enqueueWork(() -> {
+            MapConfig.serverRequireMapBook = payload.requireMapBook();
+            MapConfig.serverCaveMapMode = Math.max(0, Math.min(2, payload.caveMapMode()));
+            if (MapConfig.serverCaveMapMode != 2) {
+                CaveMode.clearManualLayer();
+                CaveMapManager.getInstance().deactivate();
+            }
+            LOGGER.info("SimpleMap synced server config: requireBook={}, caveMode={}",
+                    payload.requireMapBook(), MapConfig.serverCaveMapMode);
+        });
     }
 
     private static void handleInitSaveBookOnServer(InitSaveBookPayload payload, IPayloadContext context) {
@@ -170,7 +181,57 @@ public final class NetworkHandler {
 
     private static void handleRequestRegionFileOnClient(RequestRegionFilePayload payload,
             IPayloadContext context) {
-        ClientPayloadHooks.handleRequestRegion(payload, context);
+        context.enqueueWork(() -> {
+            if (!validTransferMetadata(payload.bookId(), payload.regionName(), payload.currentIdx(),
+                    payload.totalCount())) {
+                LOGGER.warn("[SimpleMap] Rejected invalid region request from server");
+                return;
+            }
+            File directory = MapManager.getInstance().getCurrentDimensionDir();
+            if (directory == null) {
+                sendEmptySaveReply(payload);
+                return;
+            }
+            File file = new File(directory, payload.regionName());
+            if (!isPathContained(file.toPath(), directory.toPath())) {
+                LOGGER.warn("[SimpleMap] Client region path escaped map directory");
+                sendEmptySaveReply(payload);
+                return;
+            }
+            int[] coordinates = parseRegionCoordinates(payload.regionName());
+            RegionDataStore.StoredRegion loadedSnapshot = coordinates == null ? null
+                    : MapManager.getInstance().snapshotStoredRegion(coordinates[0], coordinates[1]);
+
+            BOOK_IO_POOL.execute(() -> {
+                byte[] data = new byte[0];
+                try {
+                    RegionDataStore.StoredRegion snapshot = loadedSnapshot;
+                    if (snapshot == null && coordinates != null) {
+                        snapshot = RegionDataStore.latestPending(directory,
+                                coordinates[0], coordinates[1]);
+                    }
+                    if (snapshot != null) {
+                        byte[] encoded = RegionDataStore.toBytes(snapshot);
+                        if (encoded.length <= MAX_REGION_FILE_BYTES) data = encoded;
+                    } else if (file.isFile() && Files.size(file.toPath()) <= MAX_REGION_FILE_BYTES) {
+                        // Validate before sending so a corrupt local cache cannot poison a book.
+                        RegionDataStore.read(file);
+                        data = Files.readAllBytes(file.toPath());
+                    }
+                } catch (IOException exception) {
+                    LOGGER.warn("Failed to read map-book region {}", file.getName(), exception);
+                }
+                byte[] result = data;
+                Minecraft.getInstance().execute(() -> sendToServer(new SendRegionFilePayload(
+                        payload.bookId(), payload.regionName(), result, payload.currentIdx(),
+                        payload.totalCount(), payload.mainHand())));
+            });
+        });
+    }
+
+    private static void sendEmptySaveReply(RequestRegionFilePayload payload) {
+        sendToServer(new SendRegionFilePayload(payload.bookId(), payload.regionName(), new byte[0],
+                payload.currentIdx(), payload.totalCount(), payload.mainHand()));
     }
 
     private static void handleSendRegionFileOnServer(SendRegionFilePayload payload,
@@ -277,7 +338,11 @@ public final class NetworkHandler {
 
     private static void handleSaveBookCompleteOnClient(SaveBookCompletePayload payload,
             IPayloadContext context) {
-        ClientPayloadHooks.handleSaveComplete(payload, context);
+        context.enqueueWork(() -> {
+            if (isValidBookId(payload.bookId(), false) && MapConfig.serverRequireMapBook) {
+                MapManager.getInstance().setHasLearnedMap(true);
+            }
+        });
     }
 
     private static void handleRequestLearnBookOnServer(RequestLearnBookPayload payload,
@@ -427,12 +492,66 @@ public final class NetworkHandler {
 
     private static void handleSendLearnRegionOnClient(SendLearnRegionPayload payload,
             IPayloadContext context) {
-        ClientPayloadHooks.handleLearnRegion(payload, context);
+        context.enqueueWork(() -> {
+            if (!validTransferMetadata(payload.bookId(), payload.regionName(), payload.currentIdx(),
+                    payload.totalCount()) || payload.data().length > MAX_REGION_FILE_BYTES) {
+                LOGGER.warn("[SimpleMap] Rejected malformed learned region from server");
+                return;
+            }
+
+            MapManager mapManager = MapManager.getInstance();
+            File directory = mapManager.getCurrentDimensionDir();
+            long mapGeneration = mapManager.getGeneration();
+            byte[] data = Arrays.copyOf(payload.data(), payload.data().length);
+            BOOK_IO_POOL.execute(() -> {
+                int[] coordinates = parseRegionCoordinates(payload.regionName());
+                boolean merged = false;
+                try {
+                    if (directory == null || coordinates == null || data.length == 0) {
+                        throw new IOException("No active map directory or usable learned region data");
+                    }
+                    File localFile = new File(directory, payload.regionName());
+                    if (!isPathContained(localFile.toPath(), directory.toPath())) {
+                        throw new IOException("Learned region escaped map directory");
+                    }
+                    Files.createDirectories(directory.toPath());
+                    RegionDataStore.mergeIntoFile(localFile, data);
+                    merged = true;
+                } catch (IOException exception) {
+                    LOGGER.error("Failed to merge learned region {}", payload.regionName(), exception);
+                }
+
+                boolean diskMergeSucceeded = merged;
+                Minecraft.getInstance().execute(() -> {
+                    MapManager currentManager = MapManager.getInstance();
+                    boolean stillCurrent = diskMergeSucceeded
+                            && currentManager.isGenerationCurrent(mapGeneration)
+                            && sameFile(currentManager.getCurrentDimensionDir(), directory);
+                    if (stillCurrent) {
+                        currentManager.unloadRegion(coordinates[0], coordinates[1]);
+                        currentManager.invalidateRegionFile(coordinates[0], coordinates[1]);
+                        MapTextureManager.getInstance().markRegionDirty(coordinates[0], coordinates[1]);
+                    }
+                    sendToServer(new AckLearnRegionPayload(payload.bookId(),
+                            payload.currentIdx() + 1, stillCurrent));
+                });
+            });
+        });
     }
 
     private static void handleLearnBookCompleteOnClient(LearnBookCompletePayload payload,
             IPayloadContext context) {
-        ClientPayloadHooks.handleLearnComplete(payload, context);
+        context.enqueueWork(() -> {
+            if (!isValidBookId(payload.bookId(), false)) return;
+            MapManager.getInstance().setHasLearnedMap(true);
+            MapManager.getInstance().setLastLearnedBookId(payload.bookId());
+            MapTextureManager.getInstance().clearCache();
+            Minecraft minecraft = Minecraft.getInstance();
+            if (minecraft.player != null) {
+                minecraft.player.sendSystemMessage(Component.literal(
+                        "§aMap learned successfully! Your map has been updated."));
+            }
+        });
     }
 
     private static boolean canSaveHeldBook(ServerPlayer player, ItemStack held, String requestedId) {
@@ -489,14 +608,14 @@ public final class NetworkHandler {
         return List.copyOf(result);
     }
 
-    static boolean validTransferMetadata(String bookId, String regionName, int index, int total) {
+    private static boolean validTransferMetadata(String bookId, String regionName, int index, int total) {
         return isValidBookId(bookId, false)
                 && isValidRegionName(regionName)
                 && total >= 0 && total <= MAX_REGIONS_PER_BOOK
                 && index >= 0 && index < total;
     }
 
-    static boolean isValidBookId(String id, boolean allowEmpty) {
+    private static boolean isValidBookId(String id, boolean allowEmpty) {
         if (id == null) return false;
         if (allowEmpty && id.isEmpty()) return true;
         return id.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
@@ -507,7 +626,7 @@ public final class NetworkHandler {
         return name != null && name.matches("r\\.-?\\d{1,7}\\.-?\\d{1,7}\\.smdat");
     }
 
-    static int[] parseRegionCoordinates(String name) {
+    private static int[] parseRegionCoordinates(String name) {
         if (!isValidRegionName(name)) return null;
         String[] parts = name.split("\\.");
         try {
@@ -517,7 +636,7 @@ public final class NetworkHandler {
         }
     }
 
-    static boolean isPathContained(Path file, Path baseDirectory) {
+    private static boolean isPathContained(Path file, Path baseDirectory) {
         try {
             return file.toAbsolutePath().normalize().startsWith(baseDirectory.toAbsolutePath().normalize());
         } catch (RuntimeException exception) {
@@ -545,7 +664,7 @@ public final class NetworkHandler {
         return path.replace('/', '_');
     }
 
-    static boolean sameFile(File first, File second) {
+    private static boolean sameFile(File first, File second) {
         if (first == second) return true;
         if (first == null || second == null) return false;
         return first.toPath().toAbsolutePath().normalize()
@@ -554,13 +673,6 @@ public final class NetworkHandler {
 
     private static String sessionKey(String bookId, UUID playerId) {
         return bookId + ':' + playerId;
-    }
-
-    /** Releases bounded book-transfer state immediately when a player leaves. */
-    public static void clearSessionsForPlayer(UUID playerId) {
-        if (playerId == null) return;
-        ACTIVE_SAVES.entrySet().removeIf(entry -> entry.getValue().playerId.equals(playerId));
-        ACTIVE_LEARNS.entrySet().removeIf(entry -> entry.getValue().playerId.equals(playerId));
     }
 
     private static void cleanupExpiredSessions() {

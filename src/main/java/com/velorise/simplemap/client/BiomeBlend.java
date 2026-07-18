@@ -55,21 +55,7 @@ public final class BiomeBlend {
                 count++;
             }
         }
-        if (count == 0) {
-            if (px >= 0 && px < SIZE && pz >= 0 && pz < SIZE) {
-                long selfPacked = pixelData[pz * SIZE + px];
-                if (!MapBlockData.isEmpty(selfPacked)) {
-                    int selfBiomeIndex = MapBlockData.biomeId(selfPacked) & 0xFF;
-                    if (selfBiomeIndex != (MapBlockData.NO_BIOME & 0xFF)) {
-                        Biome selfBiome = biomeLookup.apply(selfBiomeIndex);
-                        if (selfBiome != null) {
-                            return 0xFF000000 | (extractor.extract(selfBiome) & 0x00FFFFFF);
-                        }
-                    }
-                }
-            }
-            return -1;
-        }
+        if (count == 0) return -1;
         return 0xFF000000 | ((red / count) << 16) | ((green / count) << 8) | (blue / count);
     }
 }

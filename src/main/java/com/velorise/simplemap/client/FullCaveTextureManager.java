@@ -20,15 +20,11 @@ public final class FullCaveTextureManager {
     private static final int MAX_TEXTURE_REGIONS = 128;
     private static final int MAX_VISIBLE_HISTORY = MAX_TEXTURE_REGIONS * 4;
     private static final long VISIBLE_TTL_MS = 2_000L;
-    private static final long DIRTY_QUIET_NANOS = 45_000_000L;
-    private static final long DIRTY_MAX_WAIT_NANOS = 220_000_000L;
 
     private final Map<String, TextureInfo> textures = new LinkedHashMap<>(16, 0.75f, true);
     private final Set<String> dirtyTextures = new LinkedHashSet<>();
     private final Map<String, Long> visibleTextures = new LinkedHashMap<>();
     private final Map<String, Long> revisions = new HashMap<>();
-    private final Map<String, Long> firstDirtyNanos = new HashMap<>();
-    private final Map<String, Long> lastDirtyNanos = new HashMap<>();
     private final List<TextureInfo> deferredCloses = new ArrayList<>();
     private int renderBatchDepth;
     private long lastUploadTime;
@@ -42,12 +38,10 @@ public final class FullCaveTextureManager {
 
     public void markRegionTextureDirty(int rx, int rz) {
         String key = key(rx, rz);
-        long now = System.nanoTime();
         synchronized (dirtyTextures) {
-            revisions.merge(key, 1L, Long::sum);
-            firstDirtyNanos.putIfAbsent(key, now);
-            lastDirtyNanos.put(key, now);
-            dirtyTextures.add(key);
+            // One revision per queued rebuild is enough. Thousands of changed
+            // columns in the same region now collapse into a single texture job.
+            if (dirtyTextures.add(key)) revisions.merge(key, 1L, Long::sum);
         }
     }
 
@@ -101,18 +95,6 @@ public final class FullCaveTextureManager {
         if (closeNow != null) for (TextureInfo info : closeNow) info.close();
     }
 
-
-    /** Returns only an already uploaded full-cave tile; performs no IO or rebuild. */
-    public ResourceLocation peekRegionTexture(int rx, int rz) {
-        String key = key(rx, rz);
-        synchronized (textures) {
-            TextureInfo info = textures.get(key);
-            if (info == null || !info.initialized) return null;
-            markVisible(key);
-            return info.location;
-        }
-    }
-
     public void uploadDirtyTextures() {
         uploadDirtyTextures(false);
     }
@@ -130,7 +112,7 @@ public final class FullCaveTextureManager {
 
         int budget = force ? 8 : 3;
         long deadline = System.nanoTime() + (force ? 8_000_000L : 4_000_000L);
-        for (String key : selectDirty(budget, force)) {
+        for (String key : selectDirty(budget)) {
             if (System.nanoTime() > deadline && !force) {
                 requeue(key);
                 continue;
@@ -166,27 +148,13 @@ public final class FullCaveTextureManager {
             if (!info.pending.isDone()) return;
             try {
                 MapTextureBuildWorker.PreparedSingle prepared = info.pending.join();
-                if (manager.isGenerationCurrent(info.generation)) {
-                    // Full-cave regions are also filled continuously. Publish a
-                    // complete prepared snapshot even when a few newer columns exist,
-                    // then queue the next revision instead of starving the GPU image.
-                    applyPrepared(info, prepared);
-
-                    synchronized (dirtyTextures) {
-                        long currentRevision = revisions.getOrDefault(key, 0L);
-                        if (currentRevision > prepared.revision()) {
-                            dirtyTextures.add(key);
-                        } else {
-                            dirtyTextures.remove(key);
-                            firstDirtyNanos.remove(key);
-                            lastDirtyNanos.remove(key);
-                        }
-                    }
-                }
+                if (manager.isGenerationCurrent(info.generation)) applyPrepared(info, prepared);
             } catch (RuntimeException ignored) {
-                requeue(key);
             } finally {
                 info.pending = null;
+            }
+            synchronized (dirtyTextures) {
+                if (revisions.getOrDefault(key, 0L) > info.uploadedRevision) dirtyTextures.add(key);
             }
             return;
         }
@@ -247,11 +215,8 @@ public final class FullCaveTextureManager {
     public void invalidateStyle() {
         synchronized (textures) {
             synchronized (dirtyTextures) {
-                long now = System.nanoTime();
                 for (String key : textures.keySet()) {
                     revisions.merge(key, 1L, Long::sum);
-                    firstDirtyNanos.putIfAbsent(key, now);
-                    lastDirtyNanos.put(key, now);
                     dirtyTextures.add(key);
                 }
             }
@@ -276,44 +241,30 @@ public final class FullCaveTextureManager {
         synchronized (dirtyTextures) {
             dirtyTextures.clear();
             revisions.clear();
-            firstDirtyNanos.clear();
-            lastDirtyNanos.clear();
         }
         synchronized (visibleTextures) {
             visibleTextures.clear();
         }
     }
 
-    private List<String> selectDirty(int budget, boolean force) {
+    private List<String> selectDirty(int budget) {
         List<String> result = new ArrayList<>(budget);
-        long now = System.nanoTime();
         synchronized (dirtyTextures) {
             synchronized (visibleTextures) {
                 for (String key : visibleTextures.keySet()) {
-                    if (dirtyTextures.contains(key) && isReadyForPublication(key, now, force)) {
-                        result.add(key);
-                    }
+                    if (dirtyTextures.contains(key)) result.add(key);
                     if (result.size() >= budget) break;
                 }
             }
             if (result.size() < budget) {
                 for (String key : dirtyTextures) {
-                    if (!result.contains(key) && isReadyForPublication(key, now, force)) {
-                        result.add(key);
-                    }
+                    if (!result.contains(key)) result.add(key);
                     if (result.size() >= budget) break;
                 }
             }
             dirtyTextures.removeAll(result);
         }
         return result;
-    }
-
-    private boolean isReadyForPublication(String key, long now, boolean force) {
-        if (force) return true;
-        long first = firstDirtyNanos.getOrDefault(key, now);
-        long last = lastDirtyNanos.getOrDefault(key, first);
-        return now - last >= DIRTY_QUIET_NANOS || now - first >= DIRTY_MAX_WAIT_NANOS;
     }
 
     private void markVisible(String key) {
@@ -354,9 +305,6 @@ public final class FullCaveTextureManager {
 
     private void requeue(String key) {
         synchronized (dirtyTextures) {
-            long now = System.nanoTime();
-            firstDirtyNanos.putIfAbsent(key, now);
-            lastDirtyNanos.putIfAbsent(key, now);
             dirtyTextures.add(key);
         }
     }

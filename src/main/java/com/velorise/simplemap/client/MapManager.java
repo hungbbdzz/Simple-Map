@@ -7,16 +7,10 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.File;
-import java.io.Writer;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.StandardCopyOption;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -27,7 +21,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
@@ -89,7 +82,7 @@ public class MapManager {
     }
 
     public void setLastLearnedBookId(String bookId) {
-        lastLearnedBookId = isCanonicalBookId(bookId) ? bookId.toLowerCase(Locale.ROOT) : "";
+        lastLearnedBookId = bookId == null ? "" : bookId;
         saveLearningState(hasLearnedMap);
     }
 
@@ -102,27 +95,25 @@ public class MapManager {
         saveLearningState(learned);
     }
 
-    private synchronized void saveLearningState(boolean learned) {
+    private void saveLearningState(boolean learned) {
         if (currentWorldDir == null) return;
-        Path worldPath = currentWorldDir.toPath();
-        Path learnedFile = worldPath.resolve("map_learned.dat");
-        Path idFile = worldPath.resolve("last_book_id.dat");
-        try {
-            Files.createDirectories(worldPath);
-            if (!learned) {
-                Files.deleteIfExists(learnedFile);
-                Files.deleteIfExists(idFile);
-                return;
+        File learnedFile = new File(currentWorldDir, "map_learned.dat");
+        File idFile = new File(currentWorldDir, "last_book_id.dat");
+        if (learned) {
+            try {
+                if (!learnedFile.exists()) learnedFile.createNewFile();
+                if (!lastLearnedBookId.isEmpty()) Files.writeString(idFile.toPath(), lastLearnedBookId);
+                else Files.deleteIfExists(idFile.toPath());
+            } catch (IOException exception) {
+                LOGGER.error("Failed to write map learning state", exception);
             }
-
-            writeUtf8Atomic(learnedFile, "learned\n");
-            if (isCanonicalBookId(lastLearnedBookId)) {
-                writeUtf8Atomic(idFile, lastLearnedBookId + "\n");
-            } else {
-                Files.deleteIfExists(idFile);
+        } else {
+            try {
+                Files.deleteIfExists(learnedFile.toPath());
+                Files.deleteIfExists(idFile.toPath());
+            } catch (IOException exception) {
+                LOGGER.warn("Failed to clear map learning state", exception);
             }
-        } catch (IOException exception) {
-            LOGGER.error("Failed to update map learning state atomically", exception);
         }
     }
 
@@ -133,26 +124,20 @@ public class MapManager {
         }
 
         String worldId;
-        File worldDirectory;
         if (minecraft.isLocalServer() && minecraft.getSingleplayerServer() != null) {
             try {
                 var root = minecraft.getSingleplayerServer().getWorldPath(
                         net.minecraft.world.level.storage.LevelResource.ROOT);
-                worldId = "sp_" + safePathComponent(root.toAbsolutePath().normalize().toString());
-                worldDirectory = root.resolve("simplemap").toFile();
+                worldId = "sp_" + safePathComponent(root.getFileName().toString());
             } catch (Exception exception) {
                 worldId = "sp_" + safePathComponent(
                         minecraft.getSingleplayerServer().getWorldData().getLevelName());
-                worldDirectory = new File(minecraft.gameDirectory, "simplemap/saves/" + worldId);
             }
         } else if (minecraft.getCurrentServer() != null) {
-            String address = minecraft.getCurrentServer().ip;
-            worldId = multiplayerWorldId(address);
-            worldDirectory = resolveMultiplayerWorldDirectory(minecraft, address, worldId);
+            worldId = "mp_" + safePathComponent(minecraft.getCurrentServer().ip);
         } else {
             worldId = "dim_" + safePathComponent(
                     minecraft.level.dimension().location().toString());
-            worldDirectory = new File(minecraft.gameDirectory, "simplemap/saves/" + worldId);
         }
 
         var dimensionLocation = minecraft.level.dimension().location();
@@ -167,6 +152,18 @@ public class MapManager {
         currentWorldId = worldId;
         currentDimensionId = dimensionId;
 
+        File worldDirectory;
+        if (minecraft.isLocalServer() && minecraft.getSingleplayerServer() != null) {
+            try {
+                worldDirectory = minecraft.getSingleplayerServer()
+                        .getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+                        .resolve("simplemap").toFile();
+            } catch (Exception exception) {
+                worldDirectory = new File(minecraft.gameDirectory, "simplemap/saves/" + worldId);
+            }
+        } else {
+            worldDirectory = new File(minecraft.gameDirectory, "simplemap/saves/" + worldId);
+        }
         currentWorldDir = worldDirectory;
         if (!worldDirectory.exists() && !worldDirectory.mkdirs()) {
             LOGGER.warn("Could not create SimpleMap world directory {}", worldDirectory);
@@ -184,9 +181,7 @@ public class MapManager {
         CaveMapManager.getInstance().setBaseDirectory(
                 new File(worldDirectory, "caves/" + dimensionId), currentDimensionDir);
         FullCaveMapManager.getInstance().setCacheDirectory(
-                new File(worldDirectory, "caves/" + dimensionId + "/full_v2_reliable_surface"));
-        VerticalCaveArchiveManager.getInstance().setCacheDirectory(
-                new File(worldDirectory, "caves/" + dimensionId + "/vertical_v2_reliable_surface"));
+                new File(worldDirectory, "caves/" + dimensionId + "/full"));
         loadPin();
         LOGGER.info("SimpleMap switched to lazy region directory: {}", currentDimensionDir);
     }
@@ -200,9 +195,7 @@ public class MapManager {
             return;
         }
         try {
-            String storedId = Files.readString(idFile.toPath(), StandardCharsets.UTF_8).trim();
-            lastLearnedBookId = isCanonicalBookId(storedId) ? storedId : "";
-            if (lastLearnedBookId.isEmpty()) Files.deleteIfExists(idFile.toPath());
+            lastLearnedBookId = Files.readString(idFile.toPath()).trim();
         } catch (IOException exception) {
             lastLearnedBookId = "";
         }
@@ -220,12 +213,6 @@ public class MapManager {
         return region.getBlockData(blockX & 511, blockZ & 511);
     }
 
-    public int getSurfaceTint(int blockX, int blockZ) {
-        Region region = getRegion(blockX >> 9, blockZ >> 9, false);
-        if (region == null || !region.isLoaded()) return SurfaceTintData.UNKNOWN;
-        return region.getTint(blockX & 511, blockZ & 511);
-    }
-
     public int getColor(int blockX, int blockZ) {
         MapBlockData data = getBlockData(blockX, blockZ);
         if (data == null || data.isEmpty()) return 0;
@@ -240,15 +227,11 @@ public class MapManager {
     }
 
     public void setBlockData(int blockX, int blockZ, MapBlockData data) {
-        setBlockData(blockX, blockZ, data, SurfaceTintData.UNKNOWN);
-    }
-
-    public void setBlockData(int blockX, int blockZ, MapBlockData data, int tint) {
         int regionX = blockX >> 9;
         int regionZ = blockZ >> 9;
         Region region = getRegion(regionX, regionZ, true);
         if (region == null || !region.isLoaded()) return;
-        if (region.setBlockData(blockX & 511, blockZ & 511, data, tint)) {
+        if (region.setBlockData(blockX & 511, blockZ & 511, data)) {
             markRegionDirty(regionX, regionZ);
         }
     }
@@ -325,39 +308,6 @@ public class MapManager {
         return currentDimensionDir;
     }
 
-    /** Re-colors and reloads all saved map regions in background threads. */
-    public void reloadAllRegions() {
-        File directory = currentDimensionDir;
-        worldGeneration.incrementAndGet();
-        MapTextureManager.getInstance().clearDerivedColorCaches();
-        MapTextureManager.getInstance().clearCache();
-        CaveMapManager.getInstance().clearCache();
-        FullCaveTextureManager.getInstance().clearCache();
-
-        if (directory != null) {
-            File[] files = directory.listFiles((dir, name) ->
-                    name != null && name.matches("r\\.-?\\d{1,7}\\.-?\\d{1,7}\\.smdat"));
-            if (files != null) {
-                for (File file : files) {
-                    String name = file.getName();
-                    String[] parts = name.split("\\.");
-                    if (parts.length >= 4) {
-                        try {
-                            int rx = Integer.parseInt(parts[1]);
-                            int rz = Integer.parseInt(parts[2]);
-                            MapProcessor.getInstance().enqueueSurfaceLoad(rx, rz, 100);
-                        } catch (Exception ignored) {
-                        }
-                    }
-                }
-            }
-        }
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.level != null && mc.player != null) {
-            ChunkScanner.getInstance().requestRefresh(mc);
-        }
-    }
-
     /** Includes disk regions plus loaded unsaved regions for map-book snapshots. */
     public List<String> getKnownRegionNamesForBook(int maximum) {
         int limit = Math.max(0, maximum);
@@ -391,7 +341,7 @@ public class MapManager {
             Region region = loadedRegions.get(key(rx, rz));
             if (region == null || !region.isLoaded()) return null;
             RegionSnapshot snapshot = region.snapshot();
-            return new RegionDataStore.StoredRegion(snapshot.pixels(), snapshot.tints(),
+            return new RegionDataStore.StoredRegion(snapshot.pixels(),
                     snapshot.biomePalette(), snapshot.blockPalette());
         }
     }
@@ -400,16 +350,14 @@ public class MapManager {
         try {
             LOAD_POOL.execute(() -> {
                 long[] pixels = new long[PIXEL_COUNT];
-                int[] tints = new int[PIXEL_COUNT];
                 Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
-                Arrays.fill(tints, SurfaceTintData.UNKNOWN);
                 List<String> biomePalette = new ArrayList<>();
                 List<String> blockPalette = new ArrayList<>();
                 boolean loaded = RegionDataStore.load(directory, region.rx, region.rz,
-                        pixels, tints, biomePalette, blockPalette);
+                        pixels, biomePalette, blockPalette);
                 if (!loaded) quarantineCorruptRegion(directory, region.rx, region.rz, generation);
                 if (!isLoadTargetCurrent(region, directory, generation)) return;
-                region.applyLoadedData(pixels, tints, biomePalette, blockPalette);
+                region.applyLoadedData(pixels, biomePalette, blockPalette);
                 region.markLoaded();
                 if (loaded) MapTextureManager.getInstance().markRegionDirty(region.rx, region.rz);
                 synchronized (loadedRegions) {
@@ -440,7 +388,6 @@ public class MapManager {
         MapLightManager.getInstance().tickSave();
         CaveMapManager.getInstance().tickSave();
         FullCaveMapManager.getInstance().tickSave();
-        VerticalCaveArchiveManager.getInstance().tickSave();
         long now = System.currentTimeMillis();
         if (now - lastSaveTime < 10_000L) return;
         lastSaveTime = now;
@@ -456,7 +403,6 @@ public class MapManager {
         MapLightManager.getInstance().flushAndClear();
         CaveMapManager.getInstance().flushAndClear();
         FullCaveMapManager.getInstance().flushAndClear();
-        VerticalCaveArchiveManager.getInstance().flushAndClear();
         ChunkScanner.getInstance().reset();
         RegionProcessor.getInstance().stop();
     }
@@ -500,7 +446,7 @@ public class MapManager {
     private void saveRegionSnapshot(Region region, File directory) {
         RegionSnapshot snapshot = region.snapshot();
         RegionDataStore.saveAsync(directory, region.rx, region.rz,
-                snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(), snapshot.blockPalette());
+                snapshot.pixels(), snapshot.biomePalette(), snapshot.blockPalette());
         regionFileExists.put(key(region.rx, region.rz), true);
     }
 
@@ -551,78 +497,6 @@ public class MapManager {
         }
     }
 
-
-    private static boolean isCanonicalBookId(String value) {
-        if (value == null || value.length() != 36) return false;
-        try {
-            return UUID.fromString(value).toString().equals(value.toLowerCase(Locale.ROOT));
-        } catch (IllegalArgumentException ignored) {
-            return false;
-        }
-    }
-
-    private static void writeUtf8Atomic(Path target, String contents) throws IOException {
-        Path parent = target.toAbsolutePath().normalize().getParent();
-        if (parent == null) throw new IOException("Atomic write target has no parent: " + target);
-        Files.createDirectories(parent);
-        Path temporary = Files.createTempFile(parent, target.getFileName().toString() + ".", ".tmp");
-        boolean moved = false;
-        try {
-            Files.writeString(temporary, contents, StandardCharsets.UTF_8);
-            moveReplacing(temporary, target);
-            moved = true;
-        } finally {
-            if (!moved) Files.deleteIfExists(temporary);
-        }
-    }
-
-    private static String multiplayerWorldId(String address) {
-        String normalized = address == null ? "unknown" : address.trim().toLowerCase(Locale.ROOT);
-        String readable = safePathComponent(normalized);
-        if (readable.length() > 48) readable = readable.substring(0, 48);
-        return "mp_" + readable + "_" + shortSha256(normalized);
-    }
-
-    private static File resolveMultiplayerWorldDirectory(Minecraft minecraft, String address, String worldId) {
-        File savesRoot = new File(minecraft.gameDirectory, "simplemap/saves");
-        File target = new File(savesRoot, worldId);
-        String legacyId = "mp_" + safePathComponent(address);
-        File legacy = new File(savesRoot, legacyId);
-        if (!target.exists() && legacy.isDirectory() && !legacy.equals(target)) {
-            try {
-                Files.createDirectories(savesRoot.toPath());
-                Files.move(legacy.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE);
-                LOGGER.info("Migrated legacy multiplayer map cache {} -> {}",
-                        legacy.getName(), target.getName());
-            } catch (IOException atomicFailure) {
-                try {
-                    Files.move(legacy.toPath(), target.toPath());
-                    LOGGER.info("Migrated legacy multiplayer map cache {} -> {}",
-                            legacy.getName(), target.getName());
-                } catch (IOException moveFailure) {
-                    LOGGER.warn("Could not migrate legacy multiplayer map cache {}; continuing to use it",
-                            legacy, moveFailure);
-                    return legacy;
-                }
-            }
-        }
-        return target;
-    }
-
-    private static String shortSha256(String value) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder builder = new StringBuilder(12);
-            for (int index = 0; index < 6; index++) {
-                builder.append(String.format("%02x", digest[index] & 0xFF));
-            }
-            return builder.toString();
-        } catch (NoSuchAlgorithmException impossible) {
-            return Integer.toUnsignedString(value.hashCode(), 16);
-        }
-    }
-
     private static String safePathComponent(String value) {
         if (value == null || value.isBlank()) return "unknown";
         String cleaned = value.trim().replaceAll("[^A-Za-z0-9._-]", "_")
@@ -650,7 +524,6 @@ public class MapManager {
         public final int rz;
         private final long generation;
         private final long[] pixels = new long[PIXEL_COUNT];
-        private final int[] tints = new int[PIXEL_COUNT];
         private final List<String> biomePalette = new ArrayList<>();
         private final List<String> blockPalette = new ArrayList<>();
         private final Map<String, Integer> biomeIndex = new HashMap<>();
@@ -664,7 +537,6 @@ public class MapManager {
             this.rz = rz;
             this.generation = generation;
             Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
-            Arrays.fill(tints, SurfaceTintData.UNKNOWN);
         }
 
         public String getCacheKey() { return key(rx, rz); }
@@ -685,27 +557,13 @@ public class MapManager {
             }
         }
 
-        public int getTint(int pixelX, int pixelZ) {
-            lock.lock();
-            try {
-                return tints[pixelZ * 512 + pixelX];
-            } finally {
-                lock.unlock();
-            }
-        }
-
         public boolean setBlockData(int pixelX, int pixelZ, MapBlockData data) {
-            return setBlockData(pixelX, pixelZ, data, SurfaceTintData.UNKNOWN);
-        }
-
-        public boolean setBlockData(int pixelX, int pixelZ, MapBlockData data, int tint) {
             long packed = MapBlockData.pack(data);
             lock.lock();
             try {
                 int index = pixelZ * 512 + pixelX;
-                if (pixels[index] == packed && tints[index] == tint) return false;
+                if (pixels[index] == packed) return false;
                 pixels[index] = packed;
-                tints[index] = tint;
                 return true;
             } finally {
                 lock.unlock();
@@ -765,15 +623,6 @@ public class MapManager {
             }
         }
 
-        public int[] snapshotTints() {
-            lock.lock();
-            try {
-                return Arrays.copyOf(tints, tints.length);
-            } finally {
-                lock.unlock();
-            }
-        }
-
         /** Legacy snapshot API retained for compatibility with external code. */
         public MapBlockData[] snapshotPixels() {
             lock.lock();
@@ -804,20 +653,17 @@ public class MapManager {
             lock.lock();
             try {
                 return new RegionSnapshot(Arrays.copyOf(pixels, pixels.length),
-                        Arrays.copyOf(tints, tints.length),
                         biomePalette.toArray(new String[0]), blockPalette.toArray(new String[0]));
             } finally {
                 lock.unlock();
             }
         }
 
-        private void applyLoadedData(long[] loadedPixels, int[] loadedTints,
-                List<String> biomes, List<String> blocks) {
+        private void applyLoadedData(long[] loadedPixels, List<String> biomes, List<String> blocks) {
             lock.lock();
             try {
                 if (closed) return;
                 System.arraycopy(loadedPixels, 0, pixels, 0, pixels.length);
-                System.arraycopy(loadedTints, 0, tints, 0, tints.length);
                 biomePalette.clear();
                 biomePalette.addAll(biomes);
                 blockPalette.clear();
@@ -832,7 +678,7 @@ public class MapManager {
         }
     }
 
-    private record RegionSnapshot(long[] pixels, int[] tints, String[] biomePalette, String[] blockPalette) {
+    private record RegionSnapshot(long[] pixels, String[] biomePalette, String[] blockPalette) {
     }
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -855,70 +701,32 @@ public class MapManager {
             MapConfig.pinWorldZ = 0;
             return;
         }
-        try (var reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8)) {
+        try (FileReader reader = new FileReader(file)) {
             PinData data = GSON.fromJson(reader, PinData.class);
-            if (data == null || !Double.isFinite(data.x) || !Double.isFinite(data.z)
-                    || Math.abs(data.x) > 30_000_000.0 || Math.abs(data.z) > 30_000_000.0) {
-                throw new IOException("Invalid pin coordinates");
+            if (data == null) {
+                MapConfig.pinActive = false;
+                return;
             }
             MapConfig.pinActive = data.active;
             MapConfig.pinWorldX = data.x;
             MapConfig.pinWorldZ = data.z;
-        } catch (Exception exception) {
-            LOGGER.error("Failed to load pin data; preserving unreadable file", exception);
+        } catch (IOException exception) {
+            LOGGER.error("Failed to load pin data", exception);
             MapConfig.pinActive = false;
-            quarantineSmallJson(file);
         }
     }
 
-    public synchronized void savePin() {
+    public void savePin() {
         if (currentDimensionDir == null) return;
         File file = new File(currentDimensionDir, "pin.json");
-        Path temporary = null;
-        try {
-            Files.createDirectories(currentDimensionDir.toPath());
-            temporary = Files.createTempFile(currentDimensionDir.toPath(), "pin.", ".tmp");
-            try (Writer writer = Files.newBufferedWriter(temporary, StandardCharsets.UTF_8)) {
-                PinData data = new PinData();
-                boolean validCoordinates = Double.isFinite(MapConfig.pinWorldX)
-                        && Double.isFinite(MapConfig.pinWorldZ)
-                        && Math.abs(MapConfig.pinWorldX) <= 30_000_000.0
-                        && Math.abs(MapConfig.pinWorldZ) <= 30_000_000.0;
-                data.active = MapConfig.pinActive && validCoordinates;
-                data.x = validCoordinates ? MapConfig.pinWorldX : 0.0;
-                data.z = validCoordinates ? MapConfig.pinWorldZ : 0.0;
-                GSON.toJson(data, writer);
-            }
-            moveReplacing(temporary, file.toPath());
-            temporary = null;
+        try (FileWriter writer = new FileWriter(file)) {
+            PinData data = new PinData();
+            data.active = MapConfig.pinActive;
+            data.x = MapConfig.pinWorldX;
+            data.z = MapConfig.pinWorldZ;
+            GSON.toJson(data, writer);
         } catch (IOException exception) {
-            LOGGER.error("Failed to save pin data atomically", exception);
-        } finally {
-            if (temporary != null) {
-                try {
-                    Files.deleteIfExists(temporary);
-                } catch (IOException ignored) {
-                }
-            }
-        }
-    }
-
-    private static void quarantineSmallJson(File file) {
-        if (file == null || !file.isFile()) return;
-        Path source = file.toPath();
-        Path quarantine = source.resolveSibling(file.getName() + ".corrupt." + System.currentTimeMillis());
-        try {
-            moveReplacing(source, quarantine);
-        } catch (IOException exception) {
-            LOGGER.warn("Could not quarantine unreadable file {}", file, exception);
-        }
-    }
-
-    private static void moveReplacing(Path source, Path target) throws IOException {
-        try {
-            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            LOGGER.error("Failed to save pin data", exception);
         }
     }
 }

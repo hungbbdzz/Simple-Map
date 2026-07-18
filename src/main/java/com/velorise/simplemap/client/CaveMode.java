@@ -45,22 +45,24 @@ public final class CaveMode {
 
     public static boolean isActive(Minecraft mc) {
         if (mc == null || mc.level == null || mc.player == null) return false;
-        int permission = MapConfig.getEffectiveCaveMapMode();
+        int permission = MapConfig.serverCaveMapMode;
         if (permission == 0) return false;
-        if (hasManualTopY(mc)) return true;
         if (permission == 1) {
             return mc.level.dimensionType().hasCeiling() || updateAutomaticDetection(mc);
         }
         CaveType type = getCaveType(mc);
         if (type == CaveType.OFF) return false;
+        if (permission == 2 && type == CaveType.LAYERED && hasManualTopY(mc)) return true;
         return mc.level.dimensionType().hasCeiling() || updateAutomaticDetection(mc);
     }
 
-    /** Y used by the scanner. Supports manual Top Y across cave views. */
+    /** Y used by the scanner. FULL intentionally follows the player and ignores manual Top Y. */
     public static synchronized int getLayerY(Minecraft mc) {
         if (mc == null || mc.level == null || mc.player == null) return 0;
-        Integer manual = getManualTopY(mc);
-        if (manual != null && MapConfig.getEffectiveCaveMapMode() == 2) return clampY(mc.level, manual);
+        if (getCaveType(mc) == CaveType.LAYERED) {
+            Integer manual = getManualTopY(mc);
+            if (manual != null && MapConfig.serverCaveMapMode == 2) return clampY(mc.level, manual);
+        }
 
         String dimension = dimensionKey(mc);
         int playerY = clampY(mc.level, mc.player.blockPosition().getY() + 1);
@@ -107,7 +109,7 @@ public final class CaveMode {
     }
 
     public static synchronized void setManualLayer(Minecraft mc, int topY) {
-        if (MapConfig.getEffectiveCaveMapMode() != 2 || mc == null || mc.level == null) return;
+        if (MapConfig.serverCaveMapMode != 2 || mc == null || mc.level == null) return;
         Integer previous = MANUAL_TOP_Y.put(dimensionKey(mc), clampY(mc.level, topY));
         if (previous == null || previous != clampY(mc.level, topY)) modeRevision++;
     }
@@ -127,7 +129,7 @@ public final class CaveMode {
     }
 
     public static synchronized void setCaveType(Minecraft mc, CaveType type) {
-        if (MapConfig.getEffectiveCaveMapMode() != 2 || mc == null || mc.level == null || type == null) return;
+        if (MapConfig.serverCaveMapMode != 2 || mc == null || mc.level == null || type == null) return;
         CaveType previous = CAVE_TYPES.put(dimensionKey(mc), type);
         if (previous != type) modeRevision++;
         if (type == CaveType.OFF) {
@@ -176,7 +178,7 @@ public final class CaveMode {
     public static boolean isFullView(Minecraft mc) {
         if (!isActive(mc)) return false;
         // Server AUTO is deliberately the restricted, automatic LAYERED view.
-        if (MapConfig.getEffectiveCaveMapMode() != 2) return false;
+        if (MapConfig.serverCaveMapMode != 2) return false;
         return getCaveType(mc) == CaveType.FULL;
     }
 
