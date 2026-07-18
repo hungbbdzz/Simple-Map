@@ -9,12 +9,47 @@ import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 public class MapScreen extends Screen {
+    private static final int TOOLBAR_BUTTON_SIZE = 22;
+    private static final int TOOLBAR_MARGIN = 3;
+    private static final int TOOLBAR_GAP = 2;
+    private static final float TOOLBAR_ICON_SCALE = 1.0f;
+    private static final int PLAYER_PANEL_MARGIN = 4;
+    private static final int PLAYER_PANEL_HEIGHT = 15;
+    private static final float DEFAULT_MAP_SCALE = 0.5f;
+    private static final float SURFACE_MINIMUM_SCALE = 0.02f;
+    private static final float LAYER_MINIMUM_SCALE_FLOOR = 0.055f;
+    /** Temporary exact-layer viewport cap until layered cave receives a true LOD pyramid. */
+    private static final double LAYER_MAX_VIEW_WIDTH_BLOCKS = 4_096.0;
+    private static final double LAYER_MAX_VIEW_HEIGHT_BLOCKS = 2_048.0;
+    private static final long OPEN_ANIMATION_NANOS = 1_000_000_000L;
+    /** 5x default view opens at 6x and settles back to 5x. */
+    private static final float OPEN_ANIMATION_START_MULTIPLIER = 1.2f;
+    private static final long CURSOR_CACHE_NANOS = 120_000_000L;
+    private static final double MOMENTUM_FRICTION = 7.5;
+    private static final double MAX_MOMENTUM_BLOCKS_PER_SECOND = 12_000.0;
     private double centerX;
     private double centerZ;
-    private float scale = 1.0f;
+    private float scale = DEFAULT_MAP_SCALE;
+    private float currentRenderScale = DEFAULT_MAP_SCALE;
     private boolean isDragging = false;
-    private long lastViewportScanNanos;
+    private long openAnimationStartNanos = System.nanoTime();
+    private long lastFrameNanos;
+    private long lastDragSampleNanos;
+    private long interactionHoldUntilNanos;
+    private double momentumX;
+    private double momentumZ;
+    private int cachedCursorX = Integer.MIN_VALUE;
+    private int cachedCursorZ = Integer.MIN_VALUE;
+    private long cachedCursorRevision = Long.MIN_VALUE;
+    private long cachedCursorAtNanos;
+    private BlockInfo cachedCursorInfo;
+    private boolean cursorCacheValid;
 
     // Popup context menu for waypoints and teleportation
     private boolean isPopupMenuOpen = false;
@@ -43,11 +78,15 @@ public class MapScreen extends Screen {
     }
 
     private Button waypointsToggleButton;
+    private Button waypointListButton;
     private Button refreshMapButton;
     private Button minimapConfigButton;
     private Button nightModeButton;
     private Button caveLayerModeButton;
+    private Button dimensionSwitchButton;
     private CaveLayerSlider caveLayerSlider;
+    private String selectedDimension = "LIVE";
+    private final Map<String, double[]> dimensionCameras = new HashMap<>();
     private int toolbarStartX;
     private int toolbarStartY;
     private int toolbarStepY;
@@ -59,8 +98,21 @@ public class MapScreen extends Screen {
         if (this.minecraft != null) {
             MapManager.getInstance().updateWorldAndDimension(this.minecraft);
         }
+        if (this.width > 0) {
+            this.scale = Math.max(getMinimumStableScale(), (this.width - 2) / 1000.0f);
+            this.currentRenderScale = this.scale;
+        }
 
-        waypointsToggleButton = new PixelIconButton(0, 0, 26, 26, MapUiIcons.Icon.WAYPOINT_OUTLINE,
+        // Pos 1: Settings
+        minimapConfigButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.SETTINGS, button -> {
+            if (this.minecraft != null) {
+                this.minecraft.setScreen(new MapConfigScreen(this));
+            }
+        });
+        this.addRenderableWidget(minimapConfigButton);
+
+        // Pos 2: Waypoint Toggle Visibility
+        waypointsToggleButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.WAYPOINT_OUTLINE,
                 button -> {
                     MapConfig.waypointsVisible = !MapConfig.waypointsVisible;
                     MapConfig.save();
@@ -68,12 +120,30 @@ public class MapScreen extends Screen {
                 });
         this.addRenderableWidget(waypointsToggleButton);
 
-        refreshMapButton = new PixelIconButton(0, 0, 26, 26, MapUiIcons.Icon.REFRESH, button -> {
+        // Pos 3: Waypoint List Manager (Flag directly below Waypoint Toggle)
+        waypointListButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.WAYPOINT_LIST, button -> {
+            if (this.minecraft != null) {
+                this.minecraft.setScreen(new WaypointListScreen(this));
+            }
+        });
+        this.addRenderableWidget(waypointListButton);
+
+        // Pos 4: Night Mode
+        nightModeButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.SUN, button -> {
+            MapConfig.minimapNightMode = (MapConfig.minimapNightMode + 1) % 3;
+            MapConfig.save();
+            updateToolbarTooltips();
+        });
+        this.addRenderableWidget(nightModeButton);
+
+        // Pos 5: Refresh
+        refreshMapButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.REFRESH, button -> {
             if (this.minecraft != null && this.minecraft.player != null) {
                 if (Screen.hasShiftDown()) {
                     this.centerX = this.minecraft.player.getX();
                     this.centerZ = this.minecraft.player.getZ();
-                    this.scale = 1.0f;
+                    this.scale = DEFAULT_MAP_SCALE;
+                    cancelMotionAndOpenAnimation();
                     return;
                 }
                 ChunkScanner.getInstance().requestRefresh(this.minecraft);
@@ -88,35 +158,34 @@ public class MapScreen extends Screen {
         });
         this.addRenderableWidget(refreshMapButton);
 
-        minimapConfigButton = new PixelIconButton(0, 0, 26, 26, MapUiIcons.Icon.SETTINGS, button -> {
-            if (this.minecraft != null) {
-                this.minecraft.setScreen(new MapConfigScreen(this));
-            }
-        });
-        this.addRenderableWidget(minimapConfigButton);
-
-        nightModeButton = new PixelIconButton(0, 0, 26, 26, MapUiIcons.Icon.SUN, button -> {
-            MapConfig.minimapNightMode = (MapConfig.minimapNightMode + 1) % 3;
-            MapConfig.save();
-            updateToolbarTooltips();
-        });
-        this.addRenderableWidget(nightModeButton);
+        // Dimension Switcher (above Cave controls)
+        dimensionSwitchButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE,
+                MapUiIcons.Icon.DIMENSION_PORTAL, button -> cycleViewedDimension());
+        this.addRenderableWidget(dimensionSwitchButton);
 
         if (this.minecraft != null && this.minecraft.level != null) {
-            caveLayerModeButton = new PixelIconButton(0, 0, 26, 26, MapUiIcons.Icon.CAVE, button -> {
-                if (MapConfig.serverCaveMapMode != 2) return;
+            caveLayerModeButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.CAVE_OFF, button -> {
+                if (MapConfig.getEffectiveCaveMapMode() != 2) return;
                 CaveMode.cycleCaveType(this.minecraft);
+                clampScaleForCurrentMode();
                 if (CaveMode.getCaveType(this.minecraft) == CaveMode.CaveType.OFF) {
                     CaveMapManager.getInstance().deactivate();
+                } else if (CaveMode.getCaveType(this.minecraft) == CaveMode.CaveType.LAYERED) {
+                    ChunkScanner.getInstance().requestImmediateCaveLayerRefresh(this.minecraft);
+                } else {
+                    // FULL uses a separate cache and must immediately rescan loaded
+                    // chunks instead of displaying a stale/empty previous composite.
+                    ChunkScanner.getInstance().requestRefresh(this.minecraft);
+                    FullCaveTextureManager.getInstance().uploadDirtyTextures(true);
                 }
                 if (caveLayerSlider != null) caveLayerSlider.syncFromMode();
                 updateCaveControlLayout();
             });
             this.addRenderableWidget(caveLayerModeButton);
 
-            caveLayerModeButton.active = MapConfig.serverCaveMapMode == 2;
+            caveLayerModeButton.active = MapConfig.getEffectiveCaveMapMode() == 2;
 
-            if (MapConfig.serverCaveMapMode == 2) {
+            if (MapConfig.getEffectiveCaveMapMode() == 2) {
                 int minimumY = this.minecraft.level.getMinBuildHeight();
                 int maximumY = this.minecraft.level.getMaxBuildHeight() - 1;
                 double initialValue = CaveMode.hasManualTopY(this.minecraft)
@@ -124,6 +193,9 @@ public class MapScreen extends Screen {
                         : 0.0;
                 caveLayerSlider = new CaveLayerSlider(0, 0, 156, 18,
                         minimumY, maximumY, initialValue);
+                caveLayerSlider.setTooltip(Tooltip.create(Component.literal(
+                        "Cave Top Y\nAUTO follows the player's current underground band."
+                                + "\nDrag right to select a fixed cave layer.")));
                 this.addRenderableWidget(caveLayerSlider);
             }
             updateCaveControlLayout();
@@ -134,42 +206,122 @@ public class MapScreen extends Screen {
     }
 
     private void layoutToolbar() {
-        Button[] buttons = { waypointsToggleButton, refreshMapButton,
-                nightModeButton, minimapConfigButton };
-        // Move toolbar into the top-left corner for quicker access
-        toolbarStartX = 8;
-        toolbarStartY = 8;
-        toolbarStepY = 30;
-        toolbarWidth = 26;
+        Button[] buttons = { minimapConfigButton, waypointsToggleButton, waypointListButton,
+                nightModeButton, refreshMapButton };
+        toolbarStartX = TOOLBAR_MARGIN;
+        toolbarStartY = TOOLBAR_MARGIN;
+        toolbarStepY = TOOLBAR_BUTTON_SIZE + TOOLBAR_GAP;
+        toolbarWidth = TOOLBAR_BUTTON_SIZE;
         toolbarRows = buttons.length;
         for (int i = 0; i < buttons.length; i++) {
             buttons[i].setX(toolbarStartX);
             buttons[i].setY(toolbarStartY + i * toolbarStepY);
-            buttons[i].setWidth(26);
+            buttons[i].setWidth(TOOLBAR_BUTTON_SIZE);
         }
     }
 
     private void drawToolbarBackground(GuiGraphics guiGraphics) {
-        int top = toolbarStartY - 6;
-        int bottom = toolbarStartY + toolbarRows * toolbarStepY - 1;
-        guiGraphics.fill(toolbarStartX - 8, top, toolbarStartX + toolbarWidth + 8, bottom, 0x22090B0D);
+        // Intentionally empty
     }
 
     private void updateToolbarTooltips() {
-        if (waypointsToggleButton != null) waypointsToggleButton.setTooltip(Tooltip.create(Component.literal(
-                "Waypoints\n" + (MapConfig.waypointsVisible ? "Enabled" : "Hidden"))));
-        if (refreshMapButton != null) refreshMapButton.setTooltip(Tooltip.create(Component.literal(
-                "Refresh Map\nReload nearby loaded chunks\nShift-click: reset view")));
-        if (nightModeButton != null) nightModeButton.setTooltip(Tooltip.create(Component.literal(
-                getNightModeMessage().getString())));
         if (minimapConfigButton != null) minimapConfigButton.setTooltip(Tooltip.create(Component.literal(
-                "Settings\nOpen map configuration")));
+                "Simple Map Settings\nConfigure minimap, coordinates, colors and scanning.")));
+        if (waypointListButton != null) waypointListButton.setTooltip(Tooltip.create(Component.literal(
+                "Waypoint Manager (Key: U)\nManage, edit, teleport and track waypoints.")));
+        if (waypointsToggleButton != null) waypointsToggleButton.setTooltip(Tooltip.create(Component.literal(
+                "Waypoint Visibility: " + (MapConfig.waypointsVisible ? "ON" : "OFF")
+                        + "\nClick to show or hide all waypoint markers.")));
+        if (refreshMapButton != null) refreshMapButton.setTooltip(Tooltip.create(Component.literal(
+                "Refresh Visible Map\nRescan nearby chunks currently loaded by Minecraft."
+                        + "\nShift-click: center on player and reset zoom.")));
+        if (nightModeButton != null) nightModeButton.setTooltip(Tooltip.create(Component.literal(
+                "Map Brightness: " + getNightModeMessage().getString()
+                        + "\nCycle DAY / AUTO / NIGHT rendering.")));
+        if (dimensionSwitchButton != null) dimensionSwitchButton.setTooltip(Tooltip.create(Component.literal(
+                "Dimension: " + getDimensionName(selectedDimension))));
         updateCaveTooltip();
+    }
+
+    private String getDimensionName(String dim) {
+        if ("LIVE".equals(dim)) {
+            String live = MapManager.getInstance().getLiveDimensionResourceId();
+            return "Current (" + MapManager.displayDimensionName(live) + ")";
+        }
+        return MapManager.displayDimensionName(dim);
+    }
+
+    private void cycleViewedDimension() {
+        if (this.minecraft == null) return;
+        MapManager manager = MapManager.getInstance();
+        String liveDimension = manager.getLiveDimensionResourceId();
+
+        // "Current" already represents the player's live dimension. Excluding that
+        // same resource id removes redundant cycles such as Overworld -> Current
+        // while the player is already in the Overworld.
+        if (!"LIVE".equals(selectedDimension) && selectedDimension.equals(liveDimension)) {
+            selectedDimension = "LIVE";
+        }
+        saveCurrentDimensionCamera();
+
+        List<String> options = new ArrayList<>();
+        options.add("LIVE");
+        for (String dimension : manager.getSelectableDimensions()) {
+            if (dimension == null || dimension.isBlank()
+                    || dimension.equals(liveDimension) || options.contains(dimension)) {
+                continue;
+            }
+            options.add(dimension);
+        }
+        int currentIndex = options.indexOf(selectedDimension);
+        String previous = selectedDimension;
+        selectedDimension = options.get((currentIndex + 1 + options.size()) % options.size());
+
+        if ("LIVE".equals(selectedDimension)) manager.returnToLiveDimension(this.minecraft);
+        else manager.switchToDimension(selectedDimension);
+        restoreDimensionCamera(previous, selectedDimension);
+        cursorCacheValid = false;
+        isPopupMenuOpen = false;
+        updateToolbarTooltips();
+    }
+
+    private void saveCurrentDimensionCamera() {
+        dimensionCameras.put(selectedDimension, new double[] { centerX, centerZ, scale });
+    }
+
+    private void restoreDimensionCamera(String previous, String target) {
+        double[] cached = dimensionCameras.get(target);
+        if (cached != null) {
+            centerX = cached[0];
+            centerZ = cached[1];
+            scale = (float) cached[2];
+            currentRenderScale = scale;
+            cancelMotionAndOpenAnimation();
+            return;
+        }
+        if ("LIVE".equals(target) && minecraft != null && minecraft.player != null) {
+            centerX = minecraft.player.getX();
+            centerZ = minecraft.player.getZ();
+        } else {
+            String from = "LIVE".equals(previous)
+                    ? MapManager.getInstance().getLiveDimensionResourceId() : previous;
+            String to = "LIVE".equals(target)
+                    ? MapManager.getInstance().getLiveDimensionResourceId() : target;
+            if ("minecraft:overworld".equals(from) && "minecraft:the_nether".equals(to)) {
+                centerX /= 8.0;
+                centerZ /= 8.0;
+            } else if ("minecraft:the_nether".equals(from)
+                    && "minecraft:overworld".equals(to)) {
+                centerX *= 8.0;
+                centerZ *= 8.0;
+            }
+        }
+        cancelMotionAndOpenAnimation();
     }
 
     private void updateCaveTooltip() {
         if (caveLayerModeButton == null) return;
-        String detail = MapConfig.serverCaveMapMode == 2
+        String detail = MapConfig.getEffectiveCaveMapMode() == 2
                 ? switch (CaveMode.getCaveType(this.minecraft)) {
                     case OFF -> "Surface map only";
                     case LAYERED -> "Top-Y cave band";
@@ -177,51 +329,39 @@ public class MapScreen extends Screen {
                 }
                 : "Mode controlled by the server";
         caveLayerModeButton.setTooltip(Tooltip.create(Component.literal(
-                getCaveLayerModeMessage().getString() + "\n" + detail)));
+                getCaveLayerModeMessage().getString() + "\n" + detail
+                        + "\nClick to cycle surface, layered cave and full cave views.")));
     }
 
     private void updateCaveControlLayout() {
-        if (caveLayerModeButton == null) return;
-        updateCaveTooltip();
-        int availableWidth = Math.max(44, this.width - 48);
-        // Push cave controls closer to the bottom-left corner for faster access
-        int controlY = this.height - 34;
-        caveLayerModeButton.setWidth(26);
-        caveLayerModeButton.setX(8);
-        caveLayerModeButton.setY(controlY);
-        if (caveLayerSlider == null) {
-            return;
+        int controlY = this.height - TOOLBAR_BUTTON_SIZE - TOOLBAR_MARGIN;
+        if (caveLayerModeButton != null) {
+            updateCaveTooltip();
+            caveLayerModeButton.setWidth(TOOLBAR_BUTTON_SIZE);
+            caveLayerModeButton.setX(TOOLBAR_MARGIN);
+            caveLayerModeButton.setY(controlY);
         }
+        if (dimensionSwitchButton != null) {
+            dimensionSwitchButton.setWidth(TOOLBAR_BUTTON_SIZE);
+            dimensionSwitchButton.setX(TOOLBAR_MARGIN);
+            dimensionSwitchButton.setY(controlY - TOOLBAR_BUTTON_SIZE - TOOLBAR_GAP);
+        }
+        if (caveLayerSlider == null || caveLayerModeButton == null) return;
 
+        int availableWidth = Math.max(44, this.width - 38);
         CaveMode.CaveType caveType = CaveMode.getCaveType(this.minecraft);
         caveLayerSlider.visible = caveType != CaveMode.CaveType.OFF;
-        caveLayerSlider.active = caveType == CaveMode.CaveType.LAYERED;
-        if (!caveLayerSlider.visible) {
-            return;
-        }
+        caveLayerSlider.active = caveType != CaveMode.CaveType.OFF;
+        if (!caveLayerSlider.visible) return;
+
         caveLayerSlider.setWidth(Math.min(190, availableWidth));
-        caveLayerSlider.setX(38);
+        caveLayerSlider.setX(TOOLBAR_MARGIN + TOOLBAR_BUTTON_SIZE + TOOLBAR_GAP + 2);
         caveLayerSlider.setY(controlY + 2);
     }
 
     private void drawCaveControlBackground(GuiGraphics guiGraphics) {
-        if (caveLayerModeButton == null || !caveLayerModeButton.visible) return;
-        int left = caveLayerModeButton.getX();
-        int top = caveLayerModeButton.getY();
-        int right = caveLayerModeButton.getX() + caveLayerModeButton.getWidth();
-        if (caveLayerSlider != null && caveLayerSlider.visible) {
-            left = Math.min(left, caveLayerSlider.getX());
-            top = Math.min(top, caveLayerSlider.getY());
-            right = Math.max(right, caveLayerSlider.getX() + caveLayerSlider.getWidth());
-        }
-        left -= 4;
-        top -= 4;
-        right += 4;
-        int bottom = caveLayerSlider != null && caveLayerSlider.visible
-                ? Math.max(caveLayerModeButton.getY() + 26,
-                        caveLayerSlider.getY() + 18) + 4
-                : caveLayerModeButton.getY() + 26 + 4;
-        guiGraphics.fill(left, top, right, bottom, 0x22090B0D);
+        // Intentionally empty. The cave icon and vanilla slider remain individually
+        // readable without covering the underlying map with another dark rectangle.
     }
 
     private Component getWaypointsToggleMessage() {
@@ -239,14 +379,54 @@ public class MapScreen extends Screen {
     }
 
     private Component getCaveLayerModeMessage() {
-        if (MapConfig.serverCaveMapMode == 0) return Component.literal("Cave: OFF");
-        if (MapConfig.serverCaveMapMode == 1) return Component.literal("Cave: AUTO");
+        if (MapConfig.getEffectiveCaveMapMode() == 0) return Component.literal("Cave: OFF");
+        if (MapConfig.getEffectiveCaveMapMode() == 1) return Component.literal("Cave: AUTO");
         String type = switch (CaveMode.getCaveType(this.minecraft)) {
             case OFF -> "OFF";
             case LAYERED -> "LAYER";
             case FULL -> "FULL";
         };
         return Component.literal("Cave: " + type);
+    }
+
+    private void cancelMotionAndOpenAnimation() {
+        momentumX = 0.0;
+        momentumZ = 0.0;
+        openAnimationStartNanos = 0L;
+    }
+
+    private float openAnimationMultiplier(long now) {
+        if (openAnimationStartNanos == 0L) return 1.0f;
+        float progress = Math.min(1.0f,
+                (now - openAnimationStartNanos) / (float) OPEN_ANIMATION_NANOS);
+        if (progress >= 1.0f) {
+            openAnimationStartNanos = 0L;
+            return 1.0f;
+        }
+        // Smoothstep keeps the 3x-to-2x opening motion visible through the full second.
+        float eased = progress * progress * (3.0f - 2.0f * progress);
+        return OPEN_ANIMATION_START_MULTIPLIER
+                + (1.0f - OPEN_ANIMATION_START_MULTIPLIER) * eased;
+    }
+
+    private void updateMomentum(long now) {
+        if (lastFrameNanos == 0L) {
+            lastFrameNanos = now;
+            return;
+        }
+        double seconds = Math.min(0.050, Math.max(0.0, (now - lastFrameNanos) / 1_000_000_000.0));
+        lastFrameNanos = now;
+        if (isDragging || seconds <= 0.0) return;
+        if (Math.abs(momentumX) < 0.5 && Math.abs(momentumZ) < 0.5) {
+            momentumX = 0.0;
+            momentumZ = 0.0;
+            return;
+        }
+        centerX += momentumX * seconds;
+        centerZ += momentumZ * seconds;
+        double damping = Math.exp(-MOMENTUM_FRICTION * seconds);
+        momentumX *= damping;
+        momentumZ *= damping;
     }
 
     @Override
@@ -258,6 +438,11 @@ public class MapScreen extends Screen {
 
     @Override
     public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+        long frameNow = System.nanoTime();
+        updateMomentum(frameNow);
+        clampScaleForCurrentMode();
+        currentRenderScale = scale * openAnimationMultiplier(frameNow);
+        boolean cachedOnlyPan = isDragging || Math.hypot(momentumX, momentumZ) > 1.0;
         // AUTO is a live view: keep the compact Y readout synchronized with the
         // player's stable scan band without turning the slider into manual mode.
         if (caveLayerSlider != null && !caveLayerSlider.isDragging()
@@ -293,32 +478,36 @@ public class MapScreen extends Screen {
         int vx = 1, vy = 1, vw = this.width - 2, vh = this.height - 2;
 
         // Mouse world coordinates relative to fullscreen viewport centre
-        double mouseWorldX = centerX + (mouseX - vx - vw / 2.0) / scale;
-        double mouseWorldZ = centerZ + (mouseY - vy - vh / 2.0) / scale;
+        double mouseWorldX = centerX + (mouseX - vx - vw / 2.0) / currentRenderScale;
+        double mouseWorldZ = centerZ + (mouseY - vy - vh / 2.0) / currentRenderScale;
 
-        // The full-screen map scans every client-loaded chunk in the current
-        // viewport. This eliminates the old "only a circle around the player"
-        // cave/surface coverage and keeps panned areas coherent.
-        long now = System.nanoTime();
-        if (now - lastViewportScanNanos >= 50_000_000L) {
-            lastViewportScanNanos = now;
-            double halfW = (vw / 2.0) / Math.max(0.0001f, scale);
-            double halfH = (vh / 2.0) / Math.max(0.0001f, scale);
-            ChunkScanner.getInstance().scanVisibleArea(this.minecraft,
-                    centerX - halfW, centerX + halfW,
-                    centerZ - halfH, centerZ + halfH);
-        }
+        // Scanning, IO and texture publication are handled by MapViewportCoordinator
+        // from client tick. Rendering remains cache-only.
 
         // Draw map fullscreen, North-up, no rotation
         MapRenderer.getInstance().drawMap(
             guiGraphics,
             vx, vy, vw, vh,
-            centerX, centerZ, scale,
-            true,
+            centerX, centerZ, currentRenderScale,
+            MapManager.getInstance().isViewingLiveDimension(),
             false,
             false, mouseWorldX, mouseWorldZ,
-            partialTick
+            partialTick, cachedOnlyPan
         );
+
+        if (!MapManager.getInstance().isViewingLiveDimension()
+                && !MapManager.getInstance().hasSavedDataForCurrentDimension()) {
+            String message = "No saved map data — visit "
+                    + MapManager.displayDimensionName(
+                            MapManager.getInstance().getCurrentDimensionResourceId())
+                    + " first";
+            int textWidth = this.font.width(message);
+            guiGraphics.fill((this.width - textWidth) / 2 - 6, this.height / 2 - 8,
+                    (this.width + textWidth) / 2 + 6, this.height / 2 + 8, 0xB0000000);
+            guiGraphics.drawString(this.font, message,
+                    (this.width - textWidth) / 2, this.height / 2 - 4,
+                    0xFFB8B8B8, false);
+        }
 
         // Draw GUI widgets (buttons)
         drawToolbarBackground(guiGraphics);
@@ -344,15 +533,24 @@ public class MapScreen extends Screen {
         final String id;
         final int y;
         final int waterSurfaceY;
+        final boolean cached;
+
         BlockInfo(String name, String id, int y) {
-            this(name, id, y, Integer.MIN_VALUE);
+            this(name, id, y, Integer.MIN_VALUE, false);
         }
+
         BlockInfo(String name, String id, int y, int waterSurfaceY) {
+            this(name, id, y, waterSurfaceY, false);
+        }
+
+        BlockInfo(String name, String id, int y, int waterSurfaceY, boolean cached) {
             this.name = name;
             this.id = id;
             this.y = y;
             this.waterSurfaceY = waterSurfaceY;
+            this.cached = cached;
         }
+
         boolean hasWaterSurface() {
             return waterSurfaceY != Integer.MIN_VALUE;
         }
@@ -384,35 +582,42 @@ public class MapScreen extends Screen {
                     case 2 -> MapUiIcons.Icon.MOON;
                     default -> MapUiIcons.Icon.SUN;
                 };
+            } else if (icon == MapUiIcons.Icon.CAVE_ON || icon == MapUiIcons.Icon.CAVE_OFF) {
+                // The hollow cave icon means cave view is active; the solid icon means OFF.
+                displayedIcon = CaveMode.getCaveType(Minecraft.getInstance()) == CaveMode.CaveType.OFF
+                        ? MapUiIcons.Icon.CAVE_OFF
+                        : MapUiIcons.Icon.CAVE_ON;
             }
             if (isHoveredOrFocused()) {
                 graphics.fill(getX(), getY(), getX() + getWidth(), getY() + getHeight(), 0x12FFFFFF);
             }
-            MapUiIcons.draw(graphics, displayedIcon,
+            MapUiIcons.drawScaled(graphics, displayedIcon,
                     getX() + getWidth() / 2, getY() + getHeight() / 2,
-                    active);
+                    active, TOOLBAR_ICON_SCALE);
         }
     }
 
     private void drawCoordsOverlay(GuiGraphics guiGraphics, int mouseX, int mouseY) {
         // Calculate world coordinates under the mouse cursor (viewport starts at x=1, y=1)
-        double worldX = centerX + (mouseX - 1 - (this.width - 2) / 2.0) / scale;
-        double worldZ = centerZ + (mouseY - 1 - (this.height - 2) / 2.0) / scale;
+        double worldX = centerX + (mouseX - 1 - (this.width - 2) / 2.0) / currentRenderScale;
+        double worldZ = centerZ + (mouseY - 1 - (this.height - 2) / 2.0) / currentRenderScale;
 
         int bx = (int) Math.floor(worldX);
         int bz = (int) Math.floor(worldZ);
 
-        // Find block name and Y coordinate under cursor if the chunk is loaded on client
+        // Resolve live world data first. Outside the client's chunk radius, fall back
+        // to the persistent surface/vertical archive instead of dropping the Y value.
         int yCoord = 0;
         int waterSurfaceY = Integer.MIN_VALUE;
         boolean hasY = false;
-        if (this.minecraft != null && this.minecraft.level != null && this.minecraft.level.hasChunk(bx >> 4, bz >> 4)) {
-            BlockInfo resolved = getBlockInfoAt(this.minecraft.level, bx, bz);
-            if (resolved != null && !resolved.name.isEmpty()) {
-                yCoord = resolved.y;
-                waterSurfaceY = resolved.waterSurfaceY;
-                hasY = true;
-            }
+        boolean chunkLoaded = MapManager.getInstance().isViewingLiveDimension()
+                && this.minecraft != null && this.minecraft.level != null
+                && this.minecraft.level.hasChunk(bx >> 4, bz >> 4);
+        BlockInfo resolved = resolveCursorBlockInfo(bx, bz, chunkLoaded, System.nanoTime());
+        if (resolved != null && (!resolved.name.isEmpty() || resolved.cached)) {
+            yCoord = resolved.y;
+            waterSurfaceY = resolved.waterSurfaceY;
+            hasY = true;
         }
 
         String coordText;
@@ -423,8 +628,17 @@ public class MapScreen extends Screen {
             coordText = String.format("X: %,d  Z: %,d", bx, bz);
         }
 
+        String blockText = null;
+        if (MapConfig.cursorBlockEnabled && resolved != null && resolved.name != null && !resolved.name.isBlank()) {
+            blockText = resolved.name;
+        }
+
         String biomeText = null;
-        if (MapConfig.cursorBiomeEnabled && hasY && this.minecraft != null && this.minecraft.level != null) {
+        // ClientLevel biome access is only authoritative while the chunk is live.
+        // Cached surface data currently stores a compact biome palette internally,
+        // but the cursor does not force-load world chunks merely to display it.
+        if (MapConfig.cursorBiomeEnabled && hasY && chunkLoaded
+                && this.minecraft != null && this.minecraft.level != null) {
             net.minecraft.core.BlockPos biomePos = new net.minecraft.core.BlockPos(bx, yCoord, bz);
             biomeText = this.minecraft.level.getBiome(biomePos).unwrapKey()
                     .map(key -> prettifyId(key.location().getPath()))
@@ -432,36 +646,142 @@ public class MapScreen extends Screen {
         }
 
         int coordWidth = this.font.width(coordText);
+        int blockWidth = blockText == null ? 0 : this.font.width(blockText);
         int biomeWidth = biomeText == null ? 0 : this.font.width(biomeText);
-        int panelWidth = Math.max(coordWidth, biomeWidth) + 10;
-        int panelHeight = biomeText == null ? 13 : 23;
+        int panelWidth = Math.max(coordWidth, Math.max(blockWidth, biomeWidth)) + 10;
+        int lines = 1 + (blockText == null ? 0 : 1) + (biomeText == null ? 0 : 1);
+        int panelHeight = 3 + lines * 10;
         int panelX = (this.width - panelWidth) / 2;
         // Nudge coordinate readout closer to the top edge
         int panelY = 4;
         guiGraphics.fill(panelX, panelY, panelX + panelWidth, panelY + panelHeight, 0x88000000);
+        int lineY = panelY + 3;
         guiGraphics.drawString(this.font, coordText,
-                panelX + (panelWidth - coordWidth) / 2, panelY + 3, 0xFFFFFF, false);
+                panelX + (panelWidth - coordWidth) / 2, lineY, 0xFFFFFF, false);
+        lineY += 10;
+        if (blockText != null) {
+            guiGraphics.drawString(this.font, blockText,
+                    panelX + (panelWidth - blockWidth) / 2, lineY, 0xD8D8D8, false);
+            lineY += 10;
+        }
         if (biomeText != null) {
             guiGraphics.drawString(this.font, biomeText,
-                    panelX + (panelWidth - biomeWidth) / 2, panelY + 13, 0xA8D69C, false);
+                    panelX + (panelWidth - biomeWidth) / 2, lineY, 0xA8D69C, false);
         }
 
-        // Render player coordinates at bottom-right
+        // Render player coordinates at bottom-right. Bounds and text use one shared
+        // calculation so the clickable panel cannot drift below the label.
         if (this.minecraft != null && this.minecraft.player != null) {
-            String playerText = String.format("Player X: %,d | Y: %,d | Z: %,d",
+            String playerText = getPlayerCoordinatesText();
+            int[] bounds = getPlayerCoordinatesPanelBounds(playerText);
+            boolean hovered = isInside(mouseX, mouseY, bounds);
+            guiGraphics.fill(bounds[0], bounds[1], bounds[2], bounds[3],
+                    hovered ? 0xAA000000 : 0x78000000);
+            if (hovered) {
+                guiGraphics.renderOutline(bounds[0], bounds[1], bounds[2] - bounds[0],
+                        bounds[3] - bounds[1], 0x88FFFFFF);
+            }
+            guiGraphics.drawString(this.font, playerText, bounds[0] + 5, bounds[1] + 3,
+                    0xFFFFFFFF, false);
+            if (hovered) {
+                guiGraphics.renderTooltip(this.font,
+                        Component.literal("Click to copy these coordinates and open chat."),
+                        mouseX, mouseY);
+            }
+        }
+    }
+
+    private String getPlayerCoordinatesText() {
+        return String.format("Player X: %,d | Y: %,d | Z: %,d",
                 (int) Math.floor(this.minecraft.player.getX()),
                 (int) Math.floor(this.minecraft.player.getY()),
-                (int) Math.floor(this.minecraft.player.getZ())
-            );
-            int pTextWidth = this.font.width(playerText);
-            int pPanelX = this.width - pTextWidth - 10;
-            int pPanelY = this.height - 16;
-            boolean hovered = mouseX >= pPanelX - 5 && mouseX <= pPanelX + pTextWidth + 5
-                    && mouseY >= pPanelY - 1 && mouseY <= pPanelY + 15;
-            guiGraphics.fill(pPanelX - 5, pPanelY - 1, pPanelX + pTextWidth + 5, pPanelY + 15,
-                    hovered ? 0xBB10232A : 0x88000000);
-            guiGraphics.drawString(this.font, playerText, pPanelX, pPanelY + 1, 0x00C8FF, false);
+                (int) Math.floor(this.minecraft.player.getZ()));
+    }
+
+    private int[] getPlayerCoordinatesPanelBounds(String text) {
+        int panelWidth = this.font.width(text) + 10;
+        int right = this.width - PLAYER_PANEL_MARGIN;
+        int bottom = this.height - PLAYER_PANEL_MARGIN;
+        return new int[] { right - panelWidth, bottom - PLAYER_PANEL_HEIGHT, right, bottom };
+    }
+
+    private static boolean isInside(double mouseX, double mouseY, int[] bounds) {
+        return mouseX >= bounds[0] && mouseX <= bounds[2]
+                && mouseY >= bounds[1] && mouseY <= bounds[3];
+    }
+
+    /**
+     * Looks up cursor height without requiring the Minecraft chunk to remain loaded.
+     * Surface mode uses the persisted .smdat column, while layered/full cave modes
+     * use the v3 vertical-run archive (with the older full-cave snapshot as a fallback).
+     */
+    private BlockInfo resolveCursorBlockInfo(int bx, int bz, boolean chunkLoaded, long now) {
+        long revision = CaveMode.getRevision();
+        if (cursorCacheValid && cachedCursorX == bx && cachedCursorZ == bz
+                && cachedCursorRevision == revision
+                && now - cachedCursorAtNanos < CURSOR_CACHE_NANOS) {
+            return cachedCursorInfo;
         }
+        BlockInfo resolved = null;
+        if (MapManager.getInstance().isViewingLiveDimension()
+                && chunkLoaded && this.minecraft != null && this.minecraft.level != null) {
+            resolved = getBlockInfoAt(this.minecraft.level, bx, bz);
+        }
+        if (resolved == null || resolved.name.isEmpty()) {
+            BlockInfo cached = getCachedBlockInfoAt(bx, bz);
+            if (cached != null) resolved = cached;
+        }
+        cachedCursorX = bx;
+        cachedCursorZ = bz;
+        cachedCursorRevision = revision;
+        cachedCursorAtNanos = now;
+        cachedCursorInfo = resolved;
+        cursorCacheValid = true;
+        return resolved;
+    }
+
+    private BlockInfo getCachedBlockInfoAt(int bx, int bz) {
+        if (this.minecraft == null || this.minecraft.level == null) return null;
+        net.minecraft.world.level.Level level = this.minecraft.level;
+
+        if (CaveMode.isActive(this.minecraft)) {
+            if (CaveMode.isFullView(this.minecraft)) {
+                int fullY = FullCaveMapManager.getInstance().getSurfaceY(bx, bz);
+                if (fullY != FullCaveMapManager.NO_SURFACE) {
+                    return new BlockInfo("", "", fullY, Integer.MIN_VALUE, true);
+                }
+                VerticalCaveArchiveManager.Candidate candidate =
+                        VerticalCaveArchiveManager.getInstance().getCandidate(
+                                bx, bz, level.getMaxBuildHeight() - 1, level.getMinBuildHeight());
+                return candidate == null ? null
+                        : new BlockInfo("", "", candidate.bottomY(), Integer.MIN_VALUE, true);
+            }
+
+            int layerY = CaveMode.getLayerY(this.minecraft);
+            int maximumY = CaveMode.getScanMaximum(level, layerY);
+            int minimumY = CaveMode.getScanMinimum(level, layerY);
+            VerticalCaveArchiveManager.Candidate candidate =
+                    VerticalCaveArchiveManager.getInstance().getCandidate(
+                            bx, bz, maximumY, minimumY);
+            return candidate == null ? null
+                    : new BlockInfo("", "", candidate.bottomY(), Integer.MIN_VALUE, true);
+        }
+
+        MapManager manager = MapManager.getInstance();
+        MapBlockData data = manager.getBlockData(bx, bz);
+        if (data == null) {
+            int regionX = bx >> 9;
+            int regionZ = bz >> 9;
+            if (manager.hasRegionFile(regionX, regionZ)
+                    && !manager.isRegionLoadedInCache(regionX, regionZ)) {
+                MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
+            }
+            return null;
+        }
+        if (data.isEmpty()) return null;
+        int waterSurface = data.isFluid() && !data.isGlowing()
+                ? data.topY : Integer.MIN_VALUE;
+        return new BlockInfo("", "", data.getReliefY(), waterSurface, true);
     }
 
     private BlockInfo getBlockInfoAt(net.minecraft.world.level.Level level, int bx, int bz) {
@@ -486,20 +806,30 @@ public class MapScreen extends Screen {
             int layerY = CaveMode.getLayerY(this.minecraft);
             int scanMinimum = CaveMode.getScanMinimum(level, layerY);
             int scanMaximum = CaveMode.getScanMaximum(level, layerY);
-            int maximumOffset = Math.max(layerY - scanMinimum, scanMaximum - layerY);
-            for (int offset = 0; offset <= maximumOffset; offset++) {
-                int above = layerY + offset;
-                if (above <= scanMaximum) {
-                    BlockInfo info = getCaveBlockInfoAtY(level, pos, above);
-                    if (info != null) return info;
-                }
-                int below = layerY - offset;
-                if (offset != 0 && below >= scanMinimum) {
-                    BlockInfo info = getCaveBlockInfoAtY(level, pos, below);
-                    if (info != null) return info;
-                }
+            VerticalCaveArchiveManager archive = VerticalCaveArchiveManager.getInstance();
+            if (archive.isColumnReady(bx, bz) && archive.isColumnScanned(bx, bz)) {
+                VerticalCaveArchiveManager.Candidate candidate =
+                        archive.getCandidate(bx, bz, scanMaximum, scanMinimum);
+                if (candidate == null) return null;
+                pos.setY(candidate.bottomY());
+                net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+                if (!state.isAir()) return createBlockInfo(level, pos, candidate.bottomY());
+                return new BlockInfo("", "", candidate.bottomY(), Integer.MIN_VALUE, true);
             }
-            return new BlockInfo("", "", layerY);
+
+            // Match the renderer: exact material at Top-Y first, then search only
+            // downward through the bounded band. Alternating above/below caused the
+            // cursor Y to jump between unrelated cave floors every frame.
+            pos.setY(scanMaximum);
+            net.minecraft.world.level.block.state.BlockState selected = level.getBlockState(pos);
+            if (isRenderableSliceState(level, pos, selected)) {
+                return createBlockInfo(level, pos, scanMaximum);
+            }
+            for (int y = scanMaximum; y >= scanMinimum; y--) {
+                BlockInfo info = getCaveBlockInfoAtY(level, pos, y);
+                if (info != null) return info;
+            }
+            return null;
         }
 
         int highestY;
@@ -538,6 +868,22 @@ public class MapScreen extends Screen {
             return createBlockInfo(level, pos, highestY);
         }
         return new BlockInfo("", "", minBuildHeight);
+    }
+
+    private boolean isRenderableSliceState(net.minecraft.world.level.Level level,
+            net.minecraft.core.BlockPos.MutableBlockPos pos,
+            net.minecraft.world.level.block.state.BlockState state) {
+        boolean openEmitter = state.getLightEmission() > 0
+                && state.getFluidState().isEmpty()
+                && (state.is(net.minecraft.world.level.block.Blocks.FIRE)
+                        || state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
+                        || state.getCollisionShape(level, pos).isEmpty());
+        boolean flower = MapConfig.displayFlowers
+                && state.is(net.minecraft.tags.BlockTags.FLOWERS);
+        if (openEmitter || flower || !state.getFluidState().isEmpty()) return true;
+        return !state.isAir()
+                && !state.getCollisionShape(level, pos).isEmpty()
+                && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE;
     }
 
     private BlockInfo getCaveBlockInfoAtY(net.minecraft.world.level.Level level,
@@ -621,8 +967,8 @@ public class MapScreen extends Screen {
         double vpCX = vx + vw / 2.0;
         double vpCZ = vy + vh / 2.0;
 
-        float pinScrX = (float) (vpCX + (MapConfig.pinWorldX - centerX) * scale);
-        float pinScrZ = (float) (vpCZ + (MapConfig.pinWorldZ - centerZ) * scale);
+        float pinScrX = (float) (vpCX + (MapConfig.pinWorldX - centerX) * currentRenderScale);
+        float pinScrZ = (float) (vpCZ + (MapConfig.pinWorldZ - centerZ) * currentRenderScale);
 
         // Distance label below the icon (only if on screen)
         boolean onScreen = pinScrX >= vx && pinScrX <= vx + vw && pinScrZ >= vy && pinScrZ <= vy + vh;
@@ -664,8 +1010,7 @@ public class MapScreen extends Screen {
 
         // Option 2: Teleport Here
         boolean hoverOpt2 = mouseX >= popupX && mouseX <= popupX + 100 && mouseY >= popupY + 20 && mouseY <= popupY + 40;
-        boolean canTeleport = this.minecraft != null && this.minecraft.player != null &&
-            (this.minecraft.player.isCreative() || this.minecraft.player.isSpectator() || this.minecraft.player.hasPermissions(2));
+        boolean canTeleport = MapTeleportController.canTeleport(this.minecraft);
         guiGraphics.fill((int)popupX + 1, (int)popupY + 21, (int)popupX + 99, (int)popupY + 39, hoverOpt2 && canTeleport ? 0xFF2D3033 : 0x00000000);
         guiGraphics.drawString(this.font, "Teleport Here", (int)popupX + 6, (int)popupY + 26, canTeleport ? 0xFFFFFF : 0x777777, false);
 
@@ -695,27 +1040,52 @@ public class MapScreen extends Screen {
     }
 
     @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (SimpleMap.ClientModEvents.OPEN_MAP_KEY.matches(keyCode, scanCode)) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.OPEN_MAP_KEY);
+            this.onClose();
+            return true;
+        }
+        if (SimpleMap.ClientModEvents.ZOOM_IN_KEY.matches(keyCode, scanCode)) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.ZOOM_IN_KEY);
+            this.scale = Math.min(12.0f, this.scale * 1.15f);
+            return true;
+        }
+        if (SimpleMap.ClientModEvents.ZOOM_OUT_KEY.matches(keyCode, scanCode)) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.ZOOM_OUT_KEY);
+            this.scale = Math.max(getMinimumStableScale(), this.scale / 1.15f);
+            return true;
+        }
+        if ((keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_HOME
+                || SimpleMap.ClientModEvents.CENTER_FULL_MAP_KEY.matches(keyCode, scanCode))
+                && this.minecraft != null && this.minecraft.player != null) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.CENTER_FULL_MAP_KEY);
+            this.centerX = this.minecraft.player.getX();
+            this.centerZ = this.minecraft.player.getZ();
+            this.scale = DEFAULT_MAP_SCALE;
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    private static void consumeBufferedClicks(net.minecraft.client.KeyMapping mapping) {
+        while (mapping.consumeClick()) {
+            // Prevent Screen.keyPressed and the next client tick from handling the same key.
+        }
+    }
+
+    @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
         // If map is not unlocked, only allow clicking screen widgets (buttons)
         if (!SimpleMap.isMapUnlocked(this.minecraft.player)) {
             return super.mouseClicked(mouseX, mouseY, button);
         }
 
-        // Click the visible top-right player-coordinate panel to share in chat
+        // Click the visible bottom-right player-coordinate panel to share in chat.
         if (this.minecraft != null && this.minecraft.player != null) {
-            String playerText = String.format("Player X: %,d | Y: %,d | Z: %,d",
-                (int) Math.floor(this.minecraft.player.getX()),
-                (int) Math.floor(this.minecraft.player.getY()),
-                (int) Math.floor(this.minecraft.player.getZ())
-            );
-            int pTextWidth = this.font.width(playerText);
-            int pPanelX = this.width - pTextWidth - 10;
-            int pPanelY = this.height - 16;
-            int pX1 = pPanelX - 5;
-            int pX2 = pPanelX + pTextWidth + 5;
-            int pY1 = pPanelY - 1;
-            int pY2 = pPanelY + 15;
-            if (mouseX >= pX1 && mouseX <= pX2 && mouseY >= pY1 && mouseY <= pY2) {
+            String playerText = getPlayerCoordinatesText();
+            int[] bounds = getPlayerCoordinatesPanelBounds(playerText);
+            if (isInside(mouseX, mouseY, bounds)) {
                 net.minecraft.world.entity.player.Player player = this.minecraft.player;
                 String shareText = String.format("I am at coordinates [%d, %d, %d]",
                     (int) Math.floor(player.getX()),
@@ -752,37 +1122,18 @@ public class MapScreen extends Screen {
                         }
                     }
                 } else if (mouseY < popupY + 40) {
-                    // Option 2: Teleport Here (only blocks survival players without cheats)
-                    boolean canTeleport = this.minecraft != null && this.minecraft.player != null &&
-                        (this.minecraft.player.isCreative() || this.minecraft.player.isSpectator() || this.minecraft.player.hasPermissions(2));
-                    if (canTeleport && this.minecraft.level != null) {
+                    // Option 2: Teleport to the dimension currently displayed by the map.
+                    if (MapTeleportController.canTeleport(this.minecraft)) {
                         isPopupMenuOpen = false;
-                        int tpX = (int) popupWorldX;
-                        int tpZ = (int) popupWorldZ;
-                        int targetY;
-
-                        boolean isNether = this.minecraft.level.dimensionType().hasCeiling();
-                        int minBuildHeight = this.minecraft.level.getMinBuildHeight();
-                        if (this.minecraft.level.hasChunk(tpX >> 4, tpZ >> 4)) {
-                            BlockInfo info = getBlockInfoAt(this.minecraft.level, tpX, tpZ);
-                            if (info != null && info.y > minBuildHeight) {
-                                targetY = info.y + 1;
-                            } else {
-                                if (isNether) {
-                                    targetY = 65; // Safe middle height in Nether
-                                } else {
-                                    int surfaceY = this.minecraft.level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, tpX, tpZ);
-                                    targetY = surfaceY > minBuildHeight ? surfaceY + 1 : 100;
-                                }
-                            }
-                        } else {
-                            // Unloaded chunk: Teleport to a reasonable default height (100 in Overworld, 65 in Nether)
-                            targetY = isNether ? 65 : 100;
+                        int tpX = (int) Math.floor(popupWorldX);
+                        int tpZ = (int) Math.floor(popupWorldZ);
+                        String targetDimension = MapManager.getInstance()
+                                .getCurrentDimensionResourceId();
+                        int targetY = resolveTeleportTargetY(tpX, tpZ, targetDimension);
+                        if (MapTeleportController.teleport(this.minecraft, targetDimension,
+                                tpX, targetY, tpZ)) {
+                            this.onClose();
                         }
-
-                        // Execute command using connection.sendCommand (WITHOUT leading slash) in 1.19+
-                        this.minecraft.player.connection.sendCommand("tp " + tpX + " " + targetY + " " + tpZ);
-                        this.onClose(); // Close map after teleporting
                     }
                 } else if (mouseY < popupY + 60) {
                     // Option 3: Customize block color.
@@ -824,9 +1175,12 @@ public class MapScreen extends Screen {
 
         // 3. Left click: start drag tracking; determine if it's a click vs drag on mouseReleased
         if (button == 0) {
+            cancelMotionAndOpenAnimation();
             this.isDragging = true;
             dragStartX = mouseX;
             dragStartZ = mouseY;
+            lastDragSampleNanos = System.nanoTime();
+            interactionHoldUntilNanos = lastDragSampleNanos + 250_000_000L;
             return true;
         }
 
@@ -834,13 +1188,14 @@ public class MapScreen extends Screen {
         if (button == 1) {
             popupX = mouseX;
             popupY = mouseY;
-            popupWorldX = centerX + (mouseX - this.width / 2.0) / scale;
-            popupWorldZ = centerZ + (mouseY - this.height / 2.0) / scale;
+            popupWorldX = centerX + (mouseX - this.width / 2.0) / currentRenderScale;
+            popupWorldZ = centerZ + (mouseY - this.height / 2.0) / currentRenderScale;
 
             int popupBlockX = (int) Math.floor(popupWorldX);
             int popupBlockZ = (int) Math.floor(popupWorldZ);
             popupBlockInfo = null;
-            if (this.minecraft != null && this.minecraft.level != null
+            if (MapManager.getInstance().isViewingLiveDimension()
+                    && this.minecraft != null && this.minecraft.level != null
                     && this.minecraft.level.hasChunk(popupBlockX >> 4, popupBlockZ >> 4)) {
                 popupBlockInfo = getBlockInfoAt(this.minecraft.level, popupBlockX, popupBlockZ);
             }
@@ -848,7 +1203,7 @@ public class MapScreen extends Screen {
             // Check if right-clicking on an existing waypoint
             clickedWaypoint = null;
             java.util.List<WaypointManager.Waypoint> waypoints = WaypointManager.getInstance().getWaypointsForDimension(MapManager.getInstance().getCurrentDimensionId());
-            double hoverRadius = 6.0 / scale; // 6 pixels hitbox in map world space
+            double hoverRadius = 6.0 / currentRenderScale; // 6 pixels hitbox in map world space
             for (WaypointManager.Waypoint wp : waypoints) {
                 if (Math.abs(popupWorldX - wp.x) <= hoverRadius && Math.abs(popupWorldZ - wp.z) <= hoverRadius) {
                     clickedWaypoint = wp;
@@ -861,6 +1216,35 @@ public class MapScreen extends Screen {
         }
 
         return false;
+    }
+
+    private int resolveTeleportTargetY(int blockX, int blockZ, String targetDimension) {
+        MapManager manager = MapManager.getInstance();
+        int minimumY = this.minecraft != null && this.minecraft.level != null
+                ? this.minecraft.level.getMinBuildHeight() : -64;
+
+        // Only query ClientLevel blocks when the map is displaying that live level.
+        // A remotely viewed Nether/End/modded map must never sample Overworld chunks.
+        if (manager.isViewingLiveDimension() && this.minecraft != null
+                && this.minecraft.level != null) {
+            net.minecraft.world.level.Level level = this.minecraft.level;
+            if (level.hasChunk(blockX >> 4, blockZ >> 4)) {
+                BlockInfo live = getBlockInfoAt(level, blockX, blockZ);
+                if (live != null && live.y > level.getMinBuildHeight()) {
+                    int surfaceY = live.waterSurfaceY != Integer.MIN_VALUE
+                            ? live.waterSurfaceY : live.y;
+                    return surfaceY + 2;
+                }
+            }
+        }
+
+        BlockInfo cached = getCachedBlockInfoAt(blockX, blockZ);
+        if (cached != null && cached.y > minimumY) {
+            int surfaceY = cached.waterSurfaceY != Integer.MIN_VALUE
+                    ? cached.waterSurfaceY : cached.y;
+            return surfaceY + 2;
+        }
+        return MapTeleportController.defaultTargetY(targetDimension);
     }
 
     private int abgrToArgb(int abgr) {
@@ -890,14 +1274,16 @@ public class MapScreen extends Screen {
             // If mouse barely moved, treat as a click -> place/remove pin
             double moved = Math.sqrt(Math.pow(mouseX - dragStartX, 2) + Math.pow(mouseY - dragStartZ, 2));
             if (wasDragging && moved < 4.0 && !isPopupMenuOpen && MapManager.getInstance().hasLearnedMap()) {
-                double clickWorldX = centerX + (mouseX - 1 - (this.width - 2) / 2.0) / scale;
-                double clickWorldZ = centerZ + (mouseY - 1 - (this.height - 2) / 2.0) / scale;
+                momentumX = 0.0;
+                momentumZ = 0.0;
+                double clickWorldX = centerX + (mouseX - 1 - (this.width - 2) / 2.0) / currentRenderScale;
+                double clickWorldZ = centerZ + (mouseY - 1 - (this.height - 2) / 2.0) / currentRenderScale;
 
                 double snappedPinX = Math.floor(clickWorldX) + 0.5;
                 double snappedPinZ = Math.floor(clickWorldZ) + 0.5;
 
                 // Click same pin again within 4 screen-pixels -> remove
-                if (MapConfig.pinActive && Math.abs(snappedPinX - MapConfig.pinWorldX) < 4.0 / scale && Math.abs(snappedPinZ - MapConfig.pinWorldZ) < 4.0 / scale) {
+                if (MapConfig.pinActive && Math.abs(snappedPinX - MapConfig.pinWorldX) < 4.0 / currentRenderScale && Math.abs(snappedPinZ - MapConfig.pinWorldZ) < 4.0 / currentRenderScale) {
                     MapConfig.pinActive = false;
                 } else {
                     MapConfig.pinWorldX = snappedPinX;
@@ -917,20 +1303,56 @@ public class MapScreen extends Screen {
         }
 
         if (this.isDragging) {
-            // Drag direction moves the map camera center in the opposite direction
-            this.centerX -= dragX / this.scale;
-            this.centerZ -= dragY / this.scale;
+            // Drag direction moves the map camera center in the opposite direction.
+            double deltaX = -dragX / this.scale;
+            double deltaZ = -dragY / this.scale;
+            this.centerX += deltaX;
+            this.centerZ += deltaZ;
+            long now = System.nanoTime();
+            interactionHoldUntilNanos = now + 250_000_000L;
+            double seconds = lastDragSampleNanos == 0L ? 0.0
+                    : Math.max(0.001, Math.min(0.050,
+                            (now - lastDragSampleNanos) / 1_000_000_000.0));
+            lastDragSampleNanos = now;
+            if (seconds > 0.0) {
+                double sampleX = deltaX / seconds;
+                double sampleZ = deltaZ / seconds;
+                momentumX = clampMomentum(momentumX * 0.35 + sampleX * 0.65);
+                momentumZ = clampMomentum(momentumZ * 0.35 + sampleZ * 0.65);
+            }
             return true;
         }
         return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
     }
 
+    private static double clampMomentum(double value) {
+        return Math.max(-MAX_MOMENTUM_BLOCKS_PER_SECOND,
+                Math.min(MAX_MOMENTUM_BLOCKS_PER_SECOND, value));
+    }
+
     private float getMinimumStableScale() {
-        double viewportArea = Math.max(1.0, (double) (this.width - 2) * (this.height - 2));
-        double regionPixelArea = 512.0 * 512.0;
-        double targetVisibleRegions = 112.0;
-        return (float) Math.max(0.08,
-                Math.sqrt(viewportArea / (targetVisibleRegions * regionPixelArea)));
+        if (this.minecraft == null || !CaveMode.isActive(this.minecraft)
+                || CaveMode.isFullView(this.minecraft)) {
+            return SURFACE_MINIMUM_SCALE;
+        }
+
+        // Layered mode still uses exact 512x512 textures rather than the surface
+        // LOD pyramid. Temporarily cap the world-space viewport to roughly
+        // 4096 x 2048 blocks so extreme zoom cannot enumerate/upload thousands
+        // of full-resolution cave regions. This is screen-size independent.
+        float horizontalBound = (float) (Math.max(1, this.width - 2)
+                / LAYER_MAX_VIEW_WIDTH_BLOCKS);
+        float verticalBound = (float) (Math.max(1, this.height - 2)
+                / LAYER_MAX_VIEW_HEIGHT_BLOCKS);
+        return Math.max(LAYER_MINIMUM_SCALE_FLOOR,
+                Math.max(horizontalBound, verticalBound));
+    }
+
+    private void clampScaleForCurrentMode() {
+        float minimum = getMinimumStableScale();
+        if (this.scale >= minimum) return;
+        this.scale = minimum;
+        this.currentRenderScale = Math.max(this.currentRenderScale, minimum);
     }
 
     @Override
@@ -939,6 +1361,8 @@ public class MapScreen extends Screen {
             return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
         }
 
+        cancelMotionAndOpenAnimation();
+        interactionHoldUntilNanos = System.nanoTime() + 260_000_000L;
         float oldScale = this.scale;
 
         // A 512x512 region is one GPU texture. Extremely small scales can place
@@ -1032,6 +1456,10 @@ public class MapScreen extends Screen {
             } else {
                 CaveMode.setManualLayer(MapScreen.this.minecraft, selectedY());
             }
+            // Activate and stream the selected cache. Existing exact-layer data is
+            // preserved; only a genuinely uncached player region receives a small
+            // live prime, avoiding a circular rescan that overwrote warm pixels.
+            ChunkScanner.getInstance().requestImmediateCaveLayerRefresh(MapScreen.this.minecraft);
             updateMessage();
             if (MapScreen.this.caveLayerModeButton != null) {
                 MapScreen.this.updateCaveTooltip();
@@ -1044,6 +1472,16 @@ public class MapScreen extends Screen {
             double numeric = (double) (clamped - minimumY) / (maximumY - minimumY);
             return AUTO_ZONE + numeric * (1.0 - AUTO_ZONE);
         }
+    }
+
+    @Override
+    public void onClose() {
+        if (this.minecraft != null && !"LIVE".equals(selectedDimension)) {
+            MapManager.getInstance().returnToLiveDimension(this.minecraft);
+            selectedDimension = "LIVE";
+        }
+        MapViewportCoordinator.getInstance().closeFullscreen();
+        super.onClose();
     }
 
     @Override

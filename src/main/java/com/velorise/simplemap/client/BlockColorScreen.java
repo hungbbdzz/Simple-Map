@@ -73,10 +73,8 @@ public class BlockColorScreen extends Screen {
     private void saveOverride() {
         try {
             int color = ColorCode.parse(colorInput.getValue());
-            MapConfig.blockColorOverrides.put(blockId, color);
             rememberColor(color);
-            MapConfig.save();
-            rescanSelectedColumn();
+            BlockColorOverrideController.apply(blockId, color);
             closeToParent();
         } catch (IllegalArgumentException ignored) {
             colorInput.setTextColor(0xFFFF5555);
@@ -84,9 +82,7 @@ public class BlockColorScreen extends Screen {
     }
 
     private void resetOverride() {
-        MapConfig.blockColorOverrides.remove(blockId);
-        MapConfig.save();
-        rescanSelectedColumn();
+        BlockColorOverrideController.reset(blockId);
         closeToParent();
     }
 

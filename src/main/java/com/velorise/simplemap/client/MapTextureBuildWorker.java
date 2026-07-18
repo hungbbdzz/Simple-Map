@@ -36,28 +36,32 @@ final class MapTextureBuildWorker {
      */
     static CompletableFuture<PreparedPair> tryBuildSurface(
             long[] pixels,
+            int[] tints,
             List<String> biomePalette,
             List<String> blockPalette,
             IntFunction<Biome> biomeLookup,
             java.util.Map<String, Integer> blockColors,
             java.util.Map<String, BlockTintPolicy> tintPolicies,
+            java.util.Set<String> tintDisabledBlocks,
             int colourMode,
             boolean showFlowers,
             int terrainSlopes,
             byte[] light,
             int profile,
             long revision) {
-        return tryBuildSurface(pixels, biomePalette, blockPalette, biomeLookup, blockColors,
-                tintPolicies, colourMode, showFlowers, terrainSlopes, light, profile, revision, () -> true);
+        return tryBuildSurface(pixels, tints, biomePalette, blockPalette, biomeLookup, blockColors,
+                tintPolicies, tintDisabledBlocks, colourMode, showFlowers, terrainSlopes, light, profile, revision, () -> true);
     }
 
     static CompletableFuture<PreparedPair> tryBuildSurface(
             long[] pixels,
+            int[] tints,
             List<String> biomePalette,
             List<String> blockPalette,
             IntFunction<Biome> biomeLookup,
             java.util.Map<String, Integer> blockColors,
             java.util.Map<String, BlockTintPolicy> tintPolicies,
+            java.util.Set<String> tintDisabledBlocks,
             int colourMode,
             boolean showFlowers,
             int terrainSlopes,
@@ -73,8 +77,9 @@ final class MapTextureBuildWorker {
                     BooleanSupplier valid = () -> !future.isCancelled() && stillValid.getAsBoolean();
                     if (!valid.getAsBoolean()) throw new java.util.concurrent.CancellationException();
                     int[] styled = SurfaceColorizer.colorize(
-                            pixels, biomePalette, blockPalette, biomeLookup,
-                            blockColors, tintPolicies, colourMode, showFlowers, terrainSlopes, profile, valid);
+                            pixels, tints, biomePalette, blockPalette, biomeLookup,
+                            blockColors, tintPolicies, tintDisabledBlocks, colourMode,
+                            showFlowers, terrainSlopes, profile, valid);
 
                     // 2. Generate the glow layer. The old implementation walked a
                     // full 3x3 neighbourhood for every pixel. The same [1 2 1] x
@@ -119,6 +124,105 @@ final class MapTextureBuildWorker {
                     int[] styled = CaveReliefColorizer.colorize(
                             source, heights, terrainSlopes, profile, valid);
                     future.complete(new PreparedSingle(styled, revision));
+                } catch (Throwable throwable) {
+                    future.completeExceptionally(throwable);
+                }
+            });
+            return future;
+        } catch (RejectedExecutionException rejected) {
+            return null;
+        }
+    }
+
+    static CompletableFuture<PreparedPair> tryBuildSurfacePage(
+            long[] pixels,
+            int[] tints,
+            int pageX, int pageZ,
+            List<String> biomePalette,
+            List<String> blockPalette,
+            IntFunction<Biome> biomeLookup,
+            java.util.Map<String, Integer> blockColors,
+            java.util.Map<String, BlockTintPolicy> tintPolicies,
+            java.util.Set<String> tintDisabledBlocks,
+            int colourMode,
+            boolean showFlowers,
+            int terrainSlopes,
+            byte[] light,
+            int profile,
+            long revision,
+            BooleanSupplier stillValid) {
+        CompletableFuture<PreparedPair> future = new CompletableFuture<>();
+        try {
+            WORKERS.execute(() -> {
+                try {
+                    BooleanSupplier valid = () -> !future.isCancelled() && stillValid.getAsBoolean();
+                    if (!valid.getAsBoolean()) throw new java.util.concurrent.CancellationException();
+                    int[] fullStyled = SurfaceColorizer.colorize(
+                            pixels, tints, biomePalette, blockPalette, biomeLookup,
+                            blockColors, tintPolicies, tintDisabledBlocks, colourMode,
+                            showFlowers, terrainSlopes, profile, valid);
+                    byte[] smoothed = buildSmoothedLight(light, valid);
+
+                    int pagePixels = MapPageLayout.PAGE_SIZE * MapPageLayout.PAGE_SIZE;
+                    int[] pageStyled = new int[pagePixels];
+                    int[] pageGlow = new int[pagePixels];
+
+                    int startX = pageX * MapPageLayout.PAGE_SIZE;
+                    int startZ = pageZ * MapPageLayout.PAGE_SIZE;
+
+                    for (int pz = 0; pz < MapPageLayout.PAGE_SIZE; pz++) {
+                        int z = startZ + pz;
+                        int fullRow = z * SIZE;
+                        int pageRow = pz * MapPageLayout.PAGE_SIZE;
+                        for (int px = 0; px < MapPageLayout.PAGE_SIZE; px++) {
+                            int x = startX + px;
+                            int fullIdx = fullRow + x;
+                            int pageIdx = pageRow + px;
+                            int color = fullStyled[fullIdx];
+                            pageStyled[pageIdx] = color;
+
+                            int level = smoothed == null ? 0 : smoothed[fullIdx] & 0xFF;
+                            int alpha = color == 0 || level == 0 ? 0
+                                    : Math.min(255, Math.round((float) Math.pow(level / 15.0f, 1.65f) * 255.0f));
+                            int warm = tintTowardWarmLight(color, level);
+                            pageGlow[pageIdx] = (warm & 0x00FFFFFF) | (alpha << 24);
+                        }
+                    }
+                    future.complete(new PreparedPair(pageStyled, pageGlow, revision));
+                } catch (Throwable throwable) {
+                    future.completeExceptionally(throwable);
+                }
+            });
+            return future;
+        } catch (RejectedExecutionException rejected) {
+            return null;
+        }
+    }
+
+    static CompletableFuture<PreparedSingle> tryBuildCavePage(
+            int[] source, short[] heights, int pageX, int pageZ,
+            int terrainSlopes, int profile,
+            long revision, BooleanSupplier stillValid) {
+        CompletableFuture<PreparedSingle> future = new CompletableFuture<>();
+        try {
+            WORKERS.execute(() -> {
+                try {
+                    BooleanSupplier valid = () -> !future.isCancelled() && stillValid.getAsBoolean();
+                    int[] fullStyled = CaveReliefColorizer.colorize(
+                            source, heights, terrainSlopes, profile, valid);
+                    int pagePixels = MapPageLayout.PAGE_SIZE * MapPageLayout.PAGE_SIZE;
+                    int[] pageStyled = new int[pagePixels];
+                    int startX = pageX * MapPageLayout.PAGE_SIZE;
+                    int startZ = pageZ * MapPageLayout.PAGE_SIZE;
+                    for (int pz = 0; pz < MapPageLayout.PAGE_SIZE; pz++) {
+                        int z = startZ + pz;
+                        int fullRow = z * SIZE;
+                        int pageRow = pz * MapPageLayout.PAGE_SIZE;
+                        for (int px = 0; px < MapPageLayout.PAGE_SIZE; px++) {
+                            pageStyled[pageRow + px] = fullStyled[fullRow + startX + px];
+                        }
+                    }
+                    future.complete(new PreparedSingle(pageStyled, revision));
                 } catch (Throwable throwable) {
                     future.completeExceptionally(throwable);
                 }

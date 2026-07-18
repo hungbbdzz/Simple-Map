@@ -64,6 +64,10 @@ public final class CaveMapManager {
     private final Map<String, CaveRegion> regions = new LinkedHashMap<>(16, 0.75f, true);
     private final Set<String> dirtyRegions = new HashSet<>();
     private final Set<String> seedJobs = ConcurrentHashMap.newKeySet();
+    /** Exact layer files currently loading; archive projection waits for them. */
+    private final Set<String> loadingRegions = ConcurrentHashMap.newKeySet();
+    /** Last vertical-archive revision projected into each active layer region. */
+    private final Map<String, Long> projectedArchiveRevisions = new ConcurrentHashMap<>();
     private final Map<String, Boolean> fileExists = new ConcurrentHashMap<>();
     private final Map<String, CaveSaveRequest> pendingSaves = new ConcurrentHashMap<>();
     private final Map<String, CaveSaveRequest> inFlightSaves = new ConcurrentHashMap<>();
@@ -98,7 +102,7 @@ public final class CaveMapManager {
 
     public synchronized void setBaseDirectory(File directory, File surfaceDirectory) {
         if (sameFile(baseDirectory, directory) && sameFile(this.surfaceDirectory, surfaceDirectory)) return;
-        flushAndClear();
+        flushDataForDimensionSwitch();
         baseDirectory = directory;
         this.surfaceDirectory = surfaceDirectory;
         if (baseDirectory != null && !baseDirectory.exists() && !baseDirectory.mkdirs()) {
@@ -114,16 +118,41 @@ public final class CaveMapManager {
         dirtyRegions.clear();
         fileExists.clear();
         seedJobs.clear();
+        loadingRegions.clear();
+        projectedArchiveRevisions.clear();
         activeLayerY = layerY;
+        // This namespace excludes V6 textures produced while the client-side
+        // OCEAN_FLOOR lookup could reject every underground sample. Layer semantics
+        // remain the same bounded 32-block cave-floor view.
         activeLayerDirectory = baseDirectory == null ? null
-                : new File(baseDirectory, "layer_v4_band32_" + layerY);
-        legacyLayerDirectory = baseDirectory == null ? null
-                : new File(baseDirectory, "layer_v3_band32_" + layerY);
+                : new File(baseDirectory, "layer_v10_reliable_surface_band32_" + layerY);
+        legacyLayerDirectory = null;
         if (activeLayerDirectory != null && !activeLayerDirectory.exists()
                 && !activeLayerDirectory.mkdirs()) {
             LOGGER.warn("Could not create cave layer directory {}", activeLayerDirectory);
         }
+        scanRegionFiles(activeLayerDirectory);
         CaveTextureManager.getInstance().onLayerActivated(layerY);
+    }
+
+    private void scanRegionFiles(File directory) {
+        fileExists.clear();
+        if (directory == null || !directory.isDirectory()) return;
+        String[] files = directory.list();
+        if (files != null) {
+            for (String name : files) {
+                if (name.startsWith("r.") && name.endsWith(".smdat")) {
+                    String[] parts = name.split("\\.");
+                    if (parts.length == 4) {
+                        try {
+                            int rx = Integer.parseInt(parts[1]);
+                            int rz = Integer.parseInt(parts[2]);
+                            fileExists.put(rx + "," + rz, true);
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+            }
+        }
     }
 
     public int getActiveLayerY() {
@@ -134,10 +163,13 @@ public final class CaveMapManager {
         if (layerY != activeLayerY) return;
         CaveRegion region = getRegion(rx, rz, true);
         if (region == null) return;
-        // Always attempt a Full-Cave merge for visible regions. Existing layer
-        // files can be sparse, so seeding only when the file was absent left large
-        // black holes that never filled while panning an explored map.
-        if (region.isLoaded()) scheduleVisibleSeed(layerY, rx, rz, region);
+        // Load the exact selected-Y file before applying a newer archive revision.
+        // Projecting into a blank placeholder first caused the warm cached image to
+        // be replaced region-by-region, producing mismatched black corners.
+        if (region.isLoaded() && !region.hasExactSnapshot()
+                && !loadingRegions.contains(loadingKey(layerGeneration.get(), rx, rz))) {
+            scheduleVisibleSeed(layerY, rx, rz, region);
+        }
     }
 
     public void setColor(int blockX, int blockZ, int abgrColor) {
@@ -174,8 +206,13 @@ public final class CaveMapManager {
             CaveSaveRequest pending = latestSave(activeLayerDirectory, rx, rz);
             if (pending != null) {
                 created.replacePixels(pending.pixels());
-                created.markLoaded();
+                created.markExactSnapshotLoaded();
             } else if (hasAnyStoredRegion(rx, rz)) {
+                // Keep the CPU placeholder unavailable until the exact snapshot is
+                // loaded. The warm GPU texture can still render immediately, while
+                // live chunk scanning cannot write an opaque black square into an
+                // empty placeholder and then block the disk merge.
+                loadingRegions.add(loadingKey(generation, rx, rz));
                 loadRegionAsync(created, activeLayerDirectory, legacyLayerDirectory,
                         generation, activeLayerY);
             } else created.markLoaded();
@@ -203,19 +240,41 @@ public final class CaveMapManager {
     }
 
     public synchronized void flushAndClear() {
-        deactivate();
-        baseDirectory = null;
-        surfaceDirectory = null;
+        flushDataForDimensionSwitch();
+        CaveTextureManager.getInstance().clearCache();
     }
 
-    public synchronized void deactivate() {
+    /** Clears dimension-bound cave data but retains namespace-keyed GPU textures. */
+    public synchronized void flushDataForDimensionSwitch() {
         saveDirtyRegions();
         layerGeneration.incrementAndGet();
         clearRegions();
         dirtyRegions.clear();
         fileExists.clear();
         seedJobs.clear();
+        loadingRegions.clear();
+        projectedArchiveRevisions.clear();
+        activeLayerDirectory = null;
+        legacyLayerDirectory = null;
+        activeLayerY = Integer.MIN_VALUE;
+        baseDirectory = null;
+        surfaceDirectory = null;
+    }
+
+    public synchronized void clearCache() {
+        saveDirtyRegions();
+        layerGeneration.incrementAndGet();
+        clearRegions();
+        dirtyRegions.clear();
+        fileExists.clear();
+        seedJobs.clear();
+        loadingRegions.clear();
+        projectedArchiveRevisions.clear();
         CaveTextureManager.getInstance().clearCache();
+    }
+
+    public synchronized void deactivate() {
+        clearCache();
         activeLayerDirectory = null;
         legacyLayerDirectory = null;
         activeLayerY = Integer.MIN_VALUE;
@@ -223,6 +282,8 @@ public final class CaveMapManager {
 
     private void loadRegionAsync(CaveRegion region, File directory, File requestedLegacyDirectory,
             long requestedGeneration, int requestedLayerY) {
+        String regionKey = key(region.rx, region.rz);
+        String loadKey = loadingKey(requestedGeneration, region.rx, region.rz);
         try {
             LOAD_POOL.execute(() -> {
                 int[] pixels = null;
@@ -255,22 +316,36 @@ public final class CaveMapManager {
                     quarantineCorruptFile(attemptedFile);
                     if (isLayerGenerationCurrent(requestedGeneration, requestedLayerY)
                             && sameFile(activeLayerDirectory, directory)) {
-                        fileExists.remove(key(region.rx, region.rz));
+                        fileExists.remove(regionKey);
                     }
                 }
-                if (!isLoadTargetCurrent(region, directory, requestedGeneration, requestedLayerY)) return;
-                if (pixels != null) region.replacePixels(pixels);
-                region.markLoaded();
+                if (!isLoadTargetCurrent(region, directory, requestedGeneration, requestedLayerY)) {
+                    loadingRegions.remove(loadKey);
+                    return;
+                }
+                if (pixels != null) {
+                    region.replacePixels(pixels);
+                    region.markExactSnapshotLoaded();
+                } else {
+                    region.markLoaded();
+                }
+                loadingRegions.remove(loadKey);
                 CaveTextureManager.getInstance().markRegionTextureDirty(
                         requestedLayerY, region.rx, region.rz);
                 if (legacy) markRegionDirty(region.rx, region.rz);
+                // Exact selected-Y files are authoritative snapshots. Only regions
+                // without one are reconstructed from the vertical archive.
+                if (!region.hasExactSnapshot()) {
+                    scheduleVisibleSeed(requestedLayerY, region.rx, region.rz, region);
+                }
             });
         } catch (RejectedExecutionException saturated) {
-            // Visible requests are retried by the renderer. Removing the placeholder
+            loadingRegions.remove(loadKey);
+            // Visible requests are retried by the coordinator. Removing the placeholder
             // avoids retaining thousands of unloaded regions during rapid panning.
             synchronized (regions) {
-                if (regions.get(key(region.rx, region.rz)) == region) {
-                    regions.remove(key(region.rx, region.rz));
+                if (regions.get(regionKey) == region) {
+                    regions.remove(regionKey);
                 }
             }
             region.close();
@@ -371,24 +446,23 @@ public final class CaveMapManager {
 
     private void scheduleVisibleSeed(int layerY, int rx, int rz, CaveRegion targetRegion) {
         long generation = layerGeneration.get();
+        String regionKey = key(rx, rz);
+        long archiveRevision = VerticalCaveArchiveManager.getInstance().getRegionRevision(rx, rz);
+        Long appliedRevision = projectedArchiveRevisions.get(regionKey);
+        if (appliedRevision != null && appliedRevision >= archiveRevision) return;
+
         String jobKey = generation + ":" + rx + "," + rz;
         if (!seedJobs.add(jobKey)) return;
         try {
             LOAD_POOL.execute(() -> {
                 try {
-                    FullCaveMapManager.FullSnapshot full = FullCaveMapManager.getInstance()
-                            .getLoadedSnapshot(rx, rz);
-                    if (full == null) {
-                        full = FullCaveMapManager.getInstance().readSnapshotFromDisk(rx, rz);
-                    }
-                    if (full == null || !isLayerGenerationCurrent(generation, layerY)) return;
-                    int minimumY = layerY - LAYER_DEPTH + 1;
-                    int[] seeded = new int[PIXELS];
-                    for (int i = 0; i < PIXELS; i++) {
-                        int height = full.heights()[i];
-                        if (height >= minimumY && height <= layerY) seeded[i] = full.pixels()[i];
-                    }
-                    applyVisibleSeed(generation, layerY, rx, rz, targetRegion, seeded);
+                    VerticalCaveArchiveManager.Projection projection =
+                            VerticalCaveArchiveManager.getInstance().projectRegion(layerY, rx, rz, false);
+                    if (!isLayerGenerationCurrent(generation, layerY)) return;
+
+                    applyVisibleProjection(generation, layerY, rx, rz, targetRegion, projection);
+                    projectedArchiveRevisions.put(regionKey,
+                            Math.max(archiveRevision, projection.revision()));
                 } finally {
                     seedJobs.remove(jobKey);
                 }
@@ -398,19 +472,29 @@ public final class CaveMapManager {
         }
     }
 
-    private void applyVisibleSeed(long generation, int layerY, int rx, int rz,
-            CaveRegion targetRegion, int[] seeded) {
+    /**
+     * Archived columns fill untouched parts of the selected 32-block Top-Y band.
+     * Live pixels scanned from currently loaded chunks are authoritative and must
+     * never be replaced by a delayed archive projection. A scanned-but-empty archive
+     * column may still clear stale cache data only when that pixel has not been live-scanned.
+     */
+    private void applyVisibleProjection(long generation, int layerY, int rx, int rz,
+            CaveRegion targetRegion, VerticalCaveArchiveManager.Projection projection) {
         if (!isLayerGenerationCurrent(generation, layerY)) return;
         synchronized (regions) {
             if (regions.get(key(rx, rz)) != targetRegion || !targetRegion.isLoaded()) return;
         }
+
         boolean changed = false;
         targetRegion.lock();
         try {
             int[] current = targetRegion.getPixelsDirect();
+            int[] projected = projection.colors();
+            byte[] scanned = projection.scanned();
             for (int i = 0; i < current.length; i++) {
-                if (current[i] == 0 && seeded[i] != 0) {
-                    current[i] = seeded[i];
+                if (scanned[i] == 0 || targetRegion.isLivePixelLocked(i)) continue;
+                if (current[i] != projected[i]) {
+                    current[i] = projected[i];
                     changed = true;
                 }
             }
@@ -515,11 +599,11 @@ public final class CaveMapManager {
         if (directory == null) return false;
         if (latestSave(directory, rx, rz) != null) return true;
         String key = key(rx, rz);
-        return fileExists.computeIfAbsent(key, ignored -> {
-            if (new File(directory, fileName(rx, rz)).isFile()) return true;
-            File legacy = legacyFile(rx, rz);
-            return legacy != null && legacy.isFile();
-        });
+        Boolean cached = fileExists.get(key);
+        if (cached != null) return cached;
+        boolean exists = new File(directory, fileName(rx, rz)).isFile() || legacyFile(rx, rz) != null;
+        fileExists.put(key, exists);
+        return exists;
     }
 
     private File legacyFile(int rx, int rz) {
@@ -559,6 +643,10 @@ public final class CaveMapManager {
             for (CaveRegion region : regions.values()) region.close();
             regions.clear();
         }
+    }
+
+    private static String loadingKey(long generation, int rx, int rz) {
+        return generation + ":" + rx + "," + rz;
     }
 
     private static String saveKey(File directory, int rx, int rz) {
