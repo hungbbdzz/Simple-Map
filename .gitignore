@@ -1,6 +1,7 @@
 # Gradle files
 .gradle/
 build/
+.gemini/
 
 # IDE files
 .idea/
