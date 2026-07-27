@@ -20,16 +20,53 @@ final class CaveReliefColorizer {
                 int index = z * SIZE + x;
                 int color = source[index];
                 if (color == 0) continue;
-                float shade = terrainSlopes <= 0 || heights == null
-                        ? 1.0f : shade(heights, x, z, terrainSlopes);
-                int red = clamp(Math.round((color & 0xFF) * shade));
-                int green = clamp(Math.round(((color >>> 8) & 0xFF) * shade));
-                int blue = clamp(Math.round(((color >>> 16) & 0xFF) * shade));
-                int styled = (color & 0xFF000000) | (blue << 16) | (green << 8) | red;
-                output[index] = MapColorProfile.apply(styled, profile);
+                output[index] = stylePixel(color, heights, x, z, terrainSlopes, profile);
             }
         }
         return output;
+    }
+
+    /**
+     * Styles one 64x64 page directly from a 512x512 immutable region snapshot.
+     *
+     * The old page path styled all 262,144 region pixels and then copied only 4,096
+     * of them. Direct page styling removes that 64x amplification while relief still
+     * reads the full height array, so shading remains continuous across page borders.
+     */
+    static int[] colorizePage(int[] source, short[] heights, int pageX, int pageZ,
+            int terrainSlopes, int profile, BooleanSupplier stillValid) {
+        int pageSize = MapPageLayout.PAGE_SIZE;
+        int[] output = new int[pageSize * pageSize];
+        int startX = pageX * pageSize;
+        int startZ = pageZ * pageSize;
+
+        for (int localZ = 0; localZ < pageSize; localZ++) {
+            if ((localZ & 15) == 0 && !stillValid.getAsBoolean()) {
+                throw new java.util.concurrent.CancellationException("Stale cave page job");
+            }
+            int z = startZ + localZ;
+            int sourceRow = z * SIZE;
+            int outputRow = localZ * pageSize;
+            for (int localX = 0; localX < pageSize; localX++) {
+                int x = startX + localX;
+                int color = source[sourceRow + x];
+                if (color == 0) continue;
+                output[outputRow + localX] = stylePixel(
+                        color, heights, x, z, terrainSlopes, profile);
+            }
+        }
+        return output;
+    }
+
+    private static int stylePixel(int color, short[] heights, int x, int z,
+            int terrainSlopes, int profile) {
+        float shade = terrainSlopes <= 0 || heights == null
+                ? 1.0f : shade(heights, x, z, terrainSlopes);
+        int red = clamp(Math.round((color & 0xFF) * shade));
+        int green = clamp(Math.round(((color >>> 8) & 0xFF) * shade));
+        int blue = clamp(Math.round(((color >>> 16) & 0xFF) * shade));
+        int styled = (color & 0xFF000000) | (blue << 16) | (green << 8) | red;
+        return MapColorProfile.apply(styled, profile);
     }
 
     private static float shade(short[] heights, int x, int z, int mode) {

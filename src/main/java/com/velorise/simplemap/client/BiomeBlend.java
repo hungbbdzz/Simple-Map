@@ -12,17 +12,38 @@ public final class BiomeBlend {
 
     public static int blendGrass(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup, int px, int pz) {
-        return blend(pixelData, biomeLookup, px, pz, BiomeColors::getGrassColor);
+        return blendGrass(pixelData, biomeLookup, px, pz, SIZE, SIZE);
+    }
+
+    public static int blendGrass(long[] pixelData,
+            java.util.function.IntFunction<Biome> biomeLookup, int px, int pz,
+            int width, int height) {
+        return blend(pixelData, biomeLookup, px, pz, width, height,
+                BiomeColors::getGrassColor);
     }
 
     public static int blendFoliage(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup, int px, int pz) {
-        return blend(pixelData, biomeLookup, px, pz, BiomeColors::getFoliageColor);
+        return blendFoliage(pixelData, biomeLookup, px, pz, SIZE, SIZE);
+    }
+
+    public static int blendFoliage(long[] pixelData,
+            java.util.function.IntFunction<Biome> biomeLookup, int px, int pz,
+            int width, int height) {
+        return blend(pixelData, biomeLookup, px, pz, width, height,
+                BiomeColors::getFoliageColor);
     }
 
     public static int blendWater(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup, int px, int pz) {
-        return blend(pixelData, biomeLookup, px, pz, BiomeColors::getWaterColor);
+        return blendWater(pixelData, biomeLookup, px, pz, SIZE, SIZE);
+    }
+
+    public static int blendWater(long[] pixelData,
+            java.util.function.IntFunction<Biome> biomeLookup, int px, int pz,
+            int width, int height) {
+        return blend(pixelData, biomeLookup, px, pz, width, height,
+                BiomeColors::getWaterColor);
     }
 
     @FunctionalInterface
@@ -32,7 +53,7 @@ public final class BiomeBlend {
 
     private static int blend(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup,
-            int px, int pz, ColorExtractor extractor) {
+            int px, int pz, int width, int height, ColorExtractor extractor) {
         int red = 0;
         int green = 0;
         int blue = 0;
@@ -41,8 +62,8 @@ public final class BiomeBlend {
             for (int dx = -BLEND_RADIUS; dx <= BLEND_RADIUS; dx++) {
                 int sampleX = px + dx;
                 int sampleZ = pz + dz;
-                if (sampleX < 0 || sampleX >= SIZE || sampleZ < 0 || sampleZ >= SIZE) continue;
-                long packed = pixelData[sampleZ * SIZE + sampleX];
+                if (sampleX < 0 || sampleX >= width || sampleZ < 0 || sampleZ >= height) continue;
+                long packed = pixelData[sampleZ * width + sampleX];
                 if (MapBlockData.isEmpty(packed)) continue;
                 int biomeIndex = MapBlockData.biomeId(packed) & 0xFF;
                 if (biomeIndex == (MapBlockData.NO_BIOME & 0xFF)) continue;
@@ -56,8 +77,8 @@ public final class BiomeBlend {
             }
         }
         if (count == 0) {
-            if (px >= 0 && px < SIZE && pz >= 0 && pz < SIZE) {
-                long selfPacked = pixelData[pz * SIZE + px];
+            if (px >= 0 && px < width && pz >= 0 && pz < height) {
+                long selfPacked = pixelData[pz * width + px];
                 if (!MapBlockData.isEmpty(selfPacked)) {
                     int selfBiomeIndex = MapBlockData.biomeId(selfPacked) & 0xFF;
                     if (selfBiomeIndex != (MapBlockData.NO_BIOME & 0xFF)) {

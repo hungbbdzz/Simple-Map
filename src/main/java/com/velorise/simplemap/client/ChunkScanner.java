@@ -1,5 +1,9 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.cave.CavePipeline;
+import com.velorise.simplemap.client.cave.CaveStateClassifier;
+import com.velorise.simplemap.client.cave.CaveView;
+import com.velorise.simplemap.client.cave.DenseCaveTile;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
@@ -61,6 +65,10 @@ public class ChunkScanner {
         return INSTANCE;
     }
 
+    private final CaveStateClassifier caveStateClassifier = CaveStateClassifier.getInstance();
+    private final MapVisualClassifier visualClassifier = MapVisualClassifier.getInstance();
+    private final MapBlockEntityVisualResolver blockEntityVisuals =
+            MapBlockEntityVisualResolver.getInstance();
     private final Random random = new Random();
     /** NORMAL completes loaded chunks from nearest to farthest. */
     private final Map<String, NormalScanState> normalScans = new HashMap<>();
@@ -76,6 +84,9 @@ public class ChunkScanner {
     private final Set<Long> verticalArchivePrioritySet = new HashSet<>();
     private volatile long forcedRescanUntilNanos;
     private long observedCaveModeRevision = Long.MIN_VALUE;
+    private CaveView observedCaveView;
+    private int observedCaveBandY = Integer.MIN_VALUE;
+    private int observedCaveProjectionTopY = Integer.MIN_VALUE;
 
     private ChunkScanner() {
     }
@@ -95,6 +106,10 @@ public class ChunkScanner {
         // stale black holes are replaced without requiring manual cache deletion.
         forcedRescanUntilNanos = System.nanoTime() + 3_000_000_000L;
         observedCaveModeRevision = Long.MIN_VALUE;
+        observedCaveView = null;
+        observedCaveBandY = Integer.MIN_VALUE;
+        observedCaveProjectionTopY = Integer.MIN_VALUE;
+        CavePipeline.getInstance().resetScanState();
     }
 
     /**
@@ -109,7 +124,9 @@ public class ChunkScanner {
         boolean caveActive = CaveMode.isActive(mc);
         synchronizeCaveModeRevision();
         if (caveActive) {
-            scanCaveAroundPlayerUniform(mc, maxRadius);
+            int layerY = CaveMode.getLayerY(mc);
+            if (!CaveMode.isFullView(mc)) CaveMapManager.getInstance().setActiveLayer(layerY);
+            CavePipeline.getInstance().scanAroundPlayer(mc, maxRadius);
             return;
         }
 
@@ -138,34 +155,50 @@ public class ChunkScanner {
                 scanLightIfLoaded(mc, centerBlockX + dx, centerBlockZ + dz);
             }
         }
-        scanVerticalArchiveAroundPlayer(mc, effectiveRadius,
-                System.nanoTime() + verticalArchiveBudget(mc));
+        CavePipeline.getInstance().scanBackgroundAroundPlayer(mc, effectiveRadius);
     }
 
     private void synchronizeCaveModeRevision() {
         long revision = CaveMode.getRevision();
         if (observedCaveModeRevision == revision) return;
         observedCaveModeRevision = revision;
-        normalScans.clear();
-        immediateCursors.clear();
-        urgentChunkCursors.clear();
-        viewportScans.clear();
-        verticalArchiveScans.clear();
 
         Minecraft minecraft = Minecraft.getInstance();
-        boolean layered = minecraft.level != null
-                && CaveMode.isActive(minecraft) && !CaveMode.isFullView(minecraft);
-        if (!layered) {
-            forcedRescanUntilNanos = Math.max(forcedRescanUntilNanos,
-                    System.nanoTime() + 3_000_000_000L);
+        boolean active = minecraft.level != null && CaveMode.isActive(minecraft);
+        CaveView nextView = active && CaveMode.isFullView(minecraft)
+                ? CaveView.FULL : (active ? CaveView.LAYERED : null);
+        int nextTopY = active ? CaveMode.getLayerY(minecraft) : Integer.MIN_VALUE;
+        int nextBand = nextView == null ? Integer.MIN_VALUE
+                : DenseCaveTile.normalizeLayer(nextView, nextTopY);
+        boolean retainedLayerTransition = nextView == CaveView.LAYERED
+                && observedCaveView == CaveView.LAYERED;
+
+        if (retainedLayerTransition) {
+            // Same-band changes patch the retained hierarchy. Cross-band changes use
+            // the previous band as a page fallback and warm the new band near-player
+            // first; neither path performs a global clear.
+            CavePipeline.getInstance().retargetLayer(minecraft, nextTopY);
+        } else {
+            normalScans.clear();
+            immediateCursors.clear();
+            urgentChunkCursors.clear();
+            viewportScans.clear();
+            verticalArchiveScans.clear();
+            CavePipeline.getInstance().resetScanState();
+            if (nextView != CaveView.LAYERED) {
+                forcedRescanUntilNanos = Math.max(forcedRescanUntilNanos,
+                        System.nanoTime() + 3_000_000_000L);
+            }
         }
-        // Layer changes reuse their exact cache/vertical archive. A blanket forced
-        // rescan created the visible circular overwrite wave and could replace
-        // already-cached pixels with temporary black columns.
+        observedCaveView = nextView;
+        observedCaveBandY = nextBand;
+        observedCaveProjectionTopY = nextTopY;
     }
 
     private void scanColumnIfLoaded(Minecraft mc, int blockX, int blockZ) {
         if (mc.level.hasChunk(blockX >> 4, blockZ >> 4)) {
+            GeneratedChunkIndex.getInstance().markLive(
+                    mc.level, blockX >> 4, blockZ >> 4);
             MapBlockData data = buildBlockData(mc.level, blockX, blockZ);
             if (data != null) {
                 // Don't overwrite existing data with empty scan
@@ -325,6 +358,7 @@ public class ChunkScanner {
         BlockPos.MutableBlockPos runPos = new BlockPos.MutableBlockPos(blockX, undergroundStartY, blockZ);
         List<VerticalCaveArchiveManager.Candidate> candidates = new ArrayList<>();
 
+        boolean reachedMinimumY = true;
         for (int openY = undergroundStartY; openY > minimumY; openY--) {
             CavePixel pixel = getCaveSurface(level, openPos, colorPos, openY,
                     dimensionMiddle, true, Integer.MAX_VALUE);
@@ -356,11 +390,15 @@ public class ChunkScanner {
             } else {
                 openY = Math.min(openY, pixel.surfaceY());
             }
-            if (candidates.size() >= 96) break;
+            if (candidates.size() >= 96) {
+                reachedMinimumY = false;
+                break;
+            }
         }
 
         VerticalCaveArchiveManager.Candidate[] compact = reduceVerticalCandidates(candidates);
-        return archive.recordColumn(blockX, blockZ, compact);
+        return archive.recordColumn(blockX, blockZ, compact,
+                minimumY, undergroundStartY, reachedMinimumY);
     }
 
     private int findCavityRunTop(Level level, BlockPos.MutableBlockPos probe,
@@ -451,7 +489,7 @@ public class ChunkScanner {
         immediateCursors.put(key, cursor % area);
     }
 
-    
+
 
     /** Completes the player chunk first, plus the chunk in the movement direction. */
     private void scanUrgentLoadedChunks(Minecraft mc, int layerY, boolean cave,
@@ -494,11 +532,27 @@ public class ChunkScanner {
      */
     public void scanVisibleArea(Minecraft mc, double minX, double maxX,
             double minZ, double maxZ) {
-        scanVisibleArea(mc, minX, maxX, minZ, maxZ, 1.0f);
+        scanVisibleArea(mc, minX, maxX, minZ, maxZ, 1.0f,
+                (minX + maxX) * 0.5, (minZ + maxZ) * 0.5,
+                MapRequestLane.FULLSCREEN);
     }
 
     public void scanVisibleArea(Minecraft mc, double minX, double maxX,
             double minZ, double maxZ, float scale) {
+        scanVisibleArea(mc, minX, maxX, minZ, maxZ, scale,
+                (minX + maxX) * 0.5, (minZ + maxZ) * 0.5,
+                MapRequestLane.FULLSCREEN);
+    }
+
+    public void scanVisibleArea(Minecraft mc, double minX, double maxX,
+            double minZ, double maxZ, float scale, MapRequestLane lane) {
+        scanVisibleArea(mc, minX, maxX, minZ, maxZ, scale,
+                (minX + maxX) * 0.5, (minZ + maxZ) * 0.5, lane);
+    }
+
+    public void scanVisibleArea(Minecraft mc, double minX, double maxX,
+            double minZ, double maxZ, float scale,
+            double focusX, double focusZ, MapRequestLane lane) {
         if (mc == null || mc.level == null || mc.player == null
                 || !MapManager.getInstance().isViewingLiveDimension()) return;
         boolean cave = CaveMode.isActive(mc);
@@ -506,15 +560,26 @@ public class ChunkScanner {
         boolean fullView = cave && CaveMode.isFullView(mc);
         int layerY = cave ? CaveMode.getLayerY(mc) : 0;
         if (cave && !fullView) CaveMapManager.getInstance().setActiveLayer(layerY);
+        if (cave) {
+            CavePipeline.getInstance().scanVisibleArea(mc, minX, maxX, minZ, maxZ,
+                    scale, focusX, focusZ, lane);
+            return;
+        }
 
         int minChunkX = ((int) Math.floor(minX)) >> 4;
         int maxChunkX = ((int) Math.floor(maxX)) >> 4;
         int minChunkZ = ((int) Math.floor(minZ)) >> 4;
         int maxChunkZ = ((int) Math.floor(maxZ)) >> 4;
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.FULLSCREEN : lane;
 
-        // Disk caches are independent from Minecraft's live chunk window. Queue every
-        // visible cached 512x512 region first, even when it is far from the player.
-        if (!cave || fullView) {
+        /*
+         * Surface Full Map has one read authority: the exact-page frontier requests
+         * the containing saved region when that page reaches the front. The older
+         * centre-out region prefetcher was a second producer and caused remote
+         * regions to appear as random islands. Cave cache warmup remains separate.
+         */
+        if (cave) {
             prefetchVisibleRegionCaches(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
                     cave, fullView, layerY, scale);
         }
@@ -530,17 +595,24 @@ public class ChunkScanner {
         minChunkZ = Math.max(minChunkZ, playerChunkZ - liveRadius);
         maxChunkZ = Math.min(maxChunkZ, playerChunkZ + liveRadius);
         if (minChunkX > maxChunkX || minChunkZ > maxChunkZ) return;
-        String key = viewKey(mc, cave, fullView, layerY) + ":viewport";
+        String key = viewKey(mc, cave, fullView, layerY)
+                + ":viewport:" + effectiveLane.name();
         ViewportScanState state = viewportScans.computeIfAbsent(key, ignored -> new ViewportScanState());
         int expectedChunkCount = Math.max(1, maxChunkX - minChunkX + 1)
                 * Math.max(1, maxChunkZ - minChunkZ + 1);
-        if (!state.sameShape(minChunkX, maxChunkX, minChunkZ, maxChunkZ)
+        int focusChunkX = Math.max(minChunkX, Math.min(maxChunkX,
+                ((int) Math.floor(focusX)) >> 4));
+        int focusChunkZ = Math.max(minChunkZ, Math.min(maxChunkZ,
+                ((int) Math.floor(focusZ)) >> 4));
+        boolean stableFullscreen = effectiveLane == MapRequestLane.FULLSCREEN;
+        if (!state.matches(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                focusChunkX, focusChunkZ, stableFullscreen)
                 || state.chunkOrder.length != expectedChunkCount) {
-            state.reset(minChunkX, maxChunkX, minChunkZ, maxChunkZ);
+            state.reset(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                    focusChunkX, focusChunkZ, stableFullscreen);
         } else {
-            // Relative center-first order remains valid while panning a viewport of
-            // the same shape. Preserve the cursor instead of restarting at the center
-            // every time the camera crosses a chunk boundary.
+            // Fullscreen preserves a row frontier while the viewport shifts by a
+            // small amount. Minimap retains its camera-centred order.
             state.updateBounds(minChunkX, maxChunkX, minChunkZ, maxChunkZ);
         }
 
@@ -568,6 +640,23 @@ public class ChunkScanner {
             mapBudget = MapConfig.fastFullscreenLoading
                     ? MAP_SCREEN_SCAN_BUDGET_NANOS : MAP_SCREEN_BALANCED_BUDGET_NANOS;
         }
+        MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
+        long governedViewportBudget;
+        if (effectiveLane == MapRequestLane.MINIMAP) {
+            // The minimap is visible precisely when fullscreenOpen is false. Using
+            // fullscreenScanBudgetNanos() here returned zero and aborted every
+            // minimap viewport scan before a single surface column was observed.
+            governedViewportBudget = governor.gameplayScanBudgetNanos(cave);
+        } else if (effectiveLane == MapRequestLane.FULLSCREEN) {
+            governedViewportBudget = governor.fullscreenScanBudgetNanos(
+                    scale, MapConfig.fastFullscreenLoading);
+        } else {
+            // Background/prefetch lanes receive only a small cooperative slice.
+            governedViewportBudget = Math.max(120_000L,
+                    governor.gameplayScanBudgetNanos(cave) / 2L);
+        }
+        if (governedViewportBudget <= 0L) return;
+        mapBudget = Math.min(mapBudget, governedViewportBudget);
         long deadline = System.nanoTime() + mapBudget;
         int visitedPixels = 0;
         int pixelsPerChunkBurst;
@@ -579,7 +668,8 @@ public class ChunkScanner {
         // Layered fullscreen scanning follows the same chunk-order cursor as the
         // rest of the viewport. Do not inject a special player-centred pass: it
         // creates a visibly different square and defeats deterministic tile loading.
-        if (!cave || fullView) {
+        if (effectiveLane != MapRequestLane.FULLSCREEN
+                && (!cave || fullView)) {
             scanUrgentLoadedChunks(mc, layerY, cave, fullView, deadline);
         }
 
@@ -676,26 +766,28 @@ public class ChunkScanner {
             mc.execute(() -> requestImmediateCaveLayerRefresh(mc));
             return;
         }
-        if (!CaveMode.isActive(mc) || CaveMode.isFullView(mc)) {
+        if (!CaveMode.isActive(mc)) {
             requestRefresh(mc);
             return;
         }
-
-        int layerY = CaveMode.getLayerY(mc);
-        CaveMapManager layers = CaveMapManager.getInstance();
-        layers.setActiveLayer(layerY);
+        if (!CaveMode.isFullView(mc)) {
+            CaveMapManager.getInstance().setActiveLayer(CaveMode.getLayerY(mc));
+        }
         observedCaveModeRevision = CaveMode.getRevision();
-        normalScans.clear();
-        immediateCursors.clear();
-        urgentChunkCursors.clear();
-        viewportScans.clear();
+        int topY = CaveMode.getLayerY(mc);
+        CaveView view = CaveMode.isFullView(mc) ? CaveView.FULL : CaveView.LAYERED;
+        int bandY = DenseCaveTile.normalizeLayer(view, topY);
+        boolean retainedLayerTransition = view == CaveView.LAYERED
+                && observedCaveView == CaveView.LAYERED;
+        if (retainedLayerTransition) {
+            CavePipeline.getInstance().retargetLayer(mc, topY);
+        } else {
+            CavePipeline.getInstance().resetScanState();
+        }
+        observedCaveView = view;
+        observedCaveBandY = bandY;
+        observedCaveProjectionTopY = topY;
         MapViewportCoordinator.getInstance().onLayerChanged();
-
-        // Layer changes are cache switches, not refresh requests. Exact selected-Y
-        // textures remain visible immediately and the normal viewport pipeline loads
-        // missing chunk/tile/region units in order. A player-centred prime used to
-        // write into an empty async placeholder, creating the black 16x16 square.
-        forcedRescanUntilNanos = Math.min(forcedRescanUntilNanos, System.nanoTime());
     }
 
     /** Refresh now reuses the normal chunk pipeline instead of a separate circle scan. */
@@ -708,7 +800,8 @@ public class ChunkScanner {
         if (mc != null && mc.level != null && mc.player != null) {
             int renderDistance = mc.options.renderDistance().get();
             int radius = Math.max(16, renderDistance * 16);
-            scanAroundPlayerUniform(mc, radius);
+            if (CaveMode.isActive(mc)) CavePipeline.getInstance().requestRefresh(mc, radius);
+            else scanAroundPlayerUniform(mc, radius);
         }
     }
 
@@ -827,8 +920,20 @@ public class ChunkScanner {
     }
 
     private long scanBudget(Minecraft mc, boolean cave) {
-        if (mc.screen instanceof MapScreen) return MAP_SCREEN_SCAN_BUDGET_NANOS;
-        return cave ? CAVE_SCAN_BUDGET_NANOS : SURFACE_SCAN_BUDGET_NANOS;
+        MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
+        if (mc.screen instanceof MapScreen) {
+            long governed = governor.fullscreenScanBudgetNanos(
+                    1.0f, MapConfig.fastFullscreenLoading);
+            return governed <= 0L ? 0L
+                    : Math.min(MAP_SCREEN_SCAN_BUDGET_NANOS, governed);
+        }
+        long governed = governor.gameplayScanBudgetNanos(cave);
+        if (governed <= 0L) return 0L;
+        long base = cave ? CAVE_SCAN_BUDGET_NANOS : SURFACE_SCAN_BUDGET_NANOS;
+        // ChunkScanner performs several cheap surface columns per observation unit;
+        // a small multiplier preserves throughput while keeping the governor in
+        // control of the aggregate client-thread slice.
+        return Math.min(base, Math.max(350_000L, governed * 4L));
     }
 
     private int resolveSampleTarget(boolean cave) {
@@ -868,13 +973,22 @@ public class ChunkScanner {
         private int maxChunkX;
         private int minChunkZ;
         private int maxChunkZ;
+        private int focusChunkX;
+        private int focusChunkZ;
+        private boolean stableFullscreen;
         private int chunkCursor;
         private int pixelCursor;
         private int[] chunkOrder = new int[0];
 
-        private boolean sameShape(int minX, int maxX, int minZ, int maxZ) {
-            return maxChunkX - minChunkX == maxX - minX
-                    && maxChunkZ - minChunkZ == maxZ - minZ;
+        private boolean matches(int minX, int maxX, int minZ, int maxZ,
+                int focusX, int focusZ, boolean stable) {
+            if (stableFullscreen != stable
+                    || maxChunkX - minChunkX != maxX - minX
+                    || maxChunkZ - minChunkZ != maxZ - minZ) {
+                return false;
+            }
+            // Cursor movement is never part of the fullscreen scan key.
+            return stable || (focusChunkX == focusX && focusChunkZ == focusZ);
         }
 
         private void updateBounds(int minX, int maxX, int minZ, int maxZ) {
@@ -884,18 +998,34 @@ public class ChunkScanner {
             maxChunkZ = maxZ;
         }
 
-        private void reset(int minX, int maxX, int minZ, int maxZ) {
+        private void reset(int minX, int maxX, int minZ, int maxZ,
+                int focusX, int focusZ, boolean stable) {
             minChunkX = minX;
             maxChunkX = maxX;
             minChunkZ = minZ;
             maxChunkZ = maxZ;
+            focusChunkX = focusX;
+            focusChunkZ = focusZ;
+            stableFullscreen = stable;
             chunkCursor = 0;
             pixelCursor = 0;
             int width = Math.max(1, maxX - minX + 1);
             int height = Math.max(1, maxZ - minZ + 1);
-            int centerX = (minX + maxX) >> 1;
-            int centerZ = (minZ + maxZ) >> 1;
-            List<Integer> ordered = new ArrayList<>(width * height);
+            int count = width * height;
+            chunkOrder = new int[count];
+            if (stable) {
+                // Screen rows: left-to-right, then top-to-bottom. Chunk pixels use
+                // the same row-major order, so visible source capture and exact-page
+                // admission advance in the same direction.
+                for (int index = 0; index < count; index++) {
+                    chunkOrder[index] = index;
+                }
+                return;
+            }
+
+            int centerX = focusX;
+            int centerZ = focusZ;
+            List<Integer> ordered = new ArrayList<>(count);
             for (int z = minZ; z <= maxZ; z++) {
                 for (int x = minX; x <= maxX; x++) {
                     ordered.add((z - minZ) * width + (x - minX));
@@ -913,7 +1043,6 @@ public class ChunkScanner {
                         return Math.abs(x - centerX) + Math.abs(z - centerZ);
                     })
                     .thenComparingInt(Integer::intValue));
-            chunkOrder = new int[ordered.size()];
             for (int i = 0; i < ordered.size(); i++) chunkOrder[i] = ordered.get(i);
         }
     }
@@ -1052,7 +1181,7 @@ public class ChunkScanner {
     private int findUndergroundSearchStart(Level level, int blockX, int blockZ) {
         int minimumY = level.getMinBuildHeight();
         int maximumY = level.getMaxBuildHeight() - 1;
-        int topY = level.dimensionType().hasCeiling()
+        int topY = isCaveLikeDimension(level)
                 ? maximumY
                 : Math.max(minimumY, Math.min(maximumY,
                         level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, blockX, blockZ)));
@@ -1075,9 +1204,9 @@ public class ChunkScanner {
         if (state.isAir() || !state.getFluidState().isEmpty()) return false;
         if (state.is(net.minecraft.tags.BlockTags.LEAVES)
                 || state.is(net.minecraft.tags.BlockTags.LOGS)
-                || state.is(net.minecraft.tags.BlockTags.FLOWERS)) return false;
+                || visualClassifier.info(state).flower()) return false;
         if (state.canBeReplaced()) return false;
-        return !state.getCollisionShape(level, pos).isEmpty();
+        return !caveStateClassifier.isCollisionEmpty(level, pos, state);
     }
 
     private CavePixel getCaveSurface(Level level, BlockPos.MutableBlockPos openPos,
@@ -1095,7 +1224,7 @@ public class ChunkScanner {
         BlockState colorState;
         boolean emissiveFeature = isOpenEmissiveFeature(level, openPos, openState);
         boolean visibleFlower = MapConfig.displayFlowers
-                && openState.is(net.minecraft.tags.BlockTags.FLOWERS);
+                && visualClassifier.info(openState).flower();
         boolean waterCoveredFloor = false;
         int waterDepth = 0;
         int waterTintY = openY;
@@ -1126,7 +1255,7 @@ public class ChunkScanner {
                 waterCoveredFloor = true;
             }
         } else {
-            boolean openSpace = openState.isAir() || openState.getCollisionShape(level, openPos).isEmpty();
+            boolean openSpace = openState.isAir() || caveStateClassifier.isCollisionEmpty(level, openPos, openState);
             if (!openSpace || openY <= level.getMinBuildHeight()) return null;
             colorPos.setY(openY - 1);
             colorState = level.getBlockState(colorPos);
@@ -1148,7 +1277,7 @@ public class ChunkScanner {
                 }
             } else {
                 boolean floorOpen = colorState.isAir()
-                        || (colorState.getCollisionShape(level, colorPos).isEmpty()
+                        || (caveStateClassifier.isCollisionEmpty(level, colorPos, colorState)
                                 && colorState.getFluidState().isEmpty());
                 if (floorOpen) return null;
             }
@@ -1195,7 +1324,7 @@ public class ChunkScanner {
             boolean water = state.getFluidState().is(net.minecraft.tags.FluidTags.WATER);
             boolean waterloggedSolid = water
                     && !state.is(Blocks.WATER)
-                    && !state.getCollisionShape(level, openPos).isEmpty();
+                    && !caveStateClassifier.isCollisionEmpty(level, openPos, state);
 
             if (water && !waterloggedSolid) {
                 crossedOpenSpace = true;
@@ -1244,9 +1373,9 @@ public class ChunkScanner {
         if (state.isAir()) return true;
         if (!state.getFluidState().isEmpty()) {
             return state.is(Blocks.WATER) || state.is(Blocks.LAVA)
-                    || state.getCollisionShape(level, pos).isEmpty();
+                    || caveStateClassifier.isCollisionEmpty(level, pos, state);
         }
-        return state.getCollisionShape(level, pos).isEmpty();
+        return caveStateClassifier.isCollisionEmpty(level, pos, state);
     }
 
     private WaterFloor resolveWaterFloor(Level level, BlockPos.MutableBlockPos probe,
@@ -1259,7 +1388,7 @@ public class ChunkScanner {
                     .is(net.minecraft.tags.FluidTags.WATER);
             boolean waterloggedSolid = candidateWater
                     && !candidate.is(Blocks.WATER)
-                    && !candidate.getCollisionShape(level, probe).isEmpty();
+                    && !caveStateClassifier.isCollisionEmpty(level, probe, candidate);
             if (waterloggedSolid) {
                 return new WaterFloor(candidate, y, Math.max(1, depth + 1));
             }
@@ -1270,7 +1399,7 @@ public class ChunkScanner {
             // A falling stream entering open air has no covered floor at this
             // height. The outer downward scan will resolve the lower space itself.
             if (candidate.isAir()) return null;
-            boolean passThrough = candidate.getCollisionShape(level, probe).isEmpty()
+            boolean passThrough = caveStateClassifier.isCollisionEmpty(level, probe, candidate)
                     && candidate.getFluidState().isEmpty();
             if (passThrough) continue;
             return new WaterFloor(candidate, y, Math.max(1, depth));
@@ -1333,7 +1462,7 @@ public class ChunkScanner {
             openPos.setY(openY);
             BlockState open = level.getBlockState(openPos);
             if (isOpenEmissiveFeature(level, openPos, open)
-                    || (MapConfig.displayFlowers && open.is(net.minecraft.tags.BlockTags.FLOWERS))) {
+                    || (MapConfig.displayFlowers && visualClassifier.info(open).flower())) {
                 return openY;
             }
             if (open.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
@@ -1342,7 +1471,7 @@ public class ChunkScanner {
                 continue;
             }
             if (!open.getFluidState().isEmpty()) return openY;
-            boolean openSpace = open.isAir() || open.getCollisionShape(level, openPos).isEmpty();
+            boolean openSpace = open.isAir() || caveStateClassifier.isCollisionEmpty(level, openPos, open);
             if (!openSpace || openY <= level.getMinBuildHeight()) continue;
             floorPos.setY(openY - 1);
             BlockState floor = level.getBlockState(floorPos);
@@ -1352,7 +1481,7 @@ public class ChunkScanner {
                 continue;
             }
             boolean floorOpen = floor.isAir()
-                    || (floor.getCollisionShape(level, floorPos).isEmpty()
+                    || (caveStateClassifier.isCollisionEmpty(level, floorPos, floor)
                             && floor.getFluidState().isEmpty());
             if (!floorOpen) return openY - 1;
         }
@@ -1386,14 +1515,10 @@ public class ChunkScanner {
         } else {
             rgb = resolveBlockRgb(level, pos, state, mapColor);
         }
-        boolean leaves = state.is(net.minecraft.tags.BlockTags.LEAVES);
-        boolean cherry = state.is(Blocks.CHERRY_LEAVES);
-        boolean grass = state.is(Blocks.GRASS_BLOCK);
-        boolean wood = mapColor == MapColor.WOOD
-                || state.is(net.minecraft.tags.BlockTags.PLANKS)
-                || state.is(net.minecraft.tags.BlockTags.LOGS);
+        MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
         if (MapConfig.blockColourMode == 0) {
-            rgb = makeColorRich(rgb, leaves, cherry, grass, wood);
+            rgb = makeColorRich(rgb, visual.leaves(), visual.fixedTextureColor(),
+                    visual.grass(), visual.wood() || mapColor == MapColor.WOOD);
         }
         int red = (rgb >>> 16) & 0xFF;
         int green = (rgb >>> 8) & 0xFF;
@@ -1426,10 +1551,11 @@ public class ChunkScanner {
     }
 
     private boolean isOpenEmissiveFeature(Level level, BlockPos pos, BlockState state) {
-        if (state.getLightEmission() <= 0 || !state.getFluidState().isEmpty()) return false;
+        if (state.getLightEmission() <= 0 || !state.getFluidState().isEmpty()
+                || isMapInvisibleDecoration(state)) return false;
         return state.is(Blocks.FIRE)
                 || state.is(Blocks.SOUL_FIRE)
-                || state.getCollisionShape(level, pos).isEmpty();
+                || caveStateClassifier.isCollisionEmpty(level, pos, state);
     }
 
     /** Gives flames and non-solid light sources a visible map core, not only a halo. */
@@ -1493,10 +1619,29 @@ public class ChunkScanner {
      * Now stores raw MapBlockData for re-colorizable map.
      */
     public void scanBlockColumn(Level level, BlockPos pos) {
+        scanBlockColumn(level, pos, true);
+    }
+
+    /** Surface half of an event-driven mutation. Cave work is queued separately. */
+    public void scanSurfaceColumn(Level level, int blockX, int blockZ) {
+        scanBlockColumn(level, new BlockPos(blockX, 0, blockZ), false);
+    }
+
+    /** Light-only packet path: preserve geometry and update the surface light cache. */
+    public void scanSurfaceLightColumn(Level level, int blockX, int blockZ) {
+        if (level == null || !level.isClientSide()) return;
+        MapBlockData data = MapManager.getInstance().getBlockData(blockX, blockZ);
+        int surfaceY = data != null && !data.isEmpty()
+                ? data.topY : getHighestY(level, blockX, blockZ);
+        updateSurfaceLight(level, blockX, surfaceY, blockZ);
+    }
+
+    private void scanBlockColumn(Level level, BlockPos pos, boolean invalidateCave) {
         if (!level.isClientSide()) return;
         try {
             int blockX = pos.getX();
             int blockZ = pos.getZ();
+            GeneratedChunkIndex.getInstance().markLive(level, blockX >> 4, blockZ >> 4);
             MapBlockData data = buildBlockData(level, blockX, blockZ);
             if (data != null) {
                 MapBlockData existing = MapManager.getInstance().getBlockData(blockX, blockZ);
@@ -1508,10 +1653,13 @@ public class ChunkScanner {
             int surfaceY = data != null && !data.isEmpty() ? data.topY
                     : getHighestY(level, blockX, blockZ);
             updateSurfaceLight(level, blockX, surfaceY, blockZ);
-            // A real block update invalidates every Top-Y projection in this column,
-            // but rebuilding a full vertical stack synchronously can stall the game
-            // during explosions or large edits. Prioritize it inside the scan budget.
-            queueVerticalArchiveRefresh(blockX, blockZ);
+            if (invalidateCave) {
+                // Legacy/direct callers still produce the same centralized cave
+                // mutation. Packet-driven callers use scanSurfaceColumn() and queue
+                // the cave half exactly once through MapMutationBus.
+                CavePipeline.getInstance().onColumnMutation(
+                        blockX, blockZ, MapMutationBus.BLOCK_STATE);
+            }
         } catch (Exception e) {
             LOGGER.error("Error scanning block column at " + pos, e);
         }
@@ -1521,10 +1669,10 @@ public class ChunkScanner {
     public void scanDisplayedColumn(Minecraft mc, int blockX, int blockZ) {
         if (mc == null || mc.level == null || mc.player == null) return;
         if (CaveMode.isActive(mc)) {
-            int layerY = CaveMode.getLayerY(mc);
-            boolean fullView = CaveMode.isFullView(mc);
-            if (!fullView) CaveMapManager.getInstance().setActiveLayer(layerY);
-            scanCavePixelIfLoaded(mc.level, blockX, layerY, blockZ, fullView);
+            if (!CaveMode.isFullView(mc)) {
+                CaveMapManager.getInstance().setActiveLayer(CaveMode.getLayerY(mc));
+            }
+            CavePipeline.getInstance().scanColumnNow(mc.level, blockX, blockZ);
         } else {
             scanBlockColumn(mc.level, new BlockPos(blockX, 0, blockZ));
         }
@@ -1541,7 +1689,14 @@ public class ChunkScanner {
         if (data.isFluid() && !data.isGlowing()) return SurfaceTintData.NONE;
         BlockPos pos = new BlockPos(blockX, data.topY, blockZ);
         BlockState state = level.getBlockState(pos);
-        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        state = blockEntityVisuals.resolveLive(level, pos, state);
+        /* Cherry leaves carry their pink colour in the texture itself. Persisting the
+         * generic leaves BlockColors result can turn the cached surface green or make
+         * it look identical to the grass below. Match Xaero's fixed-colour foliage
+         * handling: keep the sampled texture and explicitly disable biome tint. */
+        MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
+        if (visual.fixedTextureColor()) return SurfaceTintData.NONE;
+        String blockId = visual.blockId();
         if (BrokenBlockTintCache.getInstance().isBroken(blockId)) return SurfaceTintData.NONE;
         try {
             int tint = Minecraft.getInstance().getBlockColors().getColor(state, level, pos, 0);
@@ -1561,18 +1716,18 @@ public class ChunkScanner {
         if (!level.hasChunk(blockX >> 4, blockZ >> 4)) return null;
         int surfaceY = getHighestY(level, blockX, blockZ);
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(blockX, surfaceY, blockZ);
-        BlockState visibleState = level.getBlockState(pos);
-        MapColor mapColor = visibleState.getMapColor(level, pos);
-        boolean fluid = !visibleState.getFluidState().isEmpty();
-        if (mapColor == MapColor.NONE && !fluid) {
+        BlockState actualVisibleState = level.getBlockState(pos);
+        BlockState visibleState = blockEntityVisuals.resolveLive(level, pos, actualVisibleState);
+        boolean fluid = !actualVisibleState.getFluidState().isEmpty();
+        if (!isVisibleMapSurface(level, pos, visibleState)) {
             return new MapBlockData(MapBlockData.EMPTY_Y, MapBlockData.NO_BLOCK,
                     MapBlockData.NO_BIOME, (byte) 0, MapBlockData.EMPTY_Y);
         }
 
         int floorY = surfaceY;
         BlockState paletteState = visibleState;
-        boolean water = visibleState.getFluidState().is(net.minecraft.tags.FluidTags.WATER);
-        boolean lava = visibleState.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
+        boolean water = actualVisibleState.getFluidState().is(net.minecraft.tags.FluidTags.WATER);
+        boolean lava = actualVisibleState.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
         if (water) {
             // Store the physical floor below water, including waterlogged slabs,
             // stairs and other solid basin blocks. The previous implementation
@@ -1582,14 +1737,15 @@ public class ChunkScanner {
             for (int y = surfaceY; y >= level.getMinBuildHeight(); y--) {
                 pos.setY(y);
                 BlockState candidate = level.getBlockState(pos);
+                BlockState candidateVisual = blockEntityVisuals.resolveLive(level, pos, candidate);
                 boolean candidateWater = candidate.getFluidState()
                         .is(net.minecraft.tags.FluidTags.WATER);
                 boolean waterloggedSolid = candidateWater
                         && !candidate.is(Blocks.WATER)
-                        && !candidate.getCollisionShape(level, pos).isEmpty();
+                        && !caveStateClassifier.isCollisionEmpty(level, pos, candidate);
                 if (waterloggedSolid) {
                     floorY = y;
-                    paletteState = candidate;
+                    paletteState = candidateVisual;
                     break;
                 }
                 if (candidateWater || candidate.isAir()) continue;
@@ -1597,11 +1753,11 @@ public class ChunkScanner {
                 // Texture sampling can still color solid modded/glass blocks whose
                 // vanilla MapColor is NONE. Only pass through genuinely non-solid
                 // decoration instead of discarding the whole water column.
-                boolean passThrough = candidate.getCollisionShape(level, pos).isEmpty()
+                boolean passThrough = caveStateClassifier.isCollisionEmpty(level, pos, candidate)
                         && candidate.getFluidState().isEmpty();
                 if (passThrough) continue;
                 floorY = y;
-                paletteState = candidate;
+                paletteState = candidateVisual;
                 break;
             }
         }
@@ -1623,9 +1779,10 @@ public class ChunkScanner {
         int biomeIdx = region.getOrAddBiomeIndex(biomeId);
         int blockIdx = region.getOrAddBlockIndex(blockId);
 
-        boolean leaves = !fluid && visibleState.is(net.minecraft.tags.BlockTags.LEAVES);
-        boolean flower = !fluid && visibleState.is(net.minecraft.tags.BlockTags.FLOWERS);
-        boolean glowing = lava || (!water && visibleState.getLightEmission() > 0);
+        MapVisualClassifier.VisualInfo visual = visualClassifier.info(visibleState);
+        boolean leaves = !fluid && visual.leaves();
+        boolean flower = !fluid && visual.flower();
+        boolean glowing = lava || (!water && visual.emissive());
         int blockLight = level.getBrightness(LightLayer.BLOCK,
                 new BlockPos(blockX, surfaceY + 1, blockZ));
 
@@ -1650,8 +1807,13 @@ public class ChunkScanner {
      * every cave pixel. {@code WORLD_SURFACE} is client-available; walking down only
      * through air and water reconstructs the land/seabed cutoff once per X/Z column.</p>
      */
+    private static boolean isCaveLikeDimension(Level level) {
+        return level.dimensionType().hasCeiling()
+                || !level.dimensionType().hasSkyLight();
+    }
+
     private int getReliableCaveSurfaceCutoff(Level level, int blockX, int blockZ) {
-        if (level.dimensionType().hasCeiling()) return Integer.MAX_VALUE;
+        if (isCaveLikeDimension(level)) return Integer.MAX_VALUE;
 
         int minimumY = level.getMinBuildHeight();
         int maximumY = level.getMaxBuildHeight() - 1;
@@ -1664,7 +1826,7 @@ public class ChunkScanner {
             BlockState state = level.getBlockState(probe);
             if (state.isAir()) continue;
             if (state.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) continue;
-            boolean passThrough = state.getCollisionShape(level, probe).isEmpty()
+            boolean passThrough = caveStateClassifier.isCollisionEmpty(level, probe, state)
                     && state.getFluidState().isEmpty();
             if (passThrough) continue;
             return Math.min(level.getMaxBuildHeight(), y + 1);
@@ -1675,12 +1837,12 @@ public class ChunkScanner {
     }
 
     private int getHighestY(Level level, int blockX, int blockZ) {
-        boolean isNether = level.dimensionType().hasCeiling();
+        boolean isCaveLike = isCaveLikeDimension(level);
         int minBuildHeight = level.getMinBuildHeight();
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(blockX, 0, blockZ);
 
-        if (isNether) {
-            int startY = 120;
+        if (isCaveLike) {
+            int startY = level.getMaxBuildHeight() - 1;
             boolean foundAir = false;
             for (int y = startY; y >= minBuildHeight; y--) {
                 pos.setY(y);
@@ -1690,9 +1852,7 @@ public class ChunkScanner {
                         foundAir = true;
                     }
                 } else {
-                    MapColor mapColor = state.getMapColor(level, pos);
-                    if (!state.isAir() && mapColor != MapColor.NONE
-                            && !isHiddenFlower(state)) {
+                    if (isVisibleMapSurface(level, pos, state)) {
                         return y;
                     }
                 }
@@ -1703,10 +1863,7 @@ public class ChunkScanner {
             for (int y = highestY; y >= minBuildHeight; y--) {
                 pos.setY(y);
                 BlockState state = level.getBlockState(pos);
-                if (state.getLightEmission() > 0) return y;
-                MapColor mapColor = state.getMapColor(level, pos);
-                if (!state.isAir() && mapColor != MapColor.NONE
-                        && !isHiddenFlower(state)) {
+                if (isVisibleMapSurface(level, pos, state)) {
                     return y;
                 }
             }
@@ -1717,6 +1874,20 @@ public class ChunkScanner {
     private int getColumnColor(Level level, int blockX, int blockZ, int currentY) {
         BlockPos pos = new BlockPos(blockX, currentY, blockZ);
         BlockState targetState = level.getBlockState(pos);
+
+        // Repair stale cached columns produced before torches became map-invisible.
+        // Resolve the actual surface below instead of returning a black pixel.
+        if (isMapInvisibleDecoration(targetState)) {
+            BlockPos.MutableBlockPos probe = new BlockPos.MutableBlockPos(blockX, currentY, blockZ);
+            for (int y = currentY - 1; y >= level.getMinBuildHeight(); y--) {
+                probe.setY(y);
+                BlockState candidate = level.getBlockState(probe);
+                if (isVisibleMapSurface(level, probe, candidate)) {
+                    return getColumnColor(level, blockX, blockZ, y);
+                }
+            }
+            return 0;
+        }
 
         String blockId = BuiltInRegistries.BLOCK.getKey(targetState.getBlock()).toString();
         Integer overrideColor = MapConfig.blockColorOverrides.get(blockId);
@@ -1778,8 +1949,8 @@ public class ChunkScanner {
         boolean isGrass = targetState.is(Blocks.GRASS_BLOCK);
         MapColor mapColor = targetState.getMapColor(level, pos);
         boolean isWood = (mapColor == MapColor.WOOD) || targetState.is(net.minecraft.tags.BlockTags.PLANKS) || targetState.is(net.minecraft.tags.BlockTags.LOGS);
-        if (mapColor == MapColor.NONE) return 0;
         int rgb = resolveBlockRgb(level, pos, targetState, mapColor);
+        if (rgb == 0) return 0;
         if (MapConfig.blockColourMode == 0) {
             rgb = makeColorRich(rgb, isLeaves, isCherry, isGrass, isWood);
         }
@@ -1822,12 +1993,25 @@ public class ChunkScanner {
      * palette used by vanilla maps.
      */
     private int resolveBlockRgb(Level level, BlockPos pos, BlockState state, MapColor fallback) {
-        if (MapConfig.blockColourMode == 1) return fallback.col;
         String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
         MapTextureManager textureManager = MapTextureManager.getInstance();
+
+        if (MapConfig.blockColourMode == 1 && fallback != MapColor.NONE) {
+            return fallback.col;
+        }
+
         int sampled = textureManager.resolveBlockColor(blockId, 0);
-        if (sampled == 0) sampled = 0xFF000000 | fallback.col;
-        BlockTintPolicy policy = textureManager.resolveTintPolicy(blockId);
+        if (sampled == 0 || sampled == 0xFFFFFFFF) {
+            if (state.is(Blocks.CHERRY_LEAVES)) return 0xE0A1B8;
+            if (fallback == MapColor.NONE) return 0;
+            sampled = 0xFF000000 | fallback.col;
+        }
+
+        /* Cherry leaves use their own pink texture and must not receive the generic
+         * foliage biome tint. Other leaves still use the registered tint provider. */
+        if (visualClassifier.info(state).fixedTextureColor()) return sampled & 0x00FFFFFF;
+
+        BlockTintPolicy policy = visualClassifier.tintPolicy(state);
         if (policy == BlockTintPolicy.NONE) return sampled & 0x00FFFFFF;
 
         int tint = Minecraft.getInstance().getBlockColors().getColor(state, level, pos, 0);
@@ -1872,15 +2056,14 @@ public class ChunkScanner {
      */
     private int getTerrainHeightForSlope(Level level, int x, int z, int referenceY) {
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, 0, z);
-        if (!level.dimensionType().hasCeiling()) {
+        if (!isCaveLikeDimension(level)) {
             int top = Math.min(level.getMaxBuildHeight() - 1,
                     level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z));
             int bottom = Math.max(level.getMinBuildHeight(), top - 8);
             for (int y = top; y >= bottom; y--) {
                 pos.setY(y);
                 BlockState state = level.getBlockState(pos);
-                if (!state.isAir() && state.getMapColor(level, pos) != MapColor.NONE
-                        && !isHiddenFlower(state)) return y;
+                if (isVisibleMapSurface(level, pos, state)) return y;
             }
             return referenceY;
         }
@@ -1890,14 +2073,22 @@ public class ChunkScanner {
         for (int y = top; y >= bottom; y--) {
             pos.setY(y);
             BlockState state = level.getBlockState(pos);
-            if (!state.isAir() && state.getMapColor(level, pos) != MapColor.NONE
-                    && !isHiddenFlower(state)) return y;
+            if (isVisibleMapSurface(level, pos, state)) return y;
         }
         return referenceY;
     }
 
-    private boolean isHiddenFlower(BlockState state) {
-        return !MapConfig.displayFlowers && state.is(net.minecraft.tags.BlockTags.FLOWERS);
+    /**
+     * Xaero-style surface visibility. Thin light sources are skipped so the block
+     * below remains visible. Leaves are explicitly accepted even when a particular
+     * state reports MapColor.NONE; Accurate mode can still sample their texture.
+     */
+    private boolean isVisibleMapSurface(Level level, BlockPos pos, BlockState state) {
+        return visualClassifier.isVisibleSurface(level, pos, state, MapConfig.displayFlowers);
+    }
+
+    private boolean isMapInvisibleDecoration(BlockState state) {
+        return visualClassifier.isInvisibleDecoration(state);
     }
 
     private int argbToAbgr(int argb) {
@@ -1917,19 +2108,10 @@ public class ChunkScanner {
             return;
 
         if (CaveMode.isActive(mc)) {
-            int layerY = CaveMode.getLayerY(mc);
-            boolean fullView = CaveMode.isFullView(mc);
-            if (!fullView) CaveMapManager.getInstance().setActiveLayer(layerY);
-            int centerX = (int) Math.floor(mc.player.getX());
-            int centerZ = (int) Math.floor(mc.player.getZ());
-            int radiusSq = radius * radius;
-            for (int dz = -radius; dz <= radius; dz++) {
-                for (int dx = -radius; dx <= radius; dx++) {
-                    if (dx * dx + dz * dz <= radiusSq) {
-                        scanCavePixelIfLoaded(mc.level, centerX + dx, layerY, centerZ + dz, fullView);
-                    }
-                }
+            if (!CaveMode.isFullView(mc)) {
+                CaveMapManager.getInstance().setActiveLayer(CaveMode.getLayerY(mc));
             }
+            CavePipeline.getInstance().requestRefresh(mc, radius);
             return;
         }
 

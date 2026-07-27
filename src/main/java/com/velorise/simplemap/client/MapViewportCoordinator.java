@@ -1,5 +1,8 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.cave.CaveWorldSaveReader;
+import com.velorise.simplemap.client.cave.CaveScreenSpacePolicy;
+import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
 import net.minecraft.client.Minecraft;
 
 import java.util.ArrayList;
@@ -19,8 +22,18 @@ public final class MapViewportCoordinator {
     private long lastFullscreenRun;
     private long lastMinimapRun;
     private long lastLayerUploadRun;
+    private long lastAdjacentWarmupRun;
+    /**
+     * Surface publication must not depend on opening MapScreen or on the current
+     * minimap zoom. The scanner writes CPU metadata continuously; this bounded
+     * hot-set publisher converts those mutations into exact 64x64 leaves and LOD
+     * parents while normal gameplay continues.
+     */
+    private long lastBackgroundSurfaceRun;
+    private static final long BACKGROUND_SURFACE_INTERVAL_NANOS = 50_000_000L;
+    private static final int BACKGROUND_SURFACE_MIN_RADIUS = 96;
+    private static final int BACKGROUND_SURFACE_MAX_RADIUS = 256;
     private LayerStreamState layerStream = new LayerStreamState();
-    private LayerStreamState surfaceStream = new LayerStreamState();
 
     private MapViewportCoordinator() {
     }
@@ -31,17 +44,50 @@ public final class MapViewportCoordinator {
 
     public void submitFullscreen(double minX, double maxX, double minZ, double maxZ,
             float scale, boolean interacting) {
+        submitFullscreen(minX, maxX, minZ, maxZ, scale,
+                (minX + maxX) * 0.5, (minZ + maxZ) * 0.5, interacting);
+    }
+
+    /**
+     * Fullscreen traversal is stable for both Surface and Cave. The mouse is only
+     * an attention hint inside the current update slice and never resets the scan.
+     */
+    public void submitFullscreen(double minX, double maxX, double minZ, double maxZ,
+            float scale, double focusX, double focusZ, boolean interacting) {
+        double clampedFocusX = clamp(focusX, minX, maxX);
+        double clampedFocusZ = clamp(focusZ, minZ, maxZ);
+        Request previousFullscreen = fullscreenRequest;
+        boolean openingFullscreen = previousFullscreen == null;
+        long planningKey = planningKey(minX, maxX, minZ, maxZ, scale);
+        if (previousFullscreen == null || previousFullscreen.planningKey != planningKey) {
+            MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
+        }
         fullscreenRequest = new Request(minX, maxX, minZ, maxZ, scale,
-                interacting, System.nanoTime());
+                clampedFocusX, clampedFocusZ, interacting,
+                MapRequestLane.FULLSCREEN, System.nanoTime(), planningKey);
+        MapPipelineTelemetry.getInstance().recordViewportRequest(MapRequestLane.FULLSCREEN);
         MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
         governor.setFullscreenState(true, interacting);
-        governor.setFocus((minX + maxX) * 0.5, (minZ + maxZ) * 0.5);
+        governor.setFocus(clampedFocusX, clampedFocusZ);
+        if (openingFullscreen) {
+            UnifiedCaveTextureManager.getInstance().suspendLane(MapRequestLane.MINIMAP);
+            CaveWorldSaveReader.getInstance().suspendLane(MapRequestLane.MINIMAP);
+        }
     }
 
     public void submitMinimap(double minX, double maxX, double minZ, double maxZ,
             float scale) {
+        double focusX = (minX + maxX) * 0.5;
+        double focusZ = (minZ + maxZ) * 0.5;
+        Request previousMinimap = minimapRequest;
+        long planningKey = planningKey(minX, maxX, minZ, maxZ, scale);
+        if (previousMinimap == null || previousMinimap.planningKey != planningKey) {
+            MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
+        }
         minimapRequest = new Request(minX, maxX, minZ, maxZ, scale,
-                false, System.nanoTime());
+                focusX, focusZ, false, MapRequestLane.MINIMAP,
+                System.nanoTime(), planningKey);
+        MapPipelineTelemetry.getInstance().recordViewportRequest(MapRequestLane.MINIMAP);
         if (!MapPerformanceGovernor.getInstance().isFullscreenOpen()) {
             MapPerformanceGovernor.getInstance().setFocus(
                     (minX + maxX) * 0.5, (minZ + maxZ) * 0.5);
@@ -50,14 +96,16 @@ public final class MapViewportCoordinator {
 
     public void closeFullscreen() {
         fullscreenRequest = null;
+        MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
         layerStream = new LayerStreamState();
-        surfaceStream = new LayerStreamState();
         MapPerformanceGovernor.getInstance().setFullscreenState(false, false);
     }
 
     /** Drops only selected-Y traversal state while retaining warm GPU textures. */
     public void onLayerChanged() {
         layerStream = new LayerStreamState();
+        MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
+        MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
         lastLayerUploadRun = 0L;
     }
 
@@ -67,73 +115,193 @@ public final class MapViewportCoordinator {
         lastFullscreenRun = 0L;
         lastMinimapRun = 0L;
         lastLayerUploadRun = 0L;
+        lastAdjacentWarmupRun = 0L;
+        lastBackgroundSurfaceRun = 0L;
         layerStream = new LayerStreamState();
-        surfaceStream = new LayerStreamState();
+        MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
+        MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
         MapPerformanceGovernor.getInstance().setFullscreenState(false, false);
     }
 
     public void tick(Minecraft minecraft) {
+        tick(minecraft, MapPerformanceGovernor.getInstance().observationProfile(minecraft));
+    }
+
+    public void tick(Minecraft minecraft,
+            MapPerformanceGovernor.ObservationProfile profile) {
         if (minecraft == null || minecraft.level == null || minecraft.player == null) return;
+        if (profile == null) profile = MapPerformanceGovernor.getInstance()
+                .observationProfile(minecraft);
+        MapPublicationCoordinator publication = MapPublicationCoordinator.getInstance();
+        publication.beginTick();
         long now = System.nanoTime();
         Request fullscreen = fullscreenRequest;
-        if (fullscreen != null && now - fullscreen.submittedNanos < 500_000_000L
-                && !fullscreen.interacting && now - lastFullscreenRun >= 20_000_000L) {
+        boolean fullscreenVisible = fullscreen != null
+                && now - fullscreen.submittedNanos < 500_000_000L;
+        // The minimap is not visible while MapScreen owns the screen. Xaero keeps
+        // its writer alive near the player but does not spend fullscreen leaf/cache
+        // admission on a hidden minimap render lane. CPU live observation continues
+        // elsewhere; exact cave IO and GPU publication belong to the visible map.
+        Request minimap = minimapRequest;
+        if (!fullscreenVisible && minimap != null
+                && now - minimap.submittedNanos < 500_000_000L
+                && now - lastMinimapRun >= profile.minimapIntervalNanos()) {
+            lastMinimapRun = now;
+            // Minimap always represents the player's live level.
+            if (MapManager.getInstance().isViewingLiveDimension()) {
+                if (profile.allowVisibleScan()) {
+                    ChunkScanner.getInstance().scanVisibleArea(minecraft,
+                            minimap.minX, minimap.maxX,
+                            minimap.minZ, minimap.maxZ, minimap.scale,
+                            minimap.focusX, minimap.focusZ, minimap.lane);
+                }
+                if (profile.allowSavedVisible()) {
+                    long savedStarted = System.nanoTime();
+                    requestTextures(minecraft, minimap);
+                    MapObservationTelemetry.getInstance().record(
+                            MapObservationTelemetry.Lane.SAVED_VISIBLE,
+                            System.nanoTime() - savedStarted, 1);
+                }
+                boolean cave = CaveMode.isActive(minecraft);
+                boolean full = cave && CaveMode.isFullView(minecraft);
+                if (full) {
+                    publication.requestFullCave(false);
+                } else if (cave) {
+                    publication.requestLayeredCave();
+                } else {
+                    // requestTextures() already admitted the minimap exact hot set.
+                    // Only publish intent here; a second request pass used to repeat
+                    // the same center-out traversal every minimap tick.
+                    publication.requestSurface(MapRequestLane.MINIMAP, false);
+                }
+            }
+        }
+
+
+        if (fullscreenVisible
+                && now - lastFullscreenRun >= profile.fullscreenIntervalNanos()) {
             lastFullscreenRun = now;
 
             // A static dimension has no live ClientLevel to scan. Only saved cache
             // files are streamed; this prevents Overworld blocks being written into
             // a Nether/End/modded-dimension map while browsing it remotely.
-            if (MapManager.getInstance().isViewingLiveDimension()) {
+            if (profile.allowVisibleScan()
+                    && MapManager.getInstance().isViewingLiveDimension()) {
+                // Full Map load order is viewport-owned, never cursor-owned.
+                // The mouse remains available to UI inspection only.
+                double schedulingFocusX = (fullscreen.minX + fullscreen.maxX) * 0.5;
+                double schedulingFocusZ = (fullscreen.minZ + fullscreen.maxZ) * 0.5;
                 ChunkScanner.getInstance().scanVisibleArea(minecraft,
                         fullscreen.minX, fullscreen.maxX,
-                        fullscreen.minZ, fullscreen.maxZ, fullscreen.scale);
+                        fullscreen.minZ, fullscreen.maxZ, fullscreen.scale,
+                        schedulingFocusX, schedulingFocusZ, fullscreen.lane);
             }
 
-            requestTextures(minecraft, fullscreen);
+            if (profile.allowSavedVisible()) {
+                long savedStarted = System.nanoTime();
+                requestTextures(minecraft, fullscreen);
+                MapObservationTelemetry.getInstance().record(
+                        MapObservationTelemetry.Lane.SAVED_VISIBLE,
+                        System.nanoTime() - savedStarted, 1);
+            }
             boolean cave = CaveMode.isActive(minecraft);
             boolean full = cave && CaveMode.isFullView(minecraft);
             boolean focus = MapConfig.fastFullscreenLoading && fullscreen.scale >= 0.55f;
             if (full) {
-                FullCaveTextureManager.getInstance().uploadDirtyTextures(focus);
-                MapOverviewTextureManager.getInstance().uploadDirtyTextures(focus);
+                publication.requestFullCave(focus);
             } else if (cave) {
-                // Exact 512x512 layer images stay sharp, but publication is paced by
-                // zoom. Never use the forced upload path here: it can publish several
-                // full-size images in one frame and recreate the far-zoom freeze.
+                // Layer publication remains zoom-paced, but it is drained only once.
                 long uploadInterval = layerUploadIntervalNanos(fullscreen.scale);
                 if (now - lastLayerUploadRun >= uploadInterval) {
                     lastLayerUploadRun = now;
-                    CaveTextureManager.getInstance().uploadDirtyTextures(false);
+                    publication.requestLayeredCave();
                 }
             } else {
-                MapTextureManager.getInstance().uploadDirtyTextures(focus);
-                MapOverviewTextureManager.getInstance().uploadDirtyTextures(focus);
+                publication.requestSurface(MapRequestLane.FULLSCREEN, focus);
             }
         }
 
-        Request minimap = minimapRequest;
-        if (minimap != null && now - minimap.submittedNanos < 500_000_000L
-                && now - lastMinimapRun >= 100_000_000L) {
-            lastMinimapRun = now;
-            // Minimap always represents the player's live level.
-            if (MapManager.getInstance().isViewingLiveDimension()) {
-                ChunkScanner.getInstance().scanVisibleArea(minecraft,
-                        minimap.minX, minimap.maxX,
-                        minimap.minZ, minimap.maxZ, minimap.scale);
-                requestTextures(minecraft, minimap);
-                boolean cave = CaveMode.isActive(minecraft);
-                boolean full = cave && CaveMode.isFullView(minecraft);
-                if (full) {
-                    FullCaveTextureManager.getInstance().uploadDirtyTextures(false);
-                    MapOverviewTextureManager.getInstance().uploadDirtyTextures(false);
-                } else if (cave) {
-                    CaveTextureManager.getInstance().uploadDirtyTextures(false);
-                } else {
-                    MapTextureManager.getInstance().uploadDirtyTextures(false);
-                    MapOverviewTextureManager.getInstance().uploadDirtyTextures(false);
-                }
-            }
+        if (profile.allowArchiveBackground()) {
+            tickLiveSurfaceBackground(minecraft, now, fullscreen);
         }
+        tickAdjacentLayerWarmup(minecraft, now, fullscreen, minimap, profile);
+        publication.setPublicationAllowed(profile.allowPublication());
+    }
+
+    /**
+     * Keeps the player-centred surface hot set current even when the minimap is
+     * hidden or its scale selects only a high LOD. This is deliberately small: it
+     * publishes only already-scanned dirty regions and never expands the gameplay
+     * chunk load radius.
+     */
+    private void tickLiveSurfaceBackground(Minecraft minecraft, long now, Request fullscreen) {
+        if (!MapManager.getInstance().isViewingLiveDimension()) return;
+        if (CaveMode.isActive(minecraft)) return;
+        if (fullscreen != null && now - fullscreen.submittedNanos < 500_000_000L) return;
+        if (now - lastBackgroundSurfaceRun < BACKGROUND_SURFACE_INTERVAL_NANOS) return;
+        lastBackgroundSurfaceRun = now;
+
+        int renderDistance = minecraft.options.renderDistance().get();
+        int radius = Math.max(BACKGROUND_SURFACE_MIN_RADIUS,
+                Math.min(BACKGROUND_SURFACE_MAX_RADIUS, (renderDistance + 1) * 16));
+        double centerX = minecraft.player.getX();
+        double centerZ = minecraft.player.getZ();
+        double minX = centerX - radius;
+        double maxX = centerX + radius;
+        double minZ = centerZ - radius;
+        double maxZ = centerZ + radius;
+
+        MapTextureManager surface = MapTextureManager.getInstance();
+        surface.requestVisiblePages(minX, maxX, minZ, maxZ,
+                MapRequestLane.BACKGROUND);
+        MapPublicationCoordinator.getInstance().requestSurface(MapRequestLane.BACKGROUND, false);
+
+        // Do not decode cave Anvil sources while Surface is the active projection.
+        // The old warmup could fan one newly explored surface viewport into many
+        // 16-chunk cave source decodes and was a major CPU-spike source.
+    }
+
+    /**
+     * Warm only already-cached adjacent cave bands. This lane never changes the
+     * active layer and never starts Anvil reads; it prepares retained pages that can
+     * become an immediate fallback after a vertical band transition.
+     */
+    private void tickAdjacentLayerWarmup(Minecraft minecraft, long now,
+            Request fullscreen, Request minimap,
+            MapPerformanceGovernor.ObservationProfile profile) {
+        if (!profile.allowLayerWarmup() || !CaveMode.isActive(minecraft)
+                || CaveMode.isFullView(minecraft)
+                || (fullscreen != null
+                        && now - fullscreen.submittedNanos < 500_000_000L)
+                || !MapManager.getInstance().isViewingLiveDimension()) return;
+        if (now - lastAdjacentWarmupRun < 500_000_000L) return;
+        lastAdjacentWarmupRun = now;
+
+        Request source = fullscreen != null && now - fullscreen.submittedNanos < 500_000_000L
+                ? fullscreen : minimap;
+        double centerX = source == null ? minecraft.player.getX()
+                : (source.minX + source.maxX) * 0.5;
+        double centerZ = source == null ? minecraft.player.getZ()
+                : (source.minZ + source.maxZ) * 0.5;
+        double radius = source == null ? 128.0
+                : Math.min(256.0, Math.max(96.0,
+                        Math.max(source.maxX - source.minX,
+                                source.maxZ - source.minZ) * 0.25));
+        int activeTopY = CaveMode.getLayerY(minecraft);
+        int bandY = com.velorise.simplemap.client.cave.DenseCaveTile.normalizeLayer(
+                com.velorise.simplemap.client.cave.CaveView.LAYERED, activeTopY);
+        com.velorise.simplemap.client.cave.CavePipeline pipeline =
+                com.velorise.simplemap.client.cave.CavePipeline.getInstance();
+        long warmupStarted = System.nanoTime();
+        pipeline.warmLayerBand(bandY - 8,
+                centerX - radius, centerX + radius,
+                centerZ - radius, centerZ + radius, 0.25f);
+        pipeline.warmLayerBand(bandY + 24,
+                centerX - radius, centerX + radius,
+                centerZ - radius, centerZ + radius, 0.25f);
+        MapObservationTelemetry.getInstance().record(
+                MapObservationTelemetry.Lane.LAYER_WARMUP,
+                System.nanoTime() - warmupStarted, 2);
     }
 
     private void requestTextures(Minecraft minecraft, Request request) {
@@ -141,35 +309,52 @@ public final class MapViewportCoordinator {
         boolean full = cave && CaveMode.isFullView(minecraft);
         int layerY = cave ? CaveMode.getLayerY(minecraft) : Integer.MIN_VALUE;
 
-        if (cave && !full) {
-            CaveMapManager.getInstance().setActiveLayer(layerY);
-            requestLayerRegions(request, layerY);
+        if (cave) {
+            // Cave page projection is much heavier than Xaero's cached leaf load.
+            // Far zoom remains branch-rendered, but the screen-space policy admits
+            // one slow coherent leaf seed so a cold viewport can build LOD instead
+            // of staying black forever.
+            // Minimap is camera/player-centred. Fullscreen uses a stable
+            // viewport-owned traversal; cursor movement never changes admission.
+            double schedulingFocusX = (request.minX + request.maxX) * 0.5;
+            double schedulingFocusZ = (request.minZ + request.maxZ) * 0.5;
+            if (full) {
+                FullCaveTextureManager.getInstance().requestVisiblePages(
+                        request.minX, request.maxX, request.minZ, request.maxZ,
+                        request.scale, schedulingFocusX, schedulingFocusZ, request.lane);
+            } else {
+                CaveMapManager.getInstance().setActiveLayer(layerY);
+                CaveTextureManager.getInstance().requestVisiblePages(layerY,
+                        request.minX, request.maxX, request.minZ, request.maxZ,
+                        request.scale, schedulingFocusX, schedulingFocusZ, request.lane);
+            }
             return;
         }
 
-        if (!full && !MapManager.getInstance().isViewingLiveDimension()) {
-            // Static dimensions deliberately hide the old grey surface overview.
-            // Stream exact saved regions center-out so a stationary far-zoom view
-            // still resolves without requiring the user to zoom in and out.
-            requestSurfaceRegions(request);
-            return;
-        }
-
-        int mode = full ? MapOverviewTextureManager.MODE_FULL
-                : MapOverviewTextureManager.MODE_SURFACE;
-        int overviewStride = request.scale < 0.18f ? 8 : 4;
-        MapOverviewTextureManager.getInstance().requestVisible(mode, 0,
-                request.minX, request.maxX, request.minZ, request.maxZ,
-                overviewStride);
-        if (request.scale < 0.42f) return;
-
-        if (full) {
-            FullCaveTextureManager.getInstance().requestVisiblePages(
-                    request.minX, request.maxX, request.minZ, request.maxZ);
-        } else {
+        if (!MapManager.getInstance().isViewingLiveDimension()) {
+            // Exact-page demand is the sole read authority. When the selected page
+            // reaches publication, MapTextureManager requests its containing saved
+            // region; a separate region streamer would create a second, conflicting
+            // load order and reproduce the scattered behaviour V17 removes.
             MapTextureManager.getInstance().requestVisiblePages(
-                    request.minX, request.maxX, request.minZ, request.maxZ);
+                    request.minX, request.maxX, request.minZ, request.maxZ,
+                    (request.minX + request.maxX) * 0.5,
+                    (request.minZ + request.maxZ) * 0.5,
+                    request.lane);
+            return;
         }
+
+        // Exact leaves are the sole surface authority. At far zoom the manager
+        // admits only a bounded attention hot set; recursive branches cover the
+        // remainder without constructing legacy 512x512 overview textures.
+        MapTextureManager.getInstance().requestVisiblePages(
+                request.minX, request.maxX, request.minZ, request.maxZ,
+                (request.minX + request.maxX) * 0.5,
+                (request.minZ + request.maxZ) * 0.5,
+                request.lane);
+        // Surface demand never starts cave-world reconstruction. Cave source data is
+        // captured by the bounded archive writer and requested only when a cave
+        // projection is actually visible.
     }
 
     /**
@@ -183,10 +368,15 @@ public final class MapViewportCoordinator {
         int minRz = (int) Math.floor(request.minZ - 1.0) >> 9;
         int maxRz = (int) Math.floor(request.maxZ + 1.0) >> 9;
         String dimension = MapManager.getInstance().getDimensionCacheKey();
+        int focusRx = Math.max(minRx, Math.min(maxRx,
+                (int) Math.floor(request.focusX) >> 9));
+        int focusRz = Math.max(minRz, Math.min(maxRz,
+                (int) Math.floor(request.focusZ) >> 9));
 
-        if (!layerStream.matches(dimension, layerY, minRx, maxRx, minRz, maxRz)) {
+        if (!layerStream.matches(dimension, layerY, minRx, maxRx, minRz, maxRz,
+                focusRx, focusRz)) {
             layerStream = LayerStreamState.create(dimension, layerY,
-                    minRx, maxRx, minRz, maxRz);
+                    minRx, maxRx, minRz, maxRz, focusRx, focusRz);
         } else if (layerStream.cursor >= layerStream.regions.size()
                 && System.nanoTime() - layerStream.completedAtNanos >= 4_000_000_000L) {
             // A slow maintenance pass catches previously saturated IO or newly
@@ -226,44 +416,6 @@ public final class MapViewportCoordinator {
         }
     }
 
-    private void requestSurfaceRegions(Request request) {
-        int minRx = (int) Math.floor(request.minX - 1.0) >> 9;
-        int maxRx = (int) Math.floor(request.maxX + 1.0) >> 9;
-        int minRz = (int) Math.floor(request.minZ - 1.0) >> 9;
-        int maxRz = (int) Math.floor(request.maxZ + 1.0) >> 9;
-        String dimension = MapManager.getInstance().getDimensionCacheKey();
-        int sentinel = Integer.MIN_VALUE;
-
-        if (!surfaceStream.matches(dimension, sentinel, minRx, maxRx, minRz, maxRz)) {
-            surfaceStream = LayerStreamState.create(dimension, sentinel,
-                    minRx, maxRx, minRz, maxRz);
-        } else if (surfaceStream.cursor >= surfaceStream.regions.size()
-                && System.nanoTime() - surfaceStream.completedAtNanos >= 750_000_000L) {
-            surfaceStream.cursor = 0;
-        }
-
-        int budget = surfaceRegionBudget(request.scale);
-        MapManager manager = MapManager.getInstance();
-        MapTextureManager textures = MapTextureManager.getInstance();
-        int processed = 0;
-        while (processed < budget && surfaceStream.cursor < surfaceStream.regions.size()) {
-            int[] region = surfaceStream.regions.get(surfaceStream.cursor++);
-            int rx = region[0];
-            int rz = region[1];
-            processed++;
-            textures.requestVisibleRegion(rx, rz);
-            if (manager.hasRegionFile(rx, rz) || manager.isRegionLoadedInCache(rx, rz)) {
-                int dx = rx - surfaceStream.centerRx;
-                int dz = rz - surfaceStream.centerRz;
-                int priority = 250_000 - (dx * dx + dz * dz) * 100;
-                MapProcessor.getInstance().enqueueSurfaceLoad(rx, rz, Math.max(1, priority));
-            }
-        }
-        if (surfaceStream.cursor >= surfaceStream.regions.size()) {
-            surfaceStream.completedAtNanos = System.nanoTime();
-        }
-    }
-
     private static int layerRegionBudget(float scale) {
         // Each exact layer region may project 262,144 columns/pixels and upload a
         // 512x512 texture. Keep far zoom intentionally conservative.
@@ -274,15 +426,6 @@ public final class MapViewportCoordinator {
         return 8;
     }
 
-    private static int surfaceRegionBudget(float scale) {
-        // Surface disk loads are cheaper and can run faster than cave projection.
-        if (scale < 0.12f) return 2;
-        if (scale < 0.20f) return 4;
-        if (scale < 0.35f) return 8;
-        if (scale < 0.55f) return 16;
-        return 32;
-    }
-
     private static long layerUploadIntervalNanos(float scale) {
         if (scale < 0.12f) return 140_000_000L;
         if (scale < 0.20f) return 100_000_000L;
@@ -291,7 +434,30 @@ public final class MapViewportCoordinator {
     }
 
     private record Request(double minX, double maxX, double minZ, double maxZ,
-            float scale, boolean interacting, long submittedNanos) {
+            float scale, double focusX, double focusZ,
+            boolean interacting, MapRequestLane lane, long submittedNanos,
+            long planningKey) {
+    }
+
+    private static long planningKey(double minX, double maxX,
+            double minZ, double maxZ, float scale) {
+        int minPageX = MapPageLayout.globalPageFromBlock((int) Math.floor(minX));
+        int maxPageX = MapPageLayout.globalPageFromBlock((int) Math.floor(maxX));
+        int minPageZ = MapPageLayout.globalPageFromBlock((int) Math.floor(minZ));
+        int maxPageZ = MapPageLayout.globalPageFromBlock((int) Math.floor(maxZ));
+        int scaleBucket = Math.max(0, Math.min(15,
+                (int) Math.floor(Math.log(Math.max(0.0001f, scale)) / Math.log(2.0) + 8.0)));
+        long key = 0x9E3779B97F4A7C15L;
+        key = Long.rotateLeft(key ^ minPageX, 13) * 0xC2B2AE3D27D4EB4FL;
+        key = Long.rotateLeft(key ^ maxPageX, 17) * 0x165667B19E3779F9L;
+        key = Long.rotateLeft(key ^ minPageZ, 21) * 0x85EBCA77C2B2AE63L;
+        key = Long.rotateLeft(key ^ maxPageZ, 29) * 0x27D4EB2F165667C5L;
+        return key ^ scaleBucket;
+    }
+
+    private static double clamp(double value, double minimum, double maximum) {
+        return Math.max(Math.min(minimum, maximum),
+                Math.min(Math.max(minimum, maximum), value));
     }
 
     private static final class LayerStreamState {
@@ -308,7 +474,8 @@ public final class MapViewportCoordinator {
         private long completedAtNanos;
 
         private static LayerStreamState create(String dimension, int layerY,
-                int minRx, int maxRx, int minRz, int maxRz) {
+                int minRx, int maxRx, int minRz, int maxRz,
+                int focusRx, int focusRz) {
             LayerStreamState state = new LayerStreamState();
             state.dimension = dimension;
             state.layerY = layerY;
@@ -316,31 +483,36 @@ public final class MapViewportCoordinator {
             state.maxRx = maxRx;
             state.minRz = minRz;
             state.maxRz = maxRz;
-            state.centerRx = (minRx + maxRx) >> 1;
-            state.centerRz = (minRz + maxRz) >> 1;
+            state.centerRx = Math.max(minRx, Math.min(maxRx, focusRx));
+            state.centerRz = Math.max(minRz, Math.min(maxRz, focusRz));
             List<int[]> regions = new ArrayList<>();
-            for (int rz = minRz; rz <= maxRz; rz++) {
-                for (int rx = minRx; rx <= maxRx; rx++) {
+            for (int rx = minRx; rx <= maxRx; rx++) {
+                for (int rz = minRz; rz <= maxRz; rz++) {
                     regions.add(new int[] { rx, rz });
                 }
             }
             regions.sort(Comparator
-                    .comparingInt((int[] pair) -> Math.max(
-                            Math.abs(pair[0] - state.centerRx),
-                            Math.abs(pair[1] - state.centerRz)))
-                    .thenComparingInt(pair -> Math.abs(pair[0] - state.centerRx)
-                            + Math.abs(pair[1] - state.centerRz))
-                    .thenComparingInt(pair -> pair[1])
-                    .thenComparingInt(pair -> pair[0]));
+                    .comparingInt((int[] region) -> {
+                        int dx = region[0] - state.centerRx;
+                        int dz = region[1] - state.centerRz;
+                        return dx * dx + dz * dz;
+                    })
+                    .thenComparingInt(region -> Math.max(
+                            Math.abs(region[0] - state.centerRx),
+                            Math.abs(region[1] - state.centerRz)))
+                    .thenComparingInt(region -> region[1])
+                    .thenComparingInt(region -> region[0]));
             state.regions = regions;
             return state;
         }
 
         private boolean matches(String dimension, int layerY,
-                int minRx, int maxRx, int minRz, int maxRz) {
+                int minRx, int maxRx, int minRz, int maxRz,
+                int focusRx, int focusRz) {
             return this.dimension.equals(dimension) && this.layerY == layerY
                     && this.minRx == minRx && this.maxRx == maxRx
-                    && this.minRz == minRz && this.maxRz == maxRz;
+                    && this.minRz == minRz && this.maxRz == maxRz
+                    && this.centerRx == focusRx && this.centerRz == focusRz;
         }
     }
 }

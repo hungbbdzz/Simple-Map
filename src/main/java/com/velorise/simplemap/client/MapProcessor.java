@@ -1,5 +1,11 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.session.MapSession;
+import com.velorise.simplemap.client.session.MapSessionManager;
+import com.velorise.simplemap.client.pipeline.MapWorkGraph;
+import com.velorise.simplemap.client.pipeline.MapWorkKey;
+import com.velorise.simplemap.client.pipeline.MapWorkStage;
+import com.velorise.simplemap.client.pipeline.RegionRecord;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -17,14 +23,15 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class MapProcessor {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final MapProcessor INSTANCE = new MapProcessor();
-    private static final int MAX_QUEUED_TASKS = 4096;
 
     private final PriorityBlockingQueue<Task> queue = new PriorityBlockingQueue<>();
     private final ConcurrentHashMap<String, Task> queued = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong();
 
     private MapProcessor() {
-        for (int i = 0; i < 2; i++) {
+        // Region admission is intentionally serial. Heavy decode/style work still
+        // has its own bounded workers, while request order remains deterministic.
+        for (int i = 0; i < 1; i++) {
             Thread worker = new Thread(this::runLoop, "SimpleMap-MapProcessor-" + (i + 1));
             worker.setDaemon(true);
             worker.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 2));
@@ -37,23 +44,31 @@ public final class MapProcessor {
     }
 
     public void enqueueSurfaceLoad(int regionX, int regionZ, int priority) {
+        MapSession session = MapSessionManager.getInstance().active();
+        if (session == null || session.rootToken().isCancelled()) return;
         long generation = MapManager.getInstance().getGeneration();
-        enqueue(new Task("surface:" + generation + ':' + regionX + ',' + regionZ,
-                Kind.SURFACE_LOAD, generation, Integer.MIN_VALUE,
+        enqueue(new Task("surface:" + session.sessionId() + ':' + generation + ':' + regionX + ',' + regionZ,
+                Kind.SURFACE_LOAD, session.sessionId(), generation, Integer.MIN_VALUE,
                 regionX, regionZ, priority, sequence.getAndIncrement()));
     }
 
     public void enqueueCaveLoad(int layerY, int regionX, int regionZ, int priority) {
+        MapSession session = MapSessionManager.getInstance().active();
+        if (session == null || session.rootToken().isCancelled()) return;
         long generation = CaveMapManager.getInstance().getLayerGeneration();
-        enqueue(new Task("cave:" + generation + ':' + layerY + ':' + regionX + ',' + regionZ,
-                Kind.CAVE_LOAD, generation, layerY,
+        int bandY = com.velorise.simplemap.client.cave.DenseCaveTile.normalizeLayer(
+                com.velorise.simplemap.client.cave.CaveView.LAYERED, layerY);
+        enqueue(new Task("cave:" + session.sessionId() + ':' + generation + ':' + bandY + ':' + regionX + ',' + regionZ,
+                Kind.CAVE_LOAD, session.sessionId(), generation, layerY,
                 regionX, regionZ, priority, sequence.getAndIncrement()));
     }
 
     public void enqueueFullCaveLoad(int regionX, int regionZ, int priority) {
+        MapSession session = MapSessionManager.getInstance().active();
+        if (session == null || session.rootToken().isCancelled()) return;
         long generation = FullCaveMapManager.getInstance().getGeneration();
-        enqueue(new Task("full:" + generation + ':' + regionX + ',' + regionZ,
-                Kind.FULL_CAVE_LOAD, generation, Integer.MIN_VALUE,
+        enqueue(new Task("full:" + session.sessionId() + ':' + generation + ':' + regionX + ',' + regionZ,
+                Kind.FULL_CAVE_LOAD, session.sessionId(), generation, Integer.MIN_VALUE,
                 regionX, regionZ, priority, sequence.getAndIncrement()));
     }
 
@@ -81,34 +96,36 @@ public final class MapProcessor {
         queued.clear();
     }
 
-    private void enqueue(Task task) {
-        if (!queued.containsKey(task.key) && queued.size() >= MAX_QUEUED_TASKS) {
-            dropLowestPriorityTask(task.priority);
-            if (queued.size() >= MAX_QUEUED_TASKS) return;
+    /** Drops queued surface disk requests when the fullscreen viewport changes. */
+    public void clearSurfaceLoads() {
+        for (Task task : queued.values()) {
+            if (task.kind != Kind.SURFACE_LOAD) continue;
+            if (queued.remove(task.key, task)) queue.remove(task);
         }
+    }
+
+    private void enqueue(Task task) {
+        MapWorkGraph.Admission admission = MapWorkGraph.getInstance()
+                .request(task.workKey, task.generation);
+        if (admission != MapWorkGraph.Admission.ACCEPTED) return;
+        // Queue admission is deliberately lossless. Deduplication keeps one task
+        // per logical region, while Region/dirty state remains authoritative. A
+        // full queue must never evict a lower-priority known-region request.
         queued.compute(task.key, (key, existing) -> {
             if (existing == null) {
                 queue.offer(task);
                 return task;
             }
-            if (task.priority > existing.priority && queue.remove(existing)) {
+            boolean projectionChanged = task.kind == Kind.CAVE_LOAD
+                    && existing.kind == Kind.CAVE_LOAD
+                    && task.layerY != existing.layerY;
+            if ((projectionChanged || task.priority > existing.priority)
+                    && queue.remove(existing)) {
                 queue.offer(task);
                 return task;
             }
             return existing;
         });
-    }
-
-    private void dropLowestPriorityTask(int incomingPriority) {
-        Task worst = null;
-        for (Task candidate : queued.values()) {
-            if (worst == null || candidate.priority < worst.priority
-                    || (candidate.priority == worst.priority && candidate.sequence > worst.sequence)) {
-                worst = candidate;
-            }
-        }
-        if (worst == null || worst.priority >= incomingPriority) return;
-        if (queued.remove(worst.key, worst)) queue.remove(worst);
     }
 
     private void runLoop() {
@@ -126,25 +143,50 @@ public final class MapProcessor {
     }
 
     private void process(Task task) {
-        switch (task.kind) {
-            case SURFACE_LOAD -> {
-                MapManager manager = MapManager.getInstance();
-                if (manager.isGenerationCurrent(task.generation)) {
-                    manager.requestRegionLoad(task.regionX, task.regionZ);
+        if (!MapSessionManager.getInstance().isCurrent(task.sessionId)) {
+            MapWorkGraph.getInstance().cancelSession(task.sessionId);
+            return;
+        }
+        RegionRecord.Lease lease = MapWorkGraph.getInstance().tryBegin(task.workKey);
+        if (lease == null) return;
+        boolean admitted = false;
+        boolean completionOwnedByManager = false;
+        try {
+            switch (task.kind) {
+                case SURFACE_LOAD -> {
+                    MapManager manager = MapManager.getInstance();
+                    if (manager.isGenerationCurrent(task.generation)) {
+                        completionOwnedByManager = manager.requestRegionLoad(task.workKey,
+                                task.generation);
+                    }
+                }
+                case CAVE_LOAD -> {
+                    CaveMapManager manager = CaveMapManager.getInstance();
+                    if (manager.isLayerGenerationCurrent(task.generation, task.layerY)) {
+                        int activeTopY = manager.getActiveLayerY();
+                        if (activeTopY != Integer.MIN_VALUE) {
+                            // Exact Top-Y may have moved inside the retained band while
+                            // this serial disk admission waited. Load into the current
+                            // projection instead of dropping useful same-band work.
+                            completionOwnedByManager = manager.requestVisibleRegion(
+                                    task.workKey, task.generation, activeTopY);
+                        }
+                    }
+                }
+                case FULL_CAVE_LOAD -> {
+                    FullCaveMapManager manager = FullCaveMapManager.getInstance();
+                    if (manager.isGenerationCurrent(task.generation)) {
+                        completionOwnedByManager = manager.requestRegionLoad(
+                                task.workKey, task.generation);
+                    }
                 }
             }
-            case CAVE_LOAD -> {
-                CaveMapManager manager = CaveMapManager.getInstance();
-                if (manager.isLayerGenerationCurrent(task.generation, task.layerY)) {
-                    manager.requestVisibleRegion(task.layerY, task.regionX, task.regionZ);
-                }
-            }
-            case FULL_CAVE_LOAD -> {
-                FullCaveMapManager manager = FullCaveMapManager.getInstance();
-                if (manager.isGenerationCurrent(task.generation)) {
-                    manager.getRegion(task.regionX, task.regionZ, true);
-                }
-            }
+        } finally {
+            if (completionOwnedByManager) {
+                // Manager-owned source/projection work remains RUNNING until its
+                // asynchronous archive or disk result has committed.
+            } else if (admitted) MapWorkGraph.getInstance().complete(lease);
+            else MapWorkGraph.getInstance().defer(lease);
         }
     }
 
@@ -157,23 +199,37 @@ public final class MapProcessor {
     private static final class Task implements Comparable<Task> {
         private final String key;
         private final Kind kind;
+        private final long sessionId;
         private final long generation;
         private final int layerY;
         private final int regionX;
         private final int regionZ;
         private final int priority;
         private final long sequence;
+        private final MapWorkKey workKey;
 
-        private Task(String key, Kind kind, long generation, int layerY,
+        private Task(String key, Kind kind, long sessionId, long generation, int layerY,
                 int regionX, int regionZ, int priority, long sequence) {
             this.key = Objects.requireNonNull(key);
             this.kind = Objects.requireNonNull(kind);
+            this.sessionId = sessionId;
             this.generation = generation;
             this.layerY = layerY;
             this.regionX = regionX;
             this.regionZ = regionZ;
             this.priority = priority;
             this.sequence = sequence;
+            int projectionId = switch (kind) {
+                case CAVE_LOAD -> com.velorise.simplemap.client.cave.DenseCaveTile.normalizeLayer(
+                        com.velorise.simplemap.client.cave.CaveView.LAYERED, layerY);
+                case SURFACE_LOAD, FULL_CAVE_LOAD -> Integer.MIN_VALUE;
+            };
+            this.workKey = new MapWorkKey(sessionId, regionX, regionZ,
+                    switch (kind) {
+                        case SURFACE_LOAD -> MapWorkStage.SOURCE_READ;
+                        case CAVE_LOAD -> MapWorkStage.CAVE_PROJECTION;
+                        case FULL_CAVE_LOAD -> MapWorkStage.FULL_CAVE_PROJECTION;
+                    }, projectionId);
         }
 
         @Override

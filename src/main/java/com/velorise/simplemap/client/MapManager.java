@@ -2,6 +2,9 @@ package com.velorise.simplemap.client;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.velorise.simplemap.client.pipeline.MapWorkGraph;
+import com.velorise.simplemap.client.pipeline.MapWorkKey;
+import com.velorise.simplemap.client.session.MapSessionManager;
 import net.minecraft.client.Minecraft;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -30,10 +33,8 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -44,13 +45,8 @@ public class MapManager {
     private static final int MAX_LOADED_REGIONS = 160;
     private static final int PIXEL_COUNT = 512 * 512;
 
-    private static final ThreadPoolExecutor LOAD_POOL = new ThreadPoolExecutor(
-            3, 3, 30L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(192), runnable -> {
-                Thread thread = new Thread(runnable, "SimpleMap-RegionLoad");
-                thread.setDaemon(true);
-                thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
-                return thread;
-            }, new ThreadPoolExecutor.AbortPolicy());
+    // Saved surface region reads share the global IO control plane.
+
 
     private final Map<String, Region> loadedRegions = new LinkedHashMap<>(16, 0.75f, true);
     private final Set<String> dirtyRegions = new HashSet<>();
@@ -187,6 +183,7 @@ public class MapManager {
             loadLearningState(worldDirectory);
             WaypointManager.getInstance().updateWorldDir(worldDirectory);
             configureDimension(liveStorageId, liveResourceId);
+            MapSessionManager.getInstance().open(currentWorldId, liveResourceId);
             return;
         }
 
@@ -231,12 +228,17 @@ public class MapManager {
     }
 
     /**
-     * Clears only dimension-bound CPU state. GPU texture managers are intentionally
-     * retained and are namespace-keyed by dimension, providing a small warm cache
-     * when the user cycles back to a map that was already viewed.
+     * Clears dimension-bound CPU and GPU state. The current texture managers are
+     * not yet dimension-keyed, so keeping their images can show the previous
+     * dimension for one or more frames. RegionRecord ownership will later make a
+     * safe warm cache possible.
      */
     private void switchDimensionData(String storageId, String resourceId, boolean preserveTextures) {
+        // Cancel before clearing managers so no old worker can publish while the
+        // dimension-bound stores are in transition.
+        MapSessionManager.getInstance().closeActive();
         saveDirtyRegionsAsync();
+        MapPersistenceCoordinator.getInstance().reset();
         worldGeneration.incrementAndGet();
         MapProcessor.getInstance().clear();
         clearSurfaceDimensionData();
@@ -246,13 +248,16 @@ public class MapManager {
         VerticalCaveArchiveManager.getInstance().flushAndClear();
         ChunkScanner.getInstance().reset();
         RegionProcessor.getInstance().stop();
-        if (!preserveTextures) {
-            MapTextureManager.getInstance().clearCache();
-            CaveTextureManager.getInstance().clearCache();
-            FullCaveTextureManager.getInstance().clearCache();
-            MapOverviewTextureManager.getInstance().clearCache();
-        }
+        // Texture caches in the current renderer are not fully namespaced by
+        // dimension yet. Retaining them here can publish an Overworld tile in the
+        // Nether/End before the correct source arrives, so correctness wins over a
+        // small warm-cache benefit until RegionRecord owns texture residency.
+        MapTextureManager.getInstance().clearCache();
+        CaveTextureManager.getInstance().clearCache();
+        FullCaveTextureManager.getInstance().clearCache();
+        MapOverviewTextureManager.getInstance().clearCache();
         configureDimension(storageId, resourceId);
+        MapSessionManager.getInstance().open(currentWorldId, resourceId);
     }
 
     private void clearSurfaceDimensionData() {
@@ -495,17 +500,32 @@ public class MapManager {
         Region region = getRegion(regionX, regionZ, true);
         if (region == null || !region.isLoaded()) return;
         if (region.setBlockData(blockX & 511, blockZ & 511, data, tint)) {
-            markRegionDirty(regionX, regionZ);
+            markColumnDirty(blockX, blockZ);
         }
     }
 
     public void markRegionDirty(int regionX, int regionZ) {
+        markRegionStorageDirty(regionX, regionZ);
+        MapTextureManager.getInstance().markRegionDirty(regionX, regionZ);
+        // Far-zoom standalone overview textures are a compatibility/fallback path
+        // beside the page-rooted LOD tree. Keep their source revision in sync with
+        // live scans so they do not remain stale until MapScreen is opened.
+        MapOverviewTextureManager.getInstance().markSurfaceRegionDirty(regionX, regionZ);
+    }
+
+    private void markColumnDirty(int blockX, int blockZ) {
+        int regionX = blockX >> 9;
+        int regionZ = blockZ >> 9;
+        markRegionStorageDirty(regionX, regionZ);
+        MapTextureManager.getInstance().markPageDirtyForBlock(blockX, blockZ);
+    }
+
+    private void markRegionStorageDirty(int regionX, int regionZ) {
         String key = key(regionX, regionZ);
         synchronized (dirtyRegions) {
             dirtyRegions.add(key);
         }
         regionFileExists.put(key, true);
-        MapTextureManager.getInstance().markRegionDirty(regionX, regionZ);
     }
 
     public Region getRegion(int regionX, int regionZ, boolean loadIfMissing) {
@@ -530,6 +550,19 @@ public class MapManager {
 
     public void requestRegionLoad(int regionX, int regionZ) {
         getRegion(regionX, regionZ, true);
+    }
+
+    /**
+     * M2 bridge: keep SOURCE_READ running until this region's async disk read
+     * has actually committed its CPU data. A queue admission is not a source
+     * completion.
+     */
+    public boolean requestRegionLoad(MapWorkKey workKey, long sourceRevision) {
+        if (workKey == null || !isGenerationCurrent(sourceRevision)) return false;
+        Region region = getRegion(workKey.regionX(), workKey.regionZ(), true);
+        if (region == null) return false;
+        region.registerSourceCompletion(workKey, sourceRevision);
+        return true;
     }
 
     public void unloadRegion(int regionX, int regionZ) {
@@ -593,33 +626,29 @@ public class MapManager {
         return currentDimensionDir;
     }
 
-    /** Re-colors and reloads all saved map regions in background threads. */
+    /**
+     * Re-colors and reloads all saved regions without removing the currently
+     * displayed image. Existing CPU/GPU pages remain the visual fallback while
+     * replacement revisions are built and uploaded region by region.
+     */
     public void reloadAllRegions() {
-        File directory = currentDimensionDir;
-        worldGeneration.incrementAndGet();
+        MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().clearDerivedColorCaches();
-        MapTextureManager.getInstance().clearCache();
-        CaveMapManager.getInstance().clearCache();
-        FullCaveTextureManager.getInstance().clearCache();
+        MapVisualClassifier.getInstance().clear();
+        MapBlockEntityVisualResolver.getInstance().clear();
+        com.velorise.simplemap.client.cave.CaveStateClassifier.getInstance().clear();
 
-        if (directory != null) {
-            File[] files = directory.listFiles((dir, name) ->
-                    name != null && name.matches("r\\.-?\\d{1,7}\\.-?\\d{1,7}\\.smdat"));
-            if (files != null) {
-                for (File file : files) {
-                    String name = file.getName();
-                    String[] parts = name.split("\\.");
-                    if (parts.length >= 4) {
-                        try {
-                            int rx = Integer.parseInt(parts[1]);
-                            int rz = Integer.parseInt(parts[2]);
-                            MapProcessor.getInstance().enqueueSurfaceLoad(rx, rz, 100);
-                        } catch (Exception ignored) {
-                        }
-                    }
-                }
-            }
-        }
+        // Do not increment worldGeneration and do not clear any texture/data store.
+        // Generation changes are reserved for a real world/dimension replacement.
+        MapTextureManager.getInstance().invalidateStyle();
+        MapOverviewTextureManager.getInstance().invalidateStyle();
+        CaveTextureManager.getInstance().invalidateStyle();
+        FullCaveTextureManager.getInstance().invalidateStyle();
+
+        // Do not enqueue every .smdat file in filesystem order. That old path
+        // saturated the worker queue and made Reload All reveal random distant
+        // islands. The viewport coordinator now re-admits visible regions through
+        // the deterministic region sweep; off-screen regions are restyled lazily.
         Minecraft mc = Minecraft.getInstance();
         if (mc.level != null && mc.player != null) {
             ChunkScanner.getInstance().requestRefresh(mc);
@@ -665,8 +694,16 @@ public class MapManager {
     }
 
     private void loadRegionAsync(Region region, File directory, long generation) {
-        try {
-            LOAD_POOL.execute(() -> {
+        if (!region.beginLoad()) return;
+        // Keep the same Region object in the loaded map while IO is saturated.
+        // Xaero keeps requested regions in a pull queue; repeatedly removing and
+        // recreating them wastes allocations and can leave visible holes near the
+        // viewport centre.
+        MapWorkScheduler.scheduleIo(0L, TimeUnit.MILLISECONDS,
+                MapRequestLane.FULLSCREEN, MapWorkScheduler.WorkType.DISK_READ,
+                MapRequestLane.FULLSCREEN.priorityBase(), 24,
+                () -> isLoadTargetCurrent(region, directory, generation), () -> {
+            try {
                 long[] pixels = new long[PIXEL_COUNT];
                 int[] tints = new int[PIXEL_COUNT];
                 Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
@@ -679,21 +716,16 @@ public class MapManager {
                 if (!isLoadTargetCurrent(region, directory, generation)) return;
                 region.applyLoadedData(pixels, tints, biomePalette, blockPalette);
                 region.markLoaded();
-                if (loaded) MapTextureManager.getInstance().markRegionDirty(region.rx, region.rz);
+                region.completeSourceCompletions();
+                if (loaded) MapTextureManager.getInstance()
+                        .markRegionSourceAvailable(region.rx, region.rz);
                 synchronized (loadedRegions) {
                     evictOldRegions();
                 }
-            });
-        } catch (RejectedExecutionException saturated) {
-            // Do not let rapid map panning create an unbounded disk-I/O backlog.
-            // The renderer will request this region again when queue capacity returns.
-            synchronized (loadedRegions) {
-                if (loadedRegions.get(key(region.rx, region.rz)) == region) {
-                    loadedRegions.remove(key(region.rx, region.rz));
-                }
+            } finally {
+                region.finishLoad();
             }
-            region.close();
-        }
+        });
     }
 
     private boolean isLoadTargetCurrent(Region region, File directory, long generation) {
@@ -705,18 +737,49 @@ public class MapManager {
     }
 
     public void tickSave() {
-        MapLightManager.getInstance().tickSave();
-        CaveMapManager.getInstance().tickSave();
-        FullCaveMapManager.getInstance().tickSave();
-        VerticalCaveArchiveManager.getInstance().tickSave();
-        long now = System.currentTimeMillis();
-        if (now - lastSaveTime < 10_000L) return;
-        lastSaveTime = now;
-        saveDirtyRegionsAsync();
+        MapPersistenceCoordinator.getInstance().tick(this);
+    }
+
+    /** Pulls at most {@code maximum} dirty surface regions into persistence. */
+    int pumpDirtyRegionSaves(int maximum) {
+        File directory = currentDimensionDir;
+        if (directory == null || maximum <= 0) return dirtyRegionCount();
+        int admitted = 0;
+        while (admitted < maximum) {
+            String selected;
+            synchronized (dirtyRegions) {
+                Iterator<String> iterator = dirtyRegions.iterator();
+                if (!iterator.hasNext()) break;
+                selected = iterator.next();
+                iterator.remove();
+            }
+            Region region;
+            synchronized (loadedRegions) {
+                region = loadedRegions.get(selected);
+            }
+            if (region == null || !region.isLoaded()) continue;
+            if (!RegionDataStore.canAcceptSave(directory, region.rx, region.rz)
+                    || !saveRegionSnapshot(region, directory, false)) {
+                synchronized (dirtyRegions) {
+                    dirtyRegions.add(selected);
+                }
+                break;
+            }
+            admitted++;
+        }
+        return dirtyRegionCount();
+    }
+
+    int dirtyRegionCount() {
+        synchronized (dirtyRegions) {
+            return dirtyRegions.size();
+        }
     }
 
     public synchronized void flushAndClear() {
         saveDirtyRegionsAsync();
+        MapSessionManager.getInstance().closeActive();
+        MapPersistenceCoordinator.getInstance().reset();
         worldGeneration.incrementAndGet();
         MapProcessor.getInstance().clear();
         clearCache();
@@ -763,20 +826,32 @@ public class MapManager {
             keys = new HashSet<>(dirtyRegions);
             dirtyRegions.clear();
         }
+        // Dimension/world replacement is the rare forced-flush path. Snapshot all
+        // remaining dirty regions before their canonical CPU objects are closed.
         for (String key : keys) {
             Region region;
             synchronized (loadedRegions) {
                 region = loadedRegions.get(key);
             }
-            if (region != null && region.isLoaded()) saveRegionSnapshot(region, directory);
+            if (region != null && region.isLoaded()) saveRegionSnapshot(region, directory, true);
         }
     }
 
-    private void saveRegionSnapshot(Region region, File directory) {
+    private boolean saveRegionSnapshot(Region region, File directory, boolean force) {
+        if (region == null || directory == null || !region.isLoaded()) return false;
+        if (!force && !RegionDataStore.canAcceptSave(directory, region.rx, region.rz)) return false;
         RegionSnapshot snapshot = region.snapshot();
-        RegionDataStore.saveAsync(directory, region.rx, region.rz,
-                snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(), snapshot.blockPalette());
-        regionFileExists.put(key(region.rx, region.rz), true);
+        boolean accepted;
+        if (force) {
+            RegionDataStore.saveAsync(directory, region.rx, region.rz,
+                    snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(), snapshot.blockPalette());
+            accepted = true;
+        } else {
+            accepted = RegionDataStore.trySaveAsync(directory, region.rx, region.rz,
+                    snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(), snapshot.blockPalette());
+        }
+        if (accepted) regionFileExists.put(key(region.rx, region.rz), true);
+        return accepted;
     }
 
     private void evictOldRegions() {
@@ -798,7 +873,16 @@ public class MapManager {
             synchronized (dirtyRegions) {
                 dirty = dirtyRegions.remove(selectedKey);
             }
-            if (dirty && currentDimensionDir != null) saveRegionSnapshot(region, currentDimensionDir);
+            if (dirty && currentDimensionDir != null
+                    && !saveRegionSnapshot(region, currentDimensionDir, false)) {
+                // Retain the only authoritative dirty region until the bounded
+                // persistence queue can accept its snapshot.
+                loadedRegions.put(selectedKey, region);
+                synchronized (dirtyRegions) {
+                    dirtyRegions.add(selectedKey);
+                }
+                return;
+            }
             region.close();
         }
     }
@@ -987,13 +1071,16 @@ public class MapManager {
         private final long generation;
         private final long[] pixels = new long[PIXEL_COUNT];
         private final int[] tints = new int[PIXEL_COUNT];
+        private final int[] knownColumnsPerPage = new int[MapPageLayout.PAGES_PER_REGION * MapPageLayout.PAGES_PER_REGION];
         private final List<String> biomePalette = new ArrayList<>();
         private final List<String> blockPalette = new ArrayList<>();
         private final Map<String, Integer> biomeIndex = new HashMap<>();
         private final Map<String, Integer> blockIndex = new HashMap<>();
+        private final List<SourceCompletion> sourceCompletions = new ArrayList<>();
         private final ReentrantLock lock = new ReentrantLock();
         private volatile boolean loaded;
         private volatile boolean closed;
+        private final AtomicBoolean loadScheduled = new AtomicBoolean();
 
         private Region(int rx, int rz, long generation) {
             this.rx = rx;
@@ -1008,8 +1095,50 @@ public class MapManager {
         public long getGeneration() { return generation; }
         public void lock() { lock.lock(); }
         public void unlock() { lock.unlock(); }
-        public void close() { closed = true; }
+        public void close() {
+            closed = true;
+            deferSourceCompletions();
+        }
+        boolean beginLoad() { return !closed && loadScheduled.compareAndSet(false, true); }
+        void finishLoad() { loadScheduled.set(false); }
         void markLoaded() { if (!closed) loaded = true; }
+        void registerSourceCompletion(MapWorkKey key, long revision) {
+            if (key == null) return;
+            boolean completeNow = false;
+            boolean deferNow = false;
+            synchronized (sourceCompletions) {
+                if (closed) deferNow = true;
+                else if (loaded) completeNow = true;
+                else sourceCompletions.add(new SourceCompletion(key, revision));
+            }
+            if (completeNow) MapWorkGraph.getInstance().complete(key, revision);
+            if (deferNow) MapWorkGraph.getInstance().defer(key);
+        }
+
+        void completeSourceCompletions() {
+            SourceCompletion[] pending;
+            synchronized (sourceCompletions) {
+                pending = sourceCompletions.toArray(SourceCompletion[]::new);
+                sourceCompletions.clear();
+            }
+            for (SourceCompletion completion : pending) {
+                MapWorkGraph.getInstance().complete(completion.key(), completion.revision());
+            }
+        }
+
+        private void deferSourceCompletions() {
+            SourceCompletion[] pending;
+            synchronized (sourceCompletions) {
+                pending = sourceCompletions.toArray(SourceCompletion[]::new);
+                sourceCompletions.clear();
+            }
+            for (SourceCompletion completion : pending) {
+                MapWorkGraph.getInstance().defer(completion.key());
+            }
+        }
+
+        private record SourceCompletion(MapWorkKey key, long revision) {
+        }
 
         public MapBlockData getBlockData(int pixelX, int pixelZ) {
             lock.lock();
@@ -1030,6 +1159,21 @@ public class MapManager {
             }
         }
 
+        /** O(1) exact-leaf explored-data test used by the fullscreen frontier. */
+        public boolean hasAnyDataInPage(int pageX, int pageZ) {
+            if (pageX < 0 || pageX >= MapPageLayout.PAGES_PER_REGION
+                    || pageZ < 0 || pageZ >= MapPageLayout.PAGES_PER_REGION) {
+                return false;
+            }
+            lock.lock();
+            try {
+                return knownColumnsPerPage[
+                        pageZ * MapPageLayout.PAGES_PER_REGION + pageX] > 0;
+            } finally {
+                lock.unlock();
+            }
+        }
+
         public boolean setBlockData(int pixelX, int pixelZ, MapBlockData data) {
             return setBlockData(pixelX, pixelZ, data, SurfaceTintData.UNKNOWN);
         }
@@ -1039,7 +1183,16 @@ public class MapManager {
             lock.lock();
             try {
                 int index = pixelZ * 512 + pixelX;
-                if (pixels[index] == packed && tints[index] == tint) return false;
+                long previous = pixels[index];
+                if (previous == packed && tints[index] == tint) return false;
+                boolean wasKnown = !MapBlockData.isEmpty(previous);
+                boolean isKnown = !MapBlockData.isEmpty(packed);
+                if (wasKnown != isKnown) {
+                    int pageX = pixelX / MapPageLayout.PAGE_SIZE;
+                    int pageZ = pixelZ / MapPageLayout.PAGE_SIZE;
+                    int pageIndex = pageZ * MapPageLayout.PAGES_PER_REGION + pageX;
+                    knownColumnsPerPage[pageIndex] += isKnown ? 1 : -1;
+                }
                 pixels[index] = packed;
                 tints[index] = tint;
                 return true;
@@ -1110,6 +1263,37 @@ public class MapManager {
             }
         }
 
+        /**
+         * Copies only the requested local region rectangle. Page-rooted texture
+         * jobs use this instead of cloning all 512x512 columns for every 64x64
+         * leaf update. Palette arrays belong to this immutable window and allow
+         * the caller to remap indices when a halo crosses a region boundary.
+         */
+        public RegionWindow snapshotWindow(int minX, int minZ, int width, int height) {
+            if (minX < 0 || minZ < 0 || width <= 0 || height <= 0
+                    || minX + width > MapPageLayout.REGION_SIZE
+                    || minZ + height > MapPageLayout.REGION_SIZE) {
+                throw new IllegalArgumentException("Invalid region window "
+                        + minX + "," + minZ + " " + width + "x" + height);
+            }
+            lock.lock();
+            try {
+                long[] windowPixels = new long[width * height];
+                int[] windowTints = new int[width * height];
+                for (int z = 0; z < height; z++) {
+                    int source = (minZ + z) * MapPageLayout.REGION_SIZE + minX;
+                    int target = z * width;
+                    System.arraycopy(pixels, source, windowPixels, target, width);
+                    System.arraycopy(tints, source, windowTints, target, width);
+                }
+                return new RegionWindow(windowPixels, windowTints, width, height,
+                        biomePalette.toArray(new String[0]),
+                        blockPalette.toArray(new String[0]));
+            } finally {
+                lock.unlock();
+            }
+        }
+
         /** Legacy snapshot API retained for compatibility with external code. */
         public MapBlockData[] snapshotPixels() {
             lock.lock();
@@ -1154,6 +1338,17 @@ public class MapManager {
                 if (closed) return;
                 System.arraycopy(loadedPixels, 0, pixels, 0, pixels.length);
                 System.arraycopy(loadedTints, 0, tints, 0, tints.length);
+                Arrays.fill(knownColumnsPerPage, 0);
+                for (int z = 0; z < 512; z++) {
+                    int pageZ = z / MapPageLayout.PAGE_SIZE;
+                    int row = z * 512;
+                    for (int x = 0; x < 512; x++) {
+                        if (MapBlockData.isEmpty(pixels[row + x])) continue;
+                        int pageX = x / MapPageLayout.PAGE_SIZE;
+                        knownColumnsPerPage[
+                                pageZ * MapPageLayout.PAGES_PER_REGION + pageX]++;
+                    }
+                }
                 biomePalette.clear();
                 biomePalette.addAll(biomes);
                 blockPalette.clear();
@@ -1166,6 +1361,10 @@ public class MapManager {
                 lock.unlock();
             }
         }
+    }
+
+    public record RegionWindow(long[] pixels, int[] tints, int width, int height,
+            String[] biomePalette, String[] blockPalette) {
     }
 
     private record RegionSnapshot(long[] pixels, int[] tints, String[] biomePalette, String[] blockPalette) {

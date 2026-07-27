@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.velorise.simplemap.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "SimpleMapClientPacketListenerMixin",
+    "SimpleMapSectionBlocksUpdatePacketAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
