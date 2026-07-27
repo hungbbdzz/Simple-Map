@@ -60,7 +60,8 @@ public final class SurfaceColorizer {
                     continue;
 
                 int baseColor = resolveBaseColor(packed, tints[index], blockPalette, blockColors, tintPolicies,
-                        tintDisabledBlocks, biomeLookup, pixels, px, pz, colourMode);
+                        tintDisabledBlocks, biomeLookup, pixels, px, pz,
+                        SIZE, SIZE, colourMode);
                 if (baseColor == 0)
                     continue;
 
@@ -78,7 +79,7 @@ public final class SurfaceColorizer {
                  */
                 float shade = fluidPixel
                         ? 1.0f
-                        : calculateShade(pixels, px, pz, reliefY, terrainSlopes);
+                        : calculateShade(pixels, px, pz, SIZE, SIZE, reliefY, terrainSlopes);
                 shade *= 1.0f + microNoise(index, packed, reliefY);
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
@@ -99,6 +100,84 @@ public final class SurfaceColorizer {
         return output;
     }
 
+    /**
+     * Colorizes one exact 64x64 leaf from a compact page snapshot. The snapshot
+     * contains a two-column halo on every side, including data remapped from
+     * adjacent 512x512 regions, so biome tint, slope and local depth remain
+     * continuous without cloning the full parent region.
+     */
+    public static int[] colorizePageWindow(long[] pixels, int[] tints,
+            int stride, int halo, int worldPageStartX, int worldPageStartZ,
+            List<String> biomePalette,
+            List<String> blockPalette,
+            IntFunction<Biome> biomeLookup,
+            Map<String, Integer> blockColors,
+            Map<String, BlockTintPolicy> tintPolicies,
+            Set<String> tintDisabledBlocks,
+            int colourMode,
+            boolean showFlowers,
+            int terrainSlopes,
+            int profile,
+            BooleanSupplier stillValid) {
+        int pageSize = MapPageLayout.PAGE_SIZE;
+        if (stride < pageSize + halo * 2
+                || pixels == null || pixels.length != stride * stride
+                || tints == null || tints.length != pixels.length) {
+            throw new IllegalArgumentException("Invalid compact surface page snapshot");
+        }
+
+        int[] output = new int[pageSize * pageSize];
+        for (int localZ = 0; localZ < pageSize; localZ++) {
+            if ((localZ & 15) == 0 && !stillValid.getAsBoolean()) {
+                throw new java.util.concurrent.CancellationException("Stale SimpleMap page job");
+            }
+            int pz = halo + localZ;
+            int pageRow = localZ * pageSize;
+            for (int localX = 0; localX < pageSize; localX++) {
+                int px = halo + localX;
+                int index = pz * stride + px;
+                long packed = pixels[index];
+                if (MapBlockData.isEmpty(packed)
+                        || (MapBlockData.isFlower(packed) && !showFlowers)) {
+                    continue;
+                }
+
+                int baseColor = resolveBaseColor(packed, tints[index], blockPalette,
+                        blockColors, tintPolicies, tintDisabledBlocks, biomeLookup,
+                        pixels, px, pz, stride, stride, colourMode);
+                if (baseColor == 0) continue;
+
+                int red = (baseColor >>> 16) & 0xFF;
+                int green = (baseColor >>> 8) & 0xFF;
+                int blue = baseColor & 0xFF;
+                int reliefY = MapBlockData.reliefY(packed);
+                boolean fluidPixel = MapBlockData.isFluid(packed);
+                float shade = fluidPixel ? 1.0f
+                        : calculateShade(pixels, px, pz, stride, stride,
+                                reliefY, terrainSlopes);
+                int regionLocalX = Math.floorMod(worldPageStartX + localX, SIZE);
+                int regionLocalZ = Math.floorMod(worldPageStartZ + localZ, SIZE);
+                shade *= 1.0f + microNoise(regionLocalZ * SIZE + regionLocalX,
+                        packed, reliefY);
+                red = clamp(Math.round(red * shade));
+                green = clamp(Math.round(green * shade));
+                blue = clamp(Math.round(blue * shade));
+
+                int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
+                if (colourMode == 0) {
+                    argb = applyAccurateFinish(argb,
+                            MapBlockData.isLeaves(packed),
+                            MapBlockData.isFluid(packed));
+                }
+                int abgr = 0xFF000000 | ((argb & 0xFF) << 16)
+                        | (argb & 0x0000FF00)
+                        | ((argb >>> 16) & 0xFF);
+                output[pageRow + localX] = MapColorProfile.apply(abgr, profile);
+            }
+        }
+        return output;
+    }
+
     private static int resolveBaseColor(long packed, int storedTint,
             List<String> blockPalette,
             Map<String, Integer> blockColors,
@@ -107,6 +186,7 @@ public final class SurfaceColorizer {
             IntFunction<Biome> biomeLookup,
             long[] allPixels,
             int px, int pz,
+            int sampleWidth, int sampleHeight,
             int colourMode) {
         String blockName = blockId(packed, blockPalette);
 
@@ -129,7 +209,7 @@ public final class SurfaceColorizer {
              * are stable and are re-blended whenever adjacent map pixels arrive.
              */
             int waterTint = colourMode == 0
-                    ? BiomeBlend.blendWater(allPixels, biomeLookup, px, pz)
+                    ? BiomeBlend.blendWater(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight)
                     : VANILLA_WATER;
             if (waterTint == -1)
                 waterTint = VANILLA_WATER;
@@ -158,9 +238,19 @@ public final class SurfaceColorizer {
         }
 
         int texture = blockName == null ? 0 : blockColors.getOrDefault(blockName, 0);
+
+        MapVisualClassifier.VisualInfo visual = blockName == null
+                ? null : MapVisualClassifier.getInstance().info(blockName);
+        /* Fixed-colour foliage (vanilla cherry and modded equivalents classified
+         * the same way) keeps its texture and never receives a biome multiplier. */
+        if (visual != null && visual.fixedTextureColor()) {
+            return texture != 0 ? texture : 0xFFE0A1B8;
+        }
+
         BlockTintPolicy policy = blockName == null
                 ? BlockTintPolicy.NONE
-                : tintPolicies.getOrDefault(blockName, BlockTintPolicy.NONE);
+                : tintPolicies.getOrDefault(blockName,
+                        visual == null ? BlockTintPolicy.NONE : visual.tintPolicy());
         boolean tintDisabled = blockName != null && tintDisabledBlocks.contains(blockName);
 
         // Version-3 surface regions preserve the exact value returned by the
@@ -184,11 +274,11 @@ public final class SurfaceColorizer {
                 return texture;
             return switch (policy) {
                 case SPRUCE, BIRCH, FOLIAGE -> {
-                    int tint = BiomeBlend.blendFoliage(allPixels, biomeLookup, px, pz);
+                    int tint = BiomeBlend.blendFoliage(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
                     yield tint == -1 ? texture : applyBiomeTint(texture, tint, 0.95f);
                 }
                 case GRASS -> {
-                    int tint = BiomeBlend.blendGrass(allPixels, biomeLookup, px, pz);
+                    int tint = BiomeBlend.blendGrass(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
                     yield tint == -1 ? texture : applyBiomeTint(texture, tint, 0.90f);
                 }
                 case NONE -> texture;
@@ -201,11 +291,11 @@ public final class SurfaceColorizer {
 
         if (colourMode == 0 && texture != 0) {
             if (policy == BlockTintPolicy.GRASS) {
-                int tint = BiomeBlend.blendGrass(allPixels, biomeLookup, px, pz);
+                int tint = BiomeBlend.blendGrass(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
                 return tint == -1 ? texture : applyBiomeTint(texture, tint, 0.90f);
             }
             if (policy == BlockTintPolicy.FOLIAGE) {
-                int tint = BiomeBlend.blendFoliage(allPixels, biomeLookup, px, pz);
+                int tint = BiomeBlend.blendFoliage(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
                 return tint == -1 ? texture : applyBiomeTint(texture, tint, 0.92f);
             }
         }
@@ -219,10 +309,10 @@ public final class SurfaceColorizer {
      * plateau merely because its surface is level with the shore.
      */
     private static float calculateShade(long[] pixels, int px, int pz,
-            int centerY, int terrainSlopes) {
+            int width, int height, int centerY, int terrainSlopes) {
         if (terrainSlopes <= 0)
             return 1.0f;
-        int north = neighborY(pixels, px, pz - 1, centerY);
+        int north = neighborY(pixels, px, pz - 1, width, height, centerY);
         if (terrainSlopes == 1) {
             int delta = centerY - north;
             float stepShadow = delta < 0 ? Math.max(-0.34f, delta * 0.060f)
@@ -230,9 +320,9 @@ public final class SurfaceColorizer {
             return clamp(1.0f + stepShadow, 0.58f, 1.28f);
         }
 
-        int south = neighborY(pixels, px, pz + 1, centerY);
-        int west = neighborY(pixels, px - 1, pz, centerY);
-        int east = neighborY(pixels, px + 1, pz, centerY);
+        int south = neighborY(pixels, px, pz + 1, width, height, centerY);
+        int west = neighborY(pixels, px - 1, pz, width, height, centerY);
+        int east = neighborY(pixels, px + 1, pz, width, height, centerY);
 
         float dx = clamp((west - east) * 0.5f, -16.0f, 16.0f);
         float dz = clamp((north - south) * 0.5f, -16.0f, 16.0f);
@@ -255,32 +345,35 @@ public final class SurfaceColorizer {
          * two-block sample is enough to retain crater/ravine depth without creating
          * artificial structure-shaped shadows.
          */
-        float depthOcclusion = localDepthOcclusion(pixels, px, pz, centerY);
+        float depthOcclusion = localDepthOcclusion(pixels, px, pz, width, height, centerY);
         float shade = 1.0f + directional + ridgeLight - pitShadow - roughness - depthOcclusion;
         return clamp(shade, 0.42f, 1.28f);
     }
 
-    private static float localDepthOcclusion(long[] pixels, int px, int pz, int centerY) {
-        return Math.min(0.12f, depthAtRadius(pixels, px, pz, centerY, 2, 0.012f));
+    private static float localDepthOcclusion(long[] pixels, int px, int pz,
+            int width, int height, int centerY) {
+        return Math.min(0.12f,
+                depthAtRadius(pixels, px, pz, width, height, centerY, 2, 0.012f));
     }
 
     private static float depthAtRadius(long[] pixels, int px, int pz,
-            int centerY, int radius, float weight) {
-        int sum = Math.max(0, neighborY(pixels, px - radius, pz, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px + radius, pz, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px, pz - radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px, pz + radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px - radius, pz - radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px + radius, pz - radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px - radius, pz + radius, centerY) - centerY)
-                + Math.max(0, neighborY(pixels, px + radius, pz + radius, centerY) - centerY);
+            int width, int height, int centerY, int radius, float weight) {
+        int sum = Math.max(0, neighborY(pixels, px - radius, pz, width, height, centerY) - centerY)
+                + Math.max(0, neighborY(pixels, px + radius, pz, width, height, centerY) - centerY)
+                + Math.max(0, neighborY(pixels, px, pz - radius, width, height, centerY) - centerY)
+                + Math.max(0, neighborY(pixels, px, pz + radius, width, height, centerY) - centerY)
+                + Math.max(0, neighborY(pixels, px - radius, pz - radius, width, height, centerY) - centerY)
+                + Math.max(0, neighborY(pixels, px + radius, pz - radius, width, height, centerY) - centerY)
+                + Math.max(0, neighborY(pixels, px - radius, pz + radius, width, height, centerY) - centerY)
+                + Math.max(0, neighborY(pixels, px + radius, pz + radius, width, height, centerY) - centerY);
         return Math.min(0.16f, (sum * 0.125f) * weight);
     }
 
-    private static int neighborY(long[] pixels, int px, int pz, int fallback) {
-        if (px < 0 || px >= SIZE || pz < 0 || pz >= SIZE)
+    private static int neighborY(long[] pixels, int px, int pz,
+            int width, int height, int fallback) {
+        if (px < 0 || px >= width || pz < 0 || pz >= height)
             return fallback;
-        long packed = pixels[pz * SIZE + px];
+        long packed = pixels[pz * width + px];
         return MapBlockData.isEmpty(packed) ? fallback : MapBlockData.reliefY(packed);
     }
 

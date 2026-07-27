@@ -1,5 +1,6 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.session.MapSessionManager;
 import net.minecraft.client.Minecraft;
 
 /** Applies block-color changes atomically and refreshes all cached surface tiles. */
@@ -23,6 +24,7 @@ public final class BlockColorOverrideController {
         if (MapConfig.blockColorOverrides.isEmpty()) return;
         MapConfig.blockColorOverrides.clear();
         MapConfig.save();
+        MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().clearDerivedColorCaches();
         MapTextureManager.getInstance().invalidateStyle();
         MapTextureManager.getInstance().uploadDirtyTextures(true);
@@ -31,6 +33,7 @@ public final class BlockColorOverrideController {
 
     private static void refresh(String blockId) {
         MapConfig.save();
+        MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().invalidateBlockColor(blockId);
         MapTextureManager.getInstance().uploadDirtyTextures(true);
         requestLiveCaveRefresh();

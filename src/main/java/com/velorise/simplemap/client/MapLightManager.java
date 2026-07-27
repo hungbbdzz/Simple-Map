@@ -15,12 +15,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -36,20 +31,8 @@ public final class MapLightManager {
     private static final MapLightManager INSTANCE = new MapLightManager();
     private static final int PIXEL_COUNT = 512 * 512;
     private static final int MAX_REGIONS = 96;
-
-    private static final ThreadPoolExecutor LOAD_POOL = new ThreadPoolExecutor(
-            1, 1, 30L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(96), runnable -> {
-                Thread thread = new Thread(runnable, "SimpleMap-LightLoad");
-                thread.setDaemon(true);
-                thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
-                return thread;
-            }, new ThreadPoolExecutor.AbortPolicy());
-    private static final ExecutorService SAVE_POOL = Executors.newSingleThreadExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "SimpleMap-LightSave");
-        thread.setDaemon(true);
-        thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
-        return thread;
-    });
+    private static final int MAX_PENDING_SAVES = 12;
+    private static final long SAVE_RETRY_DELAY_MS = 500L;
 
     private final Map<String, LightRegion> regions = new LinkedHashMap<>(16, 0.75f, true);
     private final Set<String> dirtyRegions = new HashSet<>();
@@ -79,7 +62,7 @@ public final class MapLightManager {
             synchronized (dirtyRegions) {
                 dirtyRegions.add(key(rx, rz));
             }
-            MapTextureManager.getInstance().markRegionDirty(rx, rz);
+            MapTextureManager.getInstance().markPageDirtyForBlock(blockX, blockZ);
         }
     }
 
@@ -127,7 +110,50 @@ public final class MapLightManager {
         long now = System.currentTimeMillis();
         if (now - lastSaveTime < 10_000L) return;
         lastSaveTime = now;
-        saveDirtyRegions(cacheDirectory);
+        pumpDirtyRegionSaves(2);
+    }
+
+    /** Pulls only a small number of dirty light regions into the IO queue. */
+    int pumpDirtyRegionSaves(int maximum) {
+        File directory = cacheDirectory;
+        if (directory == null || maximum <= 0) return dirtyRegionCount();
+        int admitted = 0;
+        while (admitted < maximum) {
+            String selected;
+            synchronized (dirtyRegions) {
+                Iterator<String> iterator = dirtyRegions.iterator();
+                if (!iterator.hasNext()) break;
+                selected = iterator.next();
+                iterator.remove();
+            }
+            LightRegion region;
+            synchronized (regions) {
+                region = regions.get(selected);
+            }
+            if (region == null || region.closed) continue;
+            if (!saveRegionAsync(region, directory, false)) {
+                synchronized (dirtyRegions) {
+                    dirtyRegions.add(selected);
+                }
+                break;
+            }
+            admitted++;
+        }
+        return dirtyRegionCount();
+    }
+
+    int dirtyRegionCount() {
+        synchronized (dirtyRegions) {
+            return dirtyRegions.size();
+        }
+    }
+
+    int pendingSaveCount() {
+        return pendingSaves.size();
+    }
+
+    int inFlightSaveCount() {
+        return inFlightSaves.size();
     }
 
     public synchronized void flushAndClear() {
@@ -139,9 +165,13 @@ public final class MapLightManager {
     }
 
     private void loadRegionAsync(LightRegion region, File directory, long token) {
+        if (!region.beginLoad()) return;
         File file = new File(directory, fileName(region.rx, region.rz));
-        try {
-            LOAD_POOL.execute(() -> {
+        MapWorkScheduler.scheduleIo(0L, TimeUnit.MILLISECONDS,
+                MapRequestLane.FULLSCREEN, MapWorkScheduler.WorkType.DISK_READ,
+                MapRequestLane.FULLSCREEN.priorityBase(), 10,
+                () -> isCurrent(region, directory, token), () -> {
+            try {
                 byte[] bytes = null;
                 LightSaveRequest pending = latestSave(directory, region.rx, region.rz);
                 if (pending != null) {
@@ -165,16 +195,12 @@ public final class MapLightManager {
                 if (!isCurrent(region, directory, token)) return;
                 if (bytes != null) region.applyLoaded(bytes);
                 region.markLoaded();
-                MapTextureManager.getInstance().markRegionDirty(region.rx, region.rz);
-            });
-        } catch (RejectedExecutionException saturated) {
-            synchronized (regions) {
-                if (regions.get(key(region.rx, region.rz)) == region) {
-                    regions.remove(key(region.rx, region.rz));
-                }
+                MapTextureManager.getInstance()
+                        .markRegionSourceAvailable(region.rx, region.rz);
+            } finally {
+                region.finishLoad();
             }
-            region.close();
-        }
+        });
     }
 
     private boolean isCurrent(LightRegion region, File directory, long token) {
@@ -185,56 +211,64 @@ public final class MapLightManager {
     }
 
     private void flushCurrentDirectory() {
-        saveDirtyRegions(cacheDirectory);
-    }
-
-    private void saveDirtyRegions(File directory) {
+        File directory = cacheDirectory;
         if (directory == null) return;
         Set<String> keys;
         synchronized (dirtyRegions) {
-            if (dirtyRegions.isEmpty()) return;
             keys = new HashSet<>(dirtyRegions);
             dirtyRegions.clear();
         }
         synchronized (regions) {
             for (String key : keys) {
                 LightRegion region = regions.get(key);
-                if (region != null && !region.closed) saveRegionAsync(region, directory);
+                if (region != null && !region.closed) saveRegionAsync(region, directory, true);
             }
         }
     }
 
-    private void saveRegionAsync(LightRegion region, File directory) {
-        if (directory == null || region == null || region.closed) return;
+    private boolean saveRegionAsync(LightRegion region, File directory, boolean force) {
+        if (directory == null || region == null || region.closed) return false;
+        String saveKey = saveKey(directory, region.rx, region.rz);
+        if (!force && !pendingSaves.containsKey(saveKey)
+                && !inFlightSaves.containsKey(saveKey)
+                && pendingSaves.size() >= MAX_PENDING_SAVES) return false;
         LightSaveRequest request = new LightSaveRequest(directory, region.rx, region.rz,
                 region.getGeneration(), region.snapshot());
         pendingSaves.put(request.key(), request);
-        scheduleSaveDrain();
+        scheduleSaveDrain(0L);
+        return true;
     }
 
-    private void scheduleSaveDrain() {
+    private void scheduleSaveDrain(long delayMs) {
         if (!saveDrainScheduled.compareAndSet(false, true)) return;
-        SAVE_POOL.execute(() -> {
+        MapWorkScheduler.scheduleIo(Math.max(0L, delayMs), TimeUnit.MILLISECONDS,
+                MapRequestLane.BACKGROUND, MapWorkScheduler.WorkType.DISK_WRITE,
+                0, 12, () -> true, () -> {
+            boolean failed = false;
+            LightSaveRequest request = null;
             try {
-                while (true) {
-                    LightSaveRequest request = pendingSaves.values().stream().findFirst().orElse(null);
-                    if (request == null) break;
-                    if (!pendingSaves.remove(request.key(), request)) continue;
-                    inFlightSaves.put(request.key(), request);
-                    try {
-                        writeSaveRequest(request);
-                    } finally {
-                        inFlightSaves.remove(request.key(), request);
+                Iterator<LightSaveRequest> iterator = pendingSaves.values().iterator();
+                if (iterator.hasNext()) request = iterator.next();
+                if (request == null || !pendingSaves.remove(request.key(), request)) return;
+                inFlightSaves.put(request.key(), request);
+                try {
+                    if (!writeSaveRequest(request)) {
+                        failed = true;
+                        pendingSaves.putIfAbsent(request.key(), request);
                     }
+                } finally {
+                    inFlightSaves.remove(request.key(), request);
                 }
             } finally {
                 saveDrainScheduled.set(false);
-                if (!pendingSaves.isEmpty()) scheduleSaveDrain();
+                if (!pendingSaves.isEmpty()) {
+                    scheduleSaveDrain(failed ? SAVE_RETRY_DELAY_MS : 2L);
+                }
             }
         });
     }
 
-    private void writeSaveRequest(LightSaveRequest request) {
+    private boolean writeSaveRequest(LightSaveRequest request) {
         File directory = request.directory();
         File file = new File(directory, fileName(request.rx(), request.rz()));
         File temporary = null;
@@ -246,8 +280,10 @@ public final class MapLightManager {
             if (request.generation() == generation.get() && sameFile(cacheDirectory, directory)) {
                 fileExists.put(key(request.rx(), request.rz()), true);
             }
+            return true;
         } catch (IOException exception) {
             LOGGER.warn("Failed to write light cache {}", file.getName(), exception);
+            return false;
         } finally {
             if (temporary != null) {
                 try {
@@ -274,7 +310,16 @@ public final class MapLightManager {
             synchronized (dirtyRegions) {
                 dirty = dirtyRegions.remove(eldest.getKey());
             }
-            if (dirty && directory != null) saveRegionAsync(eldest.getValue(), directory);
+            if (dirty && directory != null
+                    && !saveRegionAsync(eldest.getValue(), directory, false)) {
+                // Do not evict the only authoritative dirty copy merely because
+                // the bounded save queue is full. It will be reconsidered later.
+                regions.put(eldest.getKey(), eldest.getValue());
+                synchronized (dirtyRegions) {
+                    dirtyRegions.add(eldest.getKey());
+                }
+                return;
+            }
             eldest.getValue().close();
         }
     }
@@ -350,6 +395,7 @@ public final class MapLightManager {
         private final ReentrantLock lock = new ReentrantLock();
         private volatile boolean loaded;
         private volatile boolean closed;
+        private final AtomicBoolean loadScheduled = new AtomicBoolean();
 
         private LightRegion(int rx, int rz, long generation) {
             this.rx = rx;
@@ -369,12 +415,42 @@ public final class MapLightManager {
             return levels;
         }
 
+        /** Copies a small immutable light rectangle for a page + halo job. */
+        public byte[] snapshotWindow(int minX, int minZ, int width, int height) {
+            if (minX < 0 || minZ < 0 || width <= 0 || height <= 0
+                    || minX + width > MapPageLayout.REGION_SIZE
+                    || minZ + height > MapPageLayout.REGION_SIZE) {
+                throw new IllegalArgumentException("Invalid light window "
+                        + minX + "," + minZ + " " + width + "x" + height);
+            }
+            lock.lock();
+            try {
+                byte[] result = new byte[width * height];
+                for (int z = 0; z < height; z++) {
+                    System.arraycopy(levels,
+                            (minZ + z) * MapPageLayout.REGION_SIZE + minX,
+                            result, z * width, width);
+                }
+                return result;
+            } finally {
+                lock.unlock();
+            }
+        }
+
         public boolean isLoaded() {
             return loaded && !closed;
         }
 
         public long getGeneration() {
             return generation;
+        }
+
+        private boolean beginLoad() {
+            return !closed && loadScheduled.compareAndSet(false, true);
+        }
+
+        private void finishLoad() {
+            loadScheduled.set(false);
         }
 
         private void markLoaded() {

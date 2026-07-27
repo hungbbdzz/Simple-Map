@@ -13,14 +13,18 @@ import com.velorise.simplemap.client.MapKeybindActions;
 import com.velorise.simplemap.client.MapConfig;
 import com.velorise.simplemap.client.MapConfigScreen;
 import com.velorise.simplemap.client.MapManager;
+import com.velorise.simplemap.client.MapMutationBus;
+import com.velorise.simplemap.client.MapObservationScheduler;
 import com.velorise.simplemap.client.MapOverviewTextureManager;
 import com.velorise.simplemap.client.MapPerformanceGovernor;
+import com.velorise.simplemap.client.MapPublicationCoordinator;
 import com.velorise.simplemap.client.MapScreen;
 import com.velorise.simplemap.client.MapViewportCoordinator;
 import com.velorise.simplemap.client.MinimapRenderer;
 import com.velorise.simplemap.client.MapTextureManager;
 import com.velorise.simplemap.client.RegionDataStore;
 import com.velorise.simplemap.client.WaypointManager;
+import com.velorise.simplemap.client.cave.CavePipeline;
 import com.velorise.simplemap.network.ClientNetworkHandler;
 import com.velorise.simplemap.network.NetworkHandler;
 import com.velorise.simplemap.network.payload.SyncConfigPayload;
@@ -200,7 +204,7 @@ public class SimpleMap {
             ItemStack result = event.getCrafting();
             net.minecraft.world.item.component.CustomData customData = result.get(net.minecraft.core.component.DataComponents.CUSTOM_DATA);
             CompoundTag tag = customData != null ? customData.copyTag() : null;
-            
+
             if (result.is(ModItems.MAP_BOOK.get()) && tag != null && tag.contains("PendingMerge")) {
                 Player player = event.getEntity();
                 if (player.level().isClientSide) return; // Server only
@@ -208,12 +212,12 @@ public class SimpleMap {
                 String firstId = null;
                 String secondId = null;
                 net.minecraft.world.Container container = event.getInventory();
-                
+
                 for (int i = 0; i < container.getContainerSize(); i++) {
                     ItemStack stack = container.getItem(i);
                     net.minecraft.world.item.component.CustomData stackCustomData = stack.get(net.minecraft.core.component.DataComponents.CUSTOM_DATA);
                     CompoundTag stackTag = stackCustomData != null ? stackCustomData.copyTag() : null;
-                    
+
                     if (stack.is(ModItems.MAP_BOOK.get()) && stackTag != null) {
                         String id = stackTag.getString("MapBookID");
                         if (!id.isEmpty()) {
@@ -384,6 +388,8 @@ public class SimpleMap {
     @EventBusSubscriber(modid = MODID, bus = EventBusSubscriber.Bus.GAME, value = Dist.CLIENT)
     public static class ClientGameEvents {
         private static boolean wasPlayerDead;
+        /** One monotonically increasing ledger shared by GUI and Screen render hooks. */
+        private static long mapRenderFrameId;
 
         @SubscribeEvent
         public static void onClientTick(ClientTickEvent.Post event) {
@@ -394,18 +400,13 @@ public class SimpleMap {
             // 1. Tick MapManager to update active directory and auto-save dirty regions
             MapManager.getInstance().updateWorldAndDimension(mc);
             MapManager.getInstance().tickSave();
-
-            // 2. Tick MapViewportCoordinator (handles scan + texture requests from viewport)
-            MapViewportCoordinator.getInstance().tick(mc);
-
-            // 2.5. Scan chunks ONLY if map is unlocked and fullscreen map is not open
-            // (MapViewportCoordinator handles fullscreen scan separately)
-            if (SimpleMap.isMapUnlocked(mc.player)
-                    && !(mc.screen instanceof com.velorise.simplemap.client.MapScreen)) {
-                int renderDistance = mc.options.renderDistance().get();
-                int radius = (int) Math.max(16, (renderDistance - 1.5) * 16);
-                ChunkScanner.getInstance().scanAroundPlayerUniform(mc, radius);
-            }
+            // One scheduler now owns mutation repair, live critical observation,
+            // visible saved/live admission, cave-band warmup, archive background and
+            // publication. Low-level queues remain specialized but cannot all spend
+            // their maximum budgets independently in the same tick.
+            MapObservationScheduler.getInstance().tick(mc,
+                    SimpleMap.isMapUnlocked(mc.player),
+                    mc.screen instanceof com.velorise.simplemap.client.MapScreen);
 
             // 2.25. Create one bounded death waypoint on the transition into death.
             // Polling the local player avoids relying on loader-specific client death events.
@@ -515,14 +516,25 @@ public class SimpleMap {
             // Cross-dimension map teleports use a short generic pixel transition.
             // Vanilla/modded dimensions still perform their normal server-side change.
             DimensionTeleportTransition.render(event.getGuiGraphics());
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.level != null && mc.player != null) {
+                MapPublicationCoordinator.getInstance().drainFrame(++mapRenderFrameId);
+            }
         }
 
         @SubscribeEvent
         public static void onRenderScreen(ScreenEvent.Render.Post event) {
-            if (!MinimapRenderer.isAllowedScreenForMinimap(event.getScreen())) {
-                return;
+            MapPerformanceGovernor.getInstance().onFrame();
+            if (MinimapRenderer.isAllowedScreenForMinimap(event.getScreen())) {
+                MinimapRenderer.getInstance().renderHUD(
+                        event.getGuiGraphics(), event.getPartialTick(), true);
             }
-            MinimapRenderer.getInstance().renderHUD(event.getGuiGraphics(), event.getPartialTick(), true);
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.level != null && mc.player != null) {
+                long frameId = mapRenderFrameId;
+                if (frameId == 0L) frameId = ++mapRenderFrameId;
+                MapPublicationCoordinator.getInstance().drainFrame(frameId);
+            }
         }
 
         @SubscribeEvent
@@ -545,11 +557,12 @@ public class SimpleMap {
             CaveTextureManager.getInstance().clearCache();
             FullCaveTextureManager.getInstance().clearCache();
             MapOverviewTextureManager.getInstance().clearCache();
-            MapViewportCoordinator.getInstance().reset();
+            MapObservationScheduler.getInstance().reset();
             CaveMode.clearManualLayer();
             MapConfig.serverExtensionAvailable = false;
             MapConfig.serverCaveMapMode = 0;
             MapConfig.serverRequireMapBook = false;
+            MinimapRenderer.getInstance().onWorldLeave();
             wasPlayerDead = false;
         }
     }

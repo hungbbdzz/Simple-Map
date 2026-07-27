@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client;
 
 import com.velorise.simplemap.SimpleMap;
+import com.velorise.simplemap.client.cave.CaveStateClassifier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.AbstractSliderButton;
@@ -21,12 +22,14 @@ public class MapScreen extends Screen {
     private static final float TOOLBAR_ICON_SCALE = 1.0f;
     private static final int PLAYER_PANEL_MARGIN = 4;
     private static final int PLAYER_PANEL_HEIGHT = 15;
+    private static final int ZOOM_PANEL_MARGIN = 4;
+    private static final int ZOOM_PANEL_HEIGHT = 15;
     private static final float DEFAULT_MAP_SCALE = 0.5f;
     private static final float SURFACE_MINIMUM_SCALE = 0.02f;
-    private static final float LAYER_MINIMUM_SCALE_FLOOR = 0.055f;
-    /** Temporary exact-layer viewport cap until layered cave receives a true LOD pyramid. */
-    private static final double LAYER_MAX_VIEW_WIDTH_BLOCKS = 4_096.0;
-    private static final double LAYER_MAX_VIEW_HEIGHT_BLOCKS = 2_048.0;
+    /** Xaero uses 0.0625x as the normal zoom-out floor. Cave projection is
+     * substantially heavier than surface LOD, so keep the same stable floor
+     * instead of exposing a 0.02x cave viewport with roughly ten times the area. */
+    private static final float CAVE_MINIMUM_SCALE = 0.0625f;
     private static final long OPEN_ANIMATION_NANOS = 1_000_000_000L;
     /** 5x default view opens at 6x and settles back to 5x. */
     private static final float OPEN_ANIMATION_START_MULTIPLIER = 1.2f;
@@ -41,7 +44,6 @@ public class MapScreen extends Screen {
     private long openAnimationStartNanos = System.nanoTime();
     private long lastFrameNanos;
     private long lastDragSampleNanos;
-    private long interactionHoldUntilNanos;
     private double momentumX;
     private double momentumZ;
     private int cachedCursorX = Integer.MIN_VALUE;
@@ -50,6 +52,8 @@ public class MapScreen extends Screen {
     private long cachedCursorAtNanos;
     private BlockInfo cachedCursorInfo;
     private boolean cursorCacheValid;
+    private final CaveStateClassifier caveStateClassifier = CaveStateClassifier.getInstance();
+    private final MapVisualClassifier visualClassifier = MapVisualClassifier.getInstance();
 
     // Popup context menu for waypoints and teleportation
     private boolean isPopupMenuOpen = false;
@@ -442,7 +446,6 @@ public class MapScreen extends Screen {
         updateMomentum(frameNow);
         clampScaleForCurrentMode();
         currentRenderScale = scale * openAnimationMultiplier(frameNow);
-        boolean cachedOnlyPan = isDragging || Math.hypot(momentumX, momentumZ) > 1.0;
         // AUTO is a live view: keep the compact Y readout synchronized with the
         // player's stable scan band without turning the slider into manual mode.
         if (caveLayerSlider != null && !caveLayerSlider.isDragging()
@@ -492,7 +495,7 @@ public class MapScreen extends Screen {
             MapManager.getInstance().isViewingLiveDimension(),
             false,
             false, mouseWorldX, mouseWorldZ,
-            partialTick, cachedOnlyPan
+            partialTick, false
         );
 
         if (!MapManager.getInstance().isViewingLiveDimension()
@@ -669,6 +672,8 @@ public class MapScreen extends Screen {
                     panelX + (panelWidth - biomeWidth) / 2, lineY, 0xA8D69C, false);
         }
 
+        drawZoomPanel(guiGraphics);
+
         // Render player coordinates at bottom-right. Bounds and text use one shared
         // calculation so the clickable panel cannot drift below the label.
         if (this.minecraft != null && this.minecraft.player != null) {
@@ -689,6 +694,25 @@ public class MapScreen extends Screen {
                         mouseX, mouseY);
             }
         }
+    }
+
+    private void drawZoomPanel(GuiGraphics guiGraphics) {
+        String zoomText = getZoomText();
+        int panelWidth = this.font.width(zoomText) + 10;
+        int left = (this.width - panelWidth) / 2;
+        int bottom = this.height - ZOOM_PANEL_MARGIN;
+        int top = bottom - ZOOM_PANEL_HEIGHT;
+        guiGraphics.fill(left, top, left + panelWidth, bottom, 0x78000000);
+        guiGraphics.drawString(this.font, zoomText, left + 5, top + 3,
+                0xFFE6E6E6, false);
+    }
+
+    private String getZoomText() {
+        float displayedScale = Math.max(getMinimumStableScale(), this.scale);
+        if (displayedScale >= 10.0f) {
+            return String.format(java.util.Locale.ROOT, "Zoom: %.1fx", displayedScale);
+        }
+        return String.format(java.util.Locale.ROOT, "Zoom: %.2fx", displayedScale);
     }
 
     private String getPlayerCoordinatesText() {
@@ -877,12 +901,12 @@ public class MapScreen extends Screen {
                 && state.getFluidState().isEmpty()
                 && (state.is(net.minecraft.world.level.block.Blocks.FIRE)
                         || state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
-                        || state.getCollisionShape(level, pos).isEmpty());
+                        || caveStateClassifier.isCollisionEmpty(level, pos, state));
         boolean flower = MapConfig.displayFlowers
-                && state.is(net.minecraft.tags.BlockTags.FLOWERS);
+                && visualClassifier.info(state).flower();
         if (openEmitter || flower || !state.getFluidState().isEmpty()) return true;
         return !state.isAir()
-                && !state.getCollisionShape(level, pos).isEmpty()
+                && !caveStateClassifier.isCollisionEmpty(level, pos, state)
                 && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE;
     }
 
@@ -894,19 +918,19 @@ public class MapScreen extends Screen {
                 && state.getFluidState().isEmpty()
                 && (state.is(net.minecraft.world.level.block.Blocks.FIRE)
                         || state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
-                        || state.getCollisionShape(level, pos).isEmpty());
+                        || caveStateClassifier.isCollisionEmpty(level, pos, state));
         if (openEmitter) {
             String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
                     .getKey(state.getBlock()).toString();
             return new BlockInfo(state.getBlock().getName().getString(), blockId, openY);
         }
         if (state.getFluidState().isEmpty()) {
-            boolean openSpace = state.isAir() || state.getCollisionShape(level, pos).isEmpty();
+            boolean openSpace = state.isAir() || caveStateClassifier.isCollisionEmpty(level, pos, state);
             if (!openSpace || openY <= level.getMinBuildHeight()) return null;
             pos.setY(openY - 1);
             state = level.getBlockState(pos);
             boolean floorOpen = state.isAir()
-                    || (state.getCollisionShape(level, pos).isEmpty() && state.getFluidState().isEmpty());
+                    || (caveStateClassifier.isCollisionEmpty(level, pos, state) && state.getFluidState().isEmpty());
             if (floorOpen) return null;
         }
         String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
@@ -927,7 +951,7 @@ public class MapScreen extends Screen {
                 net.minecraft.world.level.block.state.BlockState candidate = level.getBlockState(pos);
                 if (candidate.getFluidState().is(net.minecraft.tags.FluidTags.WATER)
                         || candidate.isAir()
-                        || candidate.getCollisionShape(level, pos).isEmpty()) continue;
+                        || caveStateClassifier.isCollisionEmpty(level, pos, candidate)) continue;
                 bottomY = y;
                 bottomState = candidate;
                 break;
@@ -1180,7 +1204,6 @@ public class MapScreen extends Screen {
             dragStartX = mouseX;
             dragStartZ = mouseY;
             lastDragSampleNanos = System.nanoTime();
-            interactionHoldUntilNanos = lastDragSampleNanos + 250_000_000L;
             return true;
         }
 
@@ -1309,7 +1332,6 @@ public class MapScreen extends Screen {
             this.centerX += deltaX;
             this.centerZ += deltaZ;
             long now = System.nanoTime();
-            interactionHoldUntilNanos = now + 250_000_000L;
             double seconds = lastDragSampleNanos == 0L ? 0.0
                     : Math.max(0.001, Math.min(0.050,
                             (now - lastDragSampleNanos) / 1_000_000_000.0));
@@ -1331,21 +1353,11 @@ public class MapScreen extends Screen {
     }
 
     private float getMinimumStableScale() {
-        if (this.minecraft == null || !CaveMode.isActive(this.minecraft)
-                || CaveMode.isFullView(this.minecraft)) {
-            return SURFACE_MINIMUM_SCALE;
-        }
-
-        // Layered mode still uses exact 512x512 textures rather than the surface
-        // LOD pyramid. Temporarily cap the world-space viewport to roughly
-        // 4096 x 2048 blocks so extreme zoom cannot enumerate/upload thousands
-        // of full-resolution cave regions. This is screen-size independent.
-        float horizontalBound = (float) (Math.max(1, this.width - 2)
-                / LAYER_MAX_VIEW_WIDTH_BLOCKS);
-        float verticalBound = (float) (Math.max(1, this.height - 2)
-                / LAYER_MAX_VIEW_HEIGHT_BLOCKS);
-        return Math.max(LAYER_MINIMUM_SCALE_FLOOR,
-                Math.max(horizontalBound, verticalBound));
+        // Surface can use the deeper branch hierarchy at 0.02x. Cave views retain
+        // Xaero's normal 0.0625x floor because every newly discovered exact page
+        // can require world-save decode and vertical projection before LOD exists.
+        return CaveMode.isActive(this.minecraft)
+                ? CAVE_MINIMUM_SCALE : SURFACE_MINIMUM_SCALE;
     }
 
     private void clampScaleForCurrentMode() {
@@ -1362,13 +1374,10 @@ public class MapScreen extends Screen {
         }
 
         cancelMotionAndOpenAnimation();
-        interactionHoldUntilNanos = System.nanoTime() + 260_000_000L;
         float oldScale = this.scale;
 
-        // A 512x512 region is one GPU texture. Extremely small scales can place
-        // thousands of regions on screen and force unavoidable LRU thrashing.
-        // Clamp to a screen-dependent stable overview limit until a hierarchical
-        // overview texture system is introduced.
+        // Cave and surface use different zoom-out floors. Surface can safely use
+        // deeper retained LOD; cave projection is bounded at Xaero's normal 0.0625x.
         float minimumScale = getMinimumStableScale();
         this.scale = Math.max(minimumScale,
                 Math.min(12.0f, this.scale + (float) scrollY * 0.15f * this.scale));

@@ -4,6 +4,9 @@ package com.velorise.simplemap.client;
 public final class MapPageLayout {
     public static final int REGION_SIZE = 512;
     public static final int PAGE_SIZE = 64;
+    /** Samples required by 3x3 biome tint, immediate relief and radius-2 depth. */
+    public static final int PAGE_HALO = 2;
+    public static final int PAGE_SNAPSHOT_SIZE = PAGE_SIZE + PAGE_HALO * 2;
     public static final int PAGES_PER_REGION = REGION_SIZE / PAGE_SIZE;
     public static final int PAGES_PER_REGION_SQUARED = PAGES_PER_REGION * PAGES_PER_REGION;
 

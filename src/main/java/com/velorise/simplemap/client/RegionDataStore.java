@@ -26,8 +26,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -43,17 +42,12 @@ public final class RegionDataStore {
     private static final int MAX_PALETTE_ENTRIES = 65_535;
     private static final int MAX_COMPRESSED_FILE_BYTES = 8 * 1024 * 1024;
 
-    private static final ExecutorService IO_POOL = Executors.newSingleThreadExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "SimpleMap-RegionIO");
-        thread.setDaemon(true);
-        thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
-        return thread;
-    });
-
     /* Saves are coalesced by destination so chunk updates cannot create an unbounded queue. */
     private static final Map<String, SaveRequest> PENDING_SAVES = new ConcurrentHashMap<>();
     private static final Map<String, SaveRequest> IN_FLIGHT_SAVES = new ConcurrentHashMap<>();
     private static final AtomicBoolean SAVE_DRAIN_SCHEDULED = new AtomicBoolean();
+    private static final int MAX_PENDING_SAVES = 8;
+    private static final long SAVE_RETRY_DELAY_MS = 500L;
 
     public static final String FILE_EXT = ".smdat";
 
@@ -93,15 +87,45 @@ public final class RegionDataStore {
 
     public static void saveAsync(File directory, int rx, int rz, long[] packedPixels, int[] tints,
             String[] biomePalette, String[] blockPalette) {
+        // Compatibility/flush path: preserve the historical never-drop contract.
+        // Normal client-tick persistence should call trySaveAsync() first so it
+        // cannot retain snapshots for every loaded region at once.
+        enqueueSave(directory, rx, rz, packedPixels, tints,
+                biomePalette, blockPalette, true);
+    }
+
+    public static boolean trySaveAsync(File directory, int rx, int rz,
+            long[] packedPixels, int[] tints, String[] biomePalette,
+            String[] blockPalette) {
+        return enqueueSave(directory, rx, rz, packedPixels, tints,
+                biomePalette, blockPalette, false);
+    }
+
+    public static boolean canAcceptSave(File directory, int rx, int rz) {
+        if (directory == null) return false;
+        String key = saveKey(directory, rx, rz);
+        return PENDING_SAVES.containsKey(key)
+                || IN_FLIGHT_SAVES.containsKey(key)
+                || PENDING_SAVES.size() < MAX_PENDING_SAVES;
+    }
+
+    private static boolean enqueueSave(File directory, int rx, int rz,
+            long[] packedPixels, int[] tints, String[] biomePalette,
+            String[] blockPalette, boolean force) {
         if (directory == null || packedPixels == null || packedPixels.length != PIXEL_COUNT
-                || tints == null || tints.length != PIXEL_COUNT) return;
+                || tints == null || tints.length != PIXEL_COUNT) return false;
+        String key = saveKey(directory, rx, rz);
+        if (!force && !PENDING_SAVES.containsKey(key)
+                && !IN_FLIGHT_SAVES.containsKey(key)
+                && PENDING_SAVES.size() >= MAX_PENDING_SAVES) return false;
         SaveRequest request = new SaveRequest(directory, rx, rz,
                 Arrays.copyOf(packedPixels, packedPixels.length),
                 Arrays.copyOf(tints, tints.length),
                 Arrays.copyOf(biomePalette, biomePalette.length),
                 Arrays.copyOf(blockPalette, blockPalette.length));
-        PENDING_SAVES.put(request.key(), request);
-        scheduleSaveDrain();
+        PENDING_SAVES.put(key, request);
+        scheduleSaveDrain(0L);
+        return true;
     }
 
     public static void saveAsync(File directory, int rx, int rz, long[] packedPixels,
@@ -118,27 +142,35 @@ public final class RegionDataStore {
         saveAsync(directory, rx, rz, packed, biomePalette, blockPalette);
     }
 
-    private static void scheduleSaveDrain() {
+    private static void scheduleSaveDrain(long delayMs) {
         if (!SAVE_DRAIN_SCHEDULED.compareAndSet(false, true)) return;
-        IO_POOL.execute(() -> {
+        MapWorkScheduler.scheduleIo(Math.max(0L, delayMs), TimeUnit.MILLISECONDS,
+                MapRequestLane.BACKGROUND, MapWorkScheduler.WorkType.DISK_WRITE,
+                0, 20, () -> true, () -> {
+            boolean failed = false;
+            SaveRequest request = null;
             try {
-                while (true) {
-                    SaveRequest request = PENDING_SAVES.values().stream().findFirst().orElse(null);
-                    if (request == null) break;
-                    if (!PENDING_SAVES.remove(request.key(), request)) continue;
-                    IN_FLIGHT_SAVES.put(request.key(), request);
-                    try {
-                        writeAtomic(new File(request.directory(), fileName(request.rx(), request.rz())),
-                                request.storedRegion());
-                    } catch (IOException exception) {
-                        LOGGER.error("Failed to save region {},{}", request.rx(), request.rz(), exception);
-                    } finally {
-                        IN_FLIGHT_SAVES.remove(request.key(), request);
-                    }
+                var iterator = PENDING_SAVES.values().iterator();
+                if (iterator.hasNext()) request = iterator.next();
+                if (request == null || !PENDING_SAVES.remove(request.key(), request)) return;
+                IN_FLIGHT_SAVES.put(request.key(), request);
+                try {
+                    writeAtomic(new File(request.directory(), fileName(request.rx(), request.rz())),
+                            request.storedRegion());
+                } catch (IOException exception) {
+                    failed = true;
+                    // A newer snapshot wins. Otherwise retain this exact snapshot
+                    // and retry later; a transient disk error must not clear dirty data.
+                    PENDING_SAVES.putIfAbsent(request.key(), request);
+                    LOGGER.error("Failed to save region {},{}", request.rx(), request.rz(), exception);
+                } finally {
+                    IN_FLIGHT_SAVES.remove(request.key(), request);
                 }
             } finally {
                 SAVE_DRAIN_SCHEDULED.set(false);
-                if (!PENDING_SAVES.isEmpty()) scheduleSaveDrain();
+                if (!PENDING_SAVES.isEmpty()) {
+                    scheduleSaveDrain(failed ? SAVE_RETRY_DELAY_MS : 2L);
+                }
             }
         });
     }
@@ -384,6 +416,15 @@ public final class RegionDataStore {
         SaveRequest request = PENDING_SAVES.get(key);
         if (request == null) request = IN_FLIGHT_SAVES.get(key);
         return request == null ? null : request.storedRegion();
+    }
+
+
+    public static int pendingSaveCount() {
+        return PENDING_SAVES.size();
+    }
+
+    public static int inFlightSaveCount() {
+        return IN_FLIGHT_SAVES.size();
     }
 
     public static String fileName(int rx, int rz) {

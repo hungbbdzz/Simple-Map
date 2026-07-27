@@ -10,6 +10,13 @@ public class MinimapRenderer {
     private static final MinimapRenderer INSTANCE = new MinimapRenderer();
     private static final long CAVE_ZOOM_ANIMATION_NANOS = 1_000_000_000L;
     private static final float CAVE_ZOOM_MULTIPLIER = 1.55f;
+    /**
+     * The retained FBO compositor is kept for later validation, but direct exact-leaf
+     * rendering is the stable default. A submitted draw is not proof that an FBO
+     * contains visible pixels, which previously let an opaque black target suppress
+     * the working direct path.
+     */
+    private static final boolean USE_EXPERIMENTAL_FRAMEBUFFER = false;
 
     private boolean caveAnimationInitialized;
     private boolean lastCaveActive;
@@ -29,6 +36,11 @@ public class MinimapRenderer {
 
     public void onWorldJoin() {
         this.worldJoinTimeNanos = System.nanoTime();
+        MinimapFramebufferRenderer.getInstance().resetFailureState();
+    }
+
+    public void onWorldLeave() {
+        MinimapFramebufferRenderer.getInstance().destroy();
     }
 
     public static boolean isAllowedScreenForMinimap(net.minecraft.client.gui.screens.Screen screen) {
@@ -148,16 +160,16 @@ public class MinimapRenderer {
             guiGraphics.fill(x - tHalf, y, x, y + size, MapConfig.minimapRingColor); // Left
             guiGraphics.fill(x + size, y, x + size + tHalf, y + size, MapConfig.minimapRingColor); // Right
 
-            // Draw Map
-            MapRenderer.getInstance().drawMap(
-                    guiGraphics,
-                    x, y, size, size,
-                    interpX, interpZ,
-                    effectiveZoom,
-                    true,
-                    MapConfig.minimapRotate,
-                    true, 0, 0,
-                    partialTick);
+            // Draw map through the fixed-resolution minimap target. If the GPU or
+            // another renderer rejects the FBO path, direct rendering remains a
+            // session-safe fallback.
+            renderMapContent(guiGraphics, x, y, size, interpX, interpZ,
+                    effectiveZoom, partialTick);
+            // The player marker is a HUD overlay, not map-texture content. Keeping it
+            // outside the FBO makes it survive empty/cold pages and framebuffer fallback.
+            MapRenderer.getInstance().drawMinimapPlayerOverlay(
+                    guiGraphics, x + size / 2.0f, y + size / 2.0f,
+                    MapConfig.minimapRotate, partialTick);
 
             // Draw Compass Directions on the square borders
             float cx = x + size / 2.0f;
@@ -205,6 +217,35 @@ public class MinimapRenderer {
         }
     }
 
+
+    private void renderMapContent(GuiGraphics guiGraphics, int x, int y, int size,
+            double centerX, double centerZ, float effectiveZoom, float partialTick) {
+        if (USE_EXPERIMENTAL_FRAMEBUFFER) {
+            boolean rendered = MinimapFramebufferRenderer.getInstance().render(
+                    guiGraphics, x, y, size, centerX, centerZ, effectiveZoom,
+                    MapConfig.minimapRotate, partialTick);
+            if (rendered) return;
+        }
+
+        // Render exact leaves directly into the HUD target. This is the same basic
+        // contract used by Xaero's minimap support: leaf texture residency decides
+        // visibility, while an off-screen compositor is only an optional effect layer.
+        boolean depthWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
+                org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        try {
+            guiGraphics.fill(x, y, x + size, y + size, 0xFF080A0C);
+            MapRenderer.getInstance().drawMap(
+                    guiGraphics, x, y, size, size, centerX, centerZ, effectiveZoom,
+                    false, MapConfig.minimapRotate, true, 0, 0, partialTick);
+            guiGraphics.flush();
+        } finally {
+            if (depthWasEnabled) org.lwjgl.opengl.GL11.glEnable(
+                    org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+            else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        }
+    }
+
     private void renderCircularMinimap(GuiGraphics guiGraphics, Minecraft mc, Player player,
             int x, int y, int size, int borderThickness, int tHalf,
             double interpX, double interpZ, float effectiveZoom, float partialTick) {
@@ -248,15 +289,8 @@ public class MinimapRenderer {
                     org.lwjgl.opengl.GL11.GL_KEEP, org.lwjgl.opengl.GL11.GL_KEEP);
             org.lwjgl.opengl.GL11.glStencilMask(0x00);
 
-            MapRenderer.getInstance().drawMap(
-                    guiGraphics,
-                    x, y, size, size,
-                    interpX, interpZ,
-                    effectiveZoom,
-                    true,
-                    MapConfig.minimapRotate,
-                    true, 0, 0,
-                    partialTick);
+            renderMapContent(guiGraphics, x, y, size, interpX, interpZ,
+                    effectiveZoom, partialTick);
             guiGraphics.flush();
         } finally {
             // A render exception must never leave Minecraft with color writes, depth or
@@ -271,6 +305,8 @@ public class MinimapRenderer {
             else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
         }
 
+        MapRenderer.getInstance().drawMinimapPlayerOverlay(
+                guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
         drawCircleRing(guiGraphics, cx, cy, clipRadius, radius, 64, MapConfig.minimapRingColor);
         drawCircleRing(guiGraphics, cx, cy, radius, radius + borderThickness, 64, MapConfig.minimapRingColor);
         drawCircleRing(guiGraphics, cx, cy, radius + borderThickness, radius + borderThickness + 1, 64,

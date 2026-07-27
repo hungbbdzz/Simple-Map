@@ -1,5 +1,6 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.session.MapSessionManager;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 
@@ -197,6 +198,7 @@ public final class MapKeybindActions {
     }
 
     private static void invalidateMapStyle() {
+        MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().invalidateStyle();
         CaveTextureManager.getInstance().invalidateStyle();
         FullCaveTextureManager.getInstance().invalidateStyle();

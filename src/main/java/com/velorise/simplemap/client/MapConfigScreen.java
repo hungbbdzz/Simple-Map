@@ -1,5 +1,7 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.session.MapSessionManager;
+
 import com.velorise.simplemap.ServerConfig;
 import com.velorise.simplemap.network.NetworkHandler;
 import com.velorise.simplemap.network.payload.SyncConfigPayload;
@@ -412,6 +414,7 @@ public class MapConfigScreen extends Screen {
                 button -> {
                     MapConfig.mapColorProfile = (MapConfig.mapColorProfile + 1) % MapColorProfile.NAMES.length;
                     button.setMessage(getMapStyleMessage());
+                    MapSessionManager.getInstance().bumpStyleGeneration();
                     MapTextureManager.getInstance().invalidateStyle();
                     CaveTextureManager.getInstance().invalidateStyle();
                     FullCaveTextureManager.getInstance().invalidateStyle();
@@ -637,7 +640,7 @@ public class MapConfigScreen extends Screen {
                 }).bounds(col2X, 102, colW, 20)
                 .tooltip(Tooltip.create(Component.literal(
                         "Re-color and reload all saved map regions in the background.\n"
-                        + "Runs in the background and updates textures automatically when finished.")))
+                        + "The current image stays visible until each replacement is ready.")))
                 .build();
         this.addRenderableWidget(reloadAllRegionsButton);
 
@@ -719,6 +722,7 @@ public class MapConfigScreen extends Screen {
         CaveMode.clearManualLayer();
         CaveMapManager.getInstance().deactivate();
         ChunkScanner.getInstance().reset();
+        MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().invalidateStyle();
         CaveTextureManager.getInstance().invalidateStyle();
         FullCaveTextureManager.getInstance().invalidateStyle();
@@ -1020,6 +1024,7 @@ public class MapConfigScreen extends Screen {
 
     private void refreshLoadedMapData() {
         MapConfig.save();
+        MapSessionManager.getInstance().bumpStyleGeneration();
         ChunkScanner.getInstance().reset();
         if (this.minecraft == null || this.minecraft.player == null) return;
         ChunkScanner.getInstance().requestRefresh(this.minecraft);
