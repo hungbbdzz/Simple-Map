@@ -2,6 +2,9 @@ package com.velorise.simplemap.client;
 
 import com.velorise.simplemap.client.cave.CaveAtlasRegion;
 import com.velorise.simplemap.client.cave.SurfaceLodTree;
+import com.velorise.simplemap.client.lod.RegionLodGraph;
+import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.session.MapSessionManager;
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
@@ -47,6 +50,9 @@ public final class MapOverviewTextureManager {
     private final Map<Key, Long> revisions = new HashMap<>();
     private final List<TextureInfo> deferredCloses = new ArrayList<>();
     private final SurfaceLodTree surfaceLodTree = new SurfaceLodTree();
+    /** M4 durable authority. The factor-2 tree below is now a refinement adapter. */
+    private final RegionSurfaceLodService regionLodService =
+            RegionSurfaceLodService.getInstance();
     /** Overview is a compatibility fallback and runs only on the shared background lane. */
     private int renderBatchDepth;
     private long lastUploadMs;
@@ -61,6 +67,8 @@ public final class MapOverviewTextureManager {
     private long[] streamPlan = new long[0];
     private int streamCursor;
     private long streamRestartMs;
+    /** Density-correct branch level requested by the latest visible surface view. */
+    private volatile int preferredSurfaceBranchLevel = 1;
 
     private MapOverviewTextureManager() {
     }
@@ -208,8 +216,42 @@ public final class MapOverviewTextureManager {
         return scale < 0.25f ? 8 : strideForScale(scale);
     }
 
+    public void setPreferredSurfaceScale(float scale) {
+        int densityLevel = MapLodPolicy.branchLevel(scale, 3);
+        preferredSurfaceBranchLevel = Math.max(1, densityLevel);
+    }
+
+    /**
+     * Publishes the current fullscreen Surface attention window to the LOD tree.
+     * This is priority metadata only; durable dirty nodes outside the viewport are
+     * preserved and resume through the normal background path.
+     */
+    public void setPreferredSurfaceView(float scale, int hierarchyLevel,
+            int minPageX, int maxPageX, int minPageZ, int maxPageZ,
+            int focusPageX, int focusPageZ) {
+        setPreferredSurfaceScale(scale);
+        int preferred = Math.max(1, hierarchyLevel);
+        surfaceLodTree.setVisibleWindow(currentDimension(), preferred,
+                minPageX, maxPageX, minPageZ, maxPageZ, focusPageX, focusPageZ);
+        regionLodService.setVisibleView(
+                MapSessionManager.getInstance().activeStamp(), scale,
+                minPageX, maxPageX, minPageZ, maxPageZ,
+                focusPageX, focusPageZ);
+    }
+
     public CaveAtlasRegion peekSurfaceBranch(int level, int nodeX, int nodeZ) {
         return surfaceLodTree.peek(currentDimension(), level, nodeX, nodeZ);
+    }
+
+    /** Region-centric M4 coarse node. Level 0 spans one 512x512 region. */
+    public CaveAtlasRegion peekRegionSurfaceBranch(int level, int nodeX,
+            int nodeZ) {
+        return regionLodService.peek(level, nodeX, nodeZ);
+    }
+
+    public boolean hasRegionSurfaceBranchData(int level, int nodeX,
+            int nodeZ) {
+        return regionLodService.hasData(level, nodeX, nodeZ);
     }
 
     public boolean hasSurfaceBranchData(int level, int nodeX, int nodeZ) {
@@ -228,13 +270,44 @@ public final class MapOverviewTextureManager {
             long sourceRevision, MapRequestLane lane) {
         surfaceLodTree.updatePage(currentDimension(), globalPageX, globalPageZ,
                 pixels64, knownRows, complete, sourceRevision, lane);
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null || !stamp.isCurrent()) return;
+        int regionX = Math.floorDiv(globalPageX, MapPageLayout.PAGES_PER_REGION);
+        int regionZ = Math.floorDiv(globalPageZ, MapPageLayout.PAGES_PER_REGION);
+        int localPageX = Math.floorMod(globalPageX, MapPageLayout.PAGES_PER_REGION);
+        int localPageZ = Math.floorMod(globalPageZ, MapPageLayout.PAGES_PER_REGION);
+        int leafIndex = MapPageLayout.pageIndex(localPageX, localPageZ);
+        boolean known = false;
+        if (knownRows != null) {
+            for (long row : knownRows) {
+                if (row != 0L) {
+                    known = true;
+                    break;
+                }
+            }
+        }
+        regionLodService.updateExactLeaf(stamp, regionX, regionZ,
+                leafIndex, sourceRevision, known, complete, true);
+    }
+
+    public void markSurfaceLeafEvicted(RevisionStamp stamp, int regionX,
+            int regionZ, int localPageX, int localPageZ) {
+        if (stamp == null) return;
+        regionLodService.markExactLeafEvicted(stamp, regionX, regionZ,
+                MapPageLayout.pageIndex(localPageX, localPageZ));
+    }
+
+    public RegionLodGraph.Summary lodGraphSummary() {
+        return regionLodService.summary();
     }
 
     /** Coverage fence used before an exact atlas slot may be retired. */
     public boolean hasPublishedSurfaceCoverage(int globalPageX, int globalPageZ,
             long sourceRevision) {
-        return surfaceLodTree.coversPage(currentDimension(), globalPageX,
-                globalPageZ, sourceRevision);
+        return regionLodService.coversExactPage(globalPageX, globalPageZ,
+                sourceRevision)
+                || surfaceLodTree.coversPage(currentDimension(), globalPageX,
+                        globalPageZ, sourceRevision);
     }
 
     private static int normalizeStride(int stride) {
@@ -441,7 +514,12 @@ public final class MapOverviewTextureManager {
         MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
         long deadline = System.nanoTime() + Math.max(500_000L,
                 governor.textureUploadBudgetNanos(focus) / 2);
-        surfaceLodTree.publish(focus ? 4 : 2, deadline);
+        // M4 region authority always receives the first publication slice.
+        regionLodService.publish(focus, deadline);
+        if (System.nanoTime() < deadline) {
+            surfaceLodTree.publish(focus ? 4 : 2, deadline,
+                    preferredSurfaceBranchLevel);
+        }
     }
 
     public void uploadDirtyTextures(boolean focus) {
@@ -459,8 +537,13 @@ public final class MapOverviewTextureManager {
         long deadline = System.nanoTime() + Math.max(500_000L,
                 governor.textureUploadBudgetNanos(focus) / 2);
 
-        // Manual compatibility path: branches still publish first.
-        surfaceLodTree.publish(focus ? 4 : 2, deadline);
+        // Manual compatibility path: M4 region coverage publishes first,
+        // followed by the old factor-2 refinement adapter.
+        regionLodService.publish(focus, deadline);
+        if (System.nanoTime() < deadline) {
+            surfaceLodTree.publish(focus ? 4 : 2, deadline,
+                    preferredSurfaceBranchLevel);
+        }
         if (System.nanoTime() >= deadline) return;
 
         List<Key> selected = selectDirty(budget);
@@ -743,6 +826,8 @@ public final class MapOverviewTextureManager {
 
     public void invalidateStyle() {
         SurfaceLodTree.invalidatePersistentCache();
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        regionLodService.invalidate(stamp);
         String dimension = currentDimension();
         synchronized (textures) {
             for (Key key : textures.keySet()) {
@@ -771,6 +856,7 @@ public final class MapOverviewTextureManager {
             revisions.clear();
         }
         surfaceLodTree.clear();
+        regionLodService.clear();
         streamDimension = "";
         streamMode = Integer.MIN_VALUE;
         streamLayerY = Integer.MIN_VALUE;

@@ -6,6 +6,8 @@ import com.velorise.simplemap.client.MapManager;
 import com.velorise.simplemap.client.MapVisualClassifier;
 import com.velorise.simplemap.client.MapPerformanceGovernor;
 import com.velorise.simplemap.client.MapRequestLane;
+import com.velorise.simplemap.client.MapMutationBus;
+import com.velorise.simplemap.client.MapViewportDemandPolicy;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.level.Level;
 
@@ -193,10 +195,15 @@ public final class CavePipeline {
         if (!usable(minecraft)) return;
         MapRequestLane effectiveLane = lane == null
                 ? MapRequestLane.FULLSCREEN : lane;
-        int viewportMinChunkX = ((int) Math.floor(Math.min(minX, maxX))) >> 4;
-        int viewportMaxChunkX = ((int) Math.floor(Math.max(minX, maxX))) >> 4;
-        int viewportMinChunkZ = ((int) Math.floor(Math.min(minZ, maxZ))) >> 4;
-        int viewportMaxChunkZ = ((int) Math.floor(Math.max(minZ, maxZ))) >> 4;
+        MapViewportDemandPolicy.Bounds admittedViewport =
+                MapViewportDemandPolicy.trimEdgeSlivers(
+                        minX, maxX, minZ, maxZ, effectiveLane);
+        int viewportMinChunkX = ((int) Math.floor(admittedViewport.minX())) >> 4;
+        int viewportMaxChunkX = ((int) Math.floor(
+                Math.nextDown(admittedViewport.maxX()))) >> 4;
+        int viewportMinChunkZ = ((int) Math.floor(admittedViewport.minZ())) >> 4;
+        int viewportMaxChunkZ = ((int) Math.floor(
+                Math.nextDown(admittedViewport.maxZ()))) >> 4;
         double viewportCenterX = Math.max(viewportMinChunkX,
                 Math.min(viewportMaxChunkX, focusX / 16.0));
         double viewportCenterZ = Math.max(viewportMinChunkZ,
@@ -212,42 +219,38 @@ public final class CavePipeline {
         lastViewportLayerY = DenseCaveTile.normalizeLayer(view, layerY);
         lastViewportNanos = System.nanoTime();
 
-        int admittedMinChunkX = viewportMinChunkX;
-        int admittedMaxChunkX = viewportMaxChunkX;
-        int admittedMinChunkZ = viewportMinChunkZ;
-        int admittedMaxChunkZ = viewportMaxChunkZ;
-        LayerWarmupState warmup = layerWarmup;
-        if (warmup != null && warmup.matches(view, layerY)) {
-            admittedMinChunkX = Math.max(admittedMinChunkX,
-                    warmup.centerChunkX - warmup.currentRadius);
-            admittedMaxChunkX = Math.min(admittedMaxChunkX,
-                    warmup.centerChunkX + warmup.currentRadius);
-            admittedMinChunkZ = Math.max(admittedMinChunkZ,
-                    warmup.centerChunkZ - warmup.currentRadius);
-            admittedMaxChunkZ = Math.min(admittedMaxChunkZ,
-                    warmup.centerChunkZ + warmup.currentRadius);
-        }
-
-        boolean branchOnly = CaveScreenSpacePolicy.branchOnly(scale, effectiveLane);
         // Far zoom is rendered from branch/root textures, but Xaero still admits
         // an occasional leaf when no cached branch exists. The policy limits this to
         // one coherent page per slow pass, allowing cold areas to build LOD without
         // reopening the previous exact-page flood.
-        if (admittedMinChunkX <= admittedMaxChunkX
-                && admittedMinChunkZ <= admittedMaxChunkZ) {
+        // Saved-region reconstruction is already page-budgeted and runs off the
+        // client thread. Never clip it to the live layer-warmup radius: under CPU
+        // pressure warmup is intentionally paused, which used to strand fullscreen
+        // loading forever in a tiny square around the player. Warmup now governs
+        // only live LevelChunk replacement; the rolling saved-page frontier remains
+        // free to cover the complete visible map like a region-backed world map.
+        if (viewportMinChunkX <= viewportMaxChunkX
+                && viewportMinChunkZ <= viewportMaxChunkZ) {
             worldSaveReader.requestVisible(minecraft, view, layerY,
-                    admittedMinChunkX, admittedMaxChunkX,
-                    admittedMinChunkZ, admittedMaxChunkZ,
+                    viewportMinChunkX, viewportMaxChunkX,
+                    viewportMinChunkZ, viewportMaxChunkZ,
                     viewportCenterX, viewportCenterZ, scale, effectiveLane);
         }
 
         int playerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
         int playerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
+        // The player hot set is independent of a panned fullscreen frontier. Keep
+        // the current chunk and its immediate neighbours at the strongest live
+        // priority so the HUD/full map cannot show a hole around the marker while
+        // distant saved regions are being reconstructed.
+        displayScheduler.enqueueAround(minecraft.level, view, layerY,
+                playerChunkX, playerChunkZ, 1,
+                effectiveLane.priorityBase() + 500_000);
         int liveRadius = Math.max(2, minecraft.options.renderDistance().get() + 3);
-        int minChunkX = Math.max(admittedMinChunkX - 1, playerChunkX - liveRadius);
-        int maxChunkX = Math.min(admittedMaxChunkX + 1, playerChunkX + liveRadius);
-        int minChunkZ = Math.max(admittedMinChunkZ - 1, playerChunkZ - liveRadius);
-        int maxChunkZ = Math.min(admittedMaxChunkZ + 1, playerChunkZ + liveRadius);
+        int minChunkX = Math.max(viewportMinChunkX - 1, playerChunkX - liveRadius);
+        int maxChunkX = Math.min(viewportMaxChunkX + 1, playerChunkX + liveRadius);
+        int minChunkZ = Math.max(viewportMinChunkZ - 1, playerChunkZ - liveRadius);
+        int maxChunkZ = Math.min(viewportMaxChunkZ + 1, playerChunkZ + liveRadius);
         if (CaveScreenSpacePolicy.restrictLiveProjectionToFocusPage(scale, effectiveLane)) {
             // At the normal cave zoom-out floor one exact page is only 4x4 screen
             // pixels. Keep live projection to the single focus page; saved-data
@@ -266,14 +269,18 @@ public final class CavePipeline {
                     minChunkX, maxChunkX, minChunkZ, maxChunkZ,
                     (minChunkX + maxChunkX) * 0.5, (minChunkZ + maxChunkZ) * 0.5,
                     effectiveLane.priorityBase(), effectiveLane);
-            MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
-            long budget = effectiveLane == MapRequestLane.MINIMAP
-                    ? governor.gameplayScanBudgetNanos(true)
-                    : governor.fullscreenCaveBudgetNanos(
-                            scale, MapConfig.fastFullscreenLoading);
-            if (budget > 0L) {
-                displayScheduler.process(minecraft.level, System.nanoTime() + budget);
-            }
+        }
+        // enqueueAround() above is independent of the panned/zoomed viewport. Drain
+        // it even when the live viewport intersection is empty, otherwise the player
+        // marker can remain surrounded by old/blank cave leaves until the camera is
+        // moved back over the live chunk window.
+        MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
+        long budget = effectiveLane == MapRequestLane.MINIMAP
+                ? governor.gameplayScanBudgetNanos(true)
+                : governor.fullscreenCaveBudgetNanos(
+                        scale, MapConfig.fastFullscreenLoading);
+        if (budget > 0L) {
+            displayScheduler.process(minecraft.level, System.nanoTime() + budget);
         }
         updateTelemetry();
     }
@@ -312,7 +319,9 @@ public final class CavePipeline {
     public void onColumnMutation(int blockX, int blockZ, int reasons) {
         int chunkX = blockX >> 4;
         int chunkZ = blockZ >> 4;
-        readiness.markChunkChanged(chunkX, chunkZ);
+        if (changesCaveGeometry(reasons)) {
+            readiness.markChunkChanged(chunkX, chunkZ);
+        }
         repository.invalidateColumn(blockX, blockZ);
         repository.markDisplayRangeStaleAllLayers(
                 chunkX, chunkX, chunkZ, chunkZ, 4096);
@@ -323,16 +332,34 @@ public final class CavePipeline {
 
     /**
      * Chunk/light replacement invalidates the resident archive tile and schedules a
-     * complete dense transaction. MapMutationBus already expands the 3x3 dependency
-     * neighbourhood, so this method acts on exactly one chunk.
+     * complete dense transaction. MapMutationBus sends the changed chunk here and
+     * repairs only its surface edge dependants separately.
      */
     public void onChunkMutation(int chunkX, int chunkZ, int reasons) {
-        readiness.markChunkChanged(chunkX, chunkZ);
-        repository.invalidateLoadedTile(chunkX, chunkZ);
+        boolean geometryChanged = changesCaveGeometry(reasons);
+        if (geometryChanged) {
+            readiness.markChunkChanged(chunkX, chunkZ);
+            repository.invalidateLoadedTile(chunkX, chunkZ);
+        }
         repository.markDisplayRangeStaleAllLayers(
                 chunkX, chunkX, chunkZ, chunkZ, 4096);
-        scheduler.enqueue(chunkX, chunkZ, 1_650_000);
+        // Light packets can arrive in bursts while a chunk is settling. Cave
+        // topology/emissive flags come from BlockState, so rebuilding the complete
+        // vertical archive for light-only changes is both redundant and extremely
+        // allocation-heavy. Keep the old archive/display tile visible and restyle
+        // only the active dense projection. A real block/chunk replacement still
+        // invalidates and rebuilds the authoritative archive transactionally.
+        if (geometryChanged) {
+            scheduler.enqueue(chunkX, chunkZ, 1_650_000);
+        }
         enqueueCurrentDisplayReplacement(chunkX, chunkZ, 1_800_000);
+    }
+
+    private static boolean changesCaveGeometry(int reasons) {
+        int geometryReasons = MapMutationBus.BLOCK_STATE
+                | MapMutationBus.CHUNK_REPLACE
+                | MapMutationBus.BLOCK_ENTITY;
+        return (reasons & geometryReasons) != 0;
     }
 
     /** Chunk unload revokes authority but deliberately preserves cached pixels. */

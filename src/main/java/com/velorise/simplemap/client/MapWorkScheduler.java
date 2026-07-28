@@ -1,9 +1,15 @@
 package com.velorise.simplemap.client;
 
+import java.util.AbstractQueue;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.EnumMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
-import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Semaphore;
@@ -11,6 +17,8 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
@@ -54,6 +62,10 @@ public final class MapWorkScheduler {
             new Semaphore(Math.max(1, IO_THREADS - 1));
     private static final EnumMap<MapRequestLane, AtomicLong> VIEWPORT_EPOCHS =
             new EnumMap<>(MapRequestLane.class);
+    private static final EnumMap<MapRequestLane, AtomicLong> COMPLETED_BY_LANE =
+            new EnumMap<>(MapRequestLane.class);
+    private static final EnumMap<MapRequestLane, AtomicLong> DENIED_BY_LANE =
+            new EnumMap<>(MapRequestLane.class);
 
     private static final ThreadPoolExecutor CPU = createPool(
             CPU_THREADS, "SimpleMap-CPU");
@@ -71,6 +83,8 @@ public final class MapWorkScheduler {
     static {
         for (MapRequestLane lane : MapRequestLane.values()) {
             VIEWPORT_EPOCHS.put(lane, new AtomicLong(1L));
+            COMPLETED_BY_LANE.put(lane, new AtomicLong());
+            DENIED_BY_LANE.put(lane, new AtomicLong());
         }
         for (WorkType type : WorkType.values()) {
             RUNTIME_EWMA_NANOS.put(type, new AtomicLong(500_000L));
@@ -86,7 +100,7 @@ public final class MapWorkScheduler {
 
     private static ThreadPoolExecutor createPool(int threads, String name) {
         return new ThreadPoolExecutor(threads, threads, 30L, TimeUnit.SECONDS,
-                new PriorityBlockingQueue<>(), runnable -> {
+                new FairTaskQueue(), runnable -> {
                     Thread thread = new Thread(runnable, name);
                     thread.setDaemon(true);
                     thread.setPriority(Math.max(Thread.MIN_PRIORITY,
@@ -144,7 +158,7 @@ public final class MapWorkScheduler {
         for (Runnable queued : pool.getQueue().toArray(new Runnable[0])) {
             if (!(queued instanceof PrioritizedTask task)
                     || !task.isStaleViewportTask(lane, currentEpoch)) continue;
-            if (pool.getQueue().remove(task)) task.releaseQueuedCost();
+            if (pool.getQueue().remove(task)) task.cancelBeforeRun();
         }
     }
 
@@ -318,10 +332,25 @@ public final class MapWorkScheduler {
     }
 
     public static Snapshot snapshot() {
+        int laneCount = MapRequestLane.values().length;
+        int[] cpuQueuedByLane = new int[laneCount];
+        int[] ioQueuedByLane = new int[laneCount];
+        long[] completedByLane = new long[laneCount];
+        long[] deniedByLane = new long[laneCount];
+        FairTaskQueue cpuQueue = (FairTaskQueue) CPU.getQueue();
+        FairTaskQueue ioQueue = (FairTaskQueue) IO.getQueue();
+        for (MapRequestLane lane : MapRequestLane.values()) {
+            int index = lane.ordinal();
+            cpuQueuedByLane[index] = cpuQueue.queued(lane);
+            ioQueuedByLane[index] = ioQueue.queued(lane);
+            completedByLane[index] = COMPLETED_BY_LANE.get(lane).get();
+            deniedByLane[index] = DENIED_BY_LANE.get(lane).get();
+        }
         return new Snapshot(CPU.getActiveCount(), CPU.getQueue().size(),
                 CPU_QUEUED_COST.get(), CPU_ACTIVE_COST.get(),
                 IO.getActiveCount(), IO.getQueue().size(),
-                IO_QUEUED_COST.get(), IO_ACTIVE_COST.get());
+                IO_QUEUED_COST.get(), IO_ACTIVE_COST.get(),
+                cpuQueuedByLane, ioQueuedByLane, completedByLane, deniedByLane);
     }
 
     /** Cheap preflight used before allocating a large immutable source snapshot. */
@@ -360,11 +389,22 @@ public final class MapWorkScheduler {
         if (!effectiveValid.getAsBoolean()) return false;
 
         int cost = Math.max(1, requestedCost);
+        MapMemoryLeaseManager.Category memoryCategory = memoryCategory(effectiveType);
+        long estimatedBytes = estimateRetainedBytes(effectiveType, cost);
+        MapMemoryLeaseManager.Lease memoryLease = MapMemoryLeaseManager.tryAcquire(
+                memoryCategory, estimatedBytes, effectiveLane);
+        if (memoryLease == null) {
+            DENIED_BY_LANE.get(effectiveLane).incrementAndGet();
+            return false;
+        }
+
         long after = queuedCost.addAndGet(cost) + activeCost.get();
         boolean weakLane = effectiveLane == MapRequestLane.BACKGROUND
                 || effectiveLane == MapRequestLane.PREFETCH;
         if (after > hardCost || (weakLane && after > softCost)) {
             queuedCost.addAndGet(-cost);
+            memoryLease.close();
+            DENIED_BY_LANE.get(effectiveLane).incrementAndGet();
             return false;
         }
 
@@ -373,19 +413,76 @@ public final class MapWorkScheduler {
         PrioritizedTask task = new PrioritizedTask(runnable, effectiveValid,
                 effectiveLane, effectiveType, priority,
                 SEQUENCE.getAndIncrement(), cost, queuedCost, activeCost,
-                viewportEpoch, mustRun, cpuDomain, pool);
+                viewportEpoch, mustRun, cpuDomain, pool, memoryLease);
         try {
             pool.execute(task);
             return true;
         } catch (RejectedExecutionException rejected) {
-            queuedCost.addAndGet(-cost);
+            task.cancelBeforeRun();
+            DENIED_BY_LANE.get(effectiveLane).incrementAndGet();
             return false;
         }
     }
 
+    private static MapMemoryLeaseManager.Category memoryCategory(WorkType type) {
+        return switch (type) {
+            case SOURCE_DECODE, DISK_READ ->
+                    MapMemoryLeaseManager.Category.PENDING_SOURCE;
+            case MINIMAP_EXACT, EXACT_BUILD, SOURCE_PROJECTION, LEGACY_BUILD ->
+                    MapMemoryLeaseManager.Category.PENDING_PROJECTION;
+            case BRANCH_DERIVE -> MapMemoryLeaseManager.Category.PENDING_LOD;
+            case DISK_WRITE, CACHE_MAINTENANCE ->
+                    MapMemoryLeaseManager.Category.IO_BUFFER;
+        };
+    }
+
+    private static long estimateRetainedBytes(WorkType type, int cost) {
+        long unit = switch (type) {
+            case MINIMAP_EXACT, EXACT_BUILD, SOURCE_PROJECTION -> 96L << 10;
+            case SOURCE_DECODE, DISK_READ -> 80L << 10;
+            case BRANCH_DERIVE -> 64L << 10;
+            case LEGACY_BUILD -> 48L << 10;
+            case DISK_WRITE, CACHE_MAINTENANCE -> 64L << 10;
+        };
+        return Math.max(64L << 10, Math.multiplyExact((long) cost, unit));
+    }
+
     public record Snapshot(int cpuActive, int cpuQueued, long cpuQueuedCost,
             long cpuActiveCost, int ioActive, int ioQueued, long ioQueuedCost,
-            long ioActiveCost) {
+            long ioActiveCost, int[] cpuQueuedByLane, int[] ioQueuedByLane,
+            long[] completedByLane, long[] deniedByLane) {
+        public Snapshot {
+            cpuQueuedByLane = cpuQueuedByLane.clone();
+            ioQueuedByLane = ioQueuedByLane.clone();
+            completedByLane = completedByLane.clone();
+            deniedByLane = deniedByLane.clone();
+        }
+
+        @Override public int[] cpuQueuedByLane() { return cpuQueuedByLane.clone(); }
+        @Override public int[] ioQueuedByLane() { return ioQueuedByLane.clone(); }
+        @Override public long[] completedByLane() { return completedByLane.clone(); }
+        @Override public long[] deniedByLane() { return deniedByLane.clone(); }
+
+        public int cpuQueued(MapRequestLane lane) {
+            return cpuQueuedByLane[(lane == null
+                    ? MapRequestLane.FULLSCREEN : lane).ordinal()];
+        }
+
+        public int ioQueued(MapRequestLane lane) {
+            return ioQueuedByLane[(lane == null
+                    ? MapRequestLane.FULLSCREEN : lane).ordinal()];
+        }
+
+        public long completed(MapRequestLane lane) {
+            return completedByLane[(lane == null
+                    ? MapRequestLane.FULLSCREEN : lane).ordinal()];
+        }
+
+        public long denied(MapRequestLane lane) {
+            return deniedByLane[(lane == null
+                    ? MapRequestLane.FULLSCREEN : lane).ordinal()];
+        }
+
         public long cpuTotalCost() {
             return cpuQueuedCost + cpuActiveCost;
         }
@@ -407,6 +504,299 @@ public final class MapWorkScheduler {
         } while (!ewma.compareAndSet(previous, Math.max(20_000L, next)));
     }
 
+    /**
+     * Weighted deficit-round-robin queue. Strict priority is preserved inside a
+     * lane, while continuously arriving minimap work can no longer prevent
+     * fullscreen/background/prefetch work from ever reaching a worker.
+     */
+    private static final class FairTaskQueue extends AbstractQueue<Runnable>
+            implements BlockingQueue<Runnable> {
+        private static final MapRequestLane[] LANES = MapRequestLane.values();
+        private static final long MAX_DEFICIT = 4_096L;
+
+        private final EnumMap<MapRequestLane, PriorityQueue<PrioritizedTask>> queues =
+                new EnumMap<>(MapRequestLane.class);
+        private final long[] deficits = new long[LANES.length];
+        private final ReentrantLock lock = new ReentrantLock();
+        private final Condition notEmpty = lock.newCondition();
+        private int cursor;
+        private int size;
+
+        private FairTaskQueue() {
+            for (MapRequestLane lane : LANES) {
+                queues.put(lane, new PriorityQueue<>());
+            }
+        }
+
+        @Override
+        public boolean offer(Runnable runnable) {
+            if (!(runnable instanceof PrioritizedTask task)) {
+                throw new IllegalArgumentException(
+                        "Map scheduler queue accepts PrioritizedTask only");
+            }
+            lock.lock();
+            try {
+                queues.get(task.lane).offer(task);
+                size++;
+                notEmpty.signal();
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public void put(Runnable runnable) {
+            offer(runnable);
+        }
+
+        @Override
+        public boolean offer(Runnable runnable, long timeout, TimeUnit unit) {
+            return offer(runnable);
+        }
+
+        @Override
+        public Runnable poll() {
+            lock.lock();
+            try {
+                return pollFairLocked();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public Runnable take() throws InterruptedException {
+            lock.lockInterruptibly();
+            try {
+                while (size == 0) notEmpty.await();
+                return pollFairLocked();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public Runnable poll(long timeout, TimeUnit unit)
+                throws InterruptedException {
+            long nanos = unit.toNanos(timeout);
+            lock.lockInterruptibly();
+            try {
+                while (size == 0) {
+                    if (nanos <= 0L) return null;
+                    nanos = notEmpty.awaitNanos(nanos);
+                }
+                return pollFairLocked();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public Runnable peek() {
+            lock.lock();
+            try {
+                if (size == 0) return null;
+                PrioritizedTask best = null;
+                for (MapRequestLane lane : LANES) {
+                    PrioritizedTask candidate = queues.get(lane).peek();
+                    if (candidate != null
+                            && (best == null || candidate.compareTo(best) < 0)) {
+                        best = candidate;
+                    }
+                }
+                return best;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public int size() {
+            lock.lock();
+            try {
+                return size;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public int remainingCapacity() {
+            return Integer.MAX_VALUE;
+        }
+
+        @Override
+        public boolean remove(Object value) {
+            lock.lock();
+            try {
+                if (!(value instanceof PrioritizedTask task)) return false;
+                boolean removed = queues.get(task.lane).remove(task);
+                if (removed) size--;
+                return removed;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public boolean contains(Object value) {
+            lock.lock();
+            try {
+                if (!(value instanceof PrioritizedTask task)) return false;
+                return queues.get(task.lane).contains(task);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public void clear() {
+            List<PrioritizedTask> cancelled = new ArrayList<>();
+            lock.lock();
+            try {
+                for (PriorityQueue<PrioritizedTask> queue : queues.values()) {
+                    cancelled.addAll(queue);
+                    queue.clear();
+                }
+                java.util.Arrays.fill(deficits, 0L);
+                size = 0;
+            } finally {
+                lock.unlock();
+            }
+            // ThreadPoolExecutor treats queue.clear() as removal, not task
+            // cancellation. Release durable scheduler and memory accounting here.
+            for (PrioritizedTask task : cancelled) task.cancelBeforeRun();
+        }
+
+        @Override
+        public Iterator<Runnable> iterator() {
+            return snapshotLocked().iterator();
+        }
+
+        @Override
+        public Object[] toArray() {
+            return snapshotLocked().toArray();
+        }
+
+        @Override
+        public <T> T[] toArray(T[] target) {
+            return snapshotLocked().toArray(target);
+        }
+
+        @Override
+        public int drainTo(Collection<? super Runnable> destination) {
+            return drainTo(destination, Integer.MAX_VALUE);
+        }
+
+        @Override
+        public int drainTo(Collection<? super Runnable> destination, int maxElements) {
+            if (destination == null || destination == this) {
+                throw new IllegalArgumentException("Invalid drain destination");
+            }
+            lock.lock();
+            try {
+                int drained = 0;
+                while (drained < maxElements && size > 0) {
+                    Runnable task = pollFairLocked();
+                    if (task == null) break;
+                    destination.add(task);
+                    drained++;
+                }
+                return drained;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        int queued(MapRequestLane lane) {
+            lock.lock();
+            try {
+                PriorityQueue<PrioritizedTask> queue = queues.get(lane);
+                return queue == null ? 0 : queue.size();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private PrioritizedTask pollFairLocked() {
+            if (size == 0) return null;
+            int attempts = 0;
+            int maximumAttempts = LANES.length * 256;
+            while (attempts++ < maximumAttempts) {
+                MapRequestLane lane = LANES[cursor];
+                int laneIndex = cursor;
+                PriorityQueue<PrioritizedTask> queue = queues.get(lane);
+                PrioritizedTask task = queue.peek();
+                if (task == null) {
+                    deficits[laneIndex] = 0L;
+                    cursor = (cursor + 1) % LANES.length;
+                    continue;
+                }
+
+                long charge = Math.max(1L, task.cost);
+                if (deficits[laneIndex] < charge) {
+                    deficits[laneIndex] = Math.min(MAX_DEFICIT,
+                            deficits[laneIndex] + quantum(lane));
+                }
+                if (charge > deficits[laneIndex]) {
+                    cursor = (cursor + 1) % LANES.length;
+                    continue;
+                }
+
+                queue.poll();
+                size--;
+                deficits[laneIndex] -= charge;
+                PrioritizedTask next = queue.peek();
+                if (next == null
+                        || Math.max(1L, next.cost) > deficits[laneIndex]) {
+                    cursor = (cursor + 1) % LANES.length;
+                }
+                return task;
+            }
+
+            // A task with an unexpectedly high declared cost must still make
+            // progress. Choose the oldest head and reset only its lane deficit.
+            PrioritizedTask oldest = null;
+            MapRequestLane oldestLane = null;
+            for (MapRequestLane lane : LANES) {
+                PrioritizedTask candidate = queues.get(lane).peek();
+                if (candidate != null
+                        && (oldest == null || candidate.sequence < oldest.sequence)) {
+                    oldest = candidate;
+                    oldestLane = lane;
+                }
+            }
+            if (oldest == null) return null;
+            queues.get(oldestLane).poll();
+            size--;
+            deficits[oldestLane.ordinal()] = 0L;
+            return oldest;
+        }
+
+        private List<Runnable> snapshotLocked() {
+            lock.lock();
+            try {
+                List<Runnable> snapshot = new ArrayList<>(size);
+                for (MapRequestLane lane : LANES) {
+                    snapshot.addAll(queues.get(lane));
+                }
+                return snapshot;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private static int quantum(MapRequestLane lane) {
+            return switch (lane) {
+                case MINIMAP -> 128;
+                case FULLSCREEN -> 96;
+                case BACKGROUND -> 32;
+                case PREFETCH -> 16;
+            };
+        }
+    }
+
     private static final class PrioritizedTask
             implements Runnable, Comparable<PrioritizedTask> {
         private final Runnable command;
@@ -423,12 +813,14 @@ public final class MapWorkScheduler {
         private final boolean mustRun;
         private final boolean cpuDomain;
         private final ThreadPoolExecutor owner;
+        private final MapMemoryLeaseManager.Lease memoryLease;
+        private final AtomicBoolean memoryLeaseHeld = new AtomicBoolean(true);
 
         private PrioritizedTask(Runnable command, BooleanSupplier valid,
                 MapRequestLane lane, WorkType type, int priority, long sequence,
                 int cost, AtomicLong queuedCost, AtomicLong activeCost,
                 long viewportEpoch, boolean mustRun, boolean cpuDomain,
-                ThreadPoolExecutor owner) {
+                ThreadPoolExecutor owner, MapMemoryLeaseManager.Lease memoryLease) {
             this.command = command;
             this.valid = valid;
             this.lane = lane;
@@ -442,6 +834,7 @@ public final class MapWorkScheduler {
             this.mustRun = mustRun;
             this.cpuDomain = cpuDomain;
             this.owner = owner;
+            this.memoryLease = memoryLease;
         }
 
         @Override
@@ -457,7 +850,7 @@ public final class MapWorkScheduler {
                         try {
                             owner.execute(this);
                         } catch (RejectedExecutionException rejected) {
-                            releaseQueuedCost();
+                            cancelBeforeRun();
                         }
                     }, 2L, TimeUnit.MILLISECONDS);
                     return;
@@ -485,7 +878,9 @@ public final class MapWorkScheduler {
                 // remain alive even if a maintenance task fails unexpectedly.
             } finally {
                 activeCost.addAndGet(-cost);
+                COMPLETED_BY_LANE.get(lane).incrementAndGet();
                 recordRuntime(type, System.nanoTime() - startedNanos);
+                releaseMemoryLease();
                 if (weakPermit) permitDomain.release();
             }
         }
@@ -500,6 +895,17 @@ public final class MapWorkScheduler {
             if (queuedCostHeld.compareAndSet(true, false)) {
                 queuedCost.addAndGet(-cost);
             }
+        }
+
+        private void releaseMemoryLease() {
+            if (memoryLeaseHeld.compareAndSet(true, false) && memoryLease != null) {
+                memoryLease.close();
+            }
+        }
+
+        private void cancelBeforeRun() {
+            releaseQueuedCost();
+            releaseMemoryLease();
         }
 
         @Override

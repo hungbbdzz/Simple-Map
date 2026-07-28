@@ -42,12 +42,18 @@ public final class CaveWorldSaveReader {
     private static final int FULLSCREEN_IN_FLIGHT_PAGES = 4;
     private static final long MISSING_RETRY_MS = 30_000L;
     private static final long FAILED_RETRY_MS = 8_000L;
+    /**
+     * A page that already contains useful leaves is not a failed page. Retry its
+     * unresolved holes quickly while preserving the leaves that were published by
+     * the previous pass. This keeps the player neighbourhood coherent when one
+     * Anvil chunk is briefly busy or its decode is deferred by pressure control.
+     */
+    private static final long PARTIAL_REPAIR_RETRY_MS = 250L;
     private static final long DEFERRED_RETRY_MS = 120L;
     private static final long VIEWPORT_REFRESH_MS = 50L;
     private static final long SOURCE_PREFETCH_INTERVAL_MS = 100L;
     /** Hold one source slice long enough to complete its coherent row-major window,
      * but revisit a permanently deferred/corrupt page on the next repair cycle. */
-    private static final long FULLSCREEN_SOURCE_SLICE_STALL_MS = 3_500L;
 
     private final CaveTileRepository repository = CaveTileRepository.getInstance();
     private final CaveDisplayProjector projector = new CaveDisplayProjector();
@@ -286,58 +292,39 @@ public final class CaveWorldSaveReader {
             }
             state.lastSeenMs = now;
 
+            boolean pressured = MapPerformanceGovernor.getInstance().underPressure();
             long refreshInterval = Math.max(VIEWPORT_REFRESH_MS,
-                    CaveScreenSpacePolicy.exactEnumerationRetryMs(scale, effectiveLane));
+                    CaveScreenSpacePolicy.sourceEnumerationRetryMs(
+                            scale, effectiveLane, pressured));
             boolean refreshDue = changed
                     || now - state.lastRequestMs >= refreshInterval;
             if (refreshDue && now >= state.nextPassMs) {
                 state.lastRequestMs = now;
                 retryAfter.entrySet().removeIf(entry -> entry.getValue() <= now);
                 long currentEpoch = epoch;
-                int admission = CaveScreenSpacePolicy.exactAdmissionBudget(scale,
-                        effectiveLane, MapPerformanceGovernor.getInstance().underPressure());
-                if (CaveScreenSpacePolicy.branchFirst(scale, effectiveLane)
-                        && activeTaskCountLocked(effectiveLane) > 0) {
-                    admission = 0;
-                }
+                int admission = CaveScreenSpacePolicy.sourceAdmissionBudget(
+                        scale, effectiveLane, pressured);
                 if (effectiveLane == MapRequestLane.FULLSCREEN) {
-                    int total = state.pagePlan.length;
-                    if (total > 0) {
-                        int sliceCount = Math.max(1, (total
-                                + MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE - 1)
-                                / MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE);
-                        if (state.updateSliceIndex >= sliceCount) {
-                            state.updateSliceIndex = 0;
+                    if (state.pagePlan.length > 0 && admission > 0) {
+                        if (state.pageCursor >= state.pagePlan.length) {
+                            state.pageCursor = 0;
                         }
-                        int sliceStart = state.updateSliceIndex
-                                * MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE;
-                        int sliceEnd = Math.min(total, sliceStart
-                                + MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE);
-                        if (state.sliceOpenedMs == 0L) state.sliceOpenedMs = now;
-
-                        boolean sliceSettled = true;
-                        boolean sliceHasActiveWork = false;
-                        int activeForLane = activeTaskCountLocked(effectiveLane);
+                        int capacity = Math.max(0,
+                                laneAdmissionLimitLocked(effectiveLane)
+                                        - activeTaskCountLocked(effectiveLane));
+                        int admissionLimit = Math.min(admission, capacity);
                         int admitted = 0;
-                        for (int ordinal = sliceStart; ordinal < sliceEnd; ordinal++) {
-                            long packedPage = state.pagePlan[ordinal];
+                        int considered = 0;
+                        int considerationBudget = Math.max(16, admissionLimit * 8);
+                        while (state.pageCursor < state.pagePlan.length
+                                && admitted < admissionLimit
+                                && considered < considerationBudget
+                                && queued.size() < MAX_QUEUED_PAGES) {
+                            int ordinal = state.pageCursor;
+                            long packedPage = state.pagePlan[state.pageCursor++];
+                            considered++;
                             int globalPageX = CaveLoadHierarchy.x(packedPage);
                             int globalPageZ = CaveLoadHierarchy.z(packedPage);
-                            if (repository.hasFreshDisplayPageSource(view, layerY,
-                                    globalPageX, globalPageZ,
-                                    DenseCaveTile.Source.WORLD_SAVE)) continue;
-                            sliceSettled = false;
-                            PageTaskKey taskKey = new PageTaskKey(dimension,
-                                    globalPageX, globalPageZ, view, normalizedLayer);
-                            if (queued.containsKey(taskKey)
-                                    || inFlightTasks.containsKey(taskKey)) {
-                                sliceHasActiveWork = true;
-                                continue;
-                            }
-                            if (admitted >= admission
-                                    || activeForLane + admitted
-                                            >= laneAdmissionLimitLocked(effectiveLane)
-                                    || queued.size() >= MAX_QUEUED_PAGES) continue;
                             if (admitVisiblePageLocked(serverLevel, state,
                                     dimension, view, layerY, normalizedLayer,
                                     globalPageX, globalPageZ, ordinal,
@@ -345,21 +332,15 @@ public final class CaveWorldSaveReader {
                                     repositoryGeneration, now)) {
                                 pipelineTelemetry.recordPageAdmission(effectiveLane);
                                 admitted++;
-                                sliceHasActiveWork = true;
                             }
                         }
-                        if (sliceSettled || (!sliceHasActiveWork
-                                && now - state.sliceOpenedMs
-                                        >= FULLSCREEN_SOURCE_SLICE_STALL_MS)) {
-                            state.updateSliceIndex++;
-                            state.sliceOpenedMs = 0L;
-                            if (state.updateSliceIndex >= sliceCount) {
-                                state.updateSliceIndex = 0;
-                                state.completedCycles++;
-                                state.nextPassMs = now
-                                        + CaveScreenSpacePolicy.completedPlanPauseMs(
-                                                scale, effectiveLane);
-                            }
+                        state.updateSliceIndex = state.pageCursor
+                                / MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE;
+                        if (state.pageCursor >= state.pagePlan.length) {
+                            state.completedCycles++;
+                            state.nextPassMs = now
+                                    + CaveScreenSpacePolicy.completedSourcePlanPauseMs(
+                                            scale, effectiveLane, pressured);
                         }
                     }
                 } else {
@@ -385,8 +366,8 @@ public final class CaveWorldSaveReader {
                     }
                     if (state.pageCursor >= state.pagePlan.length) {
                         state.nextPassMs = now
-                                + CaveScreenSpacePolicy.completedPlanPauseMs(
-                                        scale, effectiveLane);
+                                + CaveScreenSpacePolicy.completedSourcePlanPauseMs(
+                                        scale, effectiveLane, pressured);
                     }
                 }
 
@@ -572,17 +553,28 @@ public final class CaveWorldSaveReader {
                 new DecodedWorldRegionCache.SourceLease[16];
         CompletableFuture<DecodedWorldRegionCache.Result>[] sources =
                 new CompletableFuture[16];
+        boolean[] alreadyResolved = new boolean[16];
+        int retainedResolvedCount = 0;
         long sourceWaitStart = System.nanoTime();
         for (int order = 0; order < 16; order++) {
             int index = CaveLoadHierarchy.orderedChunkIndex(order);
             int localX = index & 3;
             int localZ = index >>> 2;
+            if (repository.hasFreshDisplayTileOrKnownEmpty(task.key.view(),
+                    task.projectionTopY, firstChunkX + localX,
+                    firstChunkZ + localZ, DenseCaveTile.Source.WORLD_SAVE)) {
+                alreadyResolved[index] = true;
+                retainedResolvedCount++;
+                sources[index] = CompletableFuture.completedFuture(null);
+                continue;
+            }
             // Foreground requests retain decoder capacity even if surface warmup has
             // already filled the prefetch window.
             leases[index] = sourceCache.requestLease(serverLevel,
                     firstChunkX + localX, firstChunkZ + localZ, task.lane);
             sources[index] = leases[index].future();
         }
+        final boolean hasRetainedResolution = retainedResolvedCount > 0;
 
         CompletableFuture.allOf(sources).whenCompleteAsync((ignored, sourceFailure) -> {
             boolean failed = false;
@@ -596,15 +588,13 @@ public final class CaveWorldSaveReader {
                 pipelineTelemetry.recordStageNanos(MapPipelineStage.SOURCE_WAIT,
                         System.nanoTime() - sourceWaitStart);
                 task.token.checkpoint("cave-page-sources-ready");
-                /*
-                 * Xaero does not expose a saved leaf as sixteen unrelated chunk
-                 * publications. Keep the old page visible while all 4x4 source
-                 * chunks resolve, then commit one coherent 64x64 transaction. This
-                 * prevents the visible top-to-bottom pass from leaving chunk holes
-                 * that are filled by a second pass moments later.
-                 */
+                /* Merge every resolved leaf immediately and retain old pixels for
+                 * unknown leaves. A single slow/deferred Anvil chunk must not hold
+                 * the other fifteen leaves hostage. Subsequent passes request only
+                 * the unresolved leaves above. */
                 for (int order = 0; order < 16; order++) {
                     int index = CaveLoadHierarchy.orderedChunkIndex(order);
+                    if (alreadyResolved[index]) continue;
                     task.token.checkpoint("cave-page-chunk-" + order);
                     if (!isCurrent(task)) return;
                     DecodedWorldRegionCache.Result result;
@@ -653,7 +643,8 @@ public final class CaveWorldSaveReader {
                     }
                 }
 
-                if (!anyUnknown && isCurrent(task)) {
+                if (isCurrent(task)
+                        && (!resolvedTiles.isEmpty() || absentCount > 0)) {
                     repository.commitDisplayPage(resolvedTiles, task.key.view(),
                             task.projectionTopY, firstChunkX, firstChunkZ,
                             absentPage, task.repositoryGeneration);
@@ -670,7 +661,10 @@ public final class CaveWorldSaveReader {
                 for (DecodedWorldRegionCache.SourceLease lease : leases) {
                     if (lease != null) lease.close();
                 }
+                boolean partialProgress = hasRetainedResolution
+                        || anyPresent || absentCount > 0;
                 long retry = deferred ? DEFERRED_RETRY_MS
+                        : anyUnknown && partialProgress ? PARTIAL_REPAIR_RETRY_MS
                         : failed || anyUnknown ? FAILED_RETRY_MS
                         : !anyPresent && absentCount == 16 ? MISSING_RETRY_MS : 0L;
                 finish(task, retry);
@@ -751,7 +745,6 @@ public final class CaveWorldSaveReader {
         private long[] pagePlan = new long[0];
         private int pageCursor;
         private int updateSliceIndex;
-        private long sliceOpenedMs;
         private long completedCycles;
         private long nextPassMs;
         private long lastRequestMs;
@@ -775,6 +768,17 @@ public final class CaveWorldSaveReader {
                 int projectionTopY, int minPageX, int maxPageX,
                 int minPageZ, int maxPageZ, int centerPageX, int centerPageZ,
                 MapRequestLane lane) {
+            boolean continuousPan = lane == MapRequestLane.FULLSCREEN
+                    && this.dimension.equals(dimension) && this.view == view
+                    && this.layerY == layerY
+                    && this.projectionTopY == projectionTopY
+                    && rectanglesOverlap(this.minPageX, this.maxPageX,
+                            this.minPageZ, this.maxPageZ,
+                            minPageX, maxPageX, minPageZ, maxPageZ);
+            int previousMinPageX = this.minPageX;
+            int previousMaxPageX = this.maxPageX;
+            int previousMinPageZ = this.minPageZ;
+            int previousMaxPageZ = this.maxPageZ;
             this.dimension = dimension;
             this.view = view;
             this.layerY = layerY;
@@ -787,13 +791,21 @@ public final class CaveWorldSaveReader {
             this.centerPageZ = centerPageZ;
             pagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
                     minPageX, maxPageX, minPageZ, maxPageZ,
-                    centerPageX, centerPageZ, lane == MapRequestLane.FULLSCREEN);
+                    centerPageX, centerPageZ, lane == MapRequestLane.FULLSCREEN,
+                    continuousPan, previousMinPageX, previousMaxPageX,
+                    previousMinPageZ, previousMaxPageZ);
             pageCursor = 0;
             updateSliceIndex = 0;
-            sliceOpenedMs = 0L;
             completedCycles = 0L;
             nextPassMs = 0L;
             lastRequestMs = 0L;
+        }
+
+        private static boolean rectanglesOverlap(int firstMinX, int firstMaxX,
+                int firstMinZ, int firstMaxZ, int secondMinX, int secondMaxX,
+                int secondMinZ, int secondMaxZ) {
+            return firstMinX <= secondMaxX && firstMaxX >= secondMinX
+                    && firstMinZ <= secondMaxZ && firstMaxZ >= secondMinZ;
         }
 
         private boolean contains(PageTask task) {
@@ -820,7 +832,6 @@ public final class CaveWorldSaveReader {
             pagePlan = new long[0];
             pageCursor = 0;
             updateSliceIndex = 0;
-            sliceOpenedMs = 0L;
             completedCycles = 0L;
             nextPassMs = 0L;
             lastRequestMs = 0L;

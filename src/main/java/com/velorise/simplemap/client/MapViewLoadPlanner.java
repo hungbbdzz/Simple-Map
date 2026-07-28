@@ -31,7 +31,9 @@ public final class MapViewLoadPlanner {
         private int sliceIndex;
         private int sliceCount;
         private boolean configured;
+        private boolean retainedOverlap;
         private long completedCycles;
+        private Page[] pagePlan = new Page[0];
 
         public boolean configure(String dimension, int minX, int maxX,
                 int minZ, int maxZ) {
@@ -43,15 +45,26 @@ public final class MapViewLoadPlanner {
             if (configured && this.dimension.equals(safeDimension)
                     && this.minX == safeMinX && this.maxX == safeMaxX
                     && this.minZ == safeMinZ && this.maxZ == safeMaxZ) return false;
+
+            int previousMinX = this.minX;
+            int previousMaxX = this.maxX;
+            int previousMinZ = this.minZ;
+            int previousMaxZ = this.maxZ;
+            boolean sameDimension = configured && this.dimension.equals(safeDimension);
+            retainedOverlap = sameDimension && rectanglesOverlap(
+                    previousMinX, previousMaxX, previousMinZ, previousMaxZ,
+                    safeMinX, safeMaxX, safeMinZ, safeMaxZ);
+
             this.dimension = safeDimension;
             this.minX = safeMinX;
             this.maxX = safeMaxX;
             this.minZ = safeMinZ;
             this.maxZ = safeMaxZ;
-            long total = totalPages();
-            this.sliceCount = (int) Math.max(1L,
-                    (total + FULLSCREEN_SLICE_SIZE - 1L)
-                            / FULLSCREEN_SLICE_SIZE);
+            this.pagePlan = buildPlan(safeMinX, safeMaxX, safeMinZ, safeMaxZ,
+                    retainedOverlap, previousMinX, previousMaxX,
+                    previousMinZ, previousMaxZ);
+            this.sliceCount = Math.max(1, (pagePlan.length
+                    + FULLSCREEN_SLICE_SIZE - 1) / FULLSCREEN_SLICE_SIZE);
             this.sliceIndex = 0;
             this.completedCycles = 0L;
             this.configured = true;
@@ -59,36 +72,22 @@ public final class MapViewLoadPlanner {
         }
 
         /**
-         * Fills the current stable fullscreen update slice without advancing it.
-         *
-         * <p>Xaero's leaf unit is a large 512-block region. Simple Map's exact leaf
-         * is only 64 blocks, so exposing the same column-major order directly would
-         * create thin vertical fragments. The equivalent user-facing progression is
-         * a stable screen-row traversal: left-to-right inside one row, then the next
-         * row from top to bottom. The slice is held until its visible work settles.</p>
+         * Fills the current fullscreen update slice without advancing it.
+         * A continuous pan places newly exposed pages before retained overlap;
+         * cold opens and teleports retain the stable row-major reveal.
          */
         public int fillCurrentFullscreenSlice(Page[] output) {
             if (!configured || output == null || output.length == 0) return 0;
-            int width = maxX - minX + 1;
-            long total = totalPages();
-            if (total <= 0L || width <= 0) return 0;
-            long start = (long) sliceIndex * FULLSCREEN_SLICE_SIZE;
-            long end = Math.min(total, start + FULLSCREEN_SLICE_SIZE);
+            int start = sliceIndex * FULLSCREEN_SLICE_SIZE;
+            int end = Math.min(pagePlan.length, start + FULLSCREEN_SLICE_SIZE);
             int count = 0;
-            for (long ordinal = start; ordinal < end && count < output.length;
-                    ordinal++) {
-                int x = minX + (int) (ordinal % width);
-                int z = minZ + (int) (ordinal / width);
-                output[count++] = new Page(x, z, (int) ordinal);
+            for (int index = start; index < end && count < output.length; index++) {
+                output[count++] = pagePlan[index];
             }
             return count;
         }
 
-        /**
-         * Advances only after the current slice has no missing or in-flight page.
-         * This is the visible-load gate that prevents fast later tasks from making
-         * the fullscreen map appear in random islands.
-         */
+        /** Advances only after the current slice has no missing or in-flight page. */
         public void advanceFullscreenSlice() {
             if (!configured) return;
             sliceIndex++;
@@ -103,6 +102,10 @@ public final class MapViewLoadPlanner {
             int count = fillCurrentFullscreenSlice(output);
             advanceFullscreenSlice();
             return count;
+        }
+
+        public boolean retainedOverlap() {
+            return retainedOverlap;
         }
 
         public long completedCycles() {
@@ -124,10 +127,104 @@ public final class MapViewLoadPlanner {
             sliceCount = 0;
             completedCycles = 0L;
             configured = false;
+            retainedOverlap = false;
+            pagePlan = new Page[0];
         }
 
-        private long totalPages() {
-            return (long) (maxX - minX + 1) * (maxZ - minZ + 1);
+        private static Page[] buildPlan(int minX, int maxX, int minZ, int maxZ,
+                boolean deltaFirst, int oldMinX, int oldMaxX,
+                int oldMinZ, int oldMaxZ) {
+            int width = Math.max(0, maxX - minX + 1);
+            int height = Math.max(0, maxZ - minZ + 1);
+            int total = width * height;
+            if (total == 0) return new Page[0];
+
+            long[] newlyExposed = new long[total];
+            int newlyExposedCount = 0;
+            if (deltaFirst) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    for (int x = minX; x <= maxX; x++) {
+                        if (x < oldMinX || x > oldMaxX
+                                || z < oldMinZ || z > oldMaxZ) {
+                            newlyExposed[newlyExposedCount++] = pack(x, z);
+                        }
+                    }
+                }
+                sortByDistance(newlyExposed, newlyExposedCount,
+                        (minX + maxX) * 0.5, (minZ + maxZ) * 0.5);
+            }
+
+            Page[] result = new Page[total];
+            int ordinal = 0;
+            for (int index = 0; index < newlyExposedCount; index++) {
+                long packed = newlyExposed[index];
+                result[ordinal] = new Page(unpackX(packed), unpackZ(packed), ordinal);
+                ordinal++;
+            }
+            for (int z = minZ; z <= maxZ; z++) {
+                for (int x = minX; x <= maxX; x++) {
+                    boolean retained = deltaFirst && x >= oldMinX && x <= oldMaxX
+                            && z >= oldMinZ && z <= oldMaxZ;
+                    if (deltaFirst && !retained) continue;
+                    result[ordinal] = new Page(x, z, ordinal);
+                    ordinal++;
+                }
+            }
+            return result;
+        }
+
+        private static void sortByDistance(long[] pages, int length,
+                double centerX, double centerZ) {
+            for (int index = 1; index < length; index++) {
+                long value = pages[index];
+                int cursor = index - 1;
+                while (cursor >= 0 && compare(value, pages[cursor],
+                        centerX, centerZ) < 0) {
+                    pages[cursor + 1] = pages[cursor];
+                    cursor--;
+                }
+                pages[cursor + 1] = value;
+            }
+        }
+
+        private static int compare(long first, long second,
+                double centerX, double centerZ) {
+            int firstX = unpackX(first);
+            int firstZ = unpackZ(first);
+            int secondX = unpackX(second);
+            int secondZ = unpackZ(second);
+            int distance = Double.compare(
+                    distanceSquared(firstX, firstZ, centerX, centerZ),
+                    distanceSquared(secondX, secondZ, centerX, centerZ));
+            if (distance != 0) return distance;
+            int byZ = Integer.compare(firstZ, secondZ);
+            return byZ != 0 ? byZ : Integer.compare(firstX, secondX);
+        }
+
+        private static double distanceSquared(int x, int z,
+                double centerX, double centerZ) {
+            double dx = x - centerX;
+            double dz = z - centerZ;
+            return dx * dx + dz * dz;
+        }
+
+        private static long pack(int x, int z) {
+            return ((long) x << 32) ^ (z & 0xffffffffL);
+        }
+
+        private static int unpackX(long packed) {
+            return (int) (packed >> 32);
+        }
+
+        private static int unpackZ(long packed) {
+            return (int) packed;
+        }
+
+        private static boolean rectanglesOverlap(int firstMinX, int firstMaxX,
+                int firstMinZ, int firstMaxZ, int secondMinX, int secondMaxX,
+                int secondMinZ, int secondMaxZ) {
+            return firstMinX <= secondMaxX && firstMaxX >= secondMinX
+                    && firstMinZ <= secondMaxZ && firstMaxZ >= secondMinZ;
         }
     }
 

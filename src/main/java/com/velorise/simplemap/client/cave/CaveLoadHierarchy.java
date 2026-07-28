@@ -49,20 +49,48 @@ final class CaveLoadHierarchy {
     static long[] buildVisiblePagePlan(int minPageX, int maxPageX,
             int minPageZ, int maxPageZ, int centerPageX, int centerPageZ,
             boolean fullscreen) {
+        return buildVisiblePagePlan(minPageX, maxPageX, minPageZ, maxPageZ,
+                centerPageX, centerPageZ, fullscreen,
+                false, 0, -1, 0, -1);
+    }
+
+    /**
+     * Builds a delta-first fullscreen plan for a continuous pan. Pages newly
+     * exposed by the new rectangle are placed first, ordered from the new viewport
+     * centre outward. Retained overlap follows in stable row-major order. A cold
+     * open, mode switch or teleport uses the original coherent row-major plan.
+     */
+    static long[] buildVisiblePagePlan(int minPageX, int maxPageX,
+            int minPageZ, int maxPageZ, int centerPageX, int centerPageZ,
+            boolean fullscreen, boolean continuousPan,
+            int previousMinPageX, int previousMaxPageX,
+            int previousMinPageZ, int previousMaxPageZ) {
         int width = Math.max(0, maxPageX - minPageX + 1);
         int height = Math.max(0, maxPageZ - minPageZ + 1);
         int total = width * height;
         long[] plan = new long[total];
         int count = 0;
-        if (fullscreen) {
-            // Present a coherent screen-row frontier: left-to-right inside one
-            // row, then the next row from top to bottom. Xaero's internal region
-            // iteration is stable, but its much larger leaf size hides column
-            // fragments. Simple Map's 64-block leaves need row-major publication
-            // to produce the same user-facing, evenly descending reveal.
+        if (fullscreen && continuousPan) {
+            long[] delta = new long[total];
+            int deltaCount = 0;
             for (int pageZ = minPageZ; pageZ <= maxPageZ; pageZ++) {
                 for (int pageX = minPageX; pageX <= maxPageX; pageX++) {
-                    plan[count++] = pack(pageX, pageZ);
+                    boolean retained = pageX >= previousMinPageX
+                            && pageX <= previousMaxPageX
+                            && pageZ >= previousMinPageZ
+                            && pageZ <= previousMaxPageZ;
+                    if (!retained) delta[deltaCount++] = pack(pageX, pageZ);
+                }
+            }
+            sortByDistance(delta, deltaCount, centerPageX, centerPageZ);
+            for (int i = 0; i < deltaCount; i++) plan[count++] = delta[i];
+            for (int pageZ = minPageZ; pageZ <= maxPageZ; pageZ++) {
+                for (int pageX = minPageX; pageX <= maxPageX; pageX++) {
+                    if (pageX >= previousMinPageX && pageX <= previousMaxPageX
+                            && pageZ >= previousMinPageZ
+                            && pageZ <= previousMaxPageZ) {
+                        plan[count++] = pack(pageX, pageZ);
+                    }
                 }
             }
             return plan;
@@ -73,16 +101,21 @@ final class CaveLoadHierarchy {
                 plan[count++] = pack(pageX, pageZ);
             }
         }
-        for (int i = 1; i < plan.length; i++) {
-            long value = plan[i];
+        if (!fullscreen) sortByDistance(plan, plan.length, centerPageX, centerPageZ);
+        return plan;
+    }
+
+    private static void sortByDistance(long[] pages, int length,
+            double centerPageX, double centerPageZ) {
+        for (int i = 1; i < length; i++) {
+            long value = pages[i];
             int j = i - 1;
-            while (j >= 0 && compare(value, plan[j], centerPageX, centerPageZ) < 0) {
-                plan[j + 1] = plan[j];
+            while (j >= 0 && compare(value, pages[j], centerPageX, centerPageZ) < 0) {
+                pages[j + 1] = pages[j];
                 j--;
             }
-            plan[j + 1] = value;
+            pages[j + 1] = value;
         }
-        return plan;
     }
 
 

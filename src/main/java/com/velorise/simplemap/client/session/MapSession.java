@@ -1,14 +1,15 @@
 package com.velorise.simplemap.client.session;
 
 import com.velorise.simplemap.client.MapCancellationToken;
+import com.velorise.simplemap.client.pipeline.RevisionStamp;
 
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
 /**
- * Immutable identity plus cooperative cancellation for one connected map world
- * and dimension.  Background work must capture this object (or its values) and
- * validate it before committing CPU, disk or GPU output.
+ * Identity plus cooperative cancellation for one connected map world and
+ * dimension. Background work must capture a RevisionStamp and validate it before
+ * committing CPU, disk or GPU output.
  */
 public final class MapSession {
     public enum State {
@@ -23,8 +24,8 @@ public final class MapSession {
     private final String worldIdentity;
     private final String dimensionIdentity;
     private final long sourceGeneration;
-    private final long styleGeneration;
-    private final long projectionGeneration;
+    private volatile long styleGeneration;
+    private volatile long projectionGeneration;
     private final MapCancellationToken rootToken;
     private volatile State state;
 
@@ -60,6 +61,16 @@ public final class MapSession {
         rootToken.cancel();
     }
 
+    void updateStyleGeneration(long generation) {
+        if (state != State.CLOSED) styleGeneration = Math.max(styleGeneration, generation);
+    }
+
+    void updateProjectionGeneration(long generation) {
+        if (state != State.CLOSED) {
+            projectionGeneration = Math.max(projectionGeneration, generation);
+        }
+    }
+
     public long sessionId() { return sessionId; }
     public String worldIdentity() { return worldIdentity; }
     public String dimensionIdentity() { return dimensionIdentity; }
@@ -68,6 +79,16 @@ public final class MapSession {
     public long projectionGeneration() { return projectionGeneration; }
     public State state() { return state; }
     public MapCancellationToken rootToken() { return rootToken; }
+
+    public RevisionStamp stamp() {
+        return new RevisionStamp(sessionId, sourceGeneration,
+                styleGeneration, projectionGeneration);
+    }
+
+    public boolean matches(RevisionStamp stamp) {
+        return stamp != null && matches(stamp.sessionId(), stamp.sourceGeneration(),
+                stamp.styleGeneration(), stamp.projectionGeneration());
+    }
 
     public boolean matches(long candidateSessionId, long candidateSourceGeneration,
             long candidateStyleGeneration, long candidateProjectionGeneration) {

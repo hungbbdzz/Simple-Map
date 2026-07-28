@@ -22,6 +22,31 @@ public final class MapGpuBudgetController {
     private static final long PRESSURE_BYTE_BUDGET = 768L << 10;
     private static final long FOCUSED_BYTE_BUDGET = 4L << 20;
     private static final long MINIMAP_RESERVE_BYTES = 384L << 10;
+    /**
+     * One exact upload is an atomic operation: it cannot be split merely because
+     * the adaptive frame slice became a few microseconds smaller than the current
+     * EWMA prediction. Without this escape hatch a cold prediction can be larger
+     * than every future frame budget, so no first upload ever runs and the EWMA can
+     * never converge.
+     */
+    private static final long ATOMIC_FOREGROUND_SOFT_MIN_NANOS = 850_000L;
+    private static final long ATOMIC_FOREGROUND_SOFT_EXTRA_NANOS = 500_000L;
+    private static final long ATOMIC_FOREGROUND_SOFT_MAX_NANOS = 1_500_000L;
+    private static final long ATOMIC_FOREGROUND_HARD_CAP_NANOS = 6_000_000L;
+    private static final long ATOMIC_FOREGROUND_MIN_INTERVAL_NANOS = 50_000_000L;
+    private static final long ATOMIC_FOREGROUND_PRESSURE_INTERVAL_NANOS = 100_000_000L;
+    private static final long ATOMIC_FOREGROUND_BYTE_CAP = 1L << 20;
+    /**
+     * Branch publication receives one small bootstrap admission before exact work.
+     * On high-refresh clients the adaptive frame budget can be smaller than the
+     * protected minimap reserve, which previously left BRANCH with zero usable time
+     * forever. This paced escape hatch is deliberately narrower than exact upload
+     * admission and is limited to one fullscreen branch every few frames.
+     */
+    private static final long BRANCH_BOOTSTRAP_HARD_CAP_NANOS = 4_000_000L;
+    private static final long BRANCH_BOOTSTRAP_BYTE_CAP = 256L << 10;
+    private static final long BRANCH_BOOTSTRAP_MIN_INTERVAL_NANOS = 24_000_000L;
+    private static final long BRANCH_BOOTSTRAP_PRESSURE_INTERVAL_NANOS = 48_000_000L;
 
     public enum UploadKind {
         SURFACE_EXACT(450_000L, 2L * 64L * 64L * 4L),
@@ -40,6 +65,8 @@ public final class MapGpuBudgetController {
 
     private final EnumMap<UploadKind, Long> ewmaNanos =
             new EnumMap<>(UploadKind.class);
+    private final EnumMap<UploadKind, Long> deniedReservations =
+            new EnumMap<>(UploadKind.class);
     private long windowStartNanos;
     private long frameBudgetNanos = NORMAL_BUDGET_NANOS;
     private long frameByteBudget = NORMAL_BYTE_BUDGET;
@@ -48,10 +75,17 @@ public final class MapGpuBudgetController {
     private long minimapReservedNanos;
     private long reservedBytes;
     private long minimapReservedBytes;
+    private long oversizedForegroundAdmissions;
+    private long lastOversizedForegroundAdmissionNanos;
+    private long branchBootstrapAdmissions;
+    private long lastBranchBootstrapAdmissionNanos;
+    /** One primary-branch escape hatch is available in every explicit render frame. */
+    private boolean branchBootstrapUsedThisFrame;
 
     private MapGpuBudgetController() {
         for (UploadKind kind : UploadKind.values()) {
             ewmaNanos.put(kind, kind.initialNanos);
+            deniedReservations.put(kind, 0L);
         }
     }
 
@@ -71,6 +105,7 @@ public final class MapGpuBudgetController {
         minimapReservedNanos = 0L;
         reservedBytes = 0L;
         minimapReservedBytes = 0L;
+        branchBootstrapUsedThisFrame = false;
         boolean pressure = MapPerformanceGovernor.getInstance().underPressure();
         long configured = MapPerformanceGovernor.getInstance()
                 .textureUploadBudgetNanos(focused);
@@ -114,11 +149,14 @@ public final class MapGpuBudgetController {
             long availableBytes = byteBudget + Math.max(0L,
                     MINIMAP_RESERVE_BYTES - minimapReservedBytes);
             if (reservedNanos + prediction > availableNanos
-                    || reservedBytes + predictedBytes > availableBytes) return false;
-            reservedNanos += prediction;
-            minimapReservedNanos += prediction;
-            reservedBytes += predictedBytes;
-            minimapReservedBytes += predictedBytes;
+                    || reservedBytes + predictedBytes > availableBytes) {
+                if (tryAdmitAtomicForeground(effectiveKind, effectiveLane,
+                        prediction, predictedBytes, availableNanos, availableBytes,
+                        System.nanoTime(), pressure)) return true;
+                recordDenied(effectiveKind);
+                return false;
+            }
+            reserve(prediction, predictedBytes, true);
             return true;
         }
 
@@ -133,10 +171,92 @@ public final class MapGpuBudgetController {
         long usableNanos = weak ? Math.max(0L, budget - protectedNanos) : budget;
         long usableBytes = weak ? Math.max(0L, byteBudget - protectedBytes) : byteBudget;
         if (reservedNanos + prediction > usableNanos
-                || reservedBytes + predictedBytes > usableBytes) return false;
-        reservedNanos += prediction;
-        reservedBytes += predictedBytes;
+                || reservedBytes + predictedBytes > usableBytes) {
+            long now = System.nanoTime();
+            if (tryAdmitBranchBootstrap(effectiveKind, effectiveLane,
+                    prediction, predictedBytes, now, pressure)) return true;
+            if (tryAdmitAtomicForeground(effectiveKind, effectiveLane,
+                    prediction, predictedBytes, usableNanos, usableBytes,
+                    now, pressure)) return true;
+            recordDenied(effectiveKind);
+            return false;
+        }
+        reserve(prediction, predictedBytes, false);
         return true;
+    }
+
+
+    private void reserve(long nanos, long bytes, boolean minimap) {
+        reservedNanos += Math.max(0L, nanos);
+        reservedBytes += Math.max(0L, bytes);
+        if (minimap) {
+            minimapReservedNanos += Math.max(0L, nanos);
+            minimapReservedBytes += Math.max(0L, bytes);
+        }
+    }
+
+
+    private boolean tryAdmitBranchBootstrap(UploadKind kind,
+            MapRequestLane lane, long prediction, long bytes,
+            long now, boolean pressure) {
+        if (kind != UploadKind.BRANCH || lane != MapRequestLane.FULLSCREEN) {
+            return false;
+        }
+        if (reservedNanos != 0L || reservedBytes != 0L) return false;
+        if (prediction > BRANCH_BOOTSTRAP_HARD_CAP_NANOS
+                || bytes > BRANCH_BOOTSTRAP_BYTE_CAP) return false;
+        if (explicitFrame) {
+            // Branches are the primary far-zoom representation. Guarantee one
+            // small branch admission before exact work in every render frame;
+            // otherwise the protected minimap reserve can starve L1 indefinitely.
+            if (branchBootstrapUsedThisFrame) return false;
+            branchBootstrapUsedThisFrame = true;
+        } else {
+            long interval = pressure ? BRANCH_BOOTSTRAP_PRESSURE_INTERVAL_NANOS
+                    : BRANCH_BOOTSTRAP_MIN_INTERVAL_NANOS;
+            if (now - lastBranchBootstrapAdmissionNanos < interval) return false;
+        }
+        reserve(prediction, bytes, false);
+        branchBootstrapAdmissions++;
+        lastBranchBootstrapAdmissionNanos = now;
+        return true;
+    }
+
+    private boolean tryAdmitAtomicForeground(UploadKind kind,
+            MapRequestLane lane, long prediction, long bytes,
+            long budget, long byteBudget, long now, boolean pressure) {
+        if (reservedNanos != 0L || reservedBytes != 0L) return false;
+        if (lane != MapRequestLane.MINIMAP && lane != MapRequestLane.FULLSCREEN) {
+            return false;
+        }
+        if (kind != UploadKind.SURFACE_EXACT && kind != UploadKind.CAVE_EXACT) {
+            return false;
+        }
+
+        long timeSoftCap = Math.max(ATOMIC_FOREGROUND_SOFT_MIN_NANOS,
+                Math.min(ATOMIC_FOREGROUND_SOFT_MAX_NANOS,
+                        Math.max(1L, budget) + ATOMIC_FOREGROUND_SOFT_EXTRA_NANOS));
+        long byteSoftCap = Math.max(ATOMIC_FOREGROUND_BYTE_CAP,
+                Math.max(1L, byteBudget) * 2L);
+        if (bytes > byteSoftCap || prediction > ATOMIC_FOREGROUND_HARD_CAP_NANOS) {
+            return false;
+        }
+
+        long interval = pressure ? ATOMIC_FOREGROUND_PRESSURE_INTERVAL_NANOS
+                : ATOMIC_FOREGROUND_MIN_INTERVAL_NANOS;
+        boolean smallAtomicOverrun = prediction <= timeSoftCap;
+        boolean pacedLargeAtomicOverrun = now - lastOversizedForegroundAdmissionNanos
+                >= interval;
+        if (!smallAtomicOverrun && !pacedLargeAtomicOverrun) return false;
+
+        reserve(prediction, bytes, lane == MapRequestLane.MINIMAP);
+        oversizedForegroundAdmissions++;
+        lastOversizedForegroundAdmissionNanos = now;
+        return true;
+    }
+
+    private void recordDenied(UploadKind kind) {
+        deniedReservations.merge(kind, 1L, Long::sum);
     }
 
     /** Records an upload that was not pre-reserved. */
@@ -180,7 +300,12 @@ public final class MapGpuBudgetController {
                 predictedNanos(UploadKind.SURFACE_EXACT),
                 predictedNanos(UploadKind.CAVE_EXACT),
                 predictedNanos(UploadKind.BRANCH),
-                predictedNanos(UploadKind.LEGACY));
+                predictedNanos(UploadKind.LEGACY),
+                deniedReservations.getOrDefault(UploadKind.SURFACE_EXACT, 0L),
+                deniedReservations.getOrDefault(UploadKind.CAVE_EXACT, 0L),
+                deniedReservations.getOrDefault(UploadKind.BRANCH, 0L),
+                deniedReservations.getOrDefault(UploadKind.LEGACY, 0L),
+                oversizedForegroundAdmissions, branchBootstrapAdmissions);
     }
 
     private void rotateWindow(long now) {
@@ -194,6 +319,7 @@ public final class MapGpuBudgetController {
             minimapReservedNanos = 0L;
             reservedBytes = 0L;
             minimapReservedBytes = 0L;
+            branchBootstrapUsedThisFrame = false;
         }
     }
 
@@ -201,6 +327,9 @@ public final class MapGpuBudgetController {
             long reservedBytes, long minimapReservedBytes,
             long frameBudgetNanos, long frameByteBudget,
             long surfaceExactPredictionNanos, long caveExactPredictionNanos,
-            long branchPredictionNanos, long legacyPredictionNanos) {
+            long branchPredictionNanos, long legacyPredictionNanos,
+            long surfaceExactDeniedReservations, long caveExactDeniedReservations,
+            long branchDeniedReservations, long legacyDeniedReservations,
+            long oversizedForegroundAdmissions, long branchBootstrapAdmissions) {
     }
 }

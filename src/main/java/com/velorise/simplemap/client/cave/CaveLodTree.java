@@ -623,7 +623,12 @@ final class CaveLodTree {
     private boolean retireOldestResident(int level, NodeKey protectedKey) {
         java.util.List<String> candidates = new java.util.ArrayList<>();
         java.util.Map<String, Node> byKey = new java.util.HashMap<>();
-        for (Map.Entry<NodeKey, Node> entry : nodes.entrySet()) {
+        // nodes is an access-order LinkedHashMap. Parent-coverage lookups call
+        // nodes.get(), which reorder the map. Iterate a stable snapshot so LRU
+        // observation cannot invalidate the active iterator.
+        java.util.List<Map.Entry<NodeKey, Node>> snapshot =
+                new java.util.ArrayList<>(nodes.entrySet());
+        for (Map.Entry<NodeKey, Node> entry : snapshot) {
             if (entry.getKey().level() != level
                     || entry.getKey().equals(protectedKey)) continue;
             Node node = entry.getValue();

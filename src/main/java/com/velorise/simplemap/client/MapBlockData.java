@@ -72,6 +72,23 @@ public final class MapBlockData {
                 flags(packed), floorY(packed));
     }
 
+    /**
+     * Allocation-minimal construction for hot map scanners. The fluent builder is
+     * convenient for configuration code, but it creates a short-lived Builder for
+     * every map pixel and was a measurable source of young-generation GC bursts
+     * while new chunks entered view.
+     */
+    public static MapBlockData create(int topY, int floorY, int blockId, int biomeId,
+            int light, boolean glowing, boolean fluid, boolean flower, boolean leaves) {
+        int resultFlags = Math.max(0, Math.min(15, light));
+        if (glowing) resultFlags |= 0x10;
+        if (fluid) resultFlags |= 0x20;
+        if (flower) resultFlags |= 0x40;
+        if (leaves) resultFlags |= 0x80;
+        return new MapBlockData((short) topY, (short) blockId, (byte) biomeId,
+                (byte) resultFlags, (short) floorY);
+    }
+
     /** Compatibility overload used by older call sites. */
     public static long packRaw(short topY, short blockId, byte biomeId, byte flags) {
         return packRaw(topY, blockId, biomeId, flags, topY);

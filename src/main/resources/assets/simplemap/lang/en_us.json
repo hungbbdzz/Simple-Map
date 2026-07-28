@@ -23,5 +23,8 @@
   "key.simplemap.toggle_cursor_biome": "Toggle Cursor Biome",
   "key.simplemap.cycle_color_mode": "Cycle Map Color Mode",
   "key.simplemap.cycle_terrain_mode": "Cycle Terrain Relief",
-  "key.simplemap.center_full_map": "Center Full Map on Player"
+  "key.simplemap.center_full_map": "Center Full Map on Player",
+  "key.simplemap.toggle_debug_overlay": "Toggle Debug Overlay",
+  "key.simplemap.toggle_debug_recording": "Pause/Resume Debug Recording",
+  "key.simplemap.mark_debug_issue": "Mark Debug Issue (20s Burst)"
 }

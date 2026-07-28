@@ -63,6 +63,10 @@ public final class MapLightManager {
                 dirtyRegions.add(key(rx, rz));
             }
             MapTextureManager.getInstance().markPageDirtyForBlock(blockX, blockZ);
+            int localChunkIndex = ((blockZ & 511) >>> 4) * 32
+                    + ((blockX & 511) >>> 4);
+            SurfaceRegionSourceDatabase.getInstance().markChunkDirty(
+                    rx, rz, localChunkIndex);
         }
     }
 

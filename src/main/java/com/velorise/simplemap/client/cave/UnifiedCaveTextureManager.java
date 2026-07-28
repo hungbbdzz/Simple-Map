@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
 import com.velorise.simplemap.client.MapCancellationToken;
+import com.velorise.simplemap.client.MapDebugRecorder;
 import com.velorise.simplemap.client.MapConfig;
 import com.velorise.simplemap.client.MapManager;
 import com.velorise.simplemap.client.MapGpuBudgetController;
@@ -13,6 +14,7 @@ import com.velorise.simplemap.client.ExactPageState;
 import com.velorise.simplemap.client.ExactPageStateTracker;
 import com.velorise.simplemap.client.MapRequestLane;
 import com.velorise.simplemap.client.MapViewLoadPlanner;
+import com.velorise.simplemap.client.MapViewportDemandPolicy;
 import com.velorise.simplemap.client.MapWorkScheduler;
 import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
@@ -41,17 +43,16 @@ public final class UnifiedCaveTextureManager {
     private static final int MAX_REQUESTS = 4096;
     private static final long INCOMPLETE_RETRY_MS = 80L;
     private static final long FAILED_RETRY_MS = 250L;
-    /** Fullscreen cave work may prepare a few leaves ahead, but visible exact
-     * publication is held at one row-major frontier. */
-    private static final int FULLSCREEN_BUILD_AHEAD = 4;
+    /** Fullscreen cave work may prepare several reusable leaves ahead. Publication
+     * remains priority ordered, but no completed visible page waits behind a missing
+     * row-major predecessor. */
     /** A corrupt/deferred source must not freeze an entire viewport forever. The
      * skipped page is revisited on the next deterministic repair cycle. */
-    private static final long FULLSCREEN_FRONTIER_STALL_MS = 2_500L;
-    /** Do not expose a brand-new page as a handful of isolated 16x16 fragments. */
-    /* One authoritative 16x16 tile is enough to start a retained page. Unknown
-     * texels stay masked and are filled by later tiles, matching Xaero's live
-     * MapTile updates instead of keeping the minimap completely blank. */
-    private static final int FIRST_PUBLICATION_MIN_KNOWN_COLUMNS = 16 * 16;
+    /** Any authoritative column is useful. Unknown texels remain masked and the
+     * existing screen-space policy hides partial exact leaves at far zoom. Requiring
+     * a full 16x16 chunk kept explored cave pages black when archive/source capture
+     * arrived incrementally. */
+    private static final int FIRST_PUBLICATION_MIN_KNOWN_COLUMNS = 1;
     /** Partial exact pages are useful near the player, but at smaller screen sizes
      * they visually tear against a stable branch backdrop. */
     private static final float PARTIAL_EXACT_MIN_SCREEN_PIXELS = 16.0f;
@@ -126,18 +127,11 @@ public final class UnifiedCaveTextureManager {
             long now = System.currentTimeMillis();
             for (PageRequest request : requests.values()) request.clearLane(lane);
             requests.entrySet().removeIf(entry -> entry.getValue().isExpired(now));
-            completedBuilds.removeIf(completed -> completed.lane() == lane);
-            for (PageInfo info : pages.values()) {
-                if (info.pending == null || info.pendingLane != lane) continue;
-                if (info.pendingToken != null) info.pendingToken.cancel();
-                if (info.pending.cancel(false)) {
-                    info.pending = null;
-                    info.pendingToken = null;
-                    info.pendingLane = null;
-                    info.nextRetryMs = 0L;
-                    pipelineTelemetry.recordTaskCancelledBeforeRun();
-                }
-            }
+            // Exact page outputs are keyed by dimension/view/layer/page and remain
+            // reusable after a HUD/fullscreen lane becomes hidden. Cancelling or
+            // removing completed work here stranded done futures in PageInfo and
+            // produced permanent BUILDING states. Stop new demand, but let bounded
+            // in-flight work finish and pass normal revision validation.
             VisiblePlanner planner = visiblePlans.get(lane);
             if (planner != null) planner.clear();
         }
@@ -160,6 +154,30 @@ public final class UnifiedCaveTextureManager {
                 if (info.pending != null && info.pendingLane == lane) count++;
             }
             return count;
+        }
+    }
+
+    public DebugSnapshot debugSnapshot() {
+        synchronized (pages) {
+            int pending = 0;
+            int initialized = 0;
+            int partial = 0;
+            int knownEmpty = 0;
+            int resident = 0;
+            for (PageInfo info : pages.values()) {
+                if (info.pending != null) pending++;
+                if (info.initialized) initialized++;
+                if (info.initialized && info.knownColumns > 0
+                        && info.knownColumns < CaveTextureAtlas.PAGE_SIZE
+                                * CaveTextureAtlas.PAGE_SIZE) partial++;
+                if (info.knownEmpty) knownEmpty++;
+                if (info.initialized && info.atlasSlot >= 0) resident++;
+            }
+            VisiblePlanner fullscreen = visiblePlans.get(MapRequestLane.FULLSCREEN);
+            return new DebugSnapshot(pages.size(), requests.size(), pending,
+                    completedBuilds.size(), initialized, partial, knownEmpty, resident,
+                    fullscreen == null ? 0 : fullscreen.updateSliceIndex,
+                    fullscreen == null ? 0 : fullscreen.pagePlan.length);
         }
     }
 
@@ -192,10 +210,13 @@ public final class UnifiedCaveTextureManager {
                 ? MapRequestLane.FULLSCREEN : lane;
         VisiblePlanner planner = visiblePlans.get(effectiveLane);
 
-        double visibleMinX = Math.min(minX, maxX);
-        double visibleMaxX = Math.max(minX, maxX);
-        double visibleMinZ = Math.min(minZ, maxZ);
-        double visibleMaxZ = Math.max(minZ, maxZ);
+        MapViewportDemandPolicy.Bounds admittedViewport =
+                MapViewportDemandPolicy.trimEdgeSlivers(
+                        minX, maxX, minZ, maxZ, effectiveLane);
+        double visibleMinX = admittedViewport.minX();
+        double visibleMaxX = admittedViewport.maxX();
+        double visibleMinZ = admittedViewport.minZ();
+        double visibleMaxZ = admittedViewport.maxZ();
         int minPageX = MapPageLayout.globalPageFromBlock(
                 (int) Math.floor(visibleMinX));
         int maxPageX = MapPageLayout.globalPageFromBlock(
@@ -255,63 +276,44 @@ public final class UnifiedCaveTextureManager {
         if (admissionBudget <= 0) return;
 
         if (effectiveLane == MapRequestLane.FULLSCREEN) {
-            /*
-             * Full Cave uses the same visible contract as the coherent Surface
-             * frontier: prepare a very small row-major window, retain the current
-             * slice until it has visibly settled, and never let mouse position
-             * reorder work. Builds may finish out of order, but publication is
-             * gated separately by fullscreenPublicationCursor.
-             */
-            int total = planner.pagePlan.length;
-            if (total == 0) return;
-            int sliceCount = Math.max(1, (total
-                    + MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE - 1)
-                    / MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE);
-            if (planner.updateSliceIndex >= sliceCount) planner.updateSliceIndex = 0;
-            int sliceStart = planner.updateSliceIndex
-                    * MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE;
-            int sliceEnd = Math.min(total, sliceStart
-                    + MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE);
-            if (planner.sliceOpenedMs == 0L) planner.sliceOpenedMs = now;
-
-            int active = activeRequestCount(effectiveLane, now);
-            int available = Math.max(0, FULLSCREEN_BUILD_AHEAD - active);
+            // Fullscreen is a rolling, bounded frontier. A missing/partial page is
+            // allowed to retry, but it must not pin every page after it. This is the
+            // same coarse-region principle used by mature map renderers: scheduling
+            // order is stable, completion order is independent.
+            if (planner.pagePlan.length == 0) return;
+            if (planner.pageCursor >= planner.pagePlan.length) {
+                if (now < planner.nextRestartMs) return;
+                planner.pageCursor = 0;
+            }
             int admitted = 0;
-            boolean sliceSettled = true;
-            boolean sliceHasActiveWork = false;
-            for (int ordinal = sliceStart; ordinal < sliceEnd; ordinal++) {
-                long packedPage = planner.pagePlan[ordinal];
+            int considered = 0;
+            int considerationBudget = Math.max(16, admissionBudget * 8);
+            while (planner.pageCursor < planner.pagePlan.length
+                    && admitted < admissionBudget
+                    && considered < considerationBudget) {
+                int ordinal = planner.pageCursor;
+                long packedPage = planner.pagePlan[planner.pageCursor++];
+                considered++;
                 int pageX = CaveLoadHierarchy.x(packedPage);
                 int pageZ = CaveLoadHierarchy.z(packedPage);
                 PageKey candidateKey = key(view, layerY, pageX, pageZ);
                 if (isPageDisplayReady(candidateKey)) continue;
-                sliceSettled = false;
-                if (isPageActive(candidateKey, effectiveLane, now)) {
-                    sliceHasActiveWork = true;
-                    continue;
-                }
-                if (admitted >= admissionBudget || admitted >= available) continue;
+                if (isPageActive(candidateKey, effectiveLane, now)) continue;
                 int priority = effectiveLane.priorityBase() + 220_000
-                        - Math.min(180_000, (ordinal - sliceStart) * 1_200);
+                        - Math.min(180_000, ordinal * 250);
                 requestPage(view, layerY, pageX, pageZ,
                         priority, effectiveLane, now, ordinal);
                 repository.requestDisplayPageLoad(view, layerY, pageX, pageZ);
                 pipelineTelemetry.recordPageAdmission(effectiveLane);
                 admitted++;
-                sliceHasActiveWork = true;
             }
-
-            if (sliceSettled || (!sliceHasActiveWork
-                    && now - planner.sliceOpenedMs >= FULLSCREEN_FRONTIER_STALL_MS)) {
-                planner.updateSliceIndex++;
-                planner.sliceOpenedMs = 0L;
-                if (planner.updateSliceIndex >= sliceCount) {
-                    planner.updateSliceIndex = 0;
-                    planner.requestCompletedCycles++;
-                    planner.nextRestartMs = now
-                            + CaveScreenSpacePolicy.completedPlanPauseMs(
-                                    scale, effectiveLane);
-                }
+            planner.updateSliceIndex = planner.pageCursor
+                    / MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE;
+            if (planner.pageCursor >= planner.pagePlan.length) {
+                planner.requestCompletedCycles++;
+                planner.nextRestartMs = now
+                        + CaveScreenSpacePolicy.completedPlanPauseMs(
+                                scale, effectiveLane);
             }
             return;
         }
@@ -347,22 +349,6 @@ public final class UnifiedCaveTextureManager {
         }
     }
 
-    private int activeRequestCount(MapRequestLane lane, long now) {
-        int count = 0;
-        synchronized (pages) {
-            for (PageRequest request : requests.values()) {
-                if (request.isLaneActive(lane, now) && ++count >= 3) break;
-            }
-            if (count < 3) {
-                for (PageInfo info : pages.values()) {
-                    if (info.pending != null && info.pendingLane == lane
-                            && ++count >= 3) break;
-                }
-            }
-        }
-        return count;
-    }
-
     private static int squaredDistance(int pageX, int pageZ,
             int focusPageX, int focusPageZ) {
         int dx = pageX - focusPageX;
@@ -386,20 +372,10 @@ public final class UnifiedCaveTextureManager {
                 if (!retained) request.clearLane(lane);
             }
             requests.entrySet().removeIf(entry -> entry.getValue().isExpired(now));
-            for (PageInfo info : pages.values()) {
-                if (info.pending == null || info.pendingLane != lane) continue;
-                PageKey key = info.key;
-                boolean retained = key.dimension().equals(dimension)
-                        && key.view() == view && key.layerY() == normalizedLayerY
-                        && key.globalPageX() >= minPageX
-                        && key.globalPageX() <= maxPageX
-                        && key.globalPageZ() >= minPageZ
-                        && key.globalPageZ() <= maxPageZ;
-                if (retained) continue;
-                if (info.pendingToken != null) info.pendingToken.cancel();
-                info.pending.cancel(false);
-                info.nextRetryMs = 0L;
-            }
+            // Do not cancel already admitted exact builds merely because the camera
+            // crossed a viewport boundary. Their immutable page result is still
+            // valid and reusable if the user pans back; session/source revisions
+            // below remain the semantic cancellation boundary.
         }
     }
 
@@ -686,8 +662,16 @@ public final class UnifiedCaveTextureManager {
     private boolean isPageDisplayReadyLocked(PageKey key) {
         if (isPageSatisfiedLocked(key)) return true;
         PageInfo info = pages.get(key);
-        return info != null && info.initialized
-                && info.knownColumns >= FIRST_PUBLICATION_MIN_KNOWN_COLUMNS;
+        if (info == null || !info.initialized
+                || info.knownColumns < FIRST_PUBLICATION_MIN_KNOWN_COLUMNS) {
+            return false;
+        }
+        // A partial page may advance the fullscreen frontier, but only while it
+        // still represents the latest retained source. World-save repair can
+        // resolve more leaves after the first publication; treating the old GPU
+        // page as permanently ready leaves black holes around the player.
+        return info.uploadedSourceRevision == repository.getPageRevision(
+                key.globalPageX(), key.globalPageZ());
     }
 
     private boolean isPageActive(PageKey key, MapRequestLane lane, long now) {
@@ -709,10 +693,12 @@ public final class UnifiedCaveTextureManager {
         long requestedRevision = revisions.getOrDefault(key, 1L);
         long sourceRevision = repository.getPageRevision(
                 key.globalPageX(), key.globalPageZ());
+        int fullColumns = CaveTextureAtlas.PAGE_SIZE * CaveTextureAtlas.PAGE_SIZE;
         return info.uploadedRevision == requestedRevision
                 && info.uploadedSourceRevision == sourceRevision
                 && (info.knownEmpty
-                        || (info.initialized && info.atlasSlot >= 0));
+                        || (info.initialized && info.atlasSlot >= 0
+                                && info.knownColumns >= fullColumns));
     }
 
     private void clearSatisfiedRequest(PageKey key, long now) {
@@ -842,6 +828,12 @@ public final class UnifiedCaveTextureManager {
             CompletableFuture<BuildResult> pending = completed.future();
             if (info.pending != pending) {
                 pipelineTelemetry.recordTaskCompletedButDiscarded();
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_COMPLETION_REPLACED", 250L)) {
+                    recorder.event("CAVE_COMPLETION_REPLACED",
+                            "page=" + info.key + " lane=" + completed.lane()
+                                    + " ordinal=" + completed.fullscreenOrdinal());
+                }
                 continue;
             }
 
@@ -858,6 +850,13 @@ public final class UnifiedCaveTextureManager {
                 info.nextRetryMs = cause instanceof CancellationException
                         ? now : now + FAILED_RETRY_MS;
                 pipelineTelemetry.recordExactBuildDiscarded();
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_BUILD_FAILED:" + info.key, 500L)) {
+                    recorder.event("CAVE_BUILD_FAILED",
+                            "page=" + info.key + " lane=" + completed.lane()
+                                    + " failure=" + cause.getClass().getSimpleName()
+                                    + ':' + String.valueOf(cause.getMessage()));
+                }
                 continue;
             }
             MapRequestLane completedLane = completed.lane();
@@ -871,8 +870,9 @@ public final class UnifiedCaveTextureManager {
             }
             long currentSource = repository.getPageRevision(
                     info.key.globalPageX(), info.key.globalPageZ());
+            boolean sourceAdvanced = result.sourceRevision() < currentSource;
             if (result.expectedRevision() != current
-                    || result.sourceRevision() != currentSource
+                    || result.sourceRevision() > currentSource
                     || !info.key.dimension().equals(dimension())) {
                 info.pending = null;
                 info.pendingToken = null;
@@ -881,41 +881,71 @@ public final class UnifiedCaveTextureManager {
                 info.nextRetryMs = now;
                 pipelineTelemetry.recordExactBuildDiscarded();
                 pipelineTelemetry.recordTaskCompletedButDiscarded();
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_RESULT_STALE:" + info.key, 250L)) {
+                    recorder.event("CAVE_RESULT_STALE",
+                            "page=" + info.key + " lane=" + completedLane
+                                    + " expected=" + result.expectedRevision()
+                                    + " current=" + current + " source="
+                                    + result.sourceRevision() + " current_source="
+                                    + currentSource + " current_dimension=" + dimension());
+                }
                 continue;
+            }
+            if (sourceAdvanced) {
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_RESULT_SOURCE_ADVANCED:" + info.key,
+                        250L)) {
+                    recorder.event("CAVE_RESULT_SOURCE_ADVANCED",
+                            "page=" + info.key + " lane=" + completedLane
+                                    + " built_source=" + result.sourceRevision()
+                                    + " current_source=" + currentSource
+                                    + " known_columns=" + result.knownColumns());
+                }
             }
             if (result.knownColumns() == 0 && !result.complete()) {
                 info.pending = null;
                 info.pendingToken = null;
                 info.pendingLane = null;
                 info.pendingCompletionRecorded = false;
+                info.noSourceRevision = result.sourceRevision();
                 // Nothing in this build is authoritative yet. Keep the previous
-                // atlas page untouched and retry when another dense tile arrives.
+                // atlas page untouched and retry when source capture advances.
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_PAGE_NO_SOURCE:" + info.key, 500L)) {
+                    recorder.event("CAVE_PAGE_NO_SOURCE",
+                            "page=" + info.key + " lane=" + completedLane
+                                    + " complete=" + result.complete()
+                                    + " source_revision=" + result.sourceRevision());
+                }
                 markIncomplete(info, now);
                 continue;
             }
-            if (!info.initialized && !result.complete()
-                    && result.knownColumns() < FIRST_PUBLICATION_MIN_KNOWN_COLUMNS) {
-                info.pending = null;
-                info.pendingToken = null;
-                info.pendingLane = null;
-                info.pendingCompletionRecorded = false;
-                // Avoid publishing sub-tile noise. One complete authoritative
-                // 16x16 tile is enough; unknown texels remain masked and later
-                // deterministic source commits fill the retained page.
-                markIncomplete(info, now);
-                continue;
-            }
-
-            if (!MapGpuBudgetController.getInstance().tryReserve(
+            MapGpuBudgetController gpuBudget = MapGpuBudgetController.getInstance();
+            if (!gpuBudget.tryReserve(
                     MapGpuBudgetController.UploadKind.CAVE_EXACT,
                     completedLane, completedLane == MapRequestLane.MINIMAP)) {
                 // Keep the completed result/future in the publication queue. The
                 // immutable CPU page must not be rebuilt merely because this frame
                 // spent its upload budget on a stronger foreground page.
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_GPU_BUDGET_DEFERRED", 500L)) {
+                    MapGpuBudgetController.Snapshot gpu = gpuBudget.snapshot();
+                    recorder.event("CAVE_GPU_BUDGET_DEFERRED",
+                            "page=" + info.key + " lane=" + completedLane
+                                    + " predicted_ms="
+                                    + (gpu.caveExactPredictionNanos() / 1_000_000.0D)
+                                    + " frame_budget_ms="
+                                    + (gpu.frameBudgetNanos() / 1_000_000.0D)
+                                    + " reserved_ms="
+                                    + (gpu.reservedNanos() / 1_000_000.0D)
+                                    + " denied=" + gpu.caveExactDeniedReservations());
+                }
                 completedBuilds.offer(completed);
                 break;
             }
 
+            boolean firstGpuPublication = !info.initialized;
             info.pending = null;
             info.pendingToken = null;
             info.pendingCompletionRecorded = false;
@@ -926,13 +956,22 @@ public final class UnifiedCaveTextureManager {
                 markIncomplete(info, now);
                 continue;
             }
-            if (result.complete()) {
-                info.uploadedRevision = current;
-                info.uploadedSourceRevision = currentSource;
+            info.uploadedRevision = current;
+            info.uploadedSourceRevision = result.sourceRevision();
+            info.noSourceRevision = Long.MIN_VALUE;
+            if (result.complete() && !sourceAdvanced) {
                 info.nextRetryMs = 0L;
                 clearSatisfiedRequest(info.key, now);
             } else {
                 markIncomplete(info, now);
+            }
+            if (firstGpuPublication && outcome.hasContent()) {
+                MapDebugRecorder.getInstance().event("CAVE_PAGE_GPU_READY",
+                        "page=" + info.key + " lane=" + completedLane
+                                + " known_columns=" + result.knownColumns()
+                                + " complete=" + result.complete()
+                                + " expected_revision=" + result.expectedRevision()
+                                + " source_revision=" + result.sourceRevision());
             }
             published++;
         }
@@ -946,77 +985,10 @@ public final class UnifiedCaveTextureManager {
      * a completed fullscreen burst must not sit in front of a ready minimap page.
      */
     private CompletedBuild pollHighestPriorityCompleted(long now) {
-        CompletedBuild[] candidates = completedBuilds.toArray(CompletedBuild[]::new);
-        java.util.Arrays.sort(candidates);
-        for (CompletedBuild candidate : candidates) {
-            if (candidate.lane() == MapRequestLane.FULLSCREEN
-                    && !canPublishFullscreen(candidate, now)) continue;
-            if (completedBuilds.remove(candidate)) return candidate;
-        }
-        return null;
-    }
-
-    /**
-     * CPU work may complete out of order, but Full Cave exact pages are exposed only
-     * at one stable row-major frontier. Minimap and background lanes remain latency
-     * ordered and are never held behind a hidden fullscreen page.
-     */
-    private boolean canPublishFullscreen(CompletedBuild completed, long now) {
-        VisiblePlanner planner = visiblePlans.get(MapRequestLane.FULLSCREEN);
-        if (planner == null || planner.pagePlan.length == 0) return true;
-        PageKey key = completed.info().key;
-        if (!key.dimension().equals(planner.dimension)
-                || key.view() != planner.view || key.layerY() != planner.layerY) {
-            return true; // stale completion is polled so normal validation can discard it.
-        }
-        advanceFullscreenPublicationCursor(planner, now);
-        int ordinal = completed.fullscreenOrdinal();
-        return ordinal == Integer.MAX_VALUE
-                || ordinal <= planner.fullscreenPublicationCursor;
-    }
-
-    private void advanceFullscreenPublicationCursor(VisiblePlanner planner, long now) {
-        synchronized (pages) {
-            while (planner.fullscreenPublicationCursor < planner.pagePlan.length) {
-                long packed = planner.pagePlan[planner.fullscreenPublicationCursor];
-                PageKey key = new PageKey(planner.dimension, planner.view, planner.layerY,
-                        CaveLoadHierarchy.x(packed), CaveLoadHierarchy.z(packed));
-                if (isPageDisplayReadyLocked(key)) {
-                    planner.fullscreenPublicationCursor++;
-                    planner.publicationBlockedSinceMs = 0L;
-                    continue;
-                }
-                if (isPageActiveLocked(key, MapRequestLane.FULLSCREEN, now)
-                        || hasCompletedFullscreenOrdinal(planner.fullscreenPublicationCursor)) {
-                    if (planner.publicationBlockedSinceMs == 0L) {
-                        planner.publicationBlockedSinceMs = now;
-                    }
-                    return;
-                }
-                if (planner.publicationBlockedSinceMs == 0L) {
-                    planner.publicationBlockedSinceMs = now;
-                    return;
-                }
-                if (now - planner.publicationBlockedSinceMs
-                        < FULLSCREEN_FRONTIER_STALL_MS) return;
-                // Defer a broken/unknown page to the next repair cycle rather than
-                // letting it freeze every visible row below it.
-                planner.fullscreenPublicationCursor++;
-                planner.publicationBlockedSinceMs = 0L;
-            }
-            if (planner.fullscreenPublicationCursor >= planner.pagePlan.length) {
-                planner.fullscreenPublicationCursor = 0;
-                planner.publicationCompletedCycles++;
-            }
-        }
-    }
-
-    private boolean hasCompletedFullscreenOrdinal(int ordinal) {
-        for (CompletedBuild completed : completedBuilds) {
-            if (completed.lane() == MapRequestLane.FULLSCREEN
-                    && completed.fullscreenOrdinal() == ordinal) return true;
-        }
-        return false;
+        // PriorityBlockingQueue already orders by lane and fullscreen ordinal. Treat
+        // ordinal as a preference, not a hard dependency: one absent or partial page
+        // must never block every completed page behind it.
+        return completedBuilds.poll();
     }
 
     private void scheduleBuilds(int budget, long deadline, long now) {
@@ -1062,6 +1034,11 @@ public final class UnifiedCaveTextureManager {
                 info = pages.computeIfAbsent(key, PageInfo::new);
                 revision = revisions.getOrDefault(key, 1L);
                 if (info.pending != null || now < info.nextRetryMs) continue;
+                // No-source is a repository state, not a timer. Rebuilding an
+                // unchanged empty snapshot only burns CPU and keeps the request
+                // lane busy; a repository revision advance re-enables it.
+                if (!info.initialized && info.knownColumns == 0
+                        && info.noSourceRevision == sourceRevision) continue;
                 if (info.uploadedRevision == revision
                         && info.uploadedSourceRevision == sourceRevision) {
                     if (info.knownEmpty) {
@@ -1073,10 +1050,19 @@ public final class UnifiedCaveTextureManager {
                         continue;
                     }
                     if (info.initialized && info.atlasSlot >= 0) {
-                        PageRequest satisfied = requests.get(key);
-                        if (satisfied != null) {
-                            satisfied.clearAll();
-                            if (satisfied.isExpired(now)) requests.remove(key);
+                        int fullColumns = CaveTextureAtlas.PAGE_SIZE
+                                * CaveTextureAtlas.PAGE_SIZE;
+                        if (info.knownColumns >= fullColumns) {
+                            PageRequest satisfied = requests.get(key);
+                            if (satisfied != null) {
+                                satisfied.clearAll();
+                                if (satisfied.isExpired(now)) requests.remove(key);
+                            }
+                        } else {
+                            // The current source revision has already been applied.
+                            // Wait for a repository revision change instead of
+                            // rebuilding the same partial page every 80 ms.
+                            info.nextRetryMs = now + INCOMPLETE_RETRY_MS;
                         }
                         continue;
                     }
@@ -1109,12 +1095,9 @@ public final class UnifiedCaveTextureManager {
                         requestLane, revision);
                 pipelineTelemetry.recordExactBuildQueued();
                 long repositoryGeneration = repository.generation();
-                long viewportEpoch = MapWorkScheduler.viewportEpoch(requestLane);
                 MapCancellationToken token = new MapCancellationToken(() ->
                         key.dimension().equals(dimension())
-                                && repository.isGenerationCurrent(repositoryGeneration)
-                                && MapWorkScheduler.isViewportCurrent(
-                                        requestLane, viewportEpoch));
+                                && repository.isGenerationCurrent(repositoryGeneration));
                 long queuedNanos = System.nanoTime();
                 CompletableFuture<BuildResult> future = CompletableFuture.supplyAsync(() -> {
                     long buildStart = System.nanoTime();
@@ -1223,7 +1206,7 @@ public final class UnifiedCaveTextureManager {
                 System.arraycopy(uploadScratchLods[lod], 0, info.frontLods[lod], 0,
                         uploadScratchLods[lod].length);
             }
-            if (info.knownColumns >= pixelCount) updateBranch(info);
+            updateBranch(info);
             info.releaseAtlasSlot();
             ExactPageStateTracker.getInstance().transition(
                     stateKey(info.key), ExactPageState.KNOWN_EMPTY,
@@ -1262,7 +1245,7 @@ public final class UnifiedCaveTextureManager {
             System.arraycopy(uploadScratchLods[lod], 0, info.frontLods[lod], 0,
                     uploadScratchLods[lod].length);
         }
-        if (info.knownColumns >= pixelCount) updateBranch(info);
+        updateBranch(info);
         if (uploaded) {
             telemetry.recordPageUpload();
             exactContentRevision.incrementAndGet();
@@ -1317,11 +1300,12 @@ public final class UnifiedCaveTextureManager {
     }
 
     private void updateBranch(PageInfo page) {
-        // Branches are stable zoom-out representations. Never derive/persist them
-        // from a page that is still missing chunks; otherwise every zoom level can
-        // expose a different partial snapshot and the map appears torn.
+        // The LOD tree carries per-pixel known/complete coverage and merges each
+        // dirty leaf into the existing branch. Publishing resolved leaves now is
+        // therefore both stable and essential: one deferred chunk must not keep a
+        // whole 4x4-chunk page (and every zoomed-out ancestor) black.
         int fullColumns = CaveTextureAtlas.PAGE_SIZE * CaveTextureAtlas.PAGE_SIZE;
-        if (page.frontLods == null || page.knownColumns < fullColumns) return;
+        if (page.frontLods == null || page.knownColumns <= 0) return;
         synchronized (pages) {
             long pageRevision = Math.max(1L, revisions.getOrDefault(
                     page.key, Math.max(1L, page.uploadedRevision)));
@@ -1365,8 +1349,8 @@ public final class UnifiedCaveTextureManager {
     }
 
     private static void markIncomplete(PageInfo info, long now) {
-        info.uploadedRevision = 0L;
-        info.uploadedSourceRevision = Long.MIN_VALUE;
+        // Preserve the last-good CPU/GPU revision. A partial page is visible and
+        // reusable; only a newer repository revision should trigger another build.
         info.nextRetryMs = now + INCOMPLETE_RETRY_MS;
     }
 
@@ -1567,11 +1551,7 @@ public final class UnifiedCaveTextureManager {
         private long[] pagePlan = new long[0];
         private int pageCursor;
         private int updateSliceIndex;
-        private int fullscreenPublicationCursor;
-        private long sliceOpenedMs;
-        private long publicationBlockedSinceMs;
         private long requestCompletedCycles;
-        private long publicationCompletedCycles;
         private float scale = 1.0f;
         private long nextRestartMs;
 
@@ -1579,6 +1559,17 @@ public final class UnifiedCaveTextureManager {
                 int projectionTopY, int minPageX, int maxPageX,
                 int minPageZ, int maxPageZ, int centerPageX, int centerPageZ,
                 MapRequestLane lane) {
+            boolean continuousPan = lane == MapRequestLane.FULLSCREEN
+                    && this.dimension.equals(dimension) && this.view == view
+                    && this.layerY == layerY
+                    && this.projectionTopY == projectionTopY
+                    && rectanglesOverlap(this.minPageX, this.maxPageX,
+                            this.minPageZ, this.maxPageZ,
+                            minPageX, maxPageX, minPageZ, maxPageZ);
+            int previousMinPageX = this.minPageX;
+            int previousMaxPageX = this.maxPageX;
+            int previousMinPageZ = this.minPageZ;
+            int previousMaxPageZ = this.maxPageZ;
             this.dimension = dimension;
             this.view = view;
             this.layerY = layerY;
@@ -1591,15 +1582,20 @@ public final class UnifiedCaveTextureManager {
             this.focusPageZ = centerPageZ;
             pagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
                     minPageX, maxPageX, minPageZ, maxPageZ,
-                    centerPageX, centerPageZ, lane == MapRequestLane.FULLSCREEN);
+                    centerPageX, centerPageZ, lane == MapRequestLane.FULLSCREEN,
+                    continuousPan, previousMinPageX, previousMaxPageX,
+                    previousMinPageZ, previousMaxPageZ);
             pageCursor = 0;
             updateSliceIndex = 0;
-            fullscreenPublicationCursor = 0;
-            sliceOpenedMs = 0L;
-            publicationBlockedSinceMs = 0L;
             requestCompletedCycles = 0L;
-            publicationCompletedCycles = 0L;
             nextRestartMs = 0L;
+        }
+
+        private static boolean rectanglesOverlap(int firstMinX, int firstMaxX,
+                int firstMinZ, int firstMaxZ, int secondMinX, int secondMaxX,
+                int secondMinZ, int secondMaxZ) {
+            return firstMinX <= secondMaxX && firstMaxX >= secondMinX
+                    && firstMinZ <= secondMaxZ && firstMaxZ >= secondMinZ;
         }
 
         private void clear() {
@@ -1613,11 +1609,7 @@ public final class UnifiedCaveTextureManager {
             pagePlan = new long[0];
             pageCursor = 0;
             updateSliceIndex = 0;
-            fullscreenPublicationCursor = 0;
-            sliceOpenedMs = 0L;
-            publicationBlockedSinceMs = 0L;
             requestCompletedCycles = 0L;
-            publicationCompletedCycles = 0L;
             scale = 1.0f;
             nextRestartMs = 0L;
         }
@@ -1751,6 +1743,7 @@ public final class UnifiedCaveTextureManager {
         private boolean pendingCompletionRecorded;
         private long uploadedRevision;
         private long uploadedSourceRevision = Long.MIN_VALUE;
+        private long noSourceRevision = Long.MIN_VALUE;
         private long nextRetryMs;
         private boolean initialized;
         private boolean knownEmpty;
@@ -1894,6 +1887,15 @@ public final class UnifiedCaveTextureManager {
         private CaveTextureAtlas.DirtyRect rect(int index) {
             return new CaveTextureAtlas.DirtyRect(minX[index], minY[index],
                     maxX[index], maxY[index]);
+        }
+    }
+
+    public record DebugSnapshot(int pages, int requests, int pendingBuilds,
+            int completedBuilds, int initializedPages, int partialPages,
+            int knownEmptyPages, int residentPages, int fullscreenSlice,
+            int fullscreenPlanPages) {
+        public static DebugSnapshot empty() {
+            return new DebugSnapshot(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 

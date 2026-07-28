@@ -159,6 +159,19 @@ public final class MapPerformanceGovernor {
         return Math.max(1, (int) Math.round(base * headroomFactor()));
     }
 
+    /**
+     * Hard client-thread deadline for packet-driven map repair. A column count is
+     * not a reliable frame budget: a water/cave column can be orders of magnitude
+     * more expensive than an already-cached flat column. Keep the count cap as a
+     * safety net, but make elapsed time the primary pre-emption signal.
+     */
+    public long mutationRepairBudgetNanos() {
+        long base = underPressure()
+                ? 300_000L
+                : (fullscreenOpen ? 1_000_000L : 650_000L);
+        return Math.max(150_000L, (long) (base * headroomFactor()));
+    }
+
 
     /**
      * One immutable admission profile consumed by the unified observation scheduler.
@@ -171,22 +184,24 @@ public final class MapPerformanceGovernor {
         boolean movingFast = minecraft != null && minecraft.player != null
                 && minecraft.player.getDeltaMovement().horizontalDistanceSqr() >= 0.18;
         if (pressured) {
-            return new ObservationProfile(24, 1, 0.65,
+            return new ObservationProfile(12, 1, mutationRepairBudgetNanos(), 0.65,
                     80_000_000L, 140_000_000L,
                     true, true, false, true, false);
         }
         if (fullscreenOpen) {
-            return new ObservationProfile(48, 2, 1.0,
+            return new ObservationProfile(24, 2, mutationRepairBudgetNanos(), 1.0,
                     20_000_000L, 50_000_000L,
                     true, true, !movingFast, true, !movingFast);
         }
-        return new ObservationProfile(64, 2, movingFast ? 0.80 : 1.0,
+        return new ObservationProfile(32, 2, mutationRepairBudgetNanos(),
+                movingFast ? 0.80 : 1.0,
                 40_000_000L, 50_000_000L,
                 true, true, !movingFast, true, !movingFast);
     }
 
     public record ObservationProfile(int mutationColumnBudget,
-            int mutationChunkBudget, double liveRadiusFactor,
+            int mutationChunkBudget, long mutationBudgetNanos,
+            double liveRadiusFactor,
             long fullscreenIntervalNanos, long minimapIntervalNanos,
             boolean allowVisibleScan, boolean allowSavedVisible,
             boolean allowLayerWarmup, boolean allowPublication,

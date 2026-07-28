@@ -41,6 +41,9 @@ final class CaveChunkReadinessTracker {
     private static final int MAX_OBSERVATIONS = 4096;
     private static final int MAX_MUTATION_EPOCHS = 16_384;
     private static final int MAX_LIGHT_WAITS = 4096;
+    private static final int PROBE_PRESENT = 1;
+    private static final int PROBE_MATCHES = 1 << 1;
+    private static final int PROBE_LIGHT_CORRECT = 1 << 2;
 
     private final Map<Long, Observation> observations =
             new LinkedHashMap<>(256, 0.75f, true);
@@ -130,9 +133,13 @@ final class CaveChunkReadinessTracker {
     Snapshot acquire(Level level, int chunkX, int chunkZ) {
         if (level == null || level != observedLevel || isSettling(level)) return null;
 
-        Capture capture = capture(level, chunkX, chunkZ);
         long key = ChunkPos.asLong(chunkX, chunkZ);
-        if (capture == null) {
+        Observation observation = observations.get(key);
+        int probe = probe(level, chunkX, chunkZ,
+                observation == null ? null : observation.chunks(),
+                observation == null ? null : observation.centerSections(),
+                observation == null ? null : observation.epochs());
+        if ((probe & PROBE_PRESENT) == 0) {
             observations.remove(key);
             lightWaitSince.remove(key);
             return null;
@@ -141,7 +148,8 @@ final class CaveChunkReadinessTracker {
         long tick = level.getGameTime();
         boolean lightGateRelevant = level.dimensionType().hasSkyLight()
                 && !level.dimensionType().hasCeiling();
-        if (lightGateRelevant && !capture.lightCorrect()) {
+        boolean lightCorrect = (probe & PROBE_LIGHT_CORRECT) != 0;
+        if (lightGateRelevant && !lightCorrect) {
             long firstWait = lightWaitSince.computeIfAbsent(key, ignored -> tick);
             trimLightWaits();
             if (tick - firstWait < LIGHT_GRACE_TICKS) return null;
@@ -149,28 +157,29 @@ final class CaveChunkReadinessTracker {
             lightWaitSince.remove(key);
         }
 
-        Observation observation = observations.get(key);
-        if (observation == null || !sameCapture(observation, capture)) {
-            observations.put(key, new Observation(capture.chunks(),
-                    capture.centerSections(), capture.epochs(), tick));
+        if (observation == null || (probe & PROBE_MATCHES) == 0) {
+            Observation replacement = captureObservation(level, chunkX, chunkZ, tick);
+            if (replacement == null) return null;
+            observations.put(key, replacement);
             trimObservations();
             return null;
         }
 
         if (tick - observation.stableSinceTick < STABLE_TICKS) return null;
-        return new Snapshot(level, chunkX, chunkZ, capture.chunks().clone(),
-                capture.centerSections().clone(), capture.epochs().clone(), tick,
-                !capture.lightCorrect());
+        // Observation arrays are immutable identity snapshots. Sharing them avoids
+        // three more array copies on every successful transaction.
+        return new Snapshot(level, chunkX, chunkZ, observation.chunks(),
+                observation.centerSections(), observation.epochs(), tick,
+                !lightCorrect);
     }
 
     boolean stillValid(Level level, Snapshot snapshot) {
         if (snapshot == null || level == null || level != snapshot.level()
                 || isSettling(level)) return false;
-        Capture current = capture(level, snapshot.chunkX(), snapshot.chunkZ());
-        return current != null
-                && sameChunks(snapshot.chunks(), current.chunks())
-                && sameSections(snapshot.centerSections(), current.centerSections())
-                && sameEpochs(snapshot.epochs(), current.epochs());
+        int probe = probe(level, snapshot.chunkX(), snapshot.chunkZ(),
+                snapshot.chunks(), snapshot.centerSections(), snapshot.epochs());
+        return (probe & (PROBE_PRESENT | PROBE_MATCHES))
+                == (PROBE_PRESENT | PROBE_MATCHES);
     }
 
     void reset() {
@@ -216,10 +225,60 @@ final class CaveChunkReadinessTracker {
         }
     }
 
-    private Capture capture(Level level, int centerChunkX, int centerChunkZ) {
+    /**
+     * Allocation-free readiness/identity probe used by the overwhelmingly common
+     * deferred and still-valid paths. Arrays are created only when a genuinely new
+     * stable observation has to be retained.
+     */
+    private int probe(Level level, int centerChunkX, int centerChunkZ,
+            LevelChunk[] expectedChunks, LevelChunkSection[] expectedSections,
+            long[] expectedEpochs) {
+        boolean matches = expectedChunks != null && expectedEpochs != null
+                && expectedChunks.length == NEIGHBOUR_COUNT
+                && expectedEpochs.length == NEIGHBOUR_COUNT;
+        boolean allLightCorrect = true;
+        int index = 0;
+        LevelChunk center = null;
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int chunkX = centerChunkX + dx;
+                int chunkZ = centerChunkZ + dz;
+                LevelChunk chunk = fullChunk(level, chunkX, chunkZ);
+                if (chunk == null) return 0;
+                if (!chunk.isLightCorrect()) allLightCorrect = false;
+                if (matches && expectedChunks[index] != chunk) matches = false;
+                long epoch = mutationEpochs.getOrDefault(
+                        ChunkPos.asLong(chunkX, chunkZ), 0L);
+                if (matches && expectedEpochs[index] != epoch) matches = false;
+                if (index == CENTRE_INDEX) center = chunk;
+                index++;
+            }
+        }
+        if (matches) {
+            LevelChunkSection[] currentSections = center == null
+                    ? null : center.getSections();
+            if (expectedSections == null || currentSections == null
+                    || expectedSections.length != currentSections.length) {
+                matches = false;
+            } else {
+                for (int i = 0; i < currentSections.length; i++) {
+                    if (expectedSections[i] != currentSections[i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+        }
+        int result = PROBE_PRESENT;
+        if (matches) result |= PROBE_MATCHES;
+        if (allLightCorrect) result |= PROBE_LIGHT_CORRECT;
+        return result;
+    }
+
+    private Observation captureObservation(Level level, int centerChunkX,
+            int centerChunkZ, long stableSinceTick) {
         LevelChunk[] result = new LevelChunk[NEIGHBOUR_COUNT];
         long[] epochs = new long[NEIGHBOUR_COUNT];
-        boolean allLightCorrect = true;
         int index = 0;
         for (int dz = -1; dz <= 1; dz++) {
             for (int dx = -1; dx <= 1; dx++) {
@@ -227,7 +286,6 @@ final class CaveChunkReadinessTracker {
                 int chunkZ = centerChunkZ + dz;
                 LevelChunk chunk = fullChunk(level, chunkX, chunkZ);
                 if (chunk == null) return null;
-                if (!chunk.isLightCorrect()) allLightCorrect = false;
                 result[index] = chunk;
                 epochs[index] = mutationEpochs.getOrDefault(
                         ChunkPos.asLong(chunkX, chunkZ), 0L);
@@ -235,7 +293,7 @@ final class CaveChunkReadinessTracker {
             }
         }
         LevelChunkSection[] sections = result[CENTRE_INDEX].getSections().clone();
-        return new Capture(result, sections, epochs, allLightCorrect);
+        return new Observation(result, sections, epochs, stableSinceTick);
     }
 
     private static LevelChunk fullChunk(Level level, int chunkX, int chunkZ) {
@@ -247,47 +305,12 @@ final class CaveChunkReadinessTracker {
         }
     }
 
-    private static boolean sameChunks(LevelChunk[] first, LevelChunk[] second) {
-        if (first == null || second == null || first.length != second.length) return false;
-        for (int i = 0; i < first.length; i++) {
-            if (first[i] != second[i]) return false;
-        }
-        return true;
-    }
-
-    private static boolean sameSections(LevelChunkSection[] first, LevelChunkSection[] second) {
-        if (first == null || second == null || first.length != second.length) return false;
-        for (int i = 0; i < first.length; i++) {
-            if (first[i] != second[i]) return false;
-        }
-        return true;
-    }
-
-    private static boolean sameEpochs(long[] first, long[] second) {
-        if (first == null || second == null || first.length != second.length) return false;
-        for (int i = 0; i < first.length; i++) {
-            if (first[i] != second[i]) return false;
-        }
-        return true;
-    }
-
-    private static boolean sameCapture(Observation observation, Capture capture) {
-        return sameChunks(observation.chunks(), capture.chunks())
-                && sameSections(observation.centerSections(), capture.centerSections())
-                && sameEpochs(observation.epochs(), capture.epochs());
-    }
-
     record Snapshot(Level level, int chunkX, int chunkZ,
             LevelChunk[] chunks, LevelChunkSection[] centerSections,
             long[] epochs, long acquiredTick, boolean provisionalLight) {
         LevelChunk centerChunk() {
             return chunks[CENTRE_INDEX];
         }
-    }
-
-    private record Capture(LevelChunk[] chunks,
-            LevelChunkSection[] centerSections, long[] epochs,
-            boolean lightCorrect) {
     }
 
     private record Observation(LevelChunk[] chunks,

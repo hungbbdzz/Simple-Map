@@ -40,6 +40,11 @@ public final class ExactPageStateTracker {
                 && state != ExactPageState.STALE_GENERATION) {
             return;
         }
+        if (previous != null && previous.state == state
+                && previous.lane == effectiveLane
+                && previous.revision == revision) {
+            return;
+        }
         entries.put(key, new Entry(state, effectiveLane, revision, now));
         transitions.get(state).incrementAndGet();
         trim();
@@ -53,18 +58,37 @@ public final class ExactPageStateTracker {
     public synchronized Snapshot snapshot() {
         EnumMap<ExactPageState, Long> counts = new EnumMap<>(ExactPageState.class);
         for (ExactPageState state : ExactPageState.values()) counts.put(state, 0L);
+        long now = System.currentTimeMillis();
+        long oldestAgeMs = 0L;
+        long requestedOlderThan5s = 0L;
+        long buildingOlderThan5s = 0L;
+        long cpuReadyOlderThan5s = 0L;
         for (Entry entry : entries.values()) {
             counts.put(entry.state, counts.get(entry.state) + 1L);
+            long age = Math.max(0L, now - entry.updatedAtMs);
+            oldestAgeMs = Math.max(oldestAgeMs, age);
+            if (age < 5_000L) continue;
+            if (entry.state == ExactPageState.REQUESTED) requestedOlderThan5s++;
+            else if (entry.state == ExactPageState.BUILDING) buildingOlderThan5s++;
+            else if (entry.state == ExactPageState.CPU_READY) cpuReadyOlderThan5s++;
         }
         EnumMap<ExactPageState, Long> transitionCounts = new EnumMap<>(ExactPageState.class);
         for (ExactPageState state : ExactPageState.values()) {
             transitionCounts.put(state, transitions.get(state).get());
         }
-        return new Snapshot(entries.size(), counts, transitionCounts);
+        return new Snapshot(entries.size(), counts, transitionCounts,
+                oldestAgeMs, requestedOlderThan5s, buildingOlderThan5s,
+                cpuReadyOlderThan5s);
     }
 
     public synchronized void clear() {
         entries.clear();
+    }
+
+    /** Resets diagnostic state at the start of a new map session. */
+    public synchronized void reset() {
+        entries.clear();
+        for (AtomicLong counter : transitions.values()) counter.set(0L);
     }
 
     public synchronized void clearPrefix(String prefix) {
@@ -88,6 +112,8 @@ public final class ExactPageStateTracker {
 
     public record Snapshot(int trackedPages,
             Map<ExactPageState, Long> pagesByState,
-            Map<ExactPageState, Long> transitionsByState) {
+            Map<ExactPageState, Long> transitionsByState,
+            long oldestStateAgeMs, long requestedOlderThan5s,
+            long buildingOlderThan5s, long cpuReadyOlderThan5s) {
     }
 }

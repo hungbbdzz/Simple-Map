@@ -1,9 +1,13 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.persistence.v2.MapPersistenceV2Service;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.velorise.simplemap.client.pipeline.MapWorkGraph;
 import com.velorise.simplemap.client.pipeline.MapWorkKey;
+import com.velorise.simplemap.client.pipeline.MapWorkStage;
+import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.pipeline.RegionRecord;
 import com.velorise.simplemap.client.session.MapSessionManager;
 import net.minecraft.client.Minecraft;
 import org.apache.logging.log4j.LogManager;
@@ -471,6 +475,17 @@ public class MapManager {
         return region.getBlockData(blockX & 511, blockZ & 511);
     }
 
+    /**
+     * Hot-path counterpart to {@link #getBlockData}. Unknown/empty columns return
+     * {@link MapBlockData#EMPTY_PACKED}; callers that only inspect flags/heights do
+     * not need to allocate a decoded object.
+     */
+    public long getPackedBlockData(int blockX, int blockZ) {
+        Region region = getRegion(blockX >> 9, blockZ >> 9, false);
+        if (region == null || !region.isLoaded()) return MapBlockData.EMPTY_PACKED;
+        return region.getPackedBlockData(blockX & 511, blockZ & 511);
+    }
+
     public int getSurfaceTint(int blockX, int blockZ) {
         Region region = getRegion(blockX >> 9, blockZ >> 9, false);
         if (region == null || !region.isLoaded()) return SurfaceTintData.UNKNOWN;
@@ -478,12 +493,12 @@ public class MapManager {
     }
 
     public int getColor(int blockX, int blockZ) {
-        MapBlockData data = getBlockData(blockX, blockZ);
-        if (data == null || data.isEmpty()) return 0;
+        long packed = getPackedBlockData(blockX, blockZ);
+        if (MapBlockData.isEmpty(packed)) return 0;
         Region region = getRegion(blockX >> 9, blockZ >> 9, false);
         if (region == null) return 0;
         List<String> palette = region.snapshotBlockPalette();
-        int index = data.blockId & 0xFFFF;
+        int index = MapBlockData.blockId(packed) & 0xFFFF;
         if (index >= palette.size()) return 0;
         Integer argb = MapTextureManager.getInstance().getBlockColor(palette.get(index));
         if (argb == null) return 0;
@@ -501,6 +516,17 @@ public class MapManager {
         if (region == null || !region.isLoaded()) return;
         if (region.setBlockData(blockX & 511, blockZ & 511, data, tint)) {
             markColumnDirty(blockX, blockZ);
+            RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+            if (stamp != null) {
+                int localChunkX = (blockX & 511) >>> 4;
+                int localChunkZ = (blockZ & 511) >>> 4;
+                int localChunkIndex = localChunkZ * 32 + localChunkX;
+                MapWorkGraph.getInstance().markSourceChunkDirty(stamp,
+                        regionX, regionZ, localChunkIndex,
+                        region.sourceRevision());
+                SurfaceRegionSourceDatabase.getInstance().markChunkDirty(
+                        regionX, regionZ, localChunkIndex);
+            }
         }
     }
 
@@ -788,6 +814,8 @@ public class MapManager {
         MapLightManager.getInstance().flushAndClear();
         CaveMapManager.getInstance().flushAndClear();
         FullCaveMapManager.getInstance().flushAndClear();
+        CaveTextureManager.getInstance().clearCache();
+        FullCaveTextureManager.getInstance().clearCache();
         VerticalCaveArchiveManager.getInstance().flushAndClear();
         ChunkScanner.getInstance().reset();
         RegionProcessor.getInstance().stop();
@@ -841,16 +869,49 @@ public class MapManager {
         if (region == null || directory == null || !region.isLoaded()) return false;
         if (!force && !RegionDataStore.canAcceptSave(directory, region.rx, region.rz)) return false;
         RegionSnapshot snapshot = region.snapshot();
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        MapWorkKey workKey = stamp == null ? null : new MapWorkKey(stamp,
+                region.rx, region.rz, MapWorkStage.CACHE_COMMIT, Integer.MIN_VALUE);
+        MapWorkGraph graph = MapWorkGraph.getInstance();
+        if (workKey != null) graph.request(workKey, snapshot.sourceRevision(),
+                RegionRecord.ALL_LEAVES);
+        final long persistenceWorldIdentity = (currentWorldId == null ? 0L
+                : currentWorldId.hashCode() * 0x9E3779B97F4A7C15L)
+                ^ directory.getAbsolutePath().hashCode();
+        final long persistenceStyleRevision = stamp == null
+                ? 0L : stamp.styleGeneration();
+
+        java.util.function.Consumer<RegionDataStore.SaveResult> completion = result -> {
+            if (workKey == null) return;
+            if (result.success()) {
+                graph.markCacheCommitted(workKey, snapshot.sourceRevision(),
+                        RegionRecord.ALL_LEAVES);
+                MapPersistenceV2Service.getInstance().appendSurface(directory,
+                        persistenceWorldIdentity, region.rx, region.rz,
+                        snapshot.sourceRevision(), persistenceStyleRevision,
+                        new RegionDataStore.StoredRegion(snapshot.pixels(),
+                                snapshot.tints(), snapshot.biomePalette(),
+                                snapshot.blockPalette()));
+            } else {
+                graph.markCacheDirty(workKey, snapshot.sourceRevision(),
+                        RegionRecord.ALL_LEAVES);
+            }
+        };
+
         boolean accepted;
         if (force) {
             RegionDataStore.saveAsync(directory, region.rx, region.rz,
-                    snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(), snapshot.blockPalette());
+                    snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(),
+                    snapshot.blockPalette(), completion);
             accepted = true;
         } else {
             accepted = RegionDataStore.trySaveAsync(directory, region.rx, region.rz,
-                    snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(), snapshot.blockPalette());
+                    snapshot.pixels(), snapshot.tints(), snapshot.biomePalette(),
+                    snapshot.blockPalette(), completion);
         }
         if (accepted) regionFileExists.put(key(region.rx, region.rz), true);
+        else if (workKey != null) graph.markCacheDirty(workKey,
+                snapshot.sourceRevision(), RegionRecord.ALL_LEAVES);
         return accepted;
     }
 
@@ -1072,6 +1133,8 @@ public class MapManager {
         private final long[] pixels = new long[PIXEL_COUNT];
         private final int[] tints = new int[PIXEL_COUNT];
         private final int[] knownColumnsPerPage = new int[MapPageLayout.PAGES_PER_REGION * MapPageLayout.PAGES_PER_REGION];
+        /** One exact count per Minecraft chunk; 256 means the tile is publishable. */
+        private final short[] knownColumnsPerChunk = new short[32 * 32];
         private final List<String> biomePalette = new ArrayList<>();
         private final List<String> blockPalette = new ArrayList<>();
         private final Map<String, Integer> biomeIndex = new HashMap<>();
@@ -1081,6 +1144,9 @@ public class MapManager {
         private volatile boolean loaded;
         private volatile boolean closed;
         private final AtomicBoolean loadScheduled = new AtomicBoolean();
+        private long sourceRevision = 1L;
+        private long paletteRevision = 1L;
+        private final long[] chunkRevisions = new long[32 * 32];
 
         private Region(int rx, int rz, long generation) {
             this.rx = rx;
@@ -1150,6 +1216,15 @@ public class MapManager {
             }
         }
 
+        public long getPackedBlockData(int pixelX, int pixelZ) {
+            lock.lock();
+            try {
+                return pixels[pixelZ * 512 + pixelX];
+            } finally {
+                lock.unlock();
+            }
+        }
+
         public int getTint(int pixelX, int pixelZ) {
             lock.lock();
             try {
@@ -1174,6 +1249,47 @@ public class MapManager {
             }
         }
 
+        /**
+         * Returns the 4x4 chunk mask whose source columns are complete. This is
+         * the authoritative target coverage for progressive 16x16 publication.
+         */
+        public int completeChunkMaskInPage(int pageX, int pageZ) {
+            if (pageX < 0 || pageX >= MapPageLayout.PAGES_PER_REGION
+                    || pageZ < 0 || pageZ >= MapPageLayout.PAGES_PER_REGION) {
+                return 0;
+            }
+            lock.lock();
+            try {
+                int result = 0;
+                int startChunkX = pageX * MapPageLayout.SUBTILES_PER_PAGE;
+                int startChunkZ = pageZ * MapPageLayout.SUBTILES_PER_PAGE;
+                for (int localZ = 0; localZ < MapPageLayout.SUBTILES_PER_PAGE; localZ++) {
+                    for (int localX = 0; localX < MapPageLayout.SUBTILES_PER_PAGE; localX++) {
+                        int chunkIndex = (startChunkZ + localZ) * 32
+                                + startChunkX + localX;
+                        if ((knownColumnsPerChunk[chunkIndex] & 0xFFFF) == 256) {
+                            result |= 1 << MapPageLayout.subtileIndex(localX, localZ);
+                        }
+                    }
+                }
+                return result;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public boolean isChunkSurfaceComplete(int localChunkX, int localChunkZ) {
+            if (localChunkX < 0 || localChunkX >= 32
+                    || localChunkZ < 0 || localChunkZ >= 32) return false;
+            lock.lock();
+            try {
+                return (knownColumnsPerChunk[localChunkZ * 32 + localChunkX]
+                        & 0xFFFF) == 256;
+            } finally {
+                lock.unlock();
+            }
+        }
+
         public boolean setBlockData(int pixelX, int pixelZ, MapBlockData data) {
             return setBlockData(pixelX, pixelZ, data, SurfaceTintData.UNKNOWN);
         }
@@ -1192,9 +1308,14 @@ public class MapManager {
                     int pageZ = pixelZ / MapPageLayout.PAGE_SIZE;
                     int pageIndex = pageZ * MapPageLayout.PAGES_PER_REGION + pageX;
                     knownColumnsPerPage[pageIndex] += isKnown ? 1 : -1;
+                    int chunkIndex = (pixelZ >>> 4) * 32 + (pixelX >>> 4);
+                    knownColumnsPerChunk[chunkIndex] += isKnown ? 1 : -1;
                 }
                 pixels[index] = packed;
                 tints[index] = tint;
+                long revision = ++sourceRevision;
+                int chunkIndex = (pixelZ >>> 4) * 32 + (pixelX >>> 4);
+                chunkRevisions[chunkIndex] = revision;
                 return true;
             } finally {
                 lock.unlock();
@@ -1211,6 +1332,7 @@ public class MapManager {
                 int index = biomePalette.size();
                 biomePalette.add(safeId);
                 biomeIndex.put(safeId, index);
+                paletteRevision++;
                 return index;
             } finally {
                 lock.unlock();
@@ -1227,7 +1349,69 @@ public class MapManager {
                 int index = blockPalette.size();
                 blockPalette.add(safeId);
                 blockIndex.put(safeId, index);
+                paletteRevision++;
                 return index;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public long sourceRevision() {
+            lock.lock();
+            try { return sourceRevision; }
+            finally { lock.unlock(); }
+        }
+
+        public long chunkRevision(int localChunkX, int localChunkZ) {
+            if (localChunkX < 0 || localChunkX >= 32
+                    || localChunkZ < 0 || localChunkZ >= 32) return 0L;
+            lock.lock();
+            try { return chunkRevisions[localChunkZ * 32 + localChunkX]; }
+            finally { lock.unlock(); }
+        }
+
+        public RegionSourcePalette snapshotSourcePalette() {
+            return snapshotSourcePaletteIfChanged(Long.MIN_VALUE);
+        }
+
+        public RegionSourcePalette snapshotSourcePaletteIfChanged(
+                long knownPaletteRevision) {
+            lock.lock();
+            try {
+                if (knownPaletteRevision >= paletteRevision) return null;
+                return RegionSourcePalette.owned(sourceRevision, paletteRevision,
+                        biomePalette.toArray(new String[0]),
+                        blockPalette.toArray(new String[0]));
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public RegionChunkSnapshot snapshotChunk(int localChunkX, int localChunkZ,
+                byte[] lightLevels) {
+            if (localChunkX < 0 || localChunkX >= 32
+                    || localChunkZ < 0 || localChunkZ >= 32) return null;
+            lock.lock();
+            try {
+                int chunkIndex = localChunkZ * 32 + localChunkX;
+                int knownColumns = knownColumnsPerChunk[chunkIndex] & 0xFFFF;
+                // Xaero exposes a MapTile only after its complete 16x16 payload is
+                // available. Do not freeze a transient half-scanned tile into the
+                // retained source database or branch hierarchy.
+                if (knownColumns != 256) return null;
+                long[] chunkPixels = new long[16 * 16];
+                int[] chunkTints = new int[16 * 16];
+                int startX = localChunkX * 16;
+                int startZ = localChunkZ * 16;
+                for (int z = 0; z < 16; z++) {
+                    int source = (startZ + z) * 512 + startX;
+                    int target = z * 16;
+                    System.arraycopy(pixels, source, chunkPixels, target, 16);
+                    System.arraycopy(tints, source, chunkTints, target, 16);
+                }
+                return RegionChunkSnapshot.owned(localChunkX, localChunkZ,
+                        chunkRevisions[chunkIndex],
+                        chunkPixels, chunkTints, lightLevels);
             } finally {
                 lock.unlock();
             }
@@ -1325,7 +1509,8 @@ public class MapManager {
             try {
                 return new RegionSnapshot(Arrays.copyOf(pixels, pixels.length),
                         Arrays.copyOf(tints, tints.length),
-                        biomePalette.toArray(new String[0]), blockPalette.toArray(new String[0]));
+                        biomePalette.toArray(new String[0]), blockPalette.toArray(new String[0]),
+                        sourceRevision);
             } finally {
                 lock.unlock();
             }
@@ -1339,6 +1524,7 @@ public class MapManager {
                 System.arraycopy(loadedPixels, 0, pixels, 0, pixels.length);
                 System.arraycopy(loadedTints, 0, tints, 0, tints.length);
                 Arrays.fill(knownColumnsPerPage, 0);
+                Arrays.fill(knownColumnsPerChunk, (short) 0);
                 for (int z = 0; z < 512; z++) {
                     int pageZ = z / MapPageLayout.PAGE_SIZE;
                     int row = z * 512;
@@ -1347,6 +1533,7 @@ public class MapManager {
                         int pageX = x / MapPageLayout.PAGE_SIZE;
                         knownColumnsPerPage[
                                 pageZ * MapPageLayout.PAGES_PER_REGION + pageX]++;
+                        knownColumnsPerChunk[(z >>> 4) * 32 + (x >>> 4)]++;
                     }
                 }
                 biomePalette.clear();
@@ -1357,6 +1544,9 @@ public class MapManager {
                 for (int i = 0; i < biomePalette.size(); i++) biomeIndex.put(biomePalette.get(i), i);
                 blockIndex.clear();
                 for (int i = 0; i < blockPalette.size(); i++) blockIndex.put(blockPalette.get(i), i);
+                paletteRevision++;
+                long loadedRevision = ++sourceRevision;
+                Arrays.fill(chunkRevisions, loadedRevision);
             } finally {
                 lock.unlock();
             }
@@ -1367,7 +1557,110 @@ public class MapManager {
             String[] biomePalette, String[] blockPalette) {
     }
 
-    private record RegionSnapshot(long[] pixels, int[] tints, String[] biomePalette, String[] blockPalette) {
+    public static final class RegionSourcePalette {
+        private final long sourceRevision;
+        private final long paletteRevision;
+        private final String[] biomePalette;
+        private final String[] blockPalette;
+
+        public RegionSourcePalette(long sourceRevision,
+                String[] biomePalette, String[] blockPalette) {
+            this(sourceRevision, sourceRevision, biomePalette, blockPalette, true);
+        }
+
+        public RegionSourcePalette(long sourceRevision, long paletteRevision,
+                String[] biomePalette, String[] blockPalette) {
+            this(sourceRevision, paletteRevision, biomePalette, blockPalette, true);
+        }
+
+        private RegionSourcePalette(long sourceRevision, long paletteRevision,
+                String[] biomePalette, String[] blockPalette, boolean copy) {
+            this.sourceRevision = Math.max(1L, sourceRevision);
+            this.paletteRevision = Math.max(1L, paletteRevision);
+            String[] safeBiomes = biomePalette == null ? new String[0] : biomePalette;
+            String[] safeBlocks = blockPalette == null ? new String[0] : blockPalette;
+            this.biomePalette = copy
+                    ? Arrays.copyOf(safeBiomes, safeBiomes.length) : safeBiomes;
+            this.blockPalette = copy
+                    ? Arrays.copyOf(safeBlocks, safeBlocks.length) : safeBlocks;
+        }
+
+        static RegionSourcePalette owned(long sourceRevision,
+                long paletteRevision, String[] biomePalette,
+                String[] blockPalette) {
+            return new RegionSourcePalette(sourceRevision, paletteRevision,
+                    biomePalette, blockPalette, false);
+        }
+
+        public long sourceRevision() { return sourceRevision; }
+        public long paletteRevision() { return paletteRevision; }
+        public String[] biomePalette() {
+            return Arrays.copyOf(biomePalette, biomePalette.length);
+        }
+        public String[] blockPalette() {
+            return Arrays.copyOf(blockPalette, blockPalette.length);
+        }
+        String[] biomePaletteUnsafe() { return biomePalette; }
+        String[] blockPaletteUnsafe() { return blockPalette; }
+    }
+
+    public static final class RegionChunkSnapshot {
+        private final int localChunkX;
+        private final int localChunkZ;
+        private final long sourceRevision;
+        private final long[] packedPixels;
+        private final int[] tints;
+        private final byte[] lightLevels;
+
+        public RegionChunkSnapshot(int localChunkX, int localChunkZ,
+                long sourceRevision, long[] packedPixels, int[] tints,
+                byte[] lightLevels) {
+            this(localChunkX, localChunkZ, sourceRevision,
+                    packedPixels, tints, lightLevels, true);
+        }
+
+        private RegionChunkSnapshot(int localChunkX, int localChunkZ,
+                long sourceRevision, long[] packedPixels, int[] tints,
+                byte[] lightLevels, boolean copy) {
+            if (packedPixels == null || packedPixels.length != 256
+                    || tints == null || tints.length != 256
+                    || (lightLevels != null && lightLevels.length != 256)) {
+                throw new IllegalArgumentException("Region chunk snapshot requires 256 columns");
+            }
+            this.localChunkX = localChunkX;
+            this.localChunkZ = localChunkZ;
+            this.sourceRevision = Math.max(1L, sourceRevision);
+            this.packedPixels = copy
+                    ? Arrays.copyOf(packedPixels, packedPixels.length) : packedPixels;
+            this.tints = copy ? Arrays.copyOf(tints, tints.length) : tints;
+            this.lightLevels = lightLevels == null ? null
+                    : copy ? Arrays.copyOf(lightLevels, lightLevels.length)
+                    : lightLevels;
+        }
+
+        static RegionChunkSnapshot owned(int localChunkX, int localChunkZ,
+                long sourceRevision, long[] packedPixels, int[] tints,
+                byte[] lightLevels) {
+            return new RegionChunkSnapshot(localChunkX, localChunkZ,
+                    sourceRevision, packedPixels, tints, lightLevels, false);
+        }
+
+        public int localChunkX() { return localChunkX; }
+        public int localChunkZ() { return localChunkZ; }
+        public long sourceRevision() { return sourceRevision; }
+        public long[] packedPixels() {
+            return Arrays.copyOf(packedPixels, packedPixels.length);
+        }
+        public int[] tints() { return Arrays.copyOf(tints, tints.length); }
+        public byte[] lightLevels() { return lightLevels == null ? null
+                : Arrays.copyOf(lightLevels, lightLevels.length); }
+        long[] packedPixelsUnsafe() { return packedPixels; }
+        int[] tintsUnsafe() { return tints; }
+        byte[] lightLevelsUnsafe() { return lightLevels; }
+    }
+
+    private record RegionSnapshot(long[] pixels, int[] tints,
+            String[] biomePalette, String[] blockPalette, long sourceRevision) {
     }
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();

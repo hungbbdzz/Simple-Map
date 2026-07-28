@@ -1,11 +1,12 @@
 package com.velorise.simplemap.client.session;
 
 import com.velorise.simplemap.client.pipeline.MapWorkGraph;
+import com.velorise.simplemap.client.pipeline.RevisionStamp;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Single lifecycle authority for map background work.  Replacing a world or
+ * Single lifecycle authority for map background work. Replacing a world or
  * dimension closes the old root token before the new session is published.
  */
 public final class MapSessionManager {
@@ -52,23 +53,40 @@ public final class MapSessionManager {
         sourceGeneration.incrementAndGet();
     }
 
-    /** Resource/style changes invalidate output without reopening the world. */
-    public long bumpStyleGeneration() {
-        return styleGeneration.incrementAndGet();
+    /** Resource/style changes update the active session atomically. */
+    public synchronized long bumpStyleGeneration() {
+        long generation = styleGeneration.incrementAndGet();
+        MapSession session = active.get();
+        if (session != null) session.updateStyleGeneration(generation);
+        return generation;
     }
 
-    /** Projection changes invalidate view-specific output without losing source. */
-    public long bumpProjectionGeneration() {
-        return projectionGeneration.incrementAndGet();
+    /** Projection changes update the active session without discarding source. */
+    public synchronized long bumpProjectionGeneration() {
+        long generation = projectionGeneration.incrementAndGet();
+        MapSession session = active.get();
+        if (session != null) session.updateProjectionGeneration(generation);
+        return generation;
     }
 
     public MapSession active() {
         return active.get();
     }
 
+    public RevisionStamp activeStamp() {
+        MapSession session = active.get();
+        return session == null ? null : session.stamp();
+    }
+
     public boolean isCurrent(long sessionId) {
         MapSession session = active.get();
         return session != null && session.state() == MapSession.State.ACTIVE
                 && session.sessionId() == sessionId && !session.rootToken().isCancelled();
+    }
+
+    public boolean isCurrent(RevisionStamp stamp) {
+        if (stamp == null) return false;
+        MapSession session = active.get();
+        return stamp.matches(session);
     }
 }
