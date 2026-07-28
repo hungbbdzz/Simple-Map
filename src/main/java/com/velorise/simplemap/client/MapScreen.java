@@ -99,6 +99,7 @@ public class MapScreen extends Screen {
 
     @Override
     protected void init() {
+        FullscreenMapFramebufferRenderer.getInstance().resetFailureState();
         if (this.minecraft != null) {
             MapManager.getInstance().updateWorldAndDimension(this.minecraft);
         }
@@ -487,16 +488,29 @@ public class MapScreen extends Screen {
         // Scanning, IO and texture publication are handled by MapViewportCoordinator
         // from client tick. Rendering remains cache-only.
 
-        // Draw map fullscreen, North-up, no rotation
-        MapRenderer.getInstance().drawMap(
-            guiGraphics,
-            vx, vy, vw, vh,
-            centerX, centerZ, currentRenderScale,
-            MapManager.getInstance().isViewingLiveDimension(),
-            false,
-            false, mouseWorldX, mouseWorldZ,
-            partialTick, false
-        );
+        // Draw map fullscreen, North-up, no rotation. The optional pixel-aligned
+        // framebuffer is currently correctness-gated by shouldUse(); all zooms
+        // fall back to the same cache-only direct renderer when it is quarantined.
+        boolean framebufferRendered = false;
+        if (FullscreenMapFramebufferRenderer.shouldUse(this.minecraft,
+                currentRenderScale)) {
+            framebufferRendered = FullscreenMapFramebufferRenderer.getInstance().render(
+                    guiGraphics, vx, vy, vw, vh,
+                    centerX, centerZ, currentRenderScale,
+                    MapManager.getInstance().isViewingLiveDimension(),
+                    mouseWorldX, mouseWorldZ, partialTick);
+        }
+        if (!framebufferRendered) {
+            MapRenderer.getInstance().drawMap(
+                guiGraphics,
+                vx, vy, vw, vh,
+                centerX, centerZ, currentRenderScale,
+                MapManager.getInstance().isViewingLiveDimension(),
+                false,
+                false, mouseWorldX, mouseWorldZ,
+                partialTick, false
+            );
+        }
 
         if (!MapManager.getInstance().isViewingLiveDimension()
                 && !MapManager.getInstance().hasSavedDataForCurrentDimension()) {
@@ -1490,6 +1504,7 @@ public class MapScreen extends Screen {
             selectedDimension = "LIVE";
         }
         MapViewportCoordinator.getInstance().closeFullscreen();
+        FullscreenMapFramebufferRenderer.getInstance().destroy();
         super.onClose();
     }
 

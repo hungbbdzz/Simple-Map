@@ -7,7 +7,6 @@ import com.velorise.simplemap.client.cave.DenseCaveTile;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
@@ -58,6 +57,7 @@ public class ChunkScanner {
     private static final int VERTICAL_ARCHIVE_MAX_COLUMN_CHECKS = 4096;
     /** Avoid restarting the vertical pass whenever the player merely crosses one chunk border. */
     private static final int VERTICAL_ARCHIVE_REANCHOR_CHUNKS = 3;
+    private static final long CAVE_PIXEL_NOT_FOUND = Long.MIN_VALUE;
 
     private static final ChunkScanner INSTANCE = new ChunkScanner();
 
@@ -69,6 +69,16 @@ public class ChunkScanner {
     private final MapVisualClassifier visualClassifier = MapVisualClassifier.getInstance();
     private final MapBlockEntityVisualResolver blockEntityVisuals =
             MapBlockEntityVisualResolver.getInstance();
+    /**
+     * Column scanning is a very hot client-side path. Reuse mutable positions per
+     * calling thread instead of allocating several BlockPos instances for every
+     * map pixel. A ThreadLocal also keeps direct UI refreshes safe if a future
+     * source reader invokes the scanner away from the client thread.
+     */
+    private final ThreadLocal<ScanScratch> scanScratch =
+            ThreadLocal.withInitial(ScanScratch::new);
+    /** Registry locations are stable; retain their serialized palette IDs once. */
+    private final Map<ResourceLocation, String> biomeIdStrings = new HashMap<>();
     private final Random random = new Random();
     /** NORMAL completes loaded chunks from nearest to farthest. */
     private final Map<String, NormalScanState> normalScans = new HashMap<>();
@@ -202,8 +212,8 @@ public class ChunkScanner {
             MapBlockData data = buildBlockData(mc.level, blockX, blockZ);
             if (data != null) {
                 // Don't overwrite existing data with empty scan
-                MapBlockData existing = MapManager.getInstance().getBlockData(blockX, blockZ);
-                if (existing == null || !data.isEmpty()) {
+                long existing = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
+                if (MapBlockData.isEmpty(existing) || !data.isEmpty()) {
                     MapManager.getInstance().setBlockData(blockX, blockZ, data,
                             resolveSurfaceTint(mc.level, blockX, blockZ, data));
                 }
@@ -353,29 +363,30 @@ public class ChunkScanner {
         int maximumY = level.getMaxBuildHeight() - 1;
         int dimensionMiddle = (minimumY + maximumY) / 2;
         int undergroundStartY = findUndergroundSearchStart(level, blockX, blockZ);
-        BlockPos.MutableBlockPos openPos = new BlockPos.MutableBlockPos(blockX, undergroundStartY, blockZ);
-        BlockPos.MutableBlockPos colorPos = new BlockPos.MutableBlockPos(blockX, undergroundStartY, blockZ);
-        BlockPos.MutableBlockPos runPos = new BlockPos.MutableBlockPos(blockX, undergroundStartY, blockZ);
+        ScanScratch scratch = scanScratch.get();
+        BlockPos.MutableBlockPos openPos = scratch.position(0, blockX, undergroundStartY, blockZ);
+        BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, undergroundStartY, blockZ);
+        BlockPos.MutableBlockPos runPos = scratch.position(2, blockX, undergroundStartY, blockZ);
         List<VerticalCaveArchiveManager.Candidate> candidates = new ArrayList<>();
 
         boolean reachedMinimumY = true;
         for (int openY = undergroundStartY; openY > minimumY; openY--) {
-            CavePixel pixel = getCaveSurface(level, openPos, colorPos, openY,
+            long pixel = getCaveSurface(level, openPos, colorPos, openY,
                     dimensionMiddle, true, Integer.MAX_VALUE);
-            if (pixel == null || pixel.color() == 0
-                    || pixel.surfaceY() == FullCaveMapManager.NO_SURFACE) continue;
+            if (pixel == CAVE_PIXEL_NOT_FOUND || cavePixelColor(pixel) == 0
+                    || cavePixelY(pixel) == FullCaveMapManager.NO_SURFACE) continue;
 
             // Store the complete vertical cavity interval, not only the floor Y.
             // A 32-block layer may intersect the middle of a tall cavern while its
             // floor lies below the band's lower edge. Floor-only candidates made
             // those caverns collapse into a few isolated pixels.
             int runCeilingY = undergroundStartY;
-            int runTopY = findCavityRunTop(level, runPos, openY, pixel.surfaceY(),
+            int runTopY = findCavityRunTop(level, runPos, openY, cavePixelY(pixel),
                     runCeilingY);
             if (candidates.isEmpty()
-                    || candidates.get(candidates.size() - 1).bottomY() != pixel.surfaceY()) {
+                    || candidates.get(candidates.size() - 1).bottomY() != cavePixelY(pixel)) {
                 candidates.add(new VerticalCaveArchiveManager.Candidate(
-                        runTopY, pixel.surfaceY(), pixel.color()));
+                        runTopY, cavePixelY(pixel), cavePixelColor(pixel)));
             }
 
             openPos.setY(openY);
@@ -388,7 +399,7 @@ public class ChunkScanner {
                     openY--;
                 }
             } else {
-                openY = Math.min(openY, pixel.surfaceY());
+                openY = Math.min(openY, cavePixelY(pixel));
             }
             if (candidates.size() >= 96) {
                 reachedMinimumY = false;
@@ -573,17 +584,6 @@ public class ChunkScanner {
         MapRequestLane effectiveLane = lane == null
                 ? MapRequestLane.FULLSCREEN : lane;
 
-        /*
-         * Surface Full Map has one read authority: the exact-page frontier requests
-         * the containing saved region when that page reaches the front. The older
-         * centre-out region prefetcher was a second producer and caused remote
-         * regions to appear as random islands. Cave cache warmup remains separate.
-         */
-        if (cave) {
-            prefetchVisibleRegionCaches(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
-                    cave, fullView, layerY, scale);
-        }
-
         // Only client-loaded chunks can be scanned. Intersecting with the player's
         // live chunk window avoids spending the viewport budget walking thousands
         // of unloaded chunks when the map is heavily zoomed out.
@@ -605,15 +605,21 @@ public class ChunkScanner {
         int focusChunkZ = Math.max(minChunkZ, Math.min(maxChunkZ,
                 ((int) Math.floor(focusZ)) >> 4));
         boolean stableFullscreen = effectiveLane == MapRequestLane.FULLSCREEN;
-        if (!state.matches(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
-                focusChunkX, focusChunkZ, stableFullscreen)
+        if (!state.matchesShape(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                stableFullscreen)
                 || state.chunkOrder.length != expectedChunkCount) {
             state.reset(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
                     focusChunkX, focusChunkZ, stableFullscreen);
+        } else if (!state.sameBounds(minChunkX, maxChunkX, minChunkZ, maxChunkZ)) {
+            // Like Xaero's viewing queue, source acquisition itself is delta-first:
+            // complete newly exposed 16x16 chunks before revisiting the overlap.
+            // This also applies to the moving minimap; resetting its whole order at
+            // every chunk boundary starved the leading edge until MapScreen opened.
+            state.shiftBoundsDeltaFirst(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                    focusChunkX, focusChunkZ);
         } else {
-            // Fullscreen preserves a row frontier while the viewport shifts by a
-            // small amount. Minimap retains its camera-centred order.
-            state.updateBounds(minChunkX, maxChunkX, minChunkZ, maxChunkZ);
+            state.updateBounds(minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                    focusChunkX, focusChunkZ);
         }
 
         int width = Math.max(1, maxChunkX - minChunkX + 1);
@@ -661,7 +667,12 @@ public class ChunkScanner {
         int visitedPixels = 0;
         int pixelsPerChunkBurst;
         if (!cave) {
-            pixelsPerChunkBurst = scale < 0.25f ? 96 : scale < 0.55f ? 160 : 256;
+            // Retain the chunk/pixel cursor and yield inside a chunk. Completing
+            // all 256 columns after the frame deadline was the main-thread spike
+            // seen when a new chunk entered the viewport. Existing pixels remain
+            // visible while the remaining rows are filled on later ticks.
+            pixelsPerChunkBurst = effectiveLane == MapRequestLane.FULLSCREEN
+                    ? 64 : 32;
         } else {
             pixelsPerChunkBurst = scale < 0.20f ? 24 : scale < 0.45f ? 48 : 96;
         }
@@ -705,52 +716,6 @@ public class ChunkScanner {
             if (state.pixelCursor >= 256) {
                 state.pixelCursor = 0;
                 state.chunkCursor++;
-            }
-        }
-    }
-
-    private void prefetchVisibleRegionCaches(int minChunkX, int maxChunkX,
-            int minChunkZ, int maxChunkZ, boolean cave, boolean fullView,
-            int layerY, float scale) {
-        int minRx = minChunkX >> 5;
-        int maxRx = maxChunkX >> 5;
-        int minRz = minChunkZ >> 5;
-        int maxRz = maxChunkZ >> 5;
-        int centerRx = (minRx + maxRx) >> 1;
-        int centerRz = (minRz + maxRz) >> 1;
-        List<int[]> regions = new ArrayList<>();
-        for (int rz = minRz; rz <= maxRz; rz++) {
-            for (int rx = minRx; rx <= maxRx; rx++) regions.add(new int[] { rx, rz });
-        }
-        regions.sort(Comparator.comparingInt(pair -> {
-            int dx = pair[0] - centerRx;
-            int dz = pair[1] - centerRz;
-            return dx * dx + dz * dz;
-        }));
-
-        int cap = scale < 0.20f ? 48 : (scale < 0.55f ? 64 : 72);
-        int queued = 0;
-        MapManager surface = MapManager.getInstance();
-        CaveMapManager layers = CaveMapManager.getInstance();
-        FullCaveMapManager full = FullCaveMapManager.getInstance();
-        VerticalCaveArchiveManager verticalArchive = VerticalCaveArchiveManager.getInstance();
-        for (int[] pair : regions) {
-            if (queued++ >= cap) break;
-            int rx = pair[0];
-            int rz = pair[1];
-            int priority = 200_000 - ((rx - centerRx) * (rx - centerRx)
-                    + (rz - centerRz) * (rz - centerRz)) * 100;
-            if (!cave && (surface.hasRegionFile(rx, rz) || surface.isRegionLoadedInCache(rx, rz))) {
-                MapProcessor.getInstance().enqueueSurfaceLoad(rx, rz, priority);
-            } else if (fullView && (full.hasRegionFile(rx, rz) || full.isRegionLoaded(rx, rz))) {
-                MapProcessor.getInstance().enqueueFullCaveLoad(rx, rz, priority);
-            } else if (cave) {
-                // Strict bounded layers load only exact-layer cache or vertical
-                // archive data. Full/surface caches describe other heights.
-                if (layers.hasRegionFile(rx, rz) || layers.isRegionLoaded(rx, rz)
-                        || verticalArchive.hasRegionData(rx, rz)) {
-                    MapProcessor.getInstance().enqueueCaveLoad(layerY, rx, rz, priority + 40);
-                }
             }
         }
     }
@@ -867,12 +832,13 @@ public class ChunkScanner {
 
     private boolean isExplored(int blockX, int blockZ, boolean cave, boolean fullView) {
         if (!cave) {
-            MapBlockData data = MapManager.getInstance().getBlockData(blockX, blockZ);
-            if (data == null || data.isEmpty()) return false;
+            long data = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
+            if (MapBlockData.isEmpty(data)) return false;
             // Version-1 water pixels had no floor height and stored the water block
             // itself. Surface v1/v2 pixels also lack an exact BlockColors result.
             // Treat both as incomplete so loaded old maps migrate automatically.
-            if (data.isFluid() && !data.isGlowing() && data.floorY == data.topY) return false;
+            if (MapBlockData.isFluid(data) && !MapBlockData.isGlowing(data)
+                    && MapBlockData.floorY(data) == MapBlockData.topY(data)) return false;
             return MapManager.getInstance().getSurfaceTint(blockX, blockZ)
                     != SurfaceTintData.UNKNOWN;
         }
@@ -980,22 +946,77 @@ public class ChunkScanner {
         private int pixelCursor;
         private int[] chunkOrder = new int[0];
 
-        private boolean matches(int minX, int maxX, int minZ, int maxZ,
-                int focusX, int focusZ, boolean stable) {
-            if (stableFullscreen != stable
-                    || maxChunkX - minChunkX != maxX - minX
-                    || maxChunkZ - minChunkZ != maxZ - minZ) {
-                return false;
-            }
-            // Cursor movement is never part of the fullscreen scan key.
-            return stable || (focusChunkX == focusX && focusChunkZ == focusZ);
+        private boolean matchesShape(int minX, int maxX, int minZ, int maxZ,
+                boolean stable) {
+            return stableFullscreen == stable
+                    && maxChunkX - minChunkX == maxX - minX
+                    && maxChunkZ - minChunkZ == maxZ - minZ;
         }
 
-        private void updateBounds(int minX, int maxX, int minZ, int maxZ) {
+        private void updateBounds(int minX, int maxX, int minZ, int maxZ,
+                int focusX, int focusZ) {
             minChunkX = minX;
             maxChunkX = maxX;
             minChunkZ = minZ;
             maxChunkZ = maxZ;
+            focusChunkX = focusX;
+            focusChunkZ = focusZ;
+        }
+
+        private boolean sameBounds(int minX, int maxX, int minZ, int maxZ) {
+            return minChunkX == minX && maxChunkX == maxX
+                    && minChunkZ == minZ && maxChunkZ == maxZ;
+        }
+
+        private void shiftBoundsDeltaFirst(int minX, int maxX,
+                int minZ, int maxZ, int focusX, int focusZ) {
+            int oldMinX = minChunkX;
+            int oldMaxX = maxChunkX;
+            int oldMinZ = minChunkZ;
+            int oldMaxZ = maxChunkZ;
+            int oldWidth = Math.max(1, oldMaxX - oldMinX + 1);
+            int[] oldOrder = chunkOrder;
+            updateBounds(minX, maxX, minZ, maxZ, focusX, focusZ);
+            chunkCursor = 0;
+            pixelCursor = 0;
+
+            int width = Math.max(1, maxX - minX + 1);
+            int height = Math.max(1, maxZ - minZ + 1);
+            int count = width * height;
+            int[] reordered = new int[count];
+            int cursor = 0;
+
+            // Newly exposed chunks are the only urgent work. Fill them directly
+            // into a primitive array: the previous implementation boxed every
+            // chunk index into two lists and sorted them on each chunk boundary,
+            // producing a GC spike precisely while the world was loading.
+            for (int z = minZ; z <= maxZ; z++) {
+                for (int x = minX; x <= maxX; x++) {
+                    if (x >= oldMinX && x <= oldMaxX
+                            && z >= oldMinZ && z <= oldMaxZ) continue;
+                    reordered[cursor++] = (z - minZ) * width + (x - minX);
+                }
+            }
+
+            // Preserve the previous centre/ring order for the overlap, remapped to
+            // the new bounds. No sort and no temporary object graph are required.
+            for (int oldIndex : oldOrder) {
+                int x = oldMinX + oldIndex % oldWidth;
+                int z = oldMinZ + oldIndex / oldWidth;
+                if (x < minX || x > maxX || z < minZ || z > maxZ) continue;
+                reordered[cursor++] = (z - minZ) * width + (x - minX);
+            }
+            // A large discontinuous move has no overlap; the first pass already
+            // fills everything. This guard also makes recovery robust if a legacy
+            // state ever carried an incomplete order.
+            if (cursor < count) {
+                boolean[] present = new boolean[count];
+                for (int i = 0; i < cursor; i++) present[reordered[i]] = true;
+                for (int index = 0; index < count; index++) {
+                    if (!present[index]) reordered[cursor++] = index;
+                }
+            }
+            chunkOrder = reordered;
         }
 
         private void reset(int minX, int maxX, int minZ, int maxZ,
@@ -1013,37 +1034,23 @@ public class ChunkScanner {
             int height = Math.max(1, maxZ - minZ + 1);
             int count = width * height;
             chunkOrder = new int[count];
-            if (stable) {
-                // Screen rows: left-to-right, then top-to-bottom. Chunk pixels use
-                // the same row-major order, so visible source capture and exact-page
-                // admission advance in the same direction.
-                for (int index = 0; index < count; index++) {
-                    chunkOrder[index] = index;
+            int centerX = stable ? (minX + maxX) >> 1 : focusX;
+            int centerZ = stable ? (minZ + maxZ) >> 1 : focusZ;
+            int cursor = 0;
+            int maximumRing = Math.max(
+                    Math.max(Math.abs(centerX - minX), Math.abs(maxX - centerX)),
+                    Math.max(Math.abs(centerZ - minZ), Math.abs(maxZ - centerZ)));
+            for (int ring = 0; ring <= maximumRing; ring++) {
+                for (int dz = -ring; dz <= ring; dz++) {
+                    for (int dx = -ring; dx <= ring; dx++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
+                        int x = centerX + dx;
+                        int z = centerZ + dz;
+                        if (x < minX || x > maxX || z < minZ || z > maxZ) continue;
+                        chunkOrder[cursor++] = (z - minZ) * width + (x - minX);
+                    }
                 }
-                return;
             }
-
-            int centerX = focusX;
-            int centerZ = focusZ;
-            List<Integer> ordered = new ArrayList<>(count);
-            for (int z = minZ; z <= maxZ; z++) {
-                for (int x = minX; x <= maxX; x++) {
-                    ordered.add((z - minZ) * width + (x - minX));
-                }
-            }
-            ordered.sort(Comparator
-                    .comparingInt((Integer index) -> {
-                        int x = minX + index % width;
-                        int z = minZ + index / width;
-                        return Math.max(Math.abs(x - centerX), Math.abs(z - centerZ));
-                    })
-                    .thenComparingInt(index -> {
-                        int x = minX + index % width;
-                        int z = minZ + index / width;
-                        return Math.abs(x - centerX) + Math.abs(z - centerZ);
-                    })
-                    .thenComparingInt(Integer::intValue));
-            for (int i = 0; i < ordered.size(); i++) chunkOrder[i] = ordered.get(i);
         }
     }
 
@@ -1116,44 +1123,47 @@ public class ChunkScanner {
         // cave scans inherit incomplete or stale floor snapshots and defeated the
         // center-out live scan. A bounded layer costs at most 32 Y checks, so scanning
         // the live column is both accurate and cheap enough for the existing budget.
-        CavePixel pixel = getCavePixel(level, blockX, layerY, blockZ, fullView);
+        long pixel = getCavePixel(level, blockX, layerY, blockZ, fullView);
 
-        int displayedColor = pixel.surfaceY() == FullCaveMapManager.NO_SURFACE
-                ? pixel.color()
-                : applyAbgrShade(pixel.color(), calculateCaveTerrainShade(
-                        level, blockX, blockZ, layerY, fullView, pixel.surfaceY()));
-        if (fullView && pixel.surfaceY() != FullCaveMapManager.NO_SURFACE) {
+        int surfaceY = cavePixelY(pixel);
+        int rawColor = cavePixelColor(pixel);
+        int displayedColor = surfaceY == FullCaveMapManager.NO_SURFACE
+                ? rawColor
+                : applyAbgrShade(rawColor, calculateCaveTerrainShade(
+                        level, blockX, blockZ, layerY, fullView, surfaceY));
+        if (fullView && surfaceY != FullCaveMapManager.NO_SURFACE) {
             FullCaveMapManager.getInstance().mergeCandidate(
-                    blockX, blockZ, displayedColor, pixel.surfaceY(), scanMaximum);
+                    blockX, blockZ, displayedColor, surfaceY, scanMaximum);
         }
         if (!fullView) CaveMapManager.getInstance().setColor(blockX, blockZ, displayedColor);
     }
 
-    private CavePixel getCavePixel(Level level, int blockX, int layerY, int blockZ, boolean fullView) {
+    private long getCavePixel(Level level, int blockX, int layerY, int blockZ, boolean fullView) {
         if (fullView) return getFullCavePixel(level, blockX, blockZ);
         int scanMinimum = CaveMode.getScanMinimum(level, layerY);
         int scanMaximum = CaveMode.getScanMaximum(level, layerY);
         int surfaceCutoffY = getReliableCaveSurfaceCutoff(level, blockX, blockZ);
-        BlockPos.MutableBlockPos openPos = new BlockPos.MutableBlockPos(blockX, scanMaximum, blockZ);
-        BlockPos.MutableBlockPos colorPos = new BlockPos.MutableBlockPos(blockX, scanMaximum, blockZ);
+        ScanScratch scratch = scanScratch.get();
+        BlockPos.MutableBlockPos openPos = scratch.position(0, blockX, scanMaximum, blockZ);
+        BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, scanMaximum, blockZ);
 
         // FULL projects to world bottom. LAYERED searches its 32-block band,
         // then follows only a cavity that is already open at the band's lower
         // boundary until that same cavity reaches its floor. It must not continue
         // through solid rock into unrelated lower caves.
         for (int openY = scanMaximum; openY >= scanMinimum; openY--) {
-            CavePixel pixel = getCaveSurface(level, openPos, colorPos, openY,
+            long pixel = getCaveSurface(level, openPos, colorPos, openY,
                     layerY, fullView, surfaceCutoffY);
-            if (pixel != null) return pixel;
+            if (pixel != CAVE_PIXEL_NOT_FOUND) return pixel;
         }
 
         if (!fullView) {
-            CavePixel crossing = resolveCavityCrossingBandFloor(
+            long crossing = resolveCavityCrossingBandFloor(
                     level, openPos, colorPos, scanMinimum, layerY, surfaceCutoffY);
-            if (crossing != null) return crossing;
+            if (crossing != CAVE_PIXEL_NOT_FOUND) return crossing;
         }
 
-        return new CavePixel(0, FullCaveMapManager.NO_SURFACE);
+        return packCavePixel(0, FullCaveMapManager.NO_SURFACE);
     }
 
     /**
@@ -1162,20 +1172,21 @@ public class ChunkScanner {
      * are skipped before the first enclosed air/fluid run is allowed to become a
      * cave floor.
      */
-    private CavePixel getFullCavePixel(Level level, int blockX, int blockZ) {
+    private long getFullCavePixel(Level level, int blockX, int blockZ) {
         int minimumY = level.getMinBuildHeight();
         int startY = findUndergroundSearchStart(level, blockX, blockZ);
-        if (startY <= minimumY) return new CavePixel(0, FullCaveMapManager.NO_SURFACE);
+        if (startY <= minimumY) return packCavePixel(0, FullCaveMapManager.NO_SURFACE);
 
         int dimensionMiddle = (minimumY + level.getMaxBuildHeight() - 1) / 2;
-        BlockPos.MutableBlockPos openPos = new BlockPos.MutableBlockPos(blockX, startY, blockZ);
-        BlockPos.MutableBlockPos colorPos = new BlockPos.MutableBlockPos(blockX, startY, blockZ);
+        ScanScratch scratch = scanScratch.get();
+        BlockPos.MutableBlockPos openPos = scratch.position(0, blockX, startY, blockZ);
+        BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, startY, blockZ);
         for (int openY = startY; openY >= minimumY; openY--) {
-            CavePixel pixel = getCaveSurface(level, openPos, colorPos, openY,
+            long pixel = getCaveSurface(level, openPos, colorPos, openY,
                     dimensionMiddle, true, Integer.MAX_VALUE);
-            if (pixel != null) return pixel;
+            if (pixel != CAVE_PIXEL_NOT_FOUND) return pixel;
         }
-        return new CavePixel(0, FullCaveMapManager.NO_SURFACE);
+        return packCavePixel(0, FullCaveMapManager.NO_SURFACE);
     }
 
     private int findUndergroundSearchStart(Level level, int blockX, int blockZ) {
@@ -1185,7 +1196,8 @@ public class ChunkScanner {
                 ? maximumY
                 : Math.max(minimumY, Math.min(maximumY,
                         level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, blockX, blockZ)));
-        BlockPos.MutableBlockPos probe = new BlockPos.MutableBlockPos(blockX, topY, blockZ);
+        BlockPos.MutableBlockPos probe = scanScratch.get().position(2,
+                blockX, topY, blockZ);
         int solidRun = 0;
         for (int y = topY; y >= minimumY; y--) {
             probe.setY(y);
@@ -1209,7 +1221,7 @@ public class ChunkScanner {
         return !caveStateClassifier.isCollisionEmpty(level, pos, state);
     }
 
-    private CavePixel getCaveSurface(Level level, BlockPos.MutableBlockPos openPos,
+    private long getCaveSurface(Level level, BlockPos.MutableBlockPos openPos,
             BlockPos.MutableBlockPos colorPos, int openY, int bandCenterY,
             boolean fullView, int surfaceCutoffY) {
         // OCEAN_FLOOR is not guaranteed to be present in a client chunk. On affected
@@ -1217,7 +1229,9 @@ public class ChunkScanner {
         // reject every underground Y and left cave textures completely black. The
         // caller now computes one reliable WORLD_SURFACE-based land/seabed cutoff
         // for the column and reuses it throughout the vertical scan.
-        if (surfaceCutoffY != Integer.MAX_VALUE && openY >= surfaceCutoffY - 1) return null;
+        if (surfaceCutoffY != Integer.MAX_VALUE && openY >= surfaceCutoffY - 1) {
+            return CAVE_PIXEL_NOT_FOUND;
+        }
 
         openPos.setY(openY);
         BlockState openState = level.getBlockState(openPos);
@@ -1256,7 +1270,7 @@ public class ChunkScanner {
             }
         } else {
             boolean openSpace = openState.isAir() || caveStateClassifier.isCollisionEmpty(level, openPos, openState);
-            if (!openSpace || openY <= level.getMinBuildHeight()) return null;
+            if (!openSpace || openY <= level.getMinBuildHeight()) return CAVE_PIXEL_NOT_FOUND;
             colorPos.setY(openY - 1);
             colorState = level.getBlockState(colorPos);
 
@@ -1279,16 +1293,17 @@ public class ChunkScanner {
                 boolean floorOpen = colorState.isAir()
                         || (caveStateClassifier.isCollisionEmpty(level, colorPos, colorState)
                                 && colorState.getFluidState().isEmpty());
-                if (floorOpen) return null;
+                if (floorOpen) return CAVE_PIXEL_NOT_FOUND;
             }
         }
 
         int baseColor = emissiveFeature
                 ? getEmissiveFeatureColor(level, colorPos, colorState)
                 : getCaveBlockColor(level, colorPos, colorState);
-        if (baseColor == 0) return null;
+        if (baseColor == 0) return CAVE_PIXEL_NOT_FOUND;
         if (waterCoveredFloor) {
-            BlockPos waterPos = new BlockPos(openPos.getX(), waterTintY, openPos.getZ());
+            BlockPos.MutableBlockPos waterPos = scanScratch.get().position(3,
+                    openPos.getX(), waterTintY, openPos.getZ());
             baseColor = applyCaveWaterOverlay(level, waterPos, baseColor, waterDepth);
         }
         int blockLight = Math.max(level.getBrightness(LightLayer.BLOCK, openPos), colorState.getLightEmission());
@@ -1299,7 +1314,8 @@ public class ChunkScanner {
         } else {
             shadeOffset = Math.round((colorPos.getY() - bandCenterY) / 8.0f);
         }
-        return new CavePixel(applyCaveLighting(baseColor, blockLight, shadeOffset), colorPos.getY());
+        return packCavePixel(applyCaveLighting(baseColor, blockLight, shadeOffset),
+                colorPos.getY());
     }
 
     /**
@@ -1308,11 +1324,11 @@ public class ChunkScanner {
      * This restores connected large caves without turning LAYERED into FULL:
      * solid rock terminates the search immediately.
      */
-    private CavePixel resolveCavityCrossingBandFloor(Level level,
+    private long resolveCavityCrossingBandFloor(Level level,
             BlockPos.MutableBlockPos openPos, BlockPos.MutableBlockPos colorPos,
             int bandMinimumY, int bandCenterY, int surfaceCutoffY) {
         if (surfaceCutoffY != Integer.MAX_VALUE
-                && bandMinimumY >= surfaceCutoffY - 1) return null;
+                && bandMinimumY >= surfaceCutoffY - 1) return CAVE_PIXEL_NOT_FOUND;
 
         int waterTopY = Integer.MIN_VALUE;
         int waterDepth = 0;
@@ -1337,11 +1353,11 @@ public class ChunkScanner {
                 // Lava or another visible fluid belongs to this cavity and should
                 // be drawn at the first encountered fluid surface.
                 int fluidColor = getCaveBlockColor(level, openPos, state);
-                if (fluidColor == 0) return null;
+                if (fluidColor == 0) return CAVE_PIXEL_NOT_FOUND;
                 int light = Math.max(level.getBrightness(LightLayer.BLOCK, openPos),
                         state.getLightEmission());
                 int offset = Math.round((y - bandCenterY) / 8.0f);
-                return new CavePixel(applyCaveLighting(fluidColor, light, offset), y);
+                return packCavePixel(applyCaveLighting(fluidColor, light, offset), y);
             }
 
             if (isCavityOpenState(level, openPos, state)) {
@@ -1349,14 +1365,15 @@ public class ChunkScanner {
                 continue;
             }
 
-            if (!crossedOpenSpace) return null;
+            if (!crossedOpenSpace) return CAVE_PIXEL_NOT_FOUND;
 
             colorPos.setY(y);
             int baseColor = getCaveBlockColor(level, colorPos, state);
-            if (baseColor == 0) return null;
+            if (baseColor == 0) return CAVE_PIXEL_NOT_FOUND;
             if (waterTopY != Integer.MIN_VALUE) {
                 baseColor = applyCaveWaterOverlay(level,
-                        new BlockPos(openPos.getX(), waterTopY, openPos.getZ()),
+                        scanScratch.get().position(3,
+                                openPos.getX(), waterTopY, openPos.getZ()),
                         baseColor, waterDepth);
             }
 
@@ -1364,9 +1381,9 @@ public class ChunkScanner {
             int blockLight = Math.max(level.getBrightness(LightLayer.BLOCK, openPos),
                     state.getLightEmission());
             int shadeOffset = Math.round((y - bandCenterY) / 8.0f);
-            return new CavePixel(applyCaveLighting(baseColor, blockLight, shadeOffset), y);
+            return packCavePixel(applyCaveLighting(baseColor, blockLight, shadeOffset), y);
         }
-        return null;
+        return CAVE_PIXEL_NOT_FOUND;
     }
 
     private boolean isCavityOpenState(Level level, BlockPos pos, BlockState state) {
@@ -1380,6 +1397,7 @@ public class ChunkScanner {
 
     private WaterFloor resolveWaterFloor(Level level, BlockPos.MutableBlockPos probe,
             int waterY, int minimumY) {
+        WaterFloor result = scanScratch.get().waterFloor;
         int depth = 0;
         for (int y = waterY; y >= minimumY; y--) {
             probe.setY(y);
@@ -1390,7 +1408,7 @@ public class ChunkScanner {
                     && !candidate.is(Blocks.WATER)
                     && !caveStateClassifier.isCollisionEmpty(level, probe, candidate);
             if (waterloggedSolid) {
-                return new WaterFloor(candidate, y, Math.max(1, depth + 1));
+                return result.set(candidate, y, Math.max(1, depth + 1));
             }
             if (candidateWater) {
                 depth++;
@@ -1402,15 +1420,46 @@ public class ChunkScanner {
             boolean passThrough = caveStateClassifier.isCollisionEmpty(level, probe, candidate)
                     && candidate.getFluidState().isEmpty();
             if (passThrough) continue;
-            return new WaterFloor(candidate, y, Math.max(1, depth));
+            return result.set(candidate, y, Math.max(1, depth));
         }
         return null;
     }
 
-    private record WaterFloor(BlockState state, int y, int depth) {
+    private static final class WaterFloor {
+        private BlockState state;
+        private int y;
+        private int depth;
+
+        private WaterFloor set(BlockState state, int y, int depth) {
+            this.state = state;
+            this.y = y;
+            this.depth = depth;
+            return this;
+        }
+
+        private BlockState state() {
+            return state;
+        }
+
+        private int y() {
+            return y;
+        }
+
+        private int depth() {
+            return depth;
+        }
     }
 
-    private record CavePixel(int color, int surfaceY) {
+    private static long packCavePixel(int color, int surfaceY) {
+        return ((long) color << 32) | (surfaceY & 0xFFFFFFFFL);
+    }
+
+    private static int cavePixelColor(long pixel) {
+        return (int) (pixel >> 32);
+    }
+
+    private static int cavePixelY(long pixel) {
+        return (int) pixel;
     }
 
     /** Cave relief follows the actual visible floor selected by the Top-Y band,
@@ -1455,8 +1504,9 @@ public class ChunkScanner {
         }
         int minimum = CaveMode.getScanMinimum(level, layerY);
         int maximum = CaveMode.getScanMaximum(level, layerY);
-        BlockPos.MutableBlockPos openPos = new BlockPos.MutableBlockPos(x, maximum, z);
-        BlockPos.MutableBlockPos floorPos = new BlockPos.MutableBlockPos(x, maximum, z);
+        ScanScratch scratch = scanScratch.get();
+        BlockPos.MutableBlockPos openPos = scratch.position(0, x, maximum, z);
+        BlockPos.MutableBlockPos floorPos = scratch.position(1, x, maximum, z);
 
         for (int openY = maximum; openY >= minimum; openY--) {
             openPos.setY(openY);
@@ -1497,7 +1547,7 @@ public class ChunkScanner {
     }
 
     private int getCaveBlockColor(Level level, BlockPos pos, BlockState state) {
-        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        String blockId = visualClassifier.info(state).blockId();
         Integer override = MapConfig.blockColorOverrides.get(blockId);
         if (override != null) return argbToAbgr(override);
         if (state.getLightEmission() > 0) return getEmissiveFeatureColor(level, pos, state);
@@ -1560,7 +1610,7 @@ public class ChunkScanner {
 
     /** Gives flames and non-solid light sources a visible map core, not only a halo. */
     private int getEmissiveFeatureColor(Level level, BlockPos pos, BlockState state) {
-        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        String blockId = visualClassifier.info(state).blockId();
         Integer override = MapConfig.blockColorOverrides.get(blockId);
         if (override != null) return argbToAbgr(override);
         int rgb = MapTextureManager.getInstance().resolveBlockColor(blockId, MapConfig.blockColourMode);
@@ -1607,7 +1657,8 @@ public class ChunkScanner {
     }
 
     private void updateSurfaceLight(Level level, int blockX, int surfaceY, int blockZ) {
-        BlockPos.MutableBlockPos lightPos = new BlockPos.MutableBlockPos(blockX, surfaceY, blockZ);
+        BlockPos.MutableBlockPos lightPos = scanScratch.get().position(3,
+                blockX, surfaceY, blockZ);
         int light = level.getBrightness(LightLayer.BLOCK, lightPos);
         lightPos.setY(surfaceY + 1);
         light = Math.max(light, level.getBrightness(LightLayer.BLOCK, lightPos));
@@ -1619,33 +1670,31 @@ public class ChunkScanner {
      * Now stores raw MapBlockData for re-colorizable map.
      */
     public void scanBlockColumn(Level level, BlockPos pos) {
-        scanBlockColumn(level, pos, true);
+        scanBlockColumn(level, pos.getX(), pos.getZ(), true);
     }
 
     /** Surface half of an event-driven mutation. Cave work is queued separately. */
     public void scanSurfaceColumn(Level level, int blockX, int blockZ) {
-        scanBlockColumn(level, new BlockPos(blockX, 0, blockZ), false);
+        scanBlockColumn(level, blockX, blockZ, false);
     }
 
     /** Light-only packet path: preserve geometry and update the surface light cache. */
     public void scanSurfaceLightColumn(Level level, int blockX, int blockZ) {
         if (level == null || !level.isClientSide()) return;
-        MapBlockData data = MapManager.getInstance().getBlockData(blockX, blockZ);
-        int surfaceY = data != null && !data.isEmpty()
-                ? data.topY : getHighestY(level, blockX, blockZ);
+        long data = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
+        int surfaceY = !MapBlockData.isEmpty(data)
+                ? MapBlockData.topY(data) : getHighestY(level, blockX, blockZ);
         updateSurfaceLight(level, blockX, surfaceY, blockZ);
     }
 
-    private void scanBlockColumn(Level level, BlockPos pos, boolean invalidateCave) {
+    private void scanBlockColumn(Level level, int blockX, int blockZ, boolean invalidateCave) {
         if (!level.isClientSide()) return;
         try {
-            int blockX = pos.getX();
-            int blockZ = pos.getZ();
             GeneratedChunkIndex.getInstance().markLive(level, blockX >> 4, blockZ >> 4);
             MapBlockData data = buildBlockData(level, blockX, blockZ);
             if (data != null) {
-                MapBlockData existing = MapManager.getInstance().getBlockData(blockX, blockZ);
-                if (existing == null || !data.isEmpty()) {
+                long existing = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
+                if (MapBlockData.isEmpty(existing) || !data.isEmpty()) {
                     MapManager.getInstance().setBlockData(blockX, blockZ, data,
                             resolveSurfaceTint(level, blockX, blockZ, data));
                 }
@@ -1661,7 +1710,7 @@ public class ChunkScanner {
                         blockX, blockZ, MapMutationBus.BLOCK_STATE);
             }
         } catch (Exception e) {
-            LOGGER.error("Error scanning block column at " + pos, e);
+            LOGGER.error("Error scanning block column at {}, {}", blockX, blockZ, e);
         }
     }
 
@@ -1674,7 +1723,7 @@ public class ChunkScanner {
             }
             CavePipeline.getInstance().scanColumnNow(mc.level, blockX, blockZ);
         } else {
-            scanBlockColumn(mc.level, new BlockPos(blockX, 0, blockZ));
+            scanBlockColumn(mc.level, blockX, blockZ, true);
         }
     }
 
@@ -1687,7 +1736,8 @@ public class ChunkScanner {
         // storing that unstable colour; SurfaceColorizer deliberately ignores it for
         // non-glowing fluids.
         if (data.isFluid() && !data.isGlowing()) return SurfaceTintData.NONE;
-        BlockPos pos = new BlockPos(blockX, data.topY, blockZ);
+        BlockPos.MutableBlockPos pos = scanScratch.get().position(2,
+                blockX, data.topY, blockZ);
         BlockState state = level.getBlockState(pos);
         state = blockEntityVisuals.resolveLive(level, pos, state);
         /* Cherry leaves carry their pink colour in the texture itself. Persisting the
@@ -1715,7 +1765,8 @@ public class ChunkScanner {
     private MapBlockData buildBlockData(Level level, int blockX, int blockZ) {
         if (!level.hasChunk(blockX >> 4, blockZ >> 4)) return null;
         int surfaceY = getHighestY(level, blockX, blockZ);
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(blockX, surfaceY, blockZ);
+        BlockPos.MutableBlockPos pos = scanScratch.get().position(0,
+                blockX, surfaceY, blockZ);
         BlockState actualVisibleState = level.getBlockState(pos);
         BlockState visibleState = blockEntityVisuals.resolveLive(level, pos, actualVisibleState);
         boolean fluid = !actualVisibleState.getFluidState().isEmpty();
@@ -1762,13 +1813,20 @@ public class ChunkScanner {
             }
         }
 
-        String blockId = BuiltInRegistries.BLOCK.getKey(paletteState.getBlock()).toString();
+        String blockId = visualClassifier.info(paletteState).blockId();
         pos.setY(surfaceY);
         String biomeId = "minecraft:plains";
         try {
             Holder<Biome> biomeHolder = level.getBiome(pos);
             java.util.Optional<net.minecraft.resources.ResourceKey<Biome>> keyOpt = biomeHolder.unwrapKey();
-            if (keyOpt.isPresent()) biomeId = keyOpt.get().location().toString();
+            if (keyOpt.isPresent()) {
+                ResourceLocation location = keyOpt.get().location();
+                biomeId = biomeIdStrings.get(location);
+                if (biomeId == null) {
+                    biomeId = location.toString();
+                    biomeIdStrings.put(location, biomeId);
+                }
+            }
         } catch (Exception ignored) {
         }
 
@@ -1783,20 +1841,12 @@ public class ChunkScanner {
         boolean leaves = !fluid && visual.leaves();
         boolean flower = !fluid && visual.flower();
         boolean glowing = lava || (!water && visual.emissive());
-        int blockLight = level.getBrightness(LightLayer.BLOCK,
-                new BlockPos(blockX, surfaceY + 1, blockZ));
+        BlockPos.MutableBlockPos lightPos = scanScratch.get().position(3,
+                blockX, surfaceY + 1, blockZ);
+        int blockLight = level.getBrightness(LightLayer.BLOCK, lightPos);
 
-        return MapBlockData.builder()
-                .topY(surfaceY)
-                .floorY(floorY)
-                .blockId(blockIdx)
-                .biomeId(biomeIdx)
-                .light(blockLight)
-                .glowing(glowing)
-                .fluid(fluid)
-                .flower(flower)
-                .leaves(leaves)
-                .build();
+        return MapBlockData.create(surfaceY, floorY, blockIdx, biomeIdx,
+                blockLight, glowing, fluid, flower, leaves);
     }
 
     /**
@@ -1819,7 +1869,8 @@ public class ChunkScanner {
         int maximumY = level.getMaxBuildHeight() - 1;
         int worldSurfaceY = level.getHeight(Heightmap.Types.WORLD_SURFACE, blockX, blockZ);
         int startY = Math.max(minimumY, Math.min(maximumY, worldSurfaceY));
-        BlockPos.MutableBlockPos probe = new BlockPos.MutableBlockPos(blockX, startY, blockZ);
+        BlockPos.MutableBlockPos probe = scanScratch.get().position(2,
+                blockX, startY, blockZ);
 
         for (int y = startY; y >= minimumY; y--) {
             probe.setY(y);
@@ -1839,7 +1890,8 @@ public class ChunkScanner {
     private int getHighestY(Level level, int blockX, int blockZ) {
         boolean isCaveLike = isCaveLikeDimension(level);
         int minBuildHeight = level.getMinBuildHeight();
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(blockX, 0, blockZ);
+        BlockPos.MutableBlockPos pos = scanScratch.get().position(1,
+                blockX, 0, blockZ);
 
         if (isCaveLike) {
             int startY = level.getMaxBuildHeight() - 1;
@@ -1872,13 +1924,15 @@ public class ChunkScanner {
     }
 
     private int getColumnColor(Level level, int blockX, int blockZ, int currentY) {
-        BlockPos pos = new BlockPos(blockX, currentY, blockZ);
+        BlockPos.MutableBlockPos pos = scanScratch.get().position(0,
+                blockX, currentY, blockZ);
         BlockState targetState = level.getBlockState(pos);
 
         // Repair stale cached columns produced before torches became map-invisible.
         // Resolve the actual surface below instead of returning a black pixel.
         if (isMapInvisibleDecoration(targetState)) {
-            BlockPos.MutableBlockPos probe = new BlockPos.MutableBlockPos(blockX, currentY, blockZ);
+            BlockPos.MutableBlockPos probe = scanScratch.get().position(1,
+                    blockX, currentY, blockZ);
             for (int y = currentY - 1; y >= level.getMinBuildHeight(); y--) {
                 probe.setY(y);
                 BlockState candidate = level.getBlockState(probe);
@@ -1889,7 +1943,7 @@ public class ChunkScanner {
             return 0;
         }
 
-        String blockId = BuiltInRegistries.BLOCK.getKey(targetState.getBlock()).toString();
+        String blockId = visualClassifier.info(targetState).blockId();
         Integer overrideColor = MapConfig.blockColorOverrides.get(blockId);
         if (overrideColor != null) {
             return argbToAbgr(overrideColor);
@@ -1907,7 +1961,8 @@ public class ChunkScanner {
         // checkerboard dither (3-4, 7-9)
         if (targetState.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
             int depth = 0;
-            BlockPos.MutableBlockPos depthPos = new BlockPos.MutableBlockPos(blockX, currentY, blockZ);
+            BlockPos.MutableBlockPos depthPos = scanScratch.get().position(1,
+                    blockX, currentY, blockZ);
             while (depth < 30) {
                 int checkY = currentY - depth - 1;
                 if (checkY < level.getMinBuildHeight())
@@ -1993,7 +2048,7 @@ public class ChunkScanner {
      * palette used by vanilla maps.
      */
     private int resolveBlockRgb(Level level, BlockPos pos, BlockState state, MapColor fallback) {
-        String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        String blockId = visualClassifier.info(state).blockId();
         MapTextureManager textureManager = MapTextureManager.getInstance();
 
         if (MapConfig.blockColourMode == 1 && fallback != MapColor.NONE) {
@@ -2055,7 +2110,7 @@ public class ChunkScanner {
      * enough to describe local relief without walking the whole Nether column.
      */
     private int getTerrainHeightForSlope(Level level, int x, int z, int referenceY) {
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, 0, z);
+        BlockPos.MutableBlockPos pos = scanScratch.get().position(2, x, 0, z);
         if (!isCaveLikeDimension(level)) {
             int top = Math.min(level.getMaxBuildHeight() - 1,
                     level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z));
@@ -2143,5 +2198,19 @@ public class ChunkScanner {
         green = Math.max(0, Math.min(255, Math.round((luma + (green - luma) * saturation) * brightness)));
         blue = Math.max(0, Math.min(255, Math.round((luma + (blue - luma) * saturation) * brightness)));
         return (red << 16) | (green << 8) | blue;
+    }
+
+    private static final class ScanScratch {
+        private final BlockPos.MutableBlockPos[] positions = {
+                new BlockPos.MutableBlockPos(),
+                new BlockPos.MutableBlockPos(),
+                new BlockPos.MutableBlockPos(),
+                new BlockPos.MutableBlockPos()
+        };
+        private final WaterFloor waterFloor = new WaterFloor();
+
+        private BlockPos.MutableBlockPos position(int slot, int x, int y, int z) {
+            return positions[slot].set(x, y, z);
+        }
     }
 }

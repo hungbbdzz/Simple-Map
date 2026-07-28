@@ -9,9 +9,12 @@ import com.velorise.simplemap.client.CaveTextureManager;
 import com.velorise.simplemap.client.DimensionTeleportTransition;
 import com.velorise.simplemap.client.FullCaveTextureManager;
 import com.velorise.simplemap.client.MapLightManager;
+import com.velorise.simplemap.client.MapArchitectureCoordinator;
 import com.velorise.simplemap.client.MapKeybindActions;
 import com.velorise.simplemap.client.MapConfig;
 import com.velorise.simplemap.client.MapConfigScreen;
+import com.velorise.simplemap.client.MapDebugOverlay;
+import com.velorise.simplemap.client.MapDebugRecorder;
 import com.velorise.simplemap.client.MapManager;
 import com.velorise.simplemap.client.MapMutationBus;
 import com.velorise.simplemap.client.MapObservationScheduler;
@@ -124,6 +127,13 @@ public class SimpleMap {
         public static final KeyMapping CYCLE_COLOR_MODE_KEY = unbound("key.simplemap.cycle_color_mode");
         public static final KeyMapping CYCLE_TERRAIN_MODE_KEY = unbound("key.simplemap.cycle_terrain_mode");
         public static final KeyMapping CENTER_FULL_MAP_KEY = unbound("key.simplemap.center_full_map");
+        /** Diagnostic build controls. F8/F9/F10 are intentionally grouped. */
+        public static final KeyMapping TOGGLE_DEBUG_OVERLAY_KEY =
+                key("key.simplemap.toggle_debug_overlay", GLFW.GLFW_KEY_F8);
+        public static final KeyMapping TOGGLE_DEBUG_RECORDING_KEY =
+                key("key.simplemap.toggle_debug_recording", GLFW.GLFW_KEY_F9);
+        public static final KeyMapping MARK_DEBUG_ISSUE_KEY =
+                key("key.simplemap.mark_debug_issue", GLFW.GLFW_KEY_F10);
 
         private static KeyMapping key(String translationKey, int glfwKey) {
             return new KeyMapping(translationKey, glfwKey, KEY_CATEGORY);
@@ -163,6 +173,9 @@ public class SimpleMap {
             event.register(CYCLE_COLOR_MODE_KEY);
             event.register(CYCLE_TERRAIN_MODE_KEY);
             event.register(CENTER_FULL_MAP_KEY);
+            event.register(TOGGLE_DEBUG_OVERLAY_KEY);
+            event.register(TOGGLE_DEBUG_RECORDING_KEY);
+            event.register(MARK_DEBUG_ISSUE_KEY);
         }
     }
 
@@ -407,6 +420,7 @@ public class SimpleMap {
             MapObservationScheduler.getInstance().tick(mc,
                     SimpleMap.isMapUnlocked(mc.player),
                     mc.screen instanceof com.velorise.simplemap.client.MapScreen);
+            MapDebugRecorder.getInstance().tick(mc);
 
             // 2.25. Create one bounded death waypoint on the transition into death.
             // Polling the local player avoids relying on loader-specific client death events.
@@ -435,6 +449,14 @@ public class SimpleMap {
             // 3. Handle configurable map actions only during normal gameplay. This
             // prevents N/L/M and zoom keys from firing while the player types in chat,
             // edits a waypoint name or uses another screen.
+            // Diagnostic controls remain available while MapScreen is open.
+            drain(ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY,
+                    () -> MapDebugRecorder.getInstance().toggleOverlay());
+            drain(ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY,
+                    () -> MapDebugRecorder.getInstance().toggleRecording(mc));
+            drain(ClientModEvents.MARK_DEBUG_ISSUE_KEY,
+                    () -> MapDebugRecorder.getInstance().markIssue(mc));
+
             if (mc.screen == null) {
                 drain(ClientModEvents.OPEN_MAP_KEY, () -> MapKeybindActions.toggleFullMap(mc));
                 drain(ClientModEvents.TOGGLE_MINIMAP_KEY, () -> MapKeybindActions.toggleMinimap(mc));
@@ -518,7 +540,12 @@ public class SimpleMap {
             DimensionTeleportTransition.render(event.getGuiGraphics());
             Minecraft mc = Minecraft.getInstance();
             if (mc.level != null && mc.player != null) {
-                MapPublicationCoordinator.getInstance().drainFrame(++mapRenderFrameId);
+                long frameId = ++mapRenderFrameId;
+                MapPublicationCoordinator.getInstance().drainFrame(frameId);
+                MapArchitectureCoordinator.getInstance().onFrameBoundary(frameId);
+            }
+            if (mc.screen == null) {
+                MapDebugOverlay.render(event.getGuiGraphics());
             }
         }
 
@@ -534,7 +561,9 @@ public class SimpleMap {
                 long frameId = mapRenderFrameId;
                 if (frameId == 0L) frameId = ++mapRenderFrameId;
                 MapPublicationCoordinator.getInstance().drainFrame(frameId);
+                MapArchitectureCoordinator.getInstance().onFrameBoundary(frameId);
             }
+            MapDebugOverlay.render(event.getGuiGraphics());
         }
 
         @SubscribeEvent
@@ -546,23 +575,24 @@ public class SimpleMap {
             MapConfig.serverCaveMapMode = 0;
             wasPlayerDead = false;
             MinimapRenderer.getInstance().onWorldJoin();
+            MapArchitectureCoordinator.getInstance().onWorldJoin();
         }
 
         @SubscribeEvent
         public static void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
+            MapDebugRecorder.getInstance().onWorldLeave();
             // Save and flush map cache and release OpenGL textures on exit
+            // MapManager owns the complete world/session teardown. Calling the
+            // subordinate caches again here can double-cancel futures and double-release
+            // GPU resources during the same logout event.
             MapManager.getInstance().flushAndClear();
-            MapTextureManager.getInstance().clearCache();
-            MapLightManager.getInstance().flushAndClear();
-            CaveTextureManager.getInstance().clearCache();
-            FullCaveTextureManager.getInstance().clearCache();
-            MapOverviewTextureManager.getInstance().clearCache();
             MapObservationScheduler.getInstance().reset();
             CaveMode.clearManualLayer();
             MapConfig.serverExtensionAvailable = false;
             MapConfig.serverCaveMapMode = 0;
             MapConfig.serverRequireMapBook = false;
             MinimapRenderer.getInstance().onWorldLeave();
+            MapArchitectureCoordinator.getInstance().onWorldLeave();
             wasPlayerDead = false;
         }
     }

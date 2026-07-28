@@ -1,9 +1,13 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.gpu.MapGpuInstancePlan;
+import com.velorise.simplemap.client.renderer.MapGpuRenderer;
+import com.velorise.simplemap.client.gpu.TileKey;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.resources.ResourceLocation;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 
@@ -17,12 +21,19 @@ import java.util.List;
  * exact page or branch node.</p>
  */
 final class MapRenderPlan {
+    /** Region-centric M4 coverage always stays below factor-2 refinement. */
+    static final int PHASE_REGION_COARSE = 4;
     static final int PHASE_BRANCH_BASE = 16;
+    /** Exact fallback drawn immediately below the density-correct L1 branch. */
+    static final int PHASE_L1_EXACT_UNDERLAY = 27;
     static final int PHASE_EXACT = 96;
     static final int PHASE_GLOW = 128;
 
     private final List<Batch> baseBatches;
     private final List<Batch> glowBatches;
+    private final MapGpuInstancePlan instancePlan;
+    private final int[] basePhases;
+    private final int[] glowPhases;
     private final long[] pendingRegions;
     private final MapDrawResult result;
     private final long topologyRevision;
@@ -31,11 +42,16 @@ final class MapRenderPlan {
     private final int batchCount;
 
     private MapRenderPlan(List<Batch> baseBatches, List<Batch> glowBatches,
+            MapGpuInstancePlan instancePlan,
+            int[] basePhases, int[] glowPhases,
             long[] pendingRegions, MapDrawResult result,
             long topologyRevision, long builtAtNanos,
             int quadCount, int batchCount) {
         this.baseBatches = baseBatches;
         this.glowBatches = glowBatches;
+        this.instancePlan = instancePlan;
+        this.basePhases = basePhases;
+        this.glowPhases = glowPhases;
         this.pendingRegions = pendingRegions;
         this.result = result;
         this.topologyRevision = topologyRevision;
@@ -45,11 +61,19 @@ final class MapRenderPlan {
     }
 
     void drawBase(GuiGraphics graphics) {
-        MapAtlasBatchRenderer.draw(graphics, baseBatches);
+        drawOrdered(graphics, baseBatches, basePhases);
     }
 
     void drawGlow(GuiGraphics graphics) {
-        MapAtlasBatchRenderer.draw(graphics, glowBatches);
+        drawOrdered(graphics, glowBatches, glowPhases);
+    }
+
+    private void drawOrdered(GuiGraphics graphics, List<Batch> batches,
+            int[] phases) {
+        for (int phase : phases) {
+            MapGpuRenderer.drawPhase(graphics, instancePlan, phase);
+            MapAtlasBatchRenderer.drawPhase(graphics, batches, phase);
+        }
     }
 
     long[] pendingRegions() {
@@ -82,7 +106,10 @@ final class MapRenderPlan {
 
     static int branchPhase(int level) {
         int clamped = Math.max(1, Math.min(MapLodPolicy.MAX_BRANCH_LEVEL, level));
-        return PHASE_BRANCH_BASE + (MapLodPolicy.MAX_BRANCH_LEVEL - clamped);
+        // Keep one free phase between adjacent branch levels so L1 can place
+        // an exact fallback underneath the branch without colliding with L2.
+        return PHASE_BRANCH_BASE
+                + (MapLodPolicy.MAX_BRANCH_LEVEL - clamped) * 2;
     }
 
     static final class Builder {
@@ -92,7 +119,10 @@ final class MapRenderPlan {
         private static final int FLOATS_PER_QUAD = FLOATS_PER_VERTEX * VERTICES_PER_QUAD;
 
         private final List<Quad> quads = new ArrayList<>();
+        private final MapGpuInstancePlan.Builder instances =
+                new MapGpuInstancePlan.Builder();
         private final java.util.LinkedHashSet<Long> pending = new java.util.LinkedHashSet<>();
+        private int instanceCount;
         private int exactPages;
         private int branchNodes;
 
@@ -113,6 +143,25 @@ final class MapRenderPlan {
             quads.add(new Quad(texture, phase, x, y, width, height,
                     u0, v0, u1, v1));
             return true;
+        }
+
+        boolean addTile(TileKey key, ResourceLocation fallbackTexture,
+                int phase, int x, int y, int width, int height,
+                float u, float v, int uWidth, int vHeight,
+                int textureWidth, int textureHeight) {
+            if (key == null || fallbackTexture == null || width <= 0 || height <= 0
+                    || uWidth <= 0 || vHeight <= 0 || textureWidth <= 0
+                    || textureHeight <= 0
+                    || quads.size() + instanceCount >= MAX_QUADS) return false;
+            float inverseWidth = 1.0f / textureWidth;
+            float inverseHeight = 1.0f / textureHeight;
+            boolean added = instances.add(key, fallbackTexture, phase,
+                    x, y, width, height,
+                    u * inverseWidth, v * inverseHeight,
+                    (u + uWidth) * inverseWidth,
+                    (v + vHeight) * inverseHeight);
+            if (added) instanceCount++;
+            return added;
         }
 
         void exact() {
@@ -164,11 +213,41 @@ final class MapRenderPlan {
             long[] pendingArray = new long[pending.size()];
             int i = 0;
             for (Long value : pending) pendingArray[i++] = value;
-            return new MapRenderPlan(List.copyOf(base), List.copyOf(glow),
-                    pendingArray,
+            MapGpuInstancePlan instancePlan = instances.build();
+            List<Batch> immutableBase = List.copyOf(base);
+            List<Batch> immutableGlow = List.copyOf(glow);
+            int[] basePhases = collectPhases(immutableBase, instancePlan, false);
+            int[] glowPhases = collectPhases(immutableGlow, instancePlan, true);
+            return new MapRenderPlan(immutableBase, immutableGlow,
+                    instancePlan, basePhases, glowPhases, pendingArray,
                     new MapDrawResult(exactPages, branchNodes, 0),
                     topologyRevision, System.nanoTime(),
-                    quads.size(), base.size() + glow.size());
+                    quads.size() + instancePlan.size(),
+                    base.size() + glow.size() + (instancePlan.size() == 0 ? 0 : 1));
+        }
+
+        private static int[] collectPhases(List<Batch> batches,
+                MapGpuInstancePlan instances, boolean glow) {
+            int[] phases = new int[batches.size() + instances.size()];
+            int count = 0;
+            for (Batch batch : batches) {
+                boolean batchGlow = batch.phase() >= PHASE_GLOW;
+                if (batchGlow == glow) phases[count++] = batch.phase();
+            }
+            for (int index = 0; index < instances.size(); index++) {
+                int phase = instances.phase(index);
+                boolean instanceGlow = phase >= PHASE_GLOW;
+                if (instanceGlow == glow) phases[count++] = phase;
+            }
+            if (count == 0) return new int[0];
+            Arrays.sort(phases, 0, count);
+            int unique = 1;
+            for (int index = 1; index < count; index++) {
+                if (phases[index] != phases[unique - 1]) {
+                    phases[unique++] = phases[index];
+                }
+            }
+            return Arrays.copyOf(phases, unique);
         }
 
         private static int writeQuad(float[] target, int offset, Quad quad) {

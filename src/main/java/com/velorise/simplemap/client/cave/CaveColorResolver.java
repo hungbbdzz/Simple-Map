@@ -37,8 +37,10 @@ public final class CaveColorResolver {
         int base = blockColor(level, floorPos, floorState, true);
         if (base == 0) return 0;
         if (waterDepth > 0) {
-            BlockPos waterPos = new BlockPos(floorPos.getX(), waterTopY, floorPos.getZ());
-            base = waterOverlay(level, waterPos, base, waterDepth);
+            int floorY = floorPos.getY();
+            floorPos.setY(waterTopY);
+            base = waterOverlay(level, floorPos, base, waterDepth);
+            floorPos.setY(floorY);
         }
         int light = Math.max(floorState.getLightEmission(),
                 level.getBrightness(LightLayer.BLOCK, floorPos));
@@ -59,8 +61,10 @@ public final class CaveColorResolver {
         int base = blockColor(level, floorPos, floorState, false);
         if (base == 0) return 0;
         if (waterDepth > 0) {
-            BlockPos waterPos = new BlockPos(floorPos.getX(), waterTopY, floorPos.getZ());
-            base = waterOverlay(level, waterPos, base, waterDepth);
+            int floorY = floorPos.getY();
+            floorPos.setY(waterTopY);
+            base = waterOverlay(level, floorPos, base, waterDepth);
+            floorPos.setY(floorY);
         }
         return base;
     }

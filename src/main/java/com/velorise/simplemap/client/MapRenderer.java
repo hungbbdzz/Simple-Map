@@ -6,6 +6,10 @@ import net.minecraft.resources.ResourceLocation;
 import com.velorise.simplemap.client.cave.CaveAtlasRegion;
 import com.velorise.simplemap.client.cave.CaveScreenSpacePolicy;
 import com.velorise.simplemap.client.cave.SurfaceLodTree;
+import com.velorise.simplemap.client.gpu.TileKey;
+import com.velorise.simplemap.client.renderer.LodSelector;
+import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.session.MapSessionManager;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.math.Axis;
 import com.mojang.blaze3d.systems.RenderSystem;
@@ -66,7 +70,7 @@ public class MapRenderer {
             boolean cachedOnly) {
         drawMapInternal(guiGraphics, viewportX, viewportY, width, height, centerX, centerZ, scale,
                 drawPlayer, rotateWithPlayer, isMinimap, mouseWorldX, mouseWorldZ, partialTick,
-                cachedOnly, true, 1.0f);
+                cachedOnly, true, 1.0f, scale);
     }
 
     /**
@@ -78,14 +82,29 @@ public class MapRenderer {
             boolean rotateWithPlayer, float partialTick, float fixedOverlayScale) {
         return drawMapInternal(guiGraphics, 0, 0, width, height, centerX, centerZ, scale,
                 drawPlayer, rotateWithPlayer, true, 0.0, 0.0, partialTick, false, false,
-                fixedOverlayScale);
+                fixedOverlayScale, scale);
+    }
+
+    /**
+     * Fullscreen surface composition entry used by the pixel-aligned framebuffer.
+     * It retains fullscreen scheduling/LOD semantics while disabling only the
+     * window-relative scissor because the framebuffer clips to its own extent.
+     */
+    MapDrawResult drawFullscreenMapOffscreen(GuiGraphics guiGraphics, int width, int height,
+            double centerX, double centerZ, float renderPixelsPerBlock,
+            float policyPixelsPerBlock, boolean drawPlayer,
+            double mouseWorldX, double mouseWorldZ, float partialTick) {
+        return drawMapInternal(guiGraphics, 0, 0, width, height, centerX, centerZ,
+                renderPixelsPerBlock, drawPlayer, false, false, mouseWorldX, mouseWorldZ,
+                partialTick, false, false, 1.0f, policyPixelsPerBlock);
     }
 
     private MapDrawResult drawMapInternal(GuiGraphics guiGraphics, int viewportX, int viewportY,
             int width, int height, double centerX, double centerZ, float scale,
             boolean drawPlayer, boolean rotateWithPlayer, boolean isMinimap,
             double mouseWorldX, double mouseWorldZ, float partialTick,
-            boolean cachedOnly, boolean manageScissor, float fixedOverlayScale) {
+            boolean cachedOnly, boolean manageScissor, float fixedOverlayScale,
+            float policyScale) {
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null)
@@ -167,20 +186,29 @@ public class MapRenderer {
         if (isMinimap) {
             hierarchyLevel = 0;
         } else {
-            int candidateLevel = MapLodPolicy.branchLevel(scale, width, height,
-                    searchFactor, visibleNodeTarget);
+            /*
+             * Surface quality follows texel density first, matching Xaero's useful
+             * L0/L1/L2/L3 selection. The old viewport-node budget could force a
+             * 0.29x view from density-correct L1 to L2/L3 and made the map look soft.
+             * Work volume is controlled by sliced demand/admission, not by silently
+             * lowering the visible texture density.
+             */
+            int candidateLevel = caveMode
+                    ? MapLodPolicy.branchLevel(policyScale, width, height,
+                            searchFactor, visibleNodeTarget)
+                    : LodSelector.surfaceLevel(policyScale);
             if (caveMode) {
                 hierarchyLevel = MapLodPolicy.stabilizeBranchLevel(
-                        candidateLevel, lastCaveHierarchyLevel, scale);
+                        candidateLevel, lastCaveHierarchyLevel, policyScale);
                 lastCaveHierarchyLevel = hierarchyLevel;
             } else {
                 hierarchyLevel = MapLodPolicy.stabilizeBranchLevel(
-                        candidateLevel, lastSurfaceHierarchyLevel, scale);
+                        candidateLevel, lastSurfaceHierarchyLevel, policyScale);
                 lastSurfaceHierarchyLevel = hierarchyLevel;
             }
         }
         boolean caveBranchOnly = caveMode && !isMinimap
-                && CaveScreenSpacePolicy.branchOnly(scale, MapRequestLane.FULLSCREEN);
+                && CaveScreenSpacePolicy.branchOnly(policyScale, MapRequestLane.FULLSCREEN);
         /*
          * Both visible-map pipelines are anchored to their viewport. The cursor is
          * reserved for coordinate inspection, waypoint interaction and tooltips;
@@ -195,10 +223,16 @@ public class MapRenderer {
 
         // Publish viewport to coordinator (tick-side scan/upload, not render-side).
         if (isMinimap) {
-            MapViewportCoordinator.getInstance().submitMinimap(minX, maxX, minZ, maxZ, scale);
+            MapViewportCoordinator.getInstance().submitMinimap(minX, maxX, minZ, maxZ, policyScale);
+        } else if (!caveMode) {
+            // Submit the complete logical viewport. SurfaceDemandController owns
+            // far-zoom trimming so render and demand policy cannot trim twice.
+            MapViewportCoordinator.getInstance().submitFullscreen(
+                    minX, maxX, minZ, maxZ,
+                    policyScale, centerX, centerZ, false);
         } else {
             MapViewportCoordinator.getInstance().submitFullscreen(
-                    minX, maxX, minZ, maxZ, scale,
+                    minX, maxX, minZ, maxZ, policyScale,
                     centerX, centerZ, false);
         }
 
@@ -212,6 +246,12 @@ public class MapRenderer {
         float caveBrightness = getCaveBrightness(mc, partialTick);
         MapTextureManager surfaceTextures = MapTextureManager.getInstance();
         MapOverviewTextureManager overviewTextures = MapOverviewTextureManager.getInstance();
+        if (!isMinimap && !caveMode) {
+            overviewTextures.setPreferredSurfaceView(policyScale, hierarchyLevel,
+                    minVisiblePageX, maxVisiblePageX,
+                    minVisiblePageZ, maxVisiblePageZ,
+                    attentionPageX, attentionPageZ);
+        }
         FullCaveTextureManager fullCaveTextures = FullCaveTextureManager.getInstance();
         CaveTextureManager caveTextures = CaveTextureManager.getInstance();
         surfaceTextures.beginRenderBatch();
@@ -228,7 +268,7 @@ public class MapRenderer {
                     ? (fullCaveView ? fullCaveTextures.contentRevision()
                             : caveTextures.contentRevision())
                     : residency.contentRevision();
-            int renderScaleClass = renderScaleClass(caveMode, scale);
+            int renderScaleClass = renderScaleClass(caveMode, policyScale);
             // Rendering and loading are both anchored to the viewport.
             int renderAttentionPageX = isMinimap ? attentionPageX
                     : Math.floorDiv((int) Math.floor(centerX), MapPageLayout.PAGE_SIZE);
@@ -246,7 +286,7 @@ public class MapRenderer {
             CachedPlan fallbackPlan = null;
             if (isMinimap) {
                 cachedPlan = selectMinimapPlan(planKey, caveMode, fullCaveView,
-                        caveLayerY, hierarchyLevel, caveBranchOnly, scale,
+                        caveLayerY, hierarchyLevel, caveBranchOnly, policyScale,
                         minX, maxX, minZ, maxZ,
                         minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                         minVisiblePageX, maxVisiblePageX,
@@ -272,7 +312,7 @@ public class MapRenderer {
                         || !cachedPlan.plan().valid(topologyRevision, nowNanos,
                                 cachedHasPending)) {
                     MapRenderPlan plan = buildRenderPlan(caveMode, fullCaveView,
-                            caveLayerY, hierarchyLevel, caveBranchOnly, scale,
+                            caveLayerY, hierarchyLevel, caveBranchOnly, policyScale,
                             true, false,
                             minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                             minVisiblePageX, maxVisiblePageX,
@@ -309,9 +349,12 @@ public class MapRenderer {
             }
 
             boolean blendWasEnabledForMap = GL11.glIsEnabled(GL11.GL_BLEND);
-            if (caveMode) {
+            boolean mapBlendRequired = caveMode || hierarchyLevel > 0;
+            if (mapBlendRequired) {
                 RenderSystem.enableBlend();
                 RenderSystem.defaultBlendFunc();
+            }
+            if (caveMode) {
                 RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
                 guiGraphics.fill(minRegionX * 512, minRegionZ * 512,
                         (maxRegionX + 1) * 512, (maxRegionZ + 1) * 512,
@@ -325,7 +368,9 @@ public class MapRenderer {
             if (fallbackPlan != null) fallbackPlan.plan().drawBase(guiGraphics);
             cachedPlan.plan().drawBase(guiGraphics);
             RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
-            if (caveMode && !blendWasEnabledForMap) RenderSystem.disableBlend();
+            if (mapBlendRequired && !blendWasEnabledForMap) {
+                RenderSystem.disableBlend();
+            }
 
             if (!caveMode && MapConfig.minimapNightMode != 0
                     && hierarchyLevel == 0) {
@@ -345,7 +390,7 @@ public class MapRenderer {
             }
             if (!isMinimap) {
                 drawLoadingIndicators(guiGraphics,
-                        cachedPlan.plan().pendingRegions(), scale);
+                        cachedPlan.plan().pendingRegions(), policyScale);
             }
             renderStats.accept(cachedPlan.plan().result());
         } finally {
@@ -444,7 +489,14 @@ public class MapRenderer {
         if (manageScissor) guiGraphics.disableScissor();
         poseStack.popPose();
         MapDrawResult result = renderStats.snapshot();
-        MapPipelineTelemetry.getInstance().recordRenderResult(result);
+        String renderProjection = isMinimap
+                ? (caveMode ? (fullCaveView ? "MINIMAP_CAVE_FULL"
+                        : "MINIMAP_CAVE_LAYERED") : "MINIMAP_SURFACE")
+                : (!caveMode ? "SURFACE"
+                        : (fullCaveView ? "CAVE_FULL" : "CAVE_LAYERED"));
+        MapPipelineTelemetry telemetry = MapPipelineTelemetry.getInstance();
+        telemetry.recordRenderContext(renderProjection, hierarchyLevel);
+        telemetry.recordRenderResult(result);
         return result;
         } finally {
             MapResidencyManager.endRender();
@@ -651,6 +703,12 @@ public class MapRenderer {
         } else {
             MapManager manager = MapManager.getInstance();
             if (hierarchyLevel > 0) {
+                // M4 region-centric coverage is an underlay authority. It is
+                // intentionally collected before the old factor-2 refinement tree
+                // so a 512x512 coarse region can appear without 64 exact leaves.
+                collectRegionSurfaceCoverage(builder, overviewTextures,
+                        minRegionX, maxRegionX, minRegionZ, maxRegionZ,
+                        scale, attentionPageX, attentionPageZ);
                 collectSurfaceHierarchy(builder, overviewTextures, surfaceTextures,
                         minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                         minVisiblePageX, maxVisiblePageX,
@@ -867,9 +925,68 @@ public class MapRenderer {
         int pz = Math.floorMod(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         CaveAtlasRegion page = source.page(rx, rz, px, pz, scale);
         if (page == null) return false;
-        addPageQuad(builder, page, rx, rz, px, pz, MapRenderPlan.PHASE_EXACT);
+        addCavePageQuad(builder, page, rx, rz, px, pz);
         drawnRegions.add(packRegion(rx, rz));
         return true;
+    }
+
+    private void collectRegionSurfaceCoverage(MapRenderPlan.Builder builder,
+            MapOverviewTextureManager overviewTextures,
+            int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
+            float scale, int focusPageX, int focusPageZ) {
+        int level = MapRegionLodPolicy.targetLevel(scale);
+        int span = MapRegionLodPolicy.regionSpan(level);
+        int minNodeX = Math.floorDiv(minRegionX, span);
+        int maxNodeX = Math.floorDiv(maxRegionX, span);
+        int minNodeZ = Math.floorDiv(minRegionZ, span);
+        int maxNodeZ = Math.floorDiv(maxRegionZ, span);
+        int focusRegionX = Math.floorDiv(focusPageX,
+                MapPageLayout.PAGES_PER_REGION);
+        int focusRegionZ = Math.floorDiv(focusPageZ,
+                MapPageLayout.PAGES_PER_REGION);
+        int focusNodeX = clamp(Math.floorDiv(focusRegionX, span),
+                minNodeX, maxNodeX);
+        int focusNodeZ = clamp(Math.floorDiv(focusRegionZ, span),
+                minNodeZ, maxNodeZ);
+        int radiusMax = gridRadius(minNodeX, maxNodeX, minNodeZ, maxNodeZ,
+                focusNodeX, focusNodeZ);
+        for (int radius = 0; radius <= radiusMax; radius++) {
+            for (int nodeZ = focusNodeZ - radius;
+                    nodeZ <= focusNodeZ + radius; nodeZ++) {
+                for (int nodeX = focusNodeX - radius;
+                        nodeX <= focusNodeX + radius; nodeX++) {
+                    if (!onRing(nodeX, nodeZ, focusNodeX, focusNodeZ, radius)
+                            || nodeX < minNodeX || nodeX > maxNodeX
+                            || nodeZ < minNodeZ || nodeZ > maxNodeZ) continue;
+                    CaveAtlasRegion branch = overviewTextures
+                            .peekRegionSurfaceBranch(level, nodeX, nodeZ);
+                    if (branch != null) {
+                        addRegionLodQuad(builder, branch, nodeX, nodeZ);
+                        continue;
+                    }
+                    CaveAtlasRegion ancestor = findRegionSurfaceAncestor(
+                            overviewTextures, level, nodeX, nodeZ);
+                    if (ancestor != null) {
+                        addRegionLodAncestorQuad(builder, ancestor,
+                                level, nodeX, nodeZ);
+                    }
+                }
+            }
+        }
+    }
+
+    private CaveAtlasRegion findRegionSurfaceAncestor(
+            MapOverviewTextureManager overviewTextures, int targetLevel,
+            int targetNodeX, int targetNodeZ) {
+        int divisor = 1;
+        for (int level = targetLevel + 1; level <= 3; level++) {
+            divisor *= 8;
+            CaveAtlasRegion ancestor = overviewTextures.peekRegionSurfaceBranch(
+                    level, Math.floorDiv(targetNodeX, divisor),
+                    Math.floorDiv(targetNodeZ, divisor));
+            if (ancestor != null) return ancestor;
+        }
+        return null;
     }
 
     private void collectSurfaceHierarchy(MapRenderPlan.Builder builder,
@@ -895,7 +1012,7 @@ public class MapRenderer {
                 for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, manager, collectPending, false);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
             }
             return;
@@ -912,7 +1029,7 @@ public class MapRenderer {
                             || nodeZ < minNodeZ || nodeZ > maxNodeZ) continue;
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, manager, collectPending, false);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
             }
         }
@@ -923,7 +1040,7 @@ public class MapRenderer {
             MapTextureManager surfaceTextures,
             int level, int nodeX, int nodeZ,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
-            MapManager manager, boolean collectPending,
+            float scale, MapManager manager, boolean collectPending,
             boolean inheritedCoverage) {
         int pageSpan = MapLodPolicy.pageSpanForBranch(level);
         int firstPageX = nodeX * pageSpan;
@@ -953,12 +1070,36 @@ public class MapRenderer {
         if (level == 1) {
             for (int childX = 0; childX < 2; childX++) {
                 for (int childZ = 0; childZ < 2; childZ++) {
+                    int childIndex = childZ * 2 + childX;
                     int pageX = firstPageX + childX;
                     int pageZ = firstPageZ + childZ;
                     if (pageX < minPageX || pageX > maxPageX
                             || pageZ < minPageZ || pageZ > maxPageZ) continue;
+                    /*
+                     * At far zoom the density-correct L1 texture is the primary
+                     * representation, not merely an underlay beneath a minified
+                     * nearest-filtered L0 page. Keep exact leaves only as a
+                     * progressive fallback for quadrants that the branch has not
+                     * captured yet. Once the L1 child is complete, drawing exact on
+                     * top would reintroduce the aliasing/softness this path exists
+                     * to remove.
+                     */
+                    boolean branchPrimary = branch != null
+                            && MapSurfaceRenderPolicy.useBranchInsteadOfExact(
+                                    scale, level, branch.childKnown(childIndex));
+                    if (branchPrimary && branch.childComplete(childIndex)) continue;
+                    /*
+                     * A partial L1 texture is transparent outside its known texels.
+                     * Keep the exact leaf underneath it instead of drawing exact on
+                     * top. The branch therefore owns every known pixel while exact
+                     * fills only the still-unknown part, avoiding both black holes
+                     * and the old nearest-filtered L0 override.
+                     */
+                    int phase = branchPrimary
+                            ? MapRenderPlan.PHASE_L1_EXACT_UNDERLAY
+                            : MapRenderPlan.PHASE_EXACT;
                     collectSurfaceLeaf(builder, surfaceTextures, pageX, pageZ,
-                            manager, collectPending);
+                            manager, collectPending, phase);
                 }
             }
             return;
@@ -974,7 +1115,7 @@ public class MapRenderer {
                 collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                         level - 1, childNodeX, childNodeZ,
                         minPageX, maxPageX, minPageZ, maxPageZ,
-                        manager, collectPending, nodeCovered);
+                        scale, manager, collectPending, nodeCovered);
             }
         }
     }
@@ -982,13 +1123,20 @@ public class MapRenderer {
     private boolean collectSurfaceLeaf(MapRenderPlan.Builder builder,
             MapTextureManager surfaceTextures, int globalPageX, int globalPageZ,
             MapManager manager, boolean collectPending) {
+        return collectSurfaceLeaf(builder, surfaceTextures, globalPageX, globalPageZ,
+                manager, collectPending, MapRenderPlan.PHASE_EXACT);
+    }
+
+    private boolean collectSurfaceLeaf(MapRenderPlan.Builder builder,
+            MapTextureManager surfaceTextures, int globalPageX, int globalPageZ,
+            MapManager manager, boolean collectPending, int phase) {
         int rx = Math.floorDiv(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int rz = Math.floorDiv(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         int px = Math.floorMod(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int pz = Math.floorMod(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         CaveAtlasRegion page = surfaceTextures.peekPageRegion(rx, rz, px, pz);
         if (page != null) {
-            addPageQuad(builder, page, rx, rz, px, pz, MapRenderPlan.PHASE_EXACT);
+            addPageQuad(builder, page, rx, rz, px, pz, phase);
             return true;
         }
         if (collectPending && (manager.hasRegionFile(rx, rz)
@@ -1035,15 +1183,50 @@ public class MapRenderer {
         }
     }
 
-    private void addPageQuad(MapRenderPlan.Builder builder, CaveAtlasRegion region,
-            int regionX, int regionZ, int pageX, int pageZ, int phase) {
-        boolean added = builder.add(region.texture(), phase,
+    /** Cave pages are not published into the M5 Surface page table yet.
+     * Replaying them as Surface TileKeys can resolve an unrelated Surface atlas
+     * entry at the same page coordinates, producing the mixed green/cave mosaic. */
+    private void addCavePageQuad(MapRenderPlan.Builder builder,
+            CaveAtlasRegion region, int regionX, int regionZ,
+            int pageX, int pageZ) {
+        if (builder.add(region.texture(), MapRenderPlan.PHASE_EXACT,
                 regionX * 512 + pageX * 64,
                 regionZ * 512 + pageZ * 64,
                 64, 64, region.sourceX(), region.sourceY(),
                 region.sourceSize(), region.sourceSize(),
-                region.atlasSize(), region.atlasSize());
-        if (added && phase == MapRenderPlan.PHASE_EXACT) builder.exact();
+                region.atlasSize(), region.atlasSize())) {
+            builder.exact();
+        }
+    }
+
+    private void addPageQuad(MapRenderPlan.Builder builder, CaveAtlasRegion region,
+            int regionX, int regionZ, int pageX, int pageZ, int phase) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        int globalPageX = regionX * MapPageLayout.PAGES_PER_REGION + pageX;
+        int globalPageZ = regionZ * MapPageLayout.PAGES_PER_REGION + pageZ;
+        int variant = phase >= MapRenderPlan.PHASE_GLOW
+                ? TileKey.VARIANT_SURFACE_GLOW
+                : TileKey.VARIANT_SURFACE_EXACT;
+        boolean added;
+        if (stamp != null) {
+            added = builder.addTile(new TileKey(stamp.sessionId(), 0, 0,
+                            globalPageX, globalPageZ, variant),
+                    region.texture(), phase,
+                    regionX * 512 + pageX * 64,
+                    regionZ * 512 + pageZ * 64,
+                    64, 64, region.sourceX(), region.sourceY(),
+                    region.sourceSize(), region.sourceSize(),
+                    region.atlasSize(), region.atlasSize());
+        } else {
+            added = builder.add(region.texture(), phase,
+                    regionX * 512 + pageX * 64,
+                    regionZ * 512 + pageZ * 64,
+                    64, 64, region.sourceX(), region.sourceY(),
+                    region.sourceSize(), region.sourceSize(),
+                    region.atlasSize(), region.atlasSize());
+        }
+        if (added && (phase == MapRenderPlan.PHASE_EXACT
+                || phase == MapRenderPlan.PHASE_L1_EXACT_UNDERLAY)) builder.exact();
     }
 
     private void addNodeQuad(MapRenderPlan.Builder builder, CaveAtlasRegion region,
@@ -1054,6 +1237,57 @@ public class MapRenderer {
                 worldSize, worldSize, region.sourceX(), region.sourceY(),
                 region.sourceSize(), region.sourceSize(),
                 region.atlasSize(), region.atlasSize())) {
+            builder.branch();
+        }
+    }
+
+    private void addRegionLodQuad(MapRenderPlan.Builder builder,
+            CaveAtlasRegion region, int nodeX, int nodeZ) {
+        int worldSize = region.worldSize();
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        boolean added;
+        if (stamp != null) {
+            added = builder.addTile(new TileKey(stamp.sessionId(),
+                            RegionSurfaceLodService.PROJECTION_SURFACE,
+                            region.level(), nodeX, nodeZ,
+                            TileKey.VARIANT_SURFACE_BRANCH),
+                    region.texture(), MapRenderPlan.PHASE_REGION_COARSE,
+                    nodeX * worldSize, nodeZ * worldSize,
+                    worldSize, worldSize, region.sourceX(), region.sourceY(),
+                    region.sourceSize(), region.sourceSize(),
+                    region.atlasSize(), region.atlasSize());
+        } else {
+            added = builder.add(region.texture(),
+                    MapRenderPlan.PHASE_REGION_COARSE,
+                    nodeX * worldSize, nodeZ * worldSize,
+                    worldSize, worldSize, region.sourceX(), region.sourceY(),
+                    region.sourceSize(), region.sourceSize(),
+                    region.atlasSize(), region.atlasSize());
+        }
+        if (added) builder.branch();
+    }
+
+    private void addRegionLodAncestorQuad(MapRenderPlan.Builder builder,
+            CaveAtlasRegion ancestor, int targetLevel,
+            int nodeX, int nodeZ) {
+        int difference = ancestor.level() - targetLevel;
+        if (difference <= 0) {
+            addRegionLodQuad(builder, ancestor, nodeX, nodeZ);
+            return;
+        }
+        int subdivision = 1;
+        for (int index = 0; index < difference; index++) subdivision *= 8;
+        int sourceSize = Math.max(1, ancestor.sourceSize() / subdivision);
+        int localX = Math.floorMod(nodeX, subdivision);
+        int localZ = Math.floorMod(nodeZ, subdivision);
+        int worldSize = MapRegionLodPolicy.worldSize(targetLevel);
+        if (builder.add(ancestor.texture(), MapRenderPlan.PHASE_REGION_COARSE,
+                nodeX * worldSize, nodeZ * worldSize,
+                worldSize, worldSize,
+                ancestor.sourceX() + localX * sourceSize,
+                ancestor.sourceY() + localZ * sourceSize,
+                sourceSize, sourceSize,
+                ancestor.atlasSize(), ancestor.atlasSize())) {
             builder.branch();
         }
     }
@@ -1451,9 +1685,11 @@ public class MapRenderer {
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
 
         CaveAtlasRegion branch = overviewTextures.peekSurfaceBranch(level, nodeX, nodeZ);
-        // Branches are derived caches. A missing parent must never prevent exact
-        // surface pages or the compatibility region fallback from being drawn.
-        if (branch != null) {
+        boolean l1BranchOverlay = level == 1 && branch != null && scale < 0.50f;
+        // Direct compatibility rendering has no phase sorter. At far L1 zoom, draw
+        // exact fallback first and the partially transparent branch afterwards so
+        // known L1 texels are authoritative while unknown texels keep exact data.
+        if (branch != null && !l1BranchOverlay) {
             drawAtlasNode(guiGraphics, branch, nodeX, nodeZ);
             stats.branchNodes++;
         }
@@ -1466,12 +1702,17 @@ public class MapRenderer {
                     int pageZ = firstPageZ + childZ;
                     if (pageX < minPageX || pageX > maxPageX
                             || pageZ < minPageZ || pageZ > maxPageZ) continue;
-                    boolean exactOrLegacyDrawn = drawSurfaceLeafPage(
-                            guiGraphics, surfaceTextures, pageX, pageZ,
+                    boolean branchPrimary = branch != null
+                            && MapSurfaceRenderPolicy.useBranchInsteadOfExact(
+                                    scale, level, branch.childKnown(childIndex));
+                    if (branchPrimary && branch.childComplete(childIndex)) continue;
+                    drawSurfaceLeafPage(guiGraphics, surfaceTextures, pageX, pageZ,
                             pendingRegions, manager, stats);
-                    if (exactOrLegacyDrawn) continue;
-                    if (branch != null && branch.childComplete(childIndex)) continue;
                 }
+            }
+            if (l1BranchOverlay) {
+                drawAtlasNode(guiGraphics, branch, nodeX, nodeZ);
+                stats.branchNodes++;
             }
             return;
         }

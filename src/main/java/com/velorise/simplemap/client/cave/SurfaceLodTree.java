@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * become an authoritative transparent hole.</p>
  */
 public final class SurfaceLodTree {
+    private static final int VISIBLE_QUEUE_SCAN_BUDGET = 512;
     public static final int MAX_LEVEL = 7;
     private static final long FULL_ROW = -1L;
     /** Clean leaf authority is LRU-bounded; dirty state is never discarded. */
@@ -35,7 +36,8 @@ public final class SurfaceLodTree {
     private final SurfaceBranchAtlas[] atlases = new SurfaceBranchAtlas[MAX_LEVEL + 1];
     private final long[] observedStorageGeneration = new long[MAX_LEVEL + 1];
     private final Map<NodeKey, Node> nodes = new LinkedHashMap<>(128, 0.75f, true);
-    private final ArrayDeque<NodeKey> dirtyQueue = new ArrayDeque<>();
+    @SuppressWarnings("unchecked")
+    private final ArrayDeque<NodeKey>[] dirtyQueues = new ArrayDeque[MAX_LEVEL + 1];
     private final Set<NodeKey> dirtySet = new HashSet<>();
     private final Set<NodeKey> loadingFromDisk = new HashSet<>();
     private final ConcurrentLinkedQueue<LoadedNode> loadedFromDisk =
@@ -55,6 +57,8 @@ public final class SurfaceLodTree {
     private final MapPipelineTelemetry pipelineTelemetry = MapPipelineTelemetry.getInstance();
     private final LodBranchDiskCache diskCache = LodBranchDiskCache.getInstance();
     private long loadGeneration = 1L;
+    /** Latest fullscreen Surface demand used only to prioritize branch work. */
+    private volatile VisibleWindow visibleWindow = VisibleWindow.none();
 
     public static void invalidatePersistentCache() {
         LodBranchDiskCache.getInstance().invalidateCurrentDimension();
@@ -64,7 +68,27 @@ public final class SurfaceLodTree {
         java.util.Arrays.fill(observedStorageGeneration, Long.MIN_VALUE);
         for (int level = 1; level <= MAX_LEVEL; level++) {
             atlases[level] = new SurfaceBranchAtlas(level);
+            dirtyQueues[level] = new ArrayDeque<>();
         }
+    }
+
+    /**
+     * Updates the visible Surface page window. This does not create work and does
+     * not discard background dirty state; it only changes which already-dirty LOD
+     * node/leaf is selected first during the next bounded publication slices.
+     */
+    public void setVisibleWindow(String dimension, int preferredLevel,
+            int minPageX, int maxPageX, int minPageZ, int maxPageZ,
+            int focusPageX, int focusPageZ) {
+        int safeMinX = Math.min(minPageX, maxPageX);
+        int safeMaxX = Math.max(minPageX, maxPageX);
+        int safeMinZ = Math.min(minPageZ, maxPageZ);
+        int safeMaxZ = Math.max(minPageZ, maxPageZ);
+        visibleWindow = new VisibleWindow(
+                dimension == null ? "" : dimension,
+                Math.max(1, Math.min(MAX_LEVEL, preferredLevel)),
+                safeMinX, safeMaxX, safeMinZ, safeMaxZ,
+                focusPageX, focusPageZ);
     }
 
     public void synchronizeStorage() {
@@ -180,7 +204,7 @@ public final class SurfaceLodTree {
         while (scheduled < budget && System.nanoTime() < deadlineNanos) {
             LeafInput input;
             synchronized (leafLock) {
-                PageUpdateKey key = pendingLeafQueue.pollFirst();
+                PageUpdateKey key = pollVisibleLeafLocked();
                 if (key == null) break;
                 pendingLeafSet.remove(key);
                 LeafState state = leafStates.get(key);
@@ -349,6 +373,47 @@ public final class SurfaceLodTree {
         trimLevel(1);
     }
 
+    private PageUpdateKey pollVisibleLeafLocked() {
+        if (pendingLeafQueue.isEmpty()) return null;
+        VisibleWindow window = visibleWindow;
+        PageUpdateKey best = null;
+        long bestDistance = Long.MAX_VALUE;
+        int scanCount = Math.min(pendingLeafQueue.size(),
+                VISIBLE_QUEUE_SCAN_BUDGET);
+        for (int scanned = 0; scanned < scanCount; scanned++) {
+            PageUpdateKey candidate = pendingLeafQueue.pollFirst();
+            if (candidate == null) break;
+            boolean visible = window.matches(candidate.dimension())
+                    && candidate.globalPageX() >= window.minPageX()
+                    && candidate.globalPageX() <= window.maxPageX()
+                    && candidate.globalPageZ() >= window.minPageZ()
+                    && candidate.globalPageZ() <= window.maxPageZ();
+            if (!visible) {
+                pendingLeafQueue.addLast(candidate);
+                continue;
+            }
+            long dx = (long) candidate.globalPageX() - window.focusPageX();
+            long dz = (long) candidate.globalPageZ() - window.focusPageZ();
+            long distance = dx * dx + dz * dz;
+            if (best == null || distance < bestDistance) {
+                if (best != null) pendingLeafQueue.addLast(best);
+                best = candidate;
+                bestDistance = distance;
+            } else {
+                pendingLeafQueue.addLast(candidate);
+            }
+        }
+        if (best != null) return best;
+        return pendingLeafQueue.pollFirst();
+    }
+
+    private boolean isVisibleNode(NodeKey candidate, VisibleWindow window,
+            int minNodeX, int maxNodeX, int minNodeZ, int maxNodeZ) {
+        return window.matches(candidate.dimension())
+                && candidate.nodeX() >= minNodeX && candidate.nodeX() <= maxNodeX
+                && candidate.nodeZ() >= minNodeZ && candidate.nodeZ() <= maxNodeZ;
+    }
+
     private void enqueueLeafLocked(PageUpdateKey key) {
         if (key != null && pendingLeafSet.add(key)) pendingLeafQueue.addLast(key);
     }
@@ -370,15 +435,43 @@ public final class SurfaceLodTree {
     }
 
     public int publish(int budget, long deadlineNanos) {
+        return publish(budget, deadlineNanos, 1);
+    }
+
+    public int publish(int budget, long deadlineNanos, int preferredLevel) {
         drainDiskLoads();
-        int deriveBudget = Math.max(2, budget * 3);
+        int safeBudget = Math.max(1, budget);
+        int safePreferredLevel = Math.max(1, Math.min(MAX_LEVEL, preferredLevel));
+        int deriveBudget = Math.max(2, safeBudget * 3);
+
+        /*
+         * Commit already-prepared leaves and upload already-dirty L1/L2 nodes before
+         * spending this short frame slice on more CPU derivation. Previously a busy
+         * derivation queue could consume the entire deadline on every frame, leaving
+         * branch publication permanently behind exact work even when GPU admission
+         * was available.
+         */
         drainPreparedLeaves(deriveBudget, deadlineNanos);
+        int published = publishDirtyNodes(safeBudget, deadlineNanos,
+                safePreferredLevel);
+        if (published >= safeBudget || System.nanoTime() >= deadlineNanos) {
+            return published;
+        }
+
         scheduleLeafDerivations(deriveBudget, deadlineNanos);
-        // Very small pages can complete while this publication slice is still open.
+        // Very small L1 reductions can complete while the same publication slice is
+        // still open. Commit them and use any remaining upload slots immediately.
         drainPreparedLeaves(deriveBudget, deadlineNanos);
+        published += publishDirtyNodes(safeBudget - published, deadlineNanos,
+                safePreferredLevel);
+        return published;
+    }
+
+    private int publishDirtyNodes(int budget, long deadlineNanos,
+            int preferredLevel) {
         int published = 0;
         while (published < budget && System.nanoTime() < deadlineNanos) {
-            NodeKey key = dirtyQueue.pollFirst();
+            NodeKey key = pollDirty(preferredLevel);
             if (key == null) break;
             dirtySet.remove(key);
             Node node = nodes.get(key);
@@ -430,7 +523,7 @@ public final class SurfaceLodTree {
     public void clear() {
         for (Node node : nodes.values()) node.close();
         nodes.clear();
-        dirtyQueue.clear();
+        for (int level = 1; level <= MAX_LEVEL; level++) dirtyQueues[level].clear();
         dirtySet.clear();
         loadGeneration++;
         loadingFromDisk.clear();
@@ -442,6 +535,7 @@ public final class SurfaceLodTree {
             inFlightLeafDerivations.clear();
         }
         preparedLeaves.clear();
+        visibleWindow = VisibleWindow.none();
         for (int level = 1; level <= MAX_LEVEL; level++) atlases[level].resetSlots();
     }
 
@@ -641,7 +735,7 @@ public final class SurfaceLodTree {
     }
 
     private static LodBranchDiskCache.Key diskKey(NodeKey key) {
-        return new LodBranchDiskCache.Key("surface_" + key.dimension,
+        return new LodBranchDiskCache.Key("surface_chunk16_" + key.dimension,
                 key.level, key.nodeX, key.nodeZ);
     }
 
@@ -711,7 +805,12 @@ public final class SurfaceLodTree {
     private boolean retireOldestResident(int level, NodeKey protectedKey) {
         java.util.List<String> candidates = new java.util.ArrayList<>();
         java.util.Map<String, Node> byKey = new java.util.HashMap<>();
-        for (Map.Entry<NodeKey, Node> entry : nodes.entrySet()) {
+        // nodes is an access-order LinkedHashMap. Parent-coverage lookups call
+        // nodes.get(), which reorder the map. Iterate a stable snapshot so LRU
+        // observation cannot invalidate the active iterator.
+        java.util.List<Map.Entry<NodeKey, Node>> snapshot =
+                new java.util.ArrayList<>(nodes.entrySet());
+        for (Map.Entry<NodeKey, Node> entry : snapshot) {
             if (entry.getKey().level() != level
                     || entry.getKey().equals(protectedKey)) continue;
             Node node = entry.getValue();
@@ -746,8 +845,81 @@ public final class SurfaceLodTree {
         return false;
     }
 
+    private NodeKey pollDirty(int preferredLevel) {
+        int preferred = Math.max(1, Math.min(MAX_LEVEL, preferredLevel));
+        NodeKey key = pollVisibleDirty(preferred);
+        if (key != null) return key;
+        key = dirtyQueues[preferred].pollFirst();
+        if (key != null) return key;
+        for (int distance = 1; distance < MAX_LEVEL; distance++) {
+            int finer = preferred - distance;
+            if (finer >= 1) {
+                key = pollVisibleDirty(finer);
+                if (key == null) key = dirtyQueues[finer].pollFirst();
+                if (key != null) return key;
+            }
+            int coarser = preferred + distance;
+            if (coarser <= MAX_LEVEL) {
+                key = pollVisibleDirty(coarser);
+                if (key == null) key = dirtyQueues[coarser].pollFirst();
+                if (key != null) return key;
+            }
+        }
+        return null;
+    }
+
+    private NodeKey pollVisibleDirty(int level) {
+        ArrayDeque<NodeKey> queue = dirtyQueues[level];
+        if (queue == null || queue.isEmpty()) return null;
+        VisibleWindow window = visibleWindow;
+        int span = 1 << level;
+        int minNodeX = Math.floorDiv(window.minPageX(), span);
+        int maxNodeX = Math.floorDiv(window.maxPageX(), span);
+        int minNodeZ = Math.floorDiv(window.minPageZ(), span);
+        int maxNodeZ = Math.floorDiv(window.maxPageZ(), span);
+        int focusNodeX = Math.floorDiv(window.focusPageX(), span);
+        int focusNodeZ = Math.floorDiv(window.focusPageZ(), span);
+        NodeKey best = null;
+        long bestDistance = Long.MAX_VALUE;
+        int scanCount = Math.min(queue.size(), VISIBLE_QUEUE_SCAN_BUDGET);
+        for (int scanned = 0; scanned < scanCount; scanned++) {
+            NodeKey candidate = queue.pollFirst();
+            if (candidate == null) break;
+            if (!isVisibleNode(candidate, window, minNodeX, maxNodeX,
+                    minNodeZ, maxNodeZ)) {
+                queue.addLast(candidate);
+                continue;
+            }
+            long dx = (long) candidate.nodeX() - focusNodeX;
+            long dz = (long) candidate.nodeZ() - focusNodeZ;
+            long distance = dx * dx + dz * dz;
+            if (best == null || distance < bestDistance) {
+                if (best != null) queue.addLast(best);
+                best = candidate;
+                bestDistance = distance;
+            } else {
+                queue.addLast(candidate);
+            }
+        }
+        return best;
+    }
+
     private void enqueue(NodeKey key) {
-        if (dirtySet.add(key)) dirtyQueue.addLast(key);
+        if (key == null || key.level() < 1 || key.level() > MAX_LEVEL) return;
+        if (dirtySet.add(key)) dirtyQueues[key.level()].addLast(key);
+    }
+
+    private record VisibleWindow(String dimension, int preferredLevel,
+            int minPageX, int maxPageX, int minPageZ, int maxPageZ,
+            int focusPageX, int focusPageZ) {
+        private static VisibleWindow none() {
+            return new VisibleWindow("", 1, Integer.MIN_VALUE, Integer.MAX_VALUE,
+                    Integer.MIN_VALUE, Integer.MAX_VALUE, 0, 0);
+        }
+
+        private boolean matches(String candidateDimension) {
+            return !dimension.isEmpty() && dimension.equals(candidateDimension);
+        }
     }
 
     private record PageUpdateKey(String dimension, int globalPageX, int globalPageZ) {

@@ -134,6 +134,8 @@ public class MinimapRenderer {
         int tHalf = Math.max(1, borderThickness / 2);
         double interpX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX());
         double interpZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
+        com.velorise.simplemap.client.minimap.MinimapService.getInstance()
+                .update(interpX, interpZ, effectiveZoom);
 
         if (MapConfig.minimapCircle) {
             renderCircularMinimap(guiGraphics, mc, player, x, y, size, borderThickness, tHalf,

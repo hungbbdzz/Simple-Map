@@ -1,5 +1,7 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.surface.SurfaceDemandController;
+import com.velorise.simplemap.client.cave.v2.CaveProjectionController;
 import com.velorise.simplemap.client.cave.CaveWorldSaveReader;
 import com.velorise.simplemap.client.cave.CaveScreenSpacePolicy;
 import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
@@ -30,7 +32,9 @@ public final class MapViewportCoordinator {
      * parents while normal gameplay continues.
      */
     private long lastBackgroundSurfaceRun;
-    private static final long BACKGROUND_SURFACE_INTERVAL_NANOS = 50_000_000L;
+    // Background publication repairs/widens the retained surface cache. It must
+    // not compete one-for-one with the visible minimap request every client tick.
+    private static final long BACKGROUND_SURFACE_INTERVAL_NANOS = 250_000_000L;
     private static final int BACKGROUND_SURFACE_MIN_RADIUS = 96;
     private static final int BACKGROUND_SURFACE_MAX_RADIUS = 256;
     private LayerStreamState layerStream = new LayerStreamState();
@@ -214,7 +218,7 @@ public final class MapViewportCoordinator {
                 long uploadInterval = layerUploadIntervalNanos(fullscreen.scale);
                 if (now - lastLayerUploadRun >= uploadInterval) {
                     lastLayerUploadRun = now;
-                    publication.requestLayeredCave();
+                    publication.requestLayeredCave(focus);
                 }
             } else {
                 publication.requestSurface(MapRequestLane.FULLSCREEN, focus);
@@ -251,9 +255,10 @@ public final class MapViewportCoordinator {
         double minZ = centerZ - radius;
         double maxZ = centerZ + radius;
 
-        MapTextureManager surface = MapTextureManager.getInstance();
-        surface.requestVisiblePages(minX, maxX, minZ, maxZ,
-                MapRequestLane.BACKGROUND);
+        SurfaceDemandController.getInstance().submit(
+                new SurfaceDemandController.Request(minX, maxX, minZ, maxZ,
+                        centerX, centerZ, 1.0f,
+                        MapRequestLane.BACKGROUND, false));
         MapPublicationCoordinator.getInstance().requestSurface(MapRequestLane.BACKGROUND, false);
 
         // Do not decode cave Anvil sources while Surface is the active projection.
@@ -318,16 +323,14 @@ public final class MapViewportCoordinator {
             // viewport-owned traversal; cursor movement never changes admission.
             double schedulingFocusX = (request.minX + request.maxX) * 0.5;
             double schedulingFocusZ = (request.minZ + request.maxZ) * 0.5;
-            if (full) {
-                FullCaveTextureManager.getInstance().requestVisiblePages(
-                        request.minX, request.maxX, request.minZ, request.maxZ,
-                        request.scale, schedulingFocusX, schedulingFocusZ, request.lane);
-            } else {
-                CaveMapManager.getInstance().setActiveLayer(layerY);
-                CaveTextureManager.getInstance().requestVisiblePages(layerY,
-                        request.minX, request.maxX, request.minZ, request.maxZ,
-                        request.scale, schedulingFocusX, schedulingFocusZ, request.lane);
-            }
+            if (!full) CaveMapManager.getInstance().setActiveLayer(layerY);
+            CaveProjectionController.getInstance().request(
+                    full ? com.velorise.simplemap.client.cave.CaveView.FULL
+                            : com.velorise.simplemap.client.cave.CaveView.LAYERED,
+                    full ? Integer.MIN_VALUE : layerY,
+                    request.minX, request.maxX, request.minZ, request.maxZ,
+                    request.scale, schedulingFocusX, schedulingFocusZ,
+                    request.lane);
             return;
         }
 
@@ -336,22 +339,28 @@ public final class MapViewportCoordinator {
             // reaches publication, MapTextureManager requests its containing saved
             // region; a separate region streamer would create a second, conflicting
             // load order and reproduce the scattered behaviour V17 removes.
-            MapTextureManager.getInstance().requestVisiblePages(
-                    request.minX, request.maxX, request.minZ, request.maxZ,
-                    (request.minX + request.maxX) * 0.5,
-                    (request.minZ + request.maxZ) * 0.5,
-                    request.lane);
+            SurfaceDemandController.getInstance().submit(
+                    new SurfaceDemandController.Request(
+                            request.minX, request.maxX,
+                            request.minZ, request.maxZ,
+                            (request.minX + request.maxX) * 0.5,
+                            (request.minZ + request.maxZ) * 0.5,
+                            request.scale, request.lane,
+                            request.lane == MapRequestLane.FULLSCREEN));
             return;
         }
 
         // Exact leaves are the sole surface authority. At far zoom the manager
         // admits only a bounded attention hot set; recursive branches cover the
         // remainder without constructing legacy 512x512 overview textures.
-        MapTextureManager.getInstance().requestVisiblePages(
-                request.minX, request.maxX, request.minZ, request.maxZ,
-                (request.minX + request.maxX) * 0.5,
-                (request.minZ + request.maxZ) * 0.5,
-                request.lane);
+        SurfaceDemandController.getInstance().submit(
+                new SurfaceDemandController.Request(
+                        request.minX, request.maxX,
+                        request.minZ, request.maxZ,
+                        (request.minX + request.maxX) * 0.5,
+                        (request.minZ + request.maxZ) * 0.5,
+                        request.scale, request.lane,
+                        request.lane == MapRequestLane.FULLSCREEN));
         // Surface demand never starts cave-world reconstruction. Cave source data is
         // captured by the bounded archive writer and requested only when a cave
         // projection is actually visible.

@@ -63,7 +63,8 @@ public final class MapObservationScheduler {
 
         long started = System.nanoTime();
         MapMutationBus.getInstance().tick(minecraft,
-                profile.mutationColumnBudget(), profile.mutationChunkBudget());
+                profile.mutationColumnBudget(), profile.mutationChunkBudget(),
+                profile.mutationBudgetNanos());
         telemetry.record(MapObservationTelemetry.Lane.MUTATION_REPAIR,
                 System.nanoTime() - started, profile.mutationColumnBudget());
 

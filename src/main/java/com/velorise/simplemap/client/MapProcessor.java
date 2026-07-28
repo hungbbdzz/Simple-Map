@@ -6,12 +6,17 @@ import com.velorise.simplemap.client.pipeline.MapWorkGraph;
 import com.velorise.simplemap.client.pipeline.MapWorkKey;
 import com.velorise.simplemap.client.pipeline.MapWorkStage;
 import com.velorise.simplemap.client.pipeline.RegionRecord;
+import com.velorise.simplemap.client.pipeline.RevisionStamp;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -27,6 +32,17 @@ public final class MapProcessor {
     private final PriorityBlockingQueue<Task> queue = new PriorityBlockingQueue<>();
     private final ConcurrentHashMap<String, Task> queued = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong();
+    private final AtomicLong processorEpoch = new AtomicLong(1L);
+    private final AtomicLong surfaceHintEpoch = new AtomicLong(1L);
+    private final Set<String> retryScheduled = ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService retryExecutor =
+            Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "SimpleMap-MapProcessor-Retry");
+                thread.setDaemon(true);
+                thread.setPriority(Math.max(Thread.MIN_PRIORITY,
+                        Thread.NORM_PRIORITY - 2));
+                return thread;
+            });
 
     private MapProcessor() {
         // Region admission is intentionally serial. Heavy decode/style work still
@@ -48,7 +64,7 @@ public final class MapProcessor {
         if (session == null || session.rootToken().isCancelled()) return;
         long generation = MapManager.getInstance().getGeneration();
         enqueue(new Task("surface:" + session.sessionId() + ':' + generation + ':' + regionX + ',' + regionZ,
-                Kind.SURFACE_LOAD, session.sessionId(), generation, Integer.MIN_VALUE,
+                Kind.SURFACE_LOAD, session.stamp(), generation, Integer.MIN_VALUE,
                 regionX, regionZ, priority, sequence.getAndIncrement()));
     }
 
@@ -59,7 +75,7 @@ public final class MapProcessor {
         int bandY = com.velorise.simplemap.client.cave.DenseCaveTile.normalizeLayer(
                 com.velorise.simplemap.client.cave.CaveView.LAYERED, layerY);
         enqueue(new Task("cave:" + session.sessionId() + ':' + generation + ':' + bandY + ':' + regionX + ',' + regionZ,
-                Kind.CAVE_LOAD, session.sessionId(), generation, layerY,
+                Kind.CAVE_LOAD, session.stamp(), generation, layerY,
                 regionX, regionZ, priority, sequence.getAndIncrement()));
     }
 
@@ -68,7 +84,7 @@ public final class MapProcessor {
         if (session == null || session.rootToken().isCancelled()) return;
         long generation = FullCaveMapManager.getInstance().getGeneration();
         enqueue(new Task("full:" + session.sessionId() + ':' + generation + ':' + regionX + ',' + regionZ,
-                Kind.FULL_CAVE_LOAD, session.sessionId(), generation, Integer.MIN_VALUE,
+                Kind.FULL_CAVE_LOAD, session.stamp(), generation, Integer.MIN_VALUE,
                 regionX, regionZ, priority, sequence.getAndIncrement()));
     }
 
@@ -92,14 +108,37 @@ public final class MapProcessor {
     }
 
     public void clear() {
+        processorEpoch.incrementAndGet();
+        surfaceHintEpoch.incrementAndGet();
         queue.clear();
         queued.clear();
+        retryScheduled.clear();
     }
 
-    /** Drops queued surface disk requests when the fullscreen viewport changes. */
+    /** Drops every queued surface disk request after a discontinuous jump. */
     public void clearSurfaceLoads() {
+        surfaceHintEpoch.incrementAndGet();
         for (Task task : queued.values()) {
             if (task.kind != Kind.SURFACE_LOAD) continue;
+            if (queued.remove(task.key, task)) queue.remove(task);
+        }
+    }
+
+    /**
+     * Retains queued source reads that are still useful to an overlapping panned
+     * viewport and removes only regions that have moved completely out of demand.
+     */
+    public void retainSurfaceLoadsInRegions(int minRegionX, int maxRegionX,
+            int minRegionZ, int maxRegionZ) {
+        int safeMinX = Math.min(minRegionX, maxRegionX);
+        int safeMaxX = Math.max(minRegionX, maxRegionX);
+        int safeMinZ = Math.min(minRegionZ, maxRegionZ);
+        int safeMaxZ = Math.max(minRegionZ, maxRegionZ);
+        surfaceHintEpoch.incrementAndGet();
+        for (Task task : queued.values()) {
+            if (task.kind != Kind.SURFACE_LOAD) continue;
+            if (task.regionX >= safeMinX && task.regionX <= safeMaxX
+                    && task.regionZ >= safeMinZ && task.regionZ <= safeMaxZ) continue;
             if (queued.remove(task.key, task)) queue.remove(task);
         }
     }
@@ -107,7 +146,15 @@ public final class MapProcessor {
     private void enqueue(Task task) {
         MapWorkGraph.Admission admission = MapWorkGraph.getInstance()
                 .request(task.workKey, task.generation);
-        if (admission != MapWorkGraph.Admission.ACCEPTED) return;
+        if (admission == MapWorkGraph.Admission.CANCELLED
+                || admission == MapWorkGraph.Admission.STALE) return;
+        // ACCEPTED and COALESCED both need an execution hint. The semantic state
+        // may already be dirty while its previous queue hint was cleared or
+        // rejected; treating COALESCED as "nothing to enqueue" would strand it.
+        enqueueHint(task);
+    }
+
+    private void enqueueHint(Task task) {
         // Queue admission is deliberately lossless. Deduplication keeps one task
         // per logical region, while Region/dirty state remains authoritative. A
         // full queue must never evict a lower-priority known-region request.
@@ -148,8 +195,10 @@ public final class MapProcessor {
             return;
         }
         RegionRecord.Lease lease = MapWorkGraph.getInstance().tryBegin(task.workKey);
-        if (lease == null) return;
-        boolean admitted = false;
+        if (lease == null) {
+            scheduleRetryIfNeeded(task);
+            return;
+        }
         boolean completionOwnedByManager = false;
         try {
             switch (task.kind) {
@@ -185,9 +234,40 @@ public final class MapProcessor {
             if (completionOwnedByManager) {
                 // Manager-owned source/projection work remains RUNNING until its
                 // asynchronous archive or disk result has committed.
-            } else if (admitted) MapWorkGraph.getInstance().complete(lease);
-            else MapWorkGraph.getInstance().defer(lease);
+            } else {
+                MapWorkGraph.getInstance().defer(lease);
+            }
         }
+    }
+
+    private void scheduleRetryIfNeeded(Task task) {
+        RegionRecord.Snapshot snapshot = MapWorkGraph.getInstance().snapshot(task.workKey);
+        if (snapshot == null || snapshot.cancelled()) return;
+        RegionRecord.StageSnapshot stage = snapshot.stages().get(
+                new RegionRecord.StageKey(task.workKey.stage(),
+                        task.workKey.projectionId()));
+        if (stage == null || (stage.state() != RegionRecord.StageState.RUNNING
+                && stage.state() != RegionRecord.StageState.DIRTY)) return;
+        if (!retryScheduled.add(task.key)) return;
+        long expectedProcessorEpoch = processorEpoch.get();
+        long expectedSurfaceEpoch = surfaceHintEpoch.get();
+        retryExecutor.schedule(() -> {
+            retryScheduled.remove(task.key);
+            if (processorEpoch.get() != expectedProcessorEpoch) return;
+            if (task.kind == Kind.SURFACE_LOAD
+                    && surfaceHintEpoch.get() != expectedSurfaceEpoch) return;
+            if (!MapSessionManager.getInstance().isCurrent(task.sessionId)) return;
+            RegionRecord.Snapshot current = MapWorkGraph.getInstance()
+                    .snapshot(task.workKey);
+            if (current == null || current.cancelled()) return;
+            RegionRecord.StageSnapshot currentStage = current.stages().get(
+                    new RegionRecord.StageKey(task.workKey.stage(),
+                            task.workKey.projectionId()));
+            if (currentStage == null || (currentStage.state()
+                    != RegionRecord.StageState.RUNNING
+                    && currentStage.state() != RegionRecord.StageState.DIRTY)) return;
+            enqueueHint(task.withSequence(sequence.getAndIncrement()));
+        }, 25L, TimeUnit.MILLISECONDS);
     }
 
     private enum Kind {
@@ -208,11 +288,12 @@ public final class MapProcessor {
         private final long sequence;
         private final MapWorkKey workKey;
 
-        private Task(String key, Kind kind, long sessionId, long generation, int layerY,
-                int regionX, int regionZ, int priority, long sequence) {
+        private Task(String key, Kind kind, RevisionStamp stamp, long generation,
+                int layerY, int regionX, int regionZ, int priority, long sequence) {
             this.key = Objects.requireNonNull(key);
             this.kind = Objects.requireNonNull(kind);
-            this.sessionId = sessionId;
+            RevisionStamp owner = Objects.requireNonNull(stamp, "stamp");
+            this.sessionId = owner.sessionId();
             this.generation = generation;
             this.layerY = layerY;
             this.regionX = regionX;
@@ -224,12 +305,17 @@ public final class MapProcessor {
                         com.velorise.simplemap.client.cave.CaveView.LAYERED, layerY);
                 case SURFACE_LOAD, FULL_CAVE_LOAD -> Integer.MIN_VALUE;
             };
-            this.workKey = new MapWorkKey(sessionId, regionX, regionZ,
+            this.workKey = new MapWorkKey(owner, regionX, regionZ,
                     switch (kind) {
                         case SURFACE_LOAD -> MapWorkStage.SOURCE_READ;
                         case CAVE_LOAD -> MapWorkStage.CAVE_PROJECTION;
                         case FULL_CAVE_LOAD -> MapWorkStage.FULL_CAVE_PROJECTION;
                     }, projectionId);
+        }
+
+        private Task withSequence(long newSequence) {
+            return new Task(key, kind, workKey.stamp(), generation, layerY,
+                    regionX, regionZ, priority, newSequence);
         }
 
         @Override

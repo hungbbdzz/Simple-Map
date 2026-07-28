@@ -103,8 +103,7 @@ final class SurfaceWorldSaveReconstructor {
             for (int localX = 0; localX < 16; localX++) {
                 int blockX = firstX + localX;
                 int blockZ = firstZ + localZ;
-                MapBlockData existing = manager.getBlockData(blockX, blockZ);
-                if (existing != null && !existing.isEmpty()) continue;
+                if (!MapBlockData.isEmpty(manager.getPackedBlockData(blockX, blockZ))) continue;
                 DecodedWorldChunkSource.SurfaceProjection projection =
                         columns[(localZ << 4) | localX];
                 if (projection == null || projection.empty()) continue;
@@ -112,17 +111,10 @@ final class SurfaceWorldSaveReconstructor {
                 if (region == null || !region.isLoaded()) continue;
                 int blockIndex = region.getOrAddBlockIndex(projection.blockId());
                 int biomeIndex = region.getOrAddBiomeIndex(projection.biomeId());
-                MapBlockData data = MapBlockData.builder()
-                        .topY(projection.topY())
-                        .floorY(projection.floorY())
-                        .blockId(blockIndex)
-                        .biomeId(biomeIndex)
-                        .light(projection.blockLight())
-                        .glowing(projection.glowing())
-                        .fluid(projection.fluid())
-                        .flower(projection.flower())
-                        .leaves(projection.leaves())
-                        .build();
+                MapBlockData data = MapBlockData.create(
+                        projection.topY(), projection.floorY(), blockIndex, biomeIndex,
+                        projection.blockLight(), projection.glowing(), projection.fluid(),
+                        projection.flower(), projection.leaves());
                 manager.setBlockData(blockX, blockZ, data, projection.tint());
             }
         }

@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -50,6 +51,19 @@ public final class RegionDataStore {
     private static final long SAVE_RETRY_DELAY_MS = 500L;
 
     public static final String FILE_EXT = ".smdat";
+
+    public enum SaveStatus {
+        COMMITTED,
+        FAILED_RETRYING,
+        SUPERSEDED,
+        REJECTED
+    }
+
+    public record SaveResult(SaveStatus status, File directory, int regionX,
+            int regionZ, Throwable failure) {
+        public boolean success() { return status == SaveStatus.COMMITTED; }
+        public boolean retrying() { return status == SaveStatus.FAILED_RETRYING; }
+    }
 
     private RegionDataStore() {
     }
@@ -91,14 +105,35 @@ public final class RegionDataStore {
         // Normal client-tick persistence should call trySaveAsync() first so it
         // cannot retain snapshots for every loaded region at once.
         enqueueSave(directory, rx, rz, packedPixels, tints,
-                biomePalette, blockPalette, true);
+                biomePalette, blockPalette, true, null);
     }
 
     public static boolean trySaveAsync(File directory, int rx, int rz,
             long[] packedPixels, int[] tints, String[] biomePalette,
             String[] blockPalette) {
         return enqueueSave(directory, rx, rz, packedPixels, tints,
-                biomePalette, blockPalette, false);
+                biomePalette, blockPalette, false, null);
+    }
+
+    public static void saveAsync(File directory, int rx, int rz,
+            long[] packedPixels, int[] tints, String[] biomePalette,
+            String[] blockPalette, Consumer<SaveResult> completion) {
+        enqueueSave(directory, rx, rz, packedPixels, tints,
+                biomePalette, blockPalette, true, completion);
+    }
+
+
+    /**
+     * Enqueues a coalesced save and reports actual disk outcomes. ACCEPTED only
+     * means the request is retained; COMMITTED is emitted after writeAtomic()
+     * succeeds. Transient failures emit FAILED_RETRYING while retaining the same
+     * immutable snapshot for retry.
+     */
+    public static boolean trySaveAsync(File directory, int rx, int rz,
+            long[] packedPixels, int[] tints, String[] biomePalette,
+            String[] blockPalette, Consumer<SaveResult> completion) {
+        return enqueueSave(directory, rx, rz, packedPixels, tints,
+                biomePalette, blockPalette, false, completion);
     }
 
     public static boolean canAcceptSave(File directory, int rx, int rz) {
@@ -111,19 +146,31 @@ public final class RegionDataStore {
 
     private static boolean enqueueSave(File directory, int rx, int rz,
             long[] packedPixels, int[] tints, String[] biomePalette,
-            String[] blockPalette, boolean force) {
+            String[] blockPalette, boolean force,
+            Consumer<SaveResult> completion) {
         if (directory == null || packedPixels == null || packedPixels.length != PIXEL_COUNT
-                || tints == null || tints.length != PIXEL_COUNT) return false;
+                || tints == null || tints.length != PIXEL_COUNT) {
+            notifyCompletion(completion, new SaveResult(SaveStatus.REJECTED,
+                    directory, rx, rz, null));
+            return false;
+        }
         String key = saveKey(directory, rx, rz);
         if (!force && !PENDING_SAVES.containsKey(key)
                 && !IN_FLIGHT_SAVES.containsKey(key)
-                && PENDING_SAVES.size() >= MAX_PENDING_SAVES) return false;
+                && PENDING_SAVES.size() >= MAX_PENDING_SAVES) {
+            notifyCompletion(completion, new SaveResult(SaveStatus.REJECTED,
+                    directory, rx, rz, null));
+            return false;
+        }
         SaveRequest request = new SaveRequest(directory, rx, rz,
                 Arrays.copyOf(packedPixels, packedPixels.length),
                 Arrays.copyOf(tints, tints.length),
                 Arrays.copyOf(biomePalette, biomePalette.length),
-                Arrays.copyOf(blockPalette, blockPalette.length));
-        PENDING_SAVES.put(key, request);
+                Arrays.copyOf(blockPalette, blockPalette.length), completion);
+        SaveRequest previous = PENDING_SAVES.put(key, request);
+        if (previous != null && previous != request) {
+            previous.notifyResult(SaveStatus.SUPERSEDED, null);
+        }
         scheduleSaveDrain(0L);
         return true;
     }
@@ -156,12 +203,18 @@ public final class RegionDataStore {
                 IN_FLIGHT_SAVES.put(request.key(), request);
                 try {
                     writeAtomic(new File(request.directory(), fileName(request.rx(), request.rz())),
-                            request.storedRegion());
+                            request.storedRegionView());
+                    request.notifyResult(SaveStatus.COMMITTED, null);
                 } catch (IOException exception) {
                     failed = true;
                     // A newer snapshot wins. Otherwise retain this exact snapshot
                     // and retry later; a transient disk error must not clear dirty data.
-                    PENDING_SAVES.putIfAbsent(request.key(), request);
+                    SaveRequest newer = PENDING_SAVES.putIfAbsent(
+                            request.key(), request);
+                    request.notifyResult(newer == null
+                                    ? SaveStatus.FAILED_RETRYING
+                                    : SaveStatus.SUPERSEDED,
+                            exception);
                     LOGGER.error("Failed to save region {},{}", request.rx(), request.rz(), exception);
                 } finally {
                     IN_FLIGHT_SAVES.remove(request.key(), request);
@@ -526,17 +579,60 @@ public final class RegionDataStore {
         return new File(directory, fileName(rx, rz)).toPath().toAbsolutePath().normalize().toString();
     }
 
-    private record SaveRequest(File directory, int rx, int rz, long[] packedPixels, int[] tints,
-            String[] biomePalette, String[] blockPalette) {
+    private static final class SaveRequest {
+        private final File directory;
+        private final int rx;
+        private final int rz;
+        private final long[] packedPixels;
+        private final int[] tints;
+        private final String[] biomePalette;
+        private final String[] blockPalette;
+        private final Consumer<SaveResult> completion;
+
+        private SaveRequest(File directory, int rx, int rz, long[] packedPixels,
+                int[] tints, String[] biomePalette, String[] blockPalette,
+                Consumer<SaveResult> completion) {
+            this.directory = directory;
+            this.rx = rx;
+            this.rz = rz;
+            this.packedPixels = packedPixels;
+            this.tints = tints;
+            this.biomePalette = biomePalette;
+            this.blockPalette = blockPalette;
+            this.completion = completion;
+        }
+
+        private File directory() { return directory; }
+        private int rx() { return rx; }
+        private int rz() { return rz; }
+
         private String key() {
             return saveKey(directory, rx, rz);
         }
 
+        /** Immutable owned arrays for the IO worker; no second 3 MiB clone. */
+        private StoredRegion storedRegionView() {
+            return new StoredRegion(packedPixels, tints, biomePalette, blockPalette);
+        }
+
+        /** Defensive copy for readers racing an in-flight save. */
         private StoredRegion storedRegion() {
-            return new StoredRegion(Arrays.copyOf(packedPixels, packedPixels.length),
-                    Arrays.copyOf(tints, tints.length),
-                    Arrays.copyOf(biomePalette, biomePalette.length),
-                    Arrays.copyOf(blockPalette, blockPalette.length));
+            return storedRegionView().deepCopy();
+        }
+
+        private void notifyResult(SaveStatus status, Throwable failure) {
+            notifyCompletion(completion,
+                    new SaveResult(status, directory, rx, rz, failure));
+        }
+    }
+
+    private static void notifyCompletion(Consumer<SaveResult> completion,
+            SaveResult result) {
+        if (completion == null) return;
+        try {
+            completion.accept(result);
+        } catch (Throwable callbackFailure) {
+            LOGGER.warn("SimpleMap save completion callback failed", callbackFailure);
         }
     }
 }

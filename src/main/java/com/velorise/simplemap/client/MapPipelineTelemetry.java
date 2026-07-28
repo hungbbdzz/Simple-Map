@@ -41,6 +41,13 @@ public final class MapPipelineTelemetry {
     private final AtomicLong sourceLeasesOpened = new AtomicLong();
     private final AtomicLong sourceLeasesClosed = new AtomicLong();
     private final AtomicLong sourceDecodesCancelledNoConsumers = new AtomicLong();
+    private volatile int lastRenderExactPages;
+    private volatile int lastRenderBranchNodes;
+    private volatile int lastRenderLegacyFallbacks;
+    private volatile boolean lastRenderHadContent;
+    private volatile String lastRenderProjection = "NONE";
+    private volatile int lastRenderHierarchyLevel;
+    private volatile long lastRenderNanos;
     private final AtomicLongArray stageCount =
             new AtomicLongArray(MapPipelineStage.values().length);
     private final AtomicLongArray stageTotalNanos =
@@ -83,14 +90,31 @@ public final class MapPipelineTelemetry {
         exactGpuReady.incrementAndGet();
     }
 
+    public void recordRenderContext(String projection, int hierarchyLevel) {
+        lastRenderProjection = projection == null ? "UNKNOWN" : projection;
+        lastRenderHierarchyLevel = Math.max(0, hierarchyLevel);
+    }
+
     public void recordRenderResult(MapDrawResult result) {
-        if (result == null || !result.drewAnyMapContent()) {
-            noContentRenderPasses.incrementAndGet();
+        MapDrawResult effective = result == null ? MapDrawResult.EMPTY : result;
+        lastRenderExactPages = Math.max(0, effective.exactPagesDrawn());
+        lastRenderBranchNodes = Math.max(0, effective.branchNodesDrawn());
+        lastRenderLegacyFallbacks = Math.max(0, effective.legacyFallbacksDrawn());
+        lastRenderHadContent = effective.drewAnyMapContent();
+        lastRenderNanos = System.nanoTime();
+        if (!effective.drewAnyMapContent()) {
+            long count = noContentRenderPasses.incrementAndGet();
+            MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+            if (recorder.shouldEmitEvent("RENDER_NO_CONTENT", 1000L)) {
+                recorder.event("RENDER_NO_CONTENT",
+                        "count=" + count + " exact_gpu=" + exactGpuReady.get()
+                                + " exact_drawn=" + exactPagesDrawn.get());
+            }
             return;
         }
-        exactPagesDrawn.addAndGet(Math.max(0, result.exactPagesDrawn()));
-        branchNodesDrawn.addAndGet(Math.max(0, result.branchNodesDrawn()));
-        legacyFallbacksDrawn.addAndGet(Math.max(0, result.legacyFallbacksDrawn()));
+        exactPagesDrawn.addAndGet(lastRenderExactPages);
+        branchNodesDrawn.addAndGet(lastRenderBranchNodes);
+        legacyFallbacksDrawn.addAndGet(lastRenderLegacyFallbacks);
     }
 
     public void recordRenderPlanBuild(int quads, int textureGroups) {
@@ -113,17 +137,31 @@ public final class MapPipelineTelemetry {
             case "PRESENT" -> sourcePresent.incrementAndGet();
             case "ABSENT" -> sourceAbsent.incrementAndGet();
             case "DEFERRED" -> sourceDeferred.incrementAndGet();
-            case "FAILED" -> sourceFailed.incrementAndGet();
+            case "FAILED" -> {
+                long count = sourceFailed.incrementAndGet();
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("SOURCE_FAILED", 500L)) {
+                    recorder.event("SOURCE_FAILED", "count=" + count);
+                }
+            }
             default -> { }
         }
     }
 
     public void recordTaskCancelledBeforeRun() {
-        tasksCancelledBeforeRun.incrementAndGet();
+        long count = tasksCancelledBeforeRun.incrementAndGet();
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent("TASK_CANCELLED_BEFORE_RUN", 500L)) {
+            recorder.event("TASK_CANCELLED_BEFORE_RUN", "count=" + count);
+        }
     }
 
     public void recordTaskCompletedButDiscarded() {
-        tasksCompletedButDiscarded.incrementAndGet();
+        long count = tasksCompletedButDiscarded.incrementAndGet();
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent("TASK_COMPLETED_DISCARDED", 500L)) {
+            recorder.event("TASK_COMPLETED_DISCARDED", "count=" + count);
+        }
     }
 
 
@@ -132,7 +170,11 @@ public final class MapPipelineTelemetry {
     }
 
     public void recordBranchUpdateDropped() {
-        branchUpdatesDropped.incrementAndGet();
+        long count = branchUpdatesDropped.incrementAndGet();
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent("BRANCH_UPDATE_DROPPED", 500L)) {
+            recorder.event("BRANCH_UPDATE_DROPPED", "count=" + count);
+        }
     }
 
     public void recordSourceLeaseOpened() {
@@ -166,6 +208,14 @@ public final class MapPipelineTelemetry {
                 stageMaxNanos.get(index));
     }
 
+    public RenderSnapshot renderSnapshot() {
+        long ageNanos = lastRenderNanos == 0L ? Long.MAX_VALUE
+                : Math.max(0L, System.nanoTime() - lastRenderNanos);
+        return new RenderSnapshot(lastRenderExactPages, lastRenderBranchNodes,
+                lastRenderLegacyFallbacks, lastRenderHadContent, ageNanos,
+                lastRenderProjection, lastRenderHierarchyLevel);
+    }
+
     public void reset() {
         for (AtomicLong counter : viewportRequests.values()) counter.set(0L);
         for (AtomicLong counter : pageAdmissions.values()) counter.set(0L);
@@ -193,6 +243,13 @@ public final class MapPipelineTelemetry {
         sourceLeasesOpened.set(0L);
         sourceLeasesClosed.set(0L);
         sourceDecodesCancelledNoConsumers.set(0L);
+        lastRenderExactPages = 0;
+        lastRenderBranchNodes = 0;
+        lastRenderLegacyFallbacks = 0;
+        lastRenderProjection = "NONE";
+        lastRenderHierarchyLevel = 0;
+        lastRenderHadContent = false;
+        lastRenderNanos = 0L;
         for (MapPipelineStage stage : MapPipelineStage.values()) {
             int index = stage.ordinal();
             stageCount.set(index, 0L);
@@ -257,11 +314,15 @@ public final class MapPipelineTelemetry {
                 + ",datafix=" + averageMillis(MapPipelineStage.DATA_FIX)
                 + ",decode=" + averageMillis(MapPipelineStage.CHUNK_DECODE)
                 + ",sourceWait=" + averageMillis(MapPipelineStage.SOURCE_WAIT)
+                + ",surfaceCapture=" + averageMillis(MapPipelineStage.SURFACE_CAPTURE)
+                + "/" + maxMillis(MapPipelineStage.SURFACE_CAPTURE)
+                + ",surfaceAssembly=" + averageMillis(MapPipelineStage.SURFACE_ASSEMBLY)
+                + "/" + maxMillis(MapPipelineStage.SURFACE_ASSEMBLY)
                 + ",exactBuild=" + averageMillis(MapPipelineStage.EXACT_BUILD)
                 + ",exactUpload=" + averageMillis(MapPipelineStage.EXACT_UPLOAD)
                 + ",branch=" + averageMillis(MapPipelineStage.BRANCH_DERIVE) + "]"
-                + schedulerSummary() + persistenceSummary()
-                + gpuSummary() + residencySummary();
+                + schedulerSummary() + surfaceSourceSummary()
+                + persistenceSummary() + gpuSummary() + residencySummary();
     }
 
     private String schedulerSummary() {
@@ -269,7 +330,28 @@ public final class MapPipelineTelemetry {
         return " work[cpu=" + scheduler.cpuActive() + "/" + scheduler.cpuQueued()
                 + ",cpuCost=" + scheduler.cpuQueuedCost()
                 + ",io=" + scheduler.ioActive() + "/" + scheduler.ioQueued()
-                + ",ioCost=" + scheduler.ioQueuedCost() + "]";
+                + ",ioCost=" + scheduler.ioQueuedCost()
+                + ",lanes=" + scheduler.cpuQueued(MapRequestLane.MINIMAP)
+                + "/" + scheduler.cpuQueued(MapRequestLane.FULLSCREEN)
+                + "/" + scheduler.cpuQueued(MapRequestLane.BACKGROUND)
+                + "/" + scheduler.cpuQueued(MapRequestLane.PREFETCH)
+                + ",done=" + scheduler.completed(MapRequestLane.MINIMAP)
+                + "/" + scheduler.completed(MapRequestLane.FULLSCREEN)
+                + "/" + scheduler.completed(MapRequestLane.BACKGROUND)
+                + "/" + scheduler.completed(MapRequestLane.PREFETCH)
+                + ",denied=" + scheduler.denied(MapRequestLane.MINIMAP)
+                + "/" + scheduler.denied(MapRequestLane.FULLSCREEN)
+                + "/" + scheduler.denied(MapRequestLane.BACKGROUND)
+                + "/" + scheduler.denied(MapRequestLane.PREFETCH) + "]";
+    }
+
+    private String surfaceSourceSummary() {
+        SurfaceRegionSourceDatabase.Snapshot source =
+                SurfaceRegionSourceDatabase.getInstance().snapshot();
+        return " sourceDb[regions=" + source.regions()
+                + ",chunks=" + source.residentChunks()
+                + ",views=" + source.pinnedViews()
+                + ",closing=" + source.closingRegions() + "]";
     }
 
     private String persistenceSummary() {
@@ -311,6 +393,12 @@ public final class MapPipelineTelemetry {
                 + ",available=" + (atlas.detectedAvailableVramBytes() > 0L
                         ? formatMiB(atlas.detectedAvailableVramBytes()) : "unknown")
                 + "]";
+    }
+
+    private String maxMillis(MapPipelineStage stage) {
+        long nanos = stageMaxNanos.get(stage.ordinal());
+        return String.format(java.util.Locale.ROOT, "%.2f",
+                nanos / 1_000_000.0);
     }
 
     private static String formatMiB(long bytes) {
@@ -365,6 +453,14 @@ public final class MapPipelineTelemetry {
 
         public long pageAdmissions(MapRequestLane lane) {
             return pageAdmissionsByLane[safe(lane).ordinal()];
+        }
+    }
+
+    public record RenderSnapshot(int exactPages, int branchNodes,
+            int legacyFallbacks, boolean hadContent, long ageNanos,
+            String projection, int hierarchyLevel) {
+        public double ageMillis() {
+            return ageNanos == Long.MAX_VALUE ? -1.0 : ageNanos / 1_000_000.0;
         }
     }
 

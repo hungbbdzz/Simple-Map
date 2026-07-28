@@ -16,6 +16,7 @@ public final class MapPublicationCoordinator {
     private boolean surfaceFocus;
     private MapRequestLane surfaceLane;
     private boolean layeredCaveRequested;
+    private boolean layeredCaveFocus;
     private boolean fullCaveRequested;
     private boolean fullCaveFocus;
     private boolean publicationAllowed;
@@ -36,6 +37,7 @@ public final class MapPublicationCoordinator {
         surfaceFocus = false;
         surfaceLane = null;
         layeredCaveRequested = false;
+        layeredCaveFocus = false;
         fullCaveRequested = false;
         fullCaveFocus = false;
         coalescedRequests = 0L;
@@ -59,8 +61,13 @@ public final class MapPublicationCoordinator {
     }
 
     public void requestLayeredCave() {
+        requestLayeredCave(false);
+    }
+
+    public void requestLayeredCave(boolean focus) {
         if (layeredCaveRequested) coalescedRequests++;
         layeredCaveRequested = true;
+        layeredCaveFocus |= focus;
     }
 
     public void requestFullCave(boolean focus) {
@@ -81,7 +88,8 @@ public final class MapPublicationCoordinator {
         if (!surfaceRequested && !layeredCaveRequested && !fullCaveRequested) return;
         lastFrameId = frameId;
 
-        boolean focused = fullCaveRequested ? fullCaveFocus : surfaceFocus;
+        boolean focused = fullCaveRequested ? fullCaveFocus
+                : layeredCaveRequested ? layeredCaveFocus : surfaceFocus;
         MapGpuBudgetController.getInstance().beginFrame(focused);
         long started = System.nanoTime();
         if (fullCaveRequested) {
@@ -89,9 +97,17 @@ public final class MapPublicationCoordinator {
         } else if (layeredCaveRequested) {
             CaveTextureManager.getInstance().uploadDirtyTextures(false);
         } else if (surfaceRequested) {
+            /*
+             * Publish prepared coarse branches before exact leaves consume the
+             * shared frame ledger. This gives far-zoom L1 coverage a deterministic
+             * path to the screen instead of letting exact uploads starve it forever.
+             * Exact pages published below feed the branch source for the next frame;
+             * avoiding a second same-frame drain keeps denial counters and render
+             * thread planning work bounded.
+             */
+            MapOverviewTextureManager.getInstance().publishBranches(surfaceFocus);
             MapTextureManager.getInstance().uploadExactTextures(
                     surfaceLane, surfaceFocus);
-            MapOverviewTextureManager.getInstance().publishBranches(surfaceFocus);
         }
         drainCount++;
         MapObservationTelemetry.getInstance().record(

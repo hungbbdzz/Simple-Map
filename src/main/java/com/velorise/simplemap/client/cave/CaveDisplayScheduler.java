@@ -23,7 +23,6 @@ final class CaveDisplayScheduler {
     private static final int MAX_TASKS = 512;
     private static final int COLUMN_BURST = 12;
     private static final long VIEWPORT_REFRESH_NANOS = 150_000_000L;
-    private static final long FULLSCREEN_PAGE_STALL_NANOS = 2_000_000_000L;
 
     private final CaveTileRepository repository;
     private final CaveChunkReadinessTracker readiness;
@@ -117,7 +116,8 @@ final class CaveDisplayScheduler {
                 minChunkX, maxChunkX, minChunkZ, maxChunkZ);
         if (!changed && now - state.lastEnqueueNanos < VIEWPORT_REFRESH_NANOS) return;
         state.update(view, normalizedLayer, layerY,
-                minChunkX, maxChunkX, minChunkZ, maxChunkZ, now, changed);
+                minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                centerChunkX, centerChunkZ, now, changed);
 
         if (changed) {
             var iterator = queued.entrySet().iterator();
@@ -132,54 +132,43 @@ final class CaveDisplayScheduler {
 
         if (effectiveLane == MapRequestLane.FULLSCREEN) {
             /*
-             * Live cave projection follows the same 64x64 page frontier as saved
-             * source reconstruction and exact publication. Only one loaded 4x4
-             * chunk page is admitted per refresh. This replaces the old centre-out
-             * enqueue of every loaded chunk in the viewport, which produced random
-             * islands and large duplicate queues.
+             * Advance a bounded rolling 64x64 page frontier. Never wait for one
+             * incomplete live page: old tiles remain visible and the missed page
+             * is revisited on the next cycle. This prevents a single unavailable
+             * chunk from freezing the full-map viewport.
              */
-            int minPageX = Math.floorDiv(minChunkX, 4);
-            int maxPageX = Math.floorDiv(maxChunkX, 4);
-            int minPageZ = Math.floorDiv(minChunkZ, 4);
-            int maxPageZ = Math.floorDiv(maxChunkZ, 4);
-            int width = Math.max(0, maxPageX - minPageX + 1);
-            int height = Math.max(0, maxPageZ - minPageZ + 1);
-            int totalPages = width * height;
+            int totalPages = state.pagePlan.length;
             if (totalPages <= 0) return;
             if (state.fullscreenPageCursor >= totalPages) {
                 state.fullscreenPageCursor = 0;
                 state.completedCycles++;
             }
-            if (state.pageOpenedNanos == 0L) state.pageOpenedNanos = now;
-
-            int ordinal = state.fullscreenPageCursor;
-            int pageX = minPageX + ordinal % width;
-            int pageZ = minPageZ + ordinal / width;
-            int firstChunkX = pageX * 4;
-            int firstChunkZ = pageZ * 4;
-            boolean pageSettled = true;
-            boolean pageHasLoadedChunks = false;
-            for (int localZ = 0; localZ < 4; localZ++) {
-                for (int localX = 0; localX < 4; localX++) {
-                    int chunkX = firstChunkX + localX;
-                    int chunkZ = firstChunkZ + localZ;
-                    if (chunkX < minChunkX || chunkX > maxChunkX
-                            || chunkZ < minChunkZ || chunkZ > maxChunkZ
-                            || !level.hasChunk(chunkX, chunkZ)) continue;
-                    pageHasLoadedChunks = true;
-                    if (repository.hasFreshDisplayTileSource(view, layerY,
-                            chunkX, chunkZ, DenseCaveTile.Source.LIVE)) continue;
-                    pageSettled = false;
-                    int localOrdinal = localZ * 4 + localX;
-                    enqueue(chunkX, chunkZ, view, layerY,
-                            basePriority + 220_000 - localOrdinal * 1_000,
-                            effectiveLane, -1, false);
+            int pageBudget = com.velorise.simplemap.client.MapPerformanceGovernor
+                    .getInstance().underPressure() ? 1 : 2;
+            for (int page = 0; page < pageBudget
+                    && state.fullscreenPageCursor < totalPages; page++) {
+                int ordinal = state.fullscreenPageCursor++;
+                long packedPage = state.pagePlan[ordinal];
+                int pageX = CaveLoadHierarchy.x(packedPage);
+                int pageZ = CaveLoadHierarchy.z(packedPage);
+                int firstChunkX = pageX * 4;
+                int firstChunkZ = pageZ * 4;
+                for (int localZ = 0; localZ < 4; localZ++) {
+                    for (int localX = 0; localX < 4; localX++) {
+                        int chunkX = firstChunkX + localX;
+                        int chunkZ = firstChunkZ + localZ;
+                        if (chunkX < minChunkX || chunkX > maxChunkX
+                                || chunkZ < minChunkZ || chunkZ > maxChunkZ
+                                || !level.hasChunk(chunkX, chunkZ)) continue;
+                        if (repository.hasFreshDisplayTileSource(view, layerY,
+                                chunkX, chunkZ, DenseCaveTile.Source.LIVE)) continue;
+                        int localOrdinal = localZ * 4 + localX;
+                        enqueue(chunkX, chunkZ, view, layerY,
+                                basePriority + 220_000 - ordinal * 250
+                                        - localOrdinal * 1_000,
+                                effectiveLane, -1, false);
+                    }
                 }
-            }
-            if (pageSettled || !pageHasLoadedChunks
-                    || now - state.pageOpenedNanos >= FULLSCREEN_PAGE_STALL_NANOS) {
-                state.fullscreenPageCursor++;
-                state.pageOpenedNanos = 0L;
             }
             return;
         }
@@ -271,12 +260,38 @@ final class CaveDisplayScheduler {
             }
             return;
         }
-        if (queued.size() >= MAX_TASKS) return;
+        if (queued.size() >= MAX_TASKS
+                && (viewportLane != null || !evictWeakViewportTask(priority))) return;
         Task task = new Task(key, layerY, priority, sequence++, repository.generation(),
                 viewportLane != null, fullProjection);
         if (!fullProjection) task.addPatchColumn(patchColumn);
         queued.put(key, task);
         queue.offer(task);
+    }
+
+    /**
+     * Mutation/player hot-set work must not be rejected merely because a distant
+     * fullscreen frontier filled the queue first. Evict only an idle, non-persistent
+     * viewport task with lower priority; started transactions are never torn down.
+     */
+    private boolean evictWeakViewportTask(int incomingPriority) {
+        Task victim = null;
+        for (Task candidate : queued.values()) {
+            if (!candidate.viewportDemand || candidate.persistentDemand
+                    || candidate.hasStarted() || candidate.cancelled) continue;
+            if (candidate.priority >= incomingPriority) continue;
+            if (victim == null || candidate.priority < victim.priority
+                    || (candidate.priority == victim.priority
+                            && candidate.sequence < victim.sequence)) {
+                victim = candidate;
+            }
+        }
+        if (victim == null) return false;
+        victim.cancelled = true;
+        queued.remove(victim.key, victim);
+        queue.remove(victim);
+        deferred.remove(victim);
+        return true;
     }
 
     int process(Level level, long deadlineNanos) {
@@ -437,8 +452,8 @@ final class CaveDisplayScheduler {
         private int minChunkZ = Integer.MIN_VALUE;
         private int maxChunkZ = Integer.MIN_VALUE;
         private long lastEnqueueNanos;
+        private long[] pagePlan = new long[0];
         private int fullscreenPageCursor;
-        private long pageOpenedNanos;
         private long completedCycles;
 
         private boolean matchesShape(CaveView view, int layerY, int projectionTopY,
@@ -451,10 +466,32 @@ final class CaveDisplayScheduler {
 
         private void update(CaveView view, int layerY, int projectionTopY,
                 int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ,
+                double centerChunkX, double centerChunkZ,
                 long nowNanos, boolean changed) {
             if (changed) {
+                int previousMinPageX = Math.floorDiv(this.minChunkX, 4);
+                int previousMaxPageX = Math.floorDiv(this.maxChunkX, 4);
+                int previousMinPageZ = Math.floorDiv(this.minChunkZ, 4);
+                int previousMaxPageZ = Math.floorDiv(this.maxChunkZ, 4);
+                int minPageX = Math.floorDiv(minChunkX, 4);
+                int maxPageX = Math.floorDiv(maxChunkX, 4);
+                int minPageZ = Math.floorDiv(minChunkZ, 4);
+                int maxPageZ = Math.floorDiv(maxChunkZ, 4);
+                boolean continuousPan = this.view == view && this.layerY == layerY
+                        && this.projectionTopY == projectionTopY
+                        && rectanglesOverlap(previousMinPageX, previousMaxPageX,
+                                previousMinPageZ, previousMaxPageZ,
+                                minPageX, maxPageX, minPageZ, maxPageZ);
+                int centerPageX = clamp((int) Math.floor(centerChunkX / 4.0),
+                        minPageX, maxPageX);
+                int centerPageZ = clamp((int) Math.floor(centerChunkZ / 4.0),
+                        minPageZ, maxPageZ);
+                pagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
+                        minPageX, maxPageX, minPageZ, maxPageZ,
+                        centerPageX, centerPageZ, true, continuousPan,
+                        previousMinPageX, previousMaxPageX,
+                        previousMinPageZ, previousMaxPageZ);
                 fullscreenPageCursor = 0;
-                pageOpenedNanos = 0L;
                 completedCycles = 0L;
             }
             this.view = view;
@@ -465,6 +502,17 @@ final class CaveDisplayScheduler {
             this.minChunkZ = minChunkZ;
             this.maxChunkZ = maxChunkZ;
             this.lastEnqueueNanos = nowNanos;
+        }
+
+        private static int clamp(int value, int minimum, int maximum) {
+            return Math.max(minimum, Math.min(maximum, value));
+        }
+
+        private static boolean rectanglesOverlap(int firstMinX, int firstMaxX,
+                int firstMinZ, int firstMaxZ, int secondMinX, int secondMaxX,
+                int secondMinZ, int secondMaxZ) {
+            return firstMinX <= secondMaxX && firstMaxX >= secondMinX
+                    && firstMinZ <= secondMaxZ && firstMaxZ >= secondMinZ;
         }
 
         private boolean contains(Task task) {
@@ -488,8 +536,8 @@ final class CaveDisplayScheduler {
             projectionTopY = Integer.MIN_VALUE;
             minChunkX = maxChunkX = minChunkZ = maxChunkZ = Integer.MIN_VALUE;
             lastEnqueueNanos = 0L;
+            pagePlan = new long[0];
             fullscreenPageCursor = 0;
-            pageOpenedNanos = 0L;
             completedCycles = 0L;
         }
     }

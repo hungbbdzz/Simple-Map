@@ -36,6 +36,11 @@ neoForge {
         client {
             client()
             systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+            // The FancyModLoader early window can time out on Windows while GLFW
+            // is still starting, even though the normal Minecraft window would
+            // initialize successfully a moment later. Disable only the dev-run
+            // progress window; this property is not packaged into the mod jar.
+            systemProperty 'fml.earlyprogresswindow', 'false'
         }
         server {
             server()
@@ -74,6 +79,54 @@ tasks.withType(ProcessResources).configureEach {
 dependencies {
 }
 
+// src/test/java contains standalone architecture checks with main() methods,
+// not JUnit/TestNG tests. Gradle 9 fails the built-in test task when test
+// sources exist but no framework tests are discovered, so allow this
+// intentional no-test suite while keeping the JavaExec checks below active.
+tasks.named('test', Test) {
+    failOnNoDiscoveredTests = false
+}
+
 jar {
     destinationDirectory = file("../mods")
+}
+
+// Dependency-light state checks for the M2/M3 migration and M4 foundation.
+tasks.register('m2m3CoreCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.M2M3CoreCheck'
+}
+
+// Alias used by checkpoints that also validate the M4 durable LOD graph.
+tasks.register('m2m4CoreCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.M2M3CoreCheck'
+}
+
+// M4 region-centric hierarchy invariants: direct source seeding, 8x8 parent
+// propagation, deferred-work durability and exact-eviction replacement.
+tasks.register('m4RegionLodCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.M4RegionLodAuthorityCheck'
+}
+
+tasks.named('m2m4CoreCheck') {
+    dependsOn tasks.named('m4RegionLodCheck')
+}
+
+// Integrated architecture invariants for M5 page tables, M6 minimap ring,
+// M7/M8 cave archive/projection, M9 upload admission, M10 recovery and M11 boundaries.
+tasks.register('architectureStackCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.ArchitectureStackCheck'
+}
+
+// Aggregate static/state gate for the complete region-centric architecture stack.
+tasks.register('architectureAllCheck') {
+    dependsOn tasks.named('m2m4CoreCheck')
+    dependsOn tasks.named('architectureStackCheck')
 }

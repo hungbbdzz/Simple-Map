@@ -3,6 +3,7 @@ package com.velorise.simplemap.client.cave;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.velorise.simplemap.client.MapAtlasMemoryTracker;
 import com.velorise.simplemap.client.MapMemoryBudgetPolicy;
+import com.velorise.simplemap.client.MapPageLayout;
 import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
 
@@ -86,6 +87,42 @@ public final class SurfaceLeafAtlas {
         if (glowPixels != null && glowPixels.length >= SIZE * SIZE) {
             glowUploader.upload(glowTextureId, atlasX, atlasY, SIZE, SIZE,
                     glowPixels, SIZE, 0, 0);
+        }
+    }
+
+    /** Uploads only the changed 16x16 chunk-sized parts of one 64x64 leaf. */
+    public void uploadSubtiles(int slot, int[] colorPixels, int[] glowPixels,
+            int subtileMask) {
+        RenderSystem.assertOnRenderThreadOrInit();
+        initialize();
+        if (slot < 0 || slot >= SLOT_COUNT || !allocated[slot]) {
+            throw new IllegalStateException(
+                    "Attempted to upload an unallocated surface leaf slot");
+        }
+        if (subtileMask == 0) return;
+        int atlasBaseX = (slot % SLOT_COLUMNS) * SIZE;
+        int atlasBaseY = (slot / SLOT_COLUMNS) * SIZE;
+        for (int subtileZ = 0; subtileZ < MapPageLayout.SUBTILES_PER_PAGE;
+                subtileZ++) {
+            for (int subtileX = 0; subtileX < MapPageLayout.SUBTILES_PER_PAGE;
+                    subtileX++) {
+                int bit = 1 << MapPageLayout.subtileIndex(subtileX, subtileZ);
+                if ((subtileMask & bit) == 0) continue;
+                int sourceX = subtileX * MapPageLayout.SUBTILE_SIZE;
+                int sourceY = subtileZ * MapPageLayout.SUBTILE_SIZE;
+                int atlasX = atlasBaseX + sourceX;
+                int atlasY = atlasBaseY + sourceY;
+                if (colorPixels != null && colorPixels.length >= SIZE * SIZE) {
+                    colorUploader.upload(colorTextureId, atlasX, atlasY,
+                            MapPageLayout.SUBTILE_SIZE, MapPageLayout.SUBTILE_SIZE,
+                            colorPixels, SIZE, sourceX, sourceY);
+                }
+                if (glowPixels != null && glowPixels.length >= SIZE * SIZE) {
+                    glowUploader.upload(glowTextureId, atlasX, atlasY,
+                            MapPageLayout.SUBTILE_SIZE, MapPageLayout.SUBTILE_SIZE,
+                            glowPixels, SIZE, sourceX, sourceY);
+                }
+            }
         }
     }
 

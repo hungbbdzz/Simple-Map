@@ -28,6 +28,27 @@ final class MapAtlasBatchRenderer {
     }
 
     static void draw(GuiGraphics graphics, List<MapRenderPlan.Batch> batches) {
+        drawFiltered(graphics, batches, null);
+    }
+
+    static void drawPhase(GuiGraphics graphics,
+            List<MapRenderPlan.Batch> batches, int targetPhase) {
+        if (!hasPhase(batches, targetPhase)) return;
+        drawFiltered(graphics, batches, targetPhase);
+    }
+
+    private static boolean hasPhase(List<MapRenderPlan.Batch> batches,
+            int targetPhase) {
+        if (batches == null || batches.isEmpty()) return false;
+        for (MapRenderPlan.Batch batch : batches) {
+            if (batch.phase() == targetPhase) return true;
+            if (batch.phase() > targetPhase) return false;
+        }
+        return false;
+    }
+
+    private static void drawFiltered(GuiGraphics graphics,
+            List<MapRenderPlan.Batch> batches, Integer targetPhase) {
         if (graphics == null || batches == null || batches.isEmpty()) return;
 
         // Preserve ordering with GuiGraphics.fill()/blit() commands emitted before
@@ -41,6 +62,7 @@ final class MapAtlasBatchRenderer {
             Matrix4f matrix = graphics.pose().last().pose();
             int submissions = 0;
             for (MapRenderPlan.Batch batch : batches) {
+                if (targetPhase != null && batch.phase() != targetPhase) continue;
                 float[] vertices = batch.vertices();
                 if (vertices.length == 0) continue;
                 RenderSystem.setShaderTexture(0, batch.texture());
