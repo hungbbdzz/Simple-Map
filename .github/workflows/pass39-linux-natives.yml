@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - ci/pass39-linux-runtime
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
