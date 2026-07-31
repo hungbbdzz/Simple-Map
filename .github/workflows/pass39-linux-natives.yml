@@ -1,0 +1,50 @@
+name: PASS39 Linux natives
+
+on:
+  push:
+    branches:
+      - ci/pass39-linux-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-linux-natives:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Minecraft 1.21.1 Linux natives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p linux-natives
+          base=https://libraries.minecraft.net
+          declare -a paths=(
+            org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-linux.jar
+            org/lwjgl/lwjgl-freetype/3.3.3/lwjgl-freetype-3.3.3-natives-linux.jar
+            org/lwjgl/lwjgl-glfw/3.3.3/lwjgl-glfw-3.3.3-natives-linux.jar
+            org/lwjgl/lwjgl-jemalloc/3.3.3/lwjgl-jemalloc-3.3.3-natives-linux.jar
+            org/lwjgl/lwjgl-openal/3.3.3/lwjgl-openal-3.3.3-natives-linux.jar
+            org/lwjgl/lwjgl-opengl/3.3.3/lwjgl-opengl-3.3.3-natives-linux.jar
+            org/lwjgl/lwjgl-stb/3.3.3/lwjgl-stb-3.3.3-natives-linux.jar
+            org/lwjgl/lwjgl-tinyfd/3.3.3/lwjgl-tinyfd-3.3.3-natives-linux.jar
+          )
+          for path in "${paths[@]}"; do
+            curl --fail --location --retry 4 --retry-delay 2 "$base/$path" -o "linux-natives/$(basename "$path")"
+          done
+
+          curl --fail --location --retry 4 --retry-delay 2 \
+            https://repo1.maven.org/maven2/io/netty/netty-transport-native-epoll/4.1.97.Final/netty-transport-native-epoll-4.1.97.Final-linux-x86_64.jar \
+            -o linux-natives/netty-transport-native-epoll-4.1.97.Final-linux-x86_64.jar
+
+          sha1sum linux-natives/*.jar | sort > linux-natives/SHA1SUMS.txt
+          unzip -t linux-natives/lwjgl-glfw-3.3.3-natives-linux.jar
+          ls -lh linux-natives
+
+      - name: Upload native bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: pass39-linux-natives
+          path: linux-natives
+          if-no-files-found: error
+          retention-days: 7
