@@ -1,5 +1,6 @@
 package com.velorise.simplemap.client;
 
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.ChunkPos;
 
@@ -28,10 +29,11 @@ public final class GeneratedChunkIndex {
     private static final int MAX_ENTRIES = 262_144;
     private static final long ABSENT_TTL_MS = 30_000L;
     private static final long FAILURE_TTL_MS = 8_000L;
+    private static final ResourceLocation UNKNOWN_DIMENSION =
+            ResourceLocation.fromNamespaceAndPath("simplemap", "unknown");
 
     private final LinkedHashMap<Key, Entry> entries =
             new LinkedHashMap<>(4096, 0.75f, true);
-    private String observedDimension = "";
     private long globalEpoch = 1L;
 
     private GeneratedChunkIndex() {
@@ -42,16 +44,13 @@ public final class GeneratedChunkIndex {
     }
 
     public synchronized void observeLevel(Level level) {
-        String dimension = level == null
-                ? "unknown" : level.dimension().location().toString();
-        if (dimension.equals(observedDimension)) return;
-        observedDimension = dimension;
-        entries.clear();
-        globalEpoch++;
+        // Keys already include the registry dimension. The live ClientLevel and a
+        // remotely viewed singleplayer ServerLevel can legitimately be observed in
+        // the same tick; clearing here made them continuously erase each other's
+        // saved/live/absent provenance while switching map dimensions.
     }
 
     public synchronized void reset() {
-        observedDimension = "";
         entries.clear();
         globalEpoch++;
     }
@@ -122,6 +121,11 @@ public final class GeneratedChunkIndex {
         return entry.state;
     }
 
+    /** Hot-path queue telemetry only needs the resident entry count. */
+    public synchronized int entryCount() {
+        return entries.size();
+    }
+
     public synchronized Snapshot snapshot() {
         EnumMap<State, Integer> counts = new EnumMap<>(State.class);
         for (State state : State.values()) counts.put(state, 0);
@@ -149,8 +153,8 @@ public final class GeneratedChunkIndex {
     }
 
     private Key key(Level level, int chunkX, int chunkZ) {
-        String dimension = level == null
-                ? "unknown" : level.dimension().location().toString();
+        ResourceLocation dimension = level == null
+                ? UNKNOWN_DIMENSION : level.dimension().location();
         return new Key(dimension, ChunkPos.asLong(chunkX, chunkZ));
     }
 
@@ -163,7 +167,7 @@ public final class GeneratedChunkIndex {
         }
     }
 
-    private record Key(String dimension, long chunkPos) {
+    private record Key(ResourceLocation dimension, long chunkPos) {
     }
 
     private static final class Entry {

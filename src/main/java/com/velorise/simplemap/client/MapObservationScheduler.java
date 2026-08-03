@@ -19,6 +19,7 @@ public final class MapObservationScheduler {
     private static final MapObservationScheduler INSTANCE = new MapObservationScheduler();
 
     private Level observedLevel;
+    private long lastMovementEpoch = Long.MIN_VALUE;
     private final MapObservationTelemetry telemetry = MapObservationTelemetry.getInstance();
 
     private MapObservationScheduler() {
@@ -34,6 +35,8 @@ public final class MapObservationScheduler {
 
     public void reset() {
         observedLevel = null;
+        lastMovementEpoch = Long.MIN_VALUE;
+        MapActivityGate.getInstance().reset();
         GeneratedChunkIndex.getInstance().reset();
         CaveContextCache.getInstance().reset();
         MapMutationBus.getInstance().reset();
@@ -61,22 +64,49 @@ public final class MapObservationScheduler {
         CavePipeline pipeline = CavePipeline.getInstance();
         pipeline.tickClientState(minecraft);
 
-        long started = System.nanoTime();
-        MapMutationBus.getInstance().tick(minecraft,
-                profile.mutationColumnBudget(), profile.mutationChunkBudget(),
-                profile.mutationBudgetNanos());
-        telemetry.record(MapObservationTelemetry.Lane.MUTATION_REPAIR,
-                System.nanoTime() - started, profile.mutationColumnBudget());
+        MapActivityGate activityGate = MapActivityGate.getInstance();
+        boolean movementWindow = activityGate.blocksMapWork();
+        if (movementWindow) {
+            long epoch = activityGate.movementEpoch();
+            if (lastMovementEpoch != epoch) {
+                lastMovementEpoch = epoch;
+                MapMutationBus.getInstance().dropQueuedWorkForMovement();
+                MapViewportCoordinator.getInstance().prepareMovementStreaming();
+            }
+        }
 
+        long started = System.nanoTime();
+        if (!movementWindow) {
+            MapMutationBus.getInstance().tick(minecraft,
+                    profile.mutationColumnBudget(), profile.mutationChunkBudget(),
+                    profile.mutationBudgetNanos());
+        }
+        telemetry.record(MapObservationTelemetry.Lane.MUTATION_REPAIR,
+                System.nanoTime() - started,
+                movementWindow ? 0 : profile.mutationColumnBudget());
+
+        MapMutationBus mutationBus = MapMutationBus.getInstance();
+        boolean authoritativeBacklog = !movementWindow
+                && mutationBus.hasBacklog(513, 17);
         if (mapUnlocked && !mapScreenOpen) {
             int renderDistance = minecraft.options.renderDistance().get();
             int baseRadius = (int) Math.max(16, (renderDistance - 1.5) * 16);
             int radius = Math.max(16,
                     (int) Math.round(baseRadius * profile.liveRadiusFactor()));
             started = System.nanoTime();
-            ChunkScanner.getInstance().scanAroundPlayerUniform(minecraft, radius);
+            /*
+             * Packet-driven mutation transactions already own complete loaded
+             * chunks. Re-reading the same terrain through the rolling scanner while
+             * that queue is backlogged doubled Level/heightmap/palette work and was
+             * the dominant 600-1400 MiB/s gameplay allocation source. Cave may still
+             * advance its projection, but the scanner suppresses its duplicate
+             * surface/archive fallback until the authoritative queue catches up.
+             */
+            ChunkScanner.getInstance().scanAroundPlayerUniform(
+                    minecraft, radius, authoritativeBacklog);
             telemetry.record(MapObservationTelemetry.Lane.LIVE_CRITICAL,
-                    System.nanoTime() - started, radius);
+                    System.nanoTime() - started,
+                    authoritativeBacklog ? -radius : radius);
         }
 
         started = System.nanoTime();
@@ -95,10 +125,10 @@ public final class MapObservationScheduler {
                 System.nanoTime() - started, profile.allowVisibleScan() ? 1 : 0);
 
         MapMutationBus.Snapshot mutations = MapMutationBus.getInstance().snapshot();
-        GeneratedChunkIndex.Snapshot generated = GeneratedChunkIndex.getInstance().snapshot();
+        int generatedChunks = GeneratedChunkIndex.getInstance().entryCount();
         telemetry.updateQueues(mutations.pendingColumns(), mutations.pendingChunks(),
                 mutations.pendingRegions(),
-                generated.entries(), governor.underPressure());
+                generatedChunks, governor.underPressure());
         CaveWorldSaveReader.SourceCacheSnapshot source =
                 CaveWorldSaveReader.getInstance().sourceCacheSnapshot();
         telemetry.updateDecodedSource(source.regions(), source.decodedChunks(),

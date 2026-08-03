@@ -16,6 +16,7 @@ import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
@@ -49,6 +50,13 @@ public final class MapVisualClassifier {
     private volatile AtomicReferenceArray<VisualInfo> byStateId =
             new AtomicReferenceArray<>(4096);
     private final Map<BlockState, VisualInfo> fallback = new IdentityHashMap<>();
+    /**
+     * Surface styling stores compact block palette entries as strings. Resolving
+     * the same id through ResourceLocation + the block registry for every map
+     * pixel dominated allocation while exact leaves were arriving. Keep the
+     * worker-safe id view alongside the state-id cache.
+     */
+    private final Map<String, VisualInfo> byBlockId = new ConcurrentHashMap<>();
     private final CaveStateClassifier geometry = CaveStateClassifier.getInstance();
 
     private MapVisualClassifier() {
@@ -87,6 +95,13 @@ public final class MapVisualClassifier {
     }
 
     public VisualInfo info(String blockId) {
+        if (blockId == null || blockId.isEmpty()) {
+            return VisualInfo.unknown(blockId == null ? "" : blockId);
+        }
+        return byBlockId.computeIfAbsent(blockId, this::resolveBlockId);
+    }
+
+    private VisualInfo resolveBlockId(String blockId) {
         try {
             Block block = BuiltInRegistries.BLOCK.get(ResourceLocation.parse(blockId));
             return info(block.defaultBlockState());
@@ -154,6 +169,7 @@ public final class MapVisualClassifier {
         AtomicReferenceArray<VisualInfo> current = byStateId;
         for (int i = 0; i < current.length(); i++) current.set(i, null);
         fallback.clear();
+        byBlockId.clear();
     }
 
     private void ensureCapacityLocked(int required) {

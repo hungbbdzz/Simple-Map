@@ -13,14 +13,23 @@ import java.util.Map;
  * Durable region-centric LOD authority introduced for M4.
  *
  * <p>Level 0 represents one 512x512 surface region and owns 64 exact-leaf
- * versions. Every higher level groups 8x8 direct children. Queue entries are
+ * versions. Every higher level groups 2x2 direct children, matching the
+ * screen-space texture-level hierarchy. Queue entries are
  * disposable hints: dirty child masks, version sums and publication state remain
  * in this graph and can reconstruct work after queue reset or admission denial.</p>
  */
 public final class RegionLodGraph {
-    public static final int CHILDREN_PER_AXIS = 8;
-    public static final int CHILD_COUNT = CHILDREN_PER_AXIS * CHILDREN_PER_AXIS;
-    public static final long ALL_CHILDREN = -1L;
+    /** Exact 64x64 leaves contained by one 512x512 level-0 source region. */
+    public static final int LEAF_CHILDREN_PER_AXIS = 8;
+    /** Retained array width; parent levels use only their first four entries. */
+    public static final int CHILD_COUNT = LEAF_CHILDREN_PER_AXIS
+            * LEAF_CHILDREN_PER_AXIS;
+    public static final int PARENT_CHILDREN_PER_AXIS = 2;
+    public static final int PARENT_CHILD_COUNT = 4;
+    public static final long ALL_LEAF_CHILDREN = -1L;
+    public static final long ALL_PARENT_CHILDREN = 0xFL;
+    /** Compatibility alias for level-0 callers. */
+    public static final long ALL_CHILDREN = ALL_LEAF_CHILDREN;
     public static final int DEFAULT_MAX_LEVEL = 3;
 
     public enum State {
@@ -97,10 +106,17 @@ public final class RegionLodGraph {
         long normalized = Math.max(1L, leafVersion);
         long bit = 1L << leafIndex;
         long previous = node.childVersionSums[leafIndex];
-        // A late exact callback must never roll a region version backwards.
-        // Stale output may still be rendered by its exact owner, but it cannot
-        // become the durable M4 hierarchy authority.
-        if (normalized < previous) return;
+        boolean unpublishedDirectSeed = (node.directSeedMask & bit) != 0L
+                && node.publishedRevision == 0L
+                && node.preparedRevision == 0L;
+        // A direct 512x512 source probe seeds every child with one region-wide
+        // watermark before exact 64x64 leaves exist. That watermark and a leaf
+        // revision are different authorities, so an exact leaf may replace an
+        // unpublished seed even when its local revision number is lower. Once a
+        // coarse branch has been prepared/published, the old monotonic fence is
+        // retained and a late exact callback cannot roll durable coverage back.
+        if (normalized < previous && !unpublishedDirectSeed) return;
+        node.directSeedMask &= ~bit;
         node.childVersionSums[leafIndex] = normalized;
         node.aggregateVersionSum = safeAdd(node.aggregateVersionSum,
                 normalized - previous);
@@ -130,14 +146,27 @@ public final class RegionLodGraph {
         long normalized = Math.max(1L, sourceWatermark);
         boolean changed = false;
         for (int child = 0; child < CHILD_COUNT; child++) {
-            if (node.childVersionSums[child] >= normalized) continue;
+            long bit = 1L << child;
+            // Exact-leaf authority must not be overwritten by an unrelated
+            // region-wide source watermark. Direct seeding owns only empty or
+            // already-direct-seeded child slots; exact publication refines them
+            // independently and can then drive the level-0 compositor.
+            boolean directOwned = (node.directSeedMask & bit) != 0L;
+            if (!directOwned && node.childVersionSums[child] > 0L) continue;
+            if (node.childVersionSums[child] >= normalized) {
+                node.directSeedMask |= bit;
+                continue;
+            }
             node.childVersionSums[child] = normalized;
-            node.dirtyChildMask |= 1L << child;
+            node.directSeedMask |= bit;
+            node.dirtyChildMask |= bit;
             changed = true;
         }
         if (changed || node.publishedRevision == 0L) {
             recomputeAggregate(node);
-            if (node.dirtyChildMask == 0L) node.dirtyChildMask = ALL_CHILDREN;
+            if (node.dirtyChildMask == 0L) {
+                node.dirtyChildMask = completeMaskForLevel(0);
+            }
             node.targetRevision = revisionFor(node);
             markDirty(node);
             propagate(node);
@@ -192,6 +221,48 @@ public final class RegionLodGraph {
         return new Lease(key, node.stamp, node.runningRevision,
                 node.dirtyChildMask, node.knownMask, node.completeMask,
                 node.childVersionSums);
+    }
+
+    /**
+     * Claims visible level-0 regions in deterministic top-to-bottom order without
+     * materializing a snapshot and sorting every graph node on each render frame.
+     */
+    public synchronized List<Lease> claimLevel0RowMajor(long sessionId,
+            int projectionId, int minNodeX, int maxNodeX,
+            int minNodeZ, int maxNodeZ, int limit) {
+        return claimLevelRowMajor(sessionId, projectionId, 0,
+                minNodeX, maxNodeX, minNodeZ, maxNodeZ, limit);
+    }
+
+    /**
+     * Claims one visible hierarchy level in deterministic screen order. Far zoom
+     * uses this for the target region level instead of copying every graph node,
+     * sorting snapshots and then discarding almost all of them each frame.
+     */
+    public synchronized List<Lease> claimLevelRowMajor(long sessionId,
+            int projectionId, int level, int minNodeX, int maxNodeX,
+            int minNodeZ, int maxNodeZ, int limit) {
+        if (level < 0 || level > maxLevel || limit <= 0
+                || minNodeX > maxNodeX || minNodeZ > maxNodeZ) {
+            return List.of();
+        }
+        List<Lease> leases = new ArrayList<>(Math.min(limit, 8));
+        for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ
+                && leases.size() < limit; nodeZ++) {
+            for (int nodeX = minNodeX; nodeX <= maxNodeX
+                    && leases.size() < limit; nodeX++) {
+                NodeKey key = new NodeKey(sessionId, projectionId, level,
+                        nodeX, nodeZ);
+                NodeRecord node = nodes.get(key);
+                if (node == null || node.cancelled
+                        || node.state != State.DIRTY
+                        || node.dirtyChildMask == 0L
+                        || node.knownMask == 0L) continue;
+                Lease lease = tryBegin(key);
+                if (lease != null) leases.add(lease);
+            }
+        }
+        return List.copyOf(leases);
     }
 
     public synchronized List<Lease> claimCoarseFirst(long sessionId,
@@ -283,8 +354,8 @@ public final class RegionLodGraph {
             if (node != null && node.gpuResident
                     && node.publishedRevision >= minimumRevision
                     && node.knownMask != 0L) return true;
-            childX = Math.floorDiv(childX, CHILDREN_PER_AXIS);
-            childZ = Math.floorDiv(childZ, CHILDREN_PER_AXIS);
+            childX = Math.floorDiv(childX, PARENT_CHILDREN_PER_AXIS);
+            childZ = Math.floorDiv(childZ, PARENT_CHILDREN_PER_AXIS);
         }
         return false;
     }
@@ -384,11 +455,14 @@ public final class RegionLodGraph {
         NodeRecord current = child;
         for (int parentLevel = child.key.level() + 1;
                 parentLevel <= maxLevel; parentLevel++) {
-            int parentX = Math.floorDiv(current.key.nodeX(), CHILDREN_PER_AXIS);
-            int parentZ = Math.floorDiv(current.key.nodeZ(), CHILDREN_PER_AXIS);
-            int childIndex = Math.floorMod(current.key.nodeZ(), CHILDREN_PER_AXIS)
-                    * CHILDREN_PER_AXIS
-                    + Math.floorMod(current.key.nodeX(), CHILDREN_PER_AXIS);
+            int parentX = Math.floorDiv(current.key.nodeX(),
+                    PARENT_CHILDREN_PER_AXIS);
+            int parentZ = Math.floorDiv(current.key.nodeZ(),
+                    PARENT_CHILDREN_PER_AXIS);
+            int childIndex = Math.floorMod(current.key.nodeZ(),
+                    PARENT_CHILDREN_PER_AXIS) * PARENT_CHILDREN_PER_AXIS
+                    + Math.floorMod(current.key.nodeX(),
+                            PARENT_CHILDREN_PER_AXIS);
             NodeRecord parent = node(new NodeKey(current.key.sessionId(),
                     current.key.projectionId(), parentLevel, parentX, parentZ),
                     current.stamp);
@@ -401,12 +475,23 @@ public final class RegionLodGraph {
             parent.knownMask = setBit(parent.knownMask, bit,
                     current.knownMask != 0L);
             parent.completeMask = setBit(parent.completeMask, bit,
-                    current.completeMask == ALL_CHILDREN);
+                    current.completeMask == completeMaskForLevel(
+                            current.key.level()));
             parent.dirtyChildMask |= bit;
             parent.targetRevision = revisionFor(parent);
             markDirty(parent);
             current = parent;
         }
+    }
+
+    /** Number of direct child slots that are meaningful for this node level. */
+    public static int childCountForLevel(int level) {
+        return level <= 0 ? CHILD_COUNT : PARENT_CHILD_COUNT;
+    }
+
+    /** Full coverage mask for this node level. */
+    public static long completeMaskForLevel(int level) {
+        return level <= 0 ? ALL_LEAF_CHILDREN : ALL_PARENT_CHILDREN;
     }
 
     private static boolean matches(Lease lease, PreparedBranch prepared) {
@@ -486,6 +571,8 @@ public final class RegionLodGraph {
         private long knownMask;
         private long completeMask;
         private long gpuChildMask;
+        /** Child versions currently owned by a region-wide direct-source seed. */
+        private long directSeedMask;
         private boolean gpuResident;
         private boolean cancelled;
         private State state = State.CLEAN;

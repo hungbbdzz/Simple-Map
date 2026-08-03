@@ -1,6 +1,10 @@
 package com.velorise.simplemap.client;
 
 import com.velorise.simplemap.client.cave.CaveContextCache;
+import com.velorise.simplemap.client.cave.CaveLayerBand;
+import com.velorise.simplemap.client.cave.CaveModeTransitionPolicy;
+import com.velorise.simplemap.client.cave.CaveView;
+import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
 import com.velorise.simplemap.client.cave.CaveStateClassifier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
@@ -28,13 +32,14 @@ public final class CaveMode {
     private static final CaveStateClassifier CAVE_STATE_CLASSIFIER = CaveStateClassifier.getInstance();
 
     /*
-     * Layered cave textures use retained 16-block bands. AUTO still moves in
-     * 8-block steps so it can follow a floor smoothly inside a tall cavern, but an
-     * exact Top-Y change inside the same band patches the existing page/LOD tree
-     * instead of abandoning it.
+     * Layered cave textures use immutable 16-block bands. AUTO may follow the
+     * local floor/roof context, but the final projection is snapped to the one
+     * deterministic Top-Y owned by that band. This prevents a revisited Nether
+     * layer from accumulating incompatible 16x16 tile projections.
      */
-    private static final int AUTO_LAYER_STEP = 8;
     private static final int AUTO_LAYER_STABLE_TICKS = 8;
+    /** Prevent stair steps and small jumps from oscillating around a band edge. */
+    private static final int AUTO_LAYER_BOUNDARY_HYSTERESIS = 3;
     private static final int AUTO_LAYER_FAST_SWITCH_DISTANCE = 32;
     private static final int LAYER_DEPTH = 32;
 
@@ -46,6 +51,9 @@ public final class CaveMode {
     private static final int AUTO_ROOF_NEARBY_RADIUS = 2;
     private static final int AUTO_ROOF_NEARBY_REQUIRED = 2;
     private static final int AUTO_FLOOR_HEADROOM = 4;
+    /** Hard bounds for synchronous AUTO probes on the client/render thread. */
+    private static final int AUTO_ROOF_PROBE_DEPTH = 48;
+    private static final int AUTO_FLOOR_PROBE_DEPTH = 48;
 
     private static int activeLayerY = Integer.MIN_VALUE;
     private static int pendingLayerY = Integer.MIN_VALUE;
@@ -84,30 +92,61 @@ public final class CaveMode {
 
     public static boolean isActive(Minecraft mc) {
         if (mc == null || mc.level == null || mc.player == null) return false;
-        int permission = MapConfig.getEffectiveCaveMapMode();
-        if (permission == 0) return false;
+        // Xaero keeps cave permission, cave type and cave activation separate.
+        // OFF disables cave rendering. CAVE/FULL use the same AUTO/manual cave-start
+        // decision; the type only decides whether that active cave is layered or full.
+        if (MapConfig.getEffectiveCaveMapMode() == 0
+                || getCaveType(mc) == CaveType.OFF) return false;
         if (hasManualTopY(mc)) return true;
-
-        boolean persistentCaveDimension = isPersistentCaveDimension(mc.level);
-        if (permission == 1) {
-            return persistentCaveDimension || updateAutomaticDetection(mc);
-        }
-        CaveType type = getCaveType(mc);
-        if (type == CaveType.OFF) return false;
-        return persistentCaveDimension || updateAutomaticDetection(mc);
+        // Xaero treats a remotely selected dimension as a custom dimension: it
+        // retains the dimension's cave index/type, but AUTO has no player-local
+        // roof context and therefore resolves to Surface.
+        if (!MapManager.getInstance().acceptsLiveLevel(mc.level)) return false;
+        return updateAutomaticDetection(mc);
     }
 
     /** Y used by the scanner. Supports manual Top Y across cave views. */
     public static synchronized int getLayerY(Minecraft mc) {
         if (mc == null || mc.level == null || mc.player == null) return 0;
+        // Full Cave is a column projection and must not acquire a new cache/render
+        // revision merely because the player climbed or fell in the Nether.
+        if (isFullView(mc)) return Integer.MIN_VALUE;
         Integer manual = getManualTopY(mc);
-        if (manual != null && MapConfig.getEffectiveCaveMapMode() == 2) return clampY(mc.level, manual);
+        if (manual != null && MapConfig.getEffectiveCaveMapMode() != 0) {
+            return clampViewedY(mc,
+                    CaveLayerBand.projectionTopY(CaveView.LAYERED, manual));
+        }
 
         String dimension = dimensionKey(mc);
+        if (!MapManager.getInstance().acceptsLiveLevel(mc.level)) {
+            // Remote AUTO has no meaningful player Y. Use one immutable vanilla
+            // cave band so viewport revisits do not continuously rebase layers.
+            int remoteTopY = 63;
+            int stableY = clampViewedY(mc,
+                    CaveLayerBand.projectionTopY(CaveView.LAYERED, remoteTopY));
+            if (!dimension.equals(activeDimension) || activeLayerY != stableY) {
+                activeDimension = dimension;
+                activeLayerY = stableY;
+                pendingLayerY = Integer.MIN_VALUE;
+                pendingLayerTicks = 0;
+                modeRevision++;
+            }
+            return activeLayerY;
+        }
         int playerY = clampY(mc.level, mc.player.blockPosition().getY() + 1);
         int anchorY = resolveAutomaticAnchorY(mc, playerY);
         int automaticY = clampY(mc.level,
-                Math.floorDiv(anchorY + AUTO_LAYER_STEP / 2, AUTO_LAYER_STEP) * AUTO_LAYER_STEP);
+                CaveLayerBand.projectionTopY(CaveView.LAYERED, anchorY));
+        if (dimension.equals(activeDimension) && activeLayerY != Integer.MIN_VALUE) {
+            int activeBand = CaveLayerBand.key(CaveView.LAYERED, activeLayerY);
+            int lowerSwitchY = CaveLayerBand.lowerY(activeBand)
+                    - AUTO_LAYER_BOUNDARY_HYSTERESIS;
+            int upperSwitchY = CaveLayerBand.upperY(activeBand)
+                    + AUTO_LAYER_BOUNDARY_HYSTERESIS;
+            if (anchorY >= lowerSwitchY && anchorY <= upperSwitchY) {
+                automaticY = activeLayerY;
+            }
+        }
         long gameTime = mc.level.getGameTime();
         if (!dimension.equals(activeDimension) || activeLayerY == Integer.MIN_VALUE) {
             activeDimension = dimension;
@@ -146,12 +185,15 @@ public final class CaveMode {
 
     public static synchronized int getSelectedTopY(Minecraft mc) {
         Integer manual = getManualTopY(mc);
-        return manual == null ? getLayerY(mc) : clampY(mc.level, manual);
+        return manual == null ? getLayerY(mc)
+                : clampViewedY(mc,
+                        CaveLayerBand.projectionTopY(CaveView.LAYERED, manual));
     }
 
     public static synchronized void setManualLayer(Minecraft mc, int topY) {
-        if (MapConfig.getEffectiveCaveMapMode() != 2 || mc == null || mc.level == null) return;
-        int clamped = clampY(mc.level, topY);
+        if (MapConfig.getEffectiveCaveMapMode() == 0 || mc == null || mc.level == null) return;
+        int clamped = clampViewedY(mc,
+                CaveLayerBand.projectionTopY(CaveView.LAYERED, topY));
         Integer previous = MANUAL_TOP_Y.put(dimensionKey(mc), clamped);
         if (previous == null || previous != clamped) modeRevision++;
     }
@@ -166,21 +208,53 @@ public final class CaveMode {
     }
 
     public static synchronized CaveType getCaveType(Minecraft mc) {
-        if (mc == null || mc.level == null) return CaveType.FULL;
-        return CAVE_TYPES.getOrDefault(dimensionKey(mc), CaveType.LAYERED);
+        if (mc == null || mc.level == null) return CaveType.LAYERED;
+        String dimension = dimensionKey(mc);
+        CaveType explicit = CAVE_TYPES.get(dimension);
+        if (explicit != null) return explicit;
+        String stored = MapConfig.caveDimensionModes.get(dimension);
+        if (stored != null) {
+            try {
+                CaveType parsed = CaveType.valueOf(stored);
+                CAVE_TYPES.put(dimension, parsed);
+                return parsed;
+            } catch (IllegalArgumentException ignored) {
+                MapConfig.caveDimensionModes.remove(dimension);
+            }
+        }
+        // Xaero stores one independent 0/1/2 cave type per dimension and uses
+        // Layered/CAVE as the default type. Dimension classification may optimize
+        // the FULL projection internally, but it never rewrites this UI state.
+        CAVE_TYPES.put(dimension, CaveType.LAYERED);
+        return CaveType.LAYERED;
     }
 
     public static synchronized void setCaveType(Minecraft mc, CaveType type) {
-        if (MapConfig.getEffectiveCaveMapMode() != 2 || mc == null || mc.level == null || type == null) return;
-        CaveType previous = CAVE_TYPES.put(dimensionKey(mc), type);
-        if (previous != type) modeRevision++;
+        if (MapConfig.getEffectiveCaveMapMode() == 0 || mc == null || mc.level == null || type == null) return;
+        String dimension = dimensionKey(mc);
+        CaveType previous = CAVE_TYPES.put(dimension, type);
+        String previousStored = MapConfig.caveDimensionModes.put(dimension, type.name());
+        if (previous != type || !type.name().equals(previousStored)) {
+            modeRevision++;
+            CaveModeTransitionPolicy.begin();
+            CaveView nextView = switch (type) {
+                case LAYERED -> CaveView.LAYERED;
+                case FULL -> CaveView.FULL;
+                case OFF -> null;
+            };
+            UnifiedCaveTextureManager.getInstance().onModeChanged(nextView);
+            MapConfig.save();
+        }
         if (type == CaveType.OFF) {
-            MANUAL_TOP_Y.remove(dimensionKey(mc));
+            // Cave type and cave-start selection are independent in Xaero. Turning
+            // the view OFF must not erase the selected Top Y; switching back to
+            // CAVE or FULL restores the previous AUTO/manual cave-start state.
             CaveMapManager.getInstance().deactivate();
         }
     }
 
     public static synchronized void cycleCaveType(Minecraft mc) {
+        if (mc == null || mc.level == null) return;
         CaveType next = switch (getCaveType(mc)) {
             case OFF -> CaveType.LAYERED;
             case LAYERED -> CaveType.FULL;
@@ -212,6 +286,7 @@ public final class CaveMode {
         lastLayerEvaluationTick = Long.MIN_VALUE;
         automaticLayerHoldUntilTick = Long.MIN_VALUE;
         activeDimension = "";
+        CaveModeTransitionPolicy.reset();
         modeRevision++;
     }
 
@@ -220,9 +295,7 @@ public final class CaveMode {
     }
 
     public static boolean isFullView(Minecraft mc) {
-        if (!isActive(mc)) return false;
-        if (MapConfig.getEffectiveCaveMapMode() != 2) return false;
-        return getCaveType(mc) == CaveType.FULL;
+        return isActive(mc) && getCaveType(mc) == CaveType.FULL;
     }
 
     private static synchronized Integer getManualTopY(Minecraft mc) {
@@ -231,16 +304,17 @@ public final class CaveMode {
     }
 
     private static String dimensionKey(Minecraft mc) {
-        return mc.level.dimension().location().toString();
+        String viewed = MapManager.getInstance().getCurrentDimensionResourceId();
+        return viewed == null || viewed.isBlank()
+                ? mc.level.dimension().location().toString() : viewed;
     }
 
-    /**
-     * Nether-style and no-skylight dimensions are cave contexts even when a modded
-     * DimensionType does not set hasCeiling(). This is the common failure mode for
-     * dedicated cave dimensions while the player is floating in a large chamber.
-     */
-    private static boolean isPersistentCaveDimension(Level level) {
-        return level.dimensionType().hasCeiling() || !level.dimensionType().hasSkyLight();
+    private static int clampViewedY(Minecraft mc, int y) {
+        String dimension = dimensionKey(mc);
+        if ("minecraft:the_nether".equals(dimension)) {
+            return Math.max(0, Math.min(255, y));
+        }
+        return clampY(mc.level, y);
     }
 
     private static synchronized int resolveAutomaticAnchorY(Minecraft mc, int fallbackY) {
@@ -279,23 +353,18 @@ public final class CaveMode {
                     mc.level, chunkX, chunkZ, playerYBand, mutationToken, gameTime,
                     () -> {
                         CaveContext context = detectCaveContext(mc);
-                        int confidence = isPersistentCaveDimension(mc.level)
-                                ? 3 : (context.covered() ? 2 : 1);
                         return new CaveContextCache.Result(context.covered(),
-                                context.suggestedTopY(), confidence);
+                                context.suggestedTopY(), context.confidence());
                     });
             if (cached != null) {
                 state.lastCovered = cached.covered();
+                state.lastConfidence = cached.confidence();
                 state.suggestedTopY = cached.suggestedTopY();
             }
         }
 
         boolean wasActive = state.active;
-        if (isPersistentCaveDimension(mc.level)) {
-            state.active = true;
-            state.coveredTicks = AUTO_ENTER_TICKS;
-            state.openTicks = 0;
-        } else if (state.lastCovered) {
+        if (state.lastCovered) {
             state.openTicks = 0;
             state.coveredTicks++;
             if (state.coveredTicks >= AUTO_ENTER_TICKS) state.active = true;
@@ -320,13 +389,13 @@ public final class CaveMode {
         int z = (int) Math.floor(mc.player.getZ());
         int eyeY = clampY(level, (int) Math.floor(mc.player.getEyeY()));
         int firstRoofY = Math.min(level.getMaxBuildHeight() - 1, eyeY + 1);
-        boolean persistent = isPersistentCaveDimension(level);
+        boolean hardCeiling = level.dimensionType().hasCeiling();
 
         BlockPos eye = new BlockPos(x, eyeY, z);
-        if (!persistent && level.dimensionType().hasSkyLight()
+        if (!hardCeiling && level.dimensionType().hasSkyLight()
                 && level.getBrightness(LightLayer.SKY, eye) >= 15
                 && level.canSeeSky(eye)) {
-            return new CaveContext(false, eyeY + 1);
+            return new CaveContext(false, eyeY + 1, 0);
         }
 
         int[][] offsets = {
@@ -335,20 +404,23 @@ public final class CaveMode {
                 { 0, AUTO_ROOF_NEARBY_RADIUS },
                 { 0, -AUTO_ROOF_NEARBY_RADIUS }
         };
-        int directRoof = Integer.MIN_VALUE;
+        int directRoof;
         int nearbyRoofCount = 0;
-        if (!persistent) {
-            directRoof = findBlockingRoofY(level, x, z, firstRoofY);
-            for (int[] offset : offsets) {
-                if (findBlockingRoofY(level, x + offset[0], z + offset[1], firstRoofY)
-                        != Integer.MIN_VALUE) {
-                    nearbyRoofCount++;
-                }
+        directRoof = findBlockingRoofY(level, x, z, firstRoofY);
+        for (int[] offset : offsets) {
+            if (findBlockingRoofY(level, x + offset[0], z + offset[1], firstRoofY)
+                    != Integer.MIN_VALUE) {
+                nearbyRoofCount++;
             }
         }
 
-        boolean covered = persistent || directRoof != Integer.MIN_VALUE
+        // A dimension ceiling is only a scan hint, never proof that the player is
+        // currently underground. This is the key Xaero cave-start distinction:
+        // Nether, End and custom dimensions all use the same real roof test.
+        boolean covered = directRoof != Integer.MIN_VALUE
                 || nearbyRoofCount >= AUTO_ROOF_NEARBY_REQUIRED;
+        int confidence = Math.min(3,
+                (directRoof != Integer.MIN_VALUE ? 1 : 0) + nearbyRoofCount);
 
         /*
          * A player hovering high above the local cave floor should not select an empty
@@ -365,14 +437,15 @@ public final class CaveMode {
                 && suggestedTop - nearestFloor >= LAYER_DEPTH) {
             suggestedTop = nearestFloor + LAYER_DEPTH - AUTO_FLOOR_HEADROOM;
         }
-        return new CaveContext(covered, clampY(level, suggestedTop));
+        return new CaveContext(covered, clampY(level, suggestedTop), confidence);
     }
 
     private static int findBlockingRoofY(Level level, int x, int z, int firstY) {
         LevelChunk chunk = fullChunk(level, x >> 4, z >> 4);
         if (chunk == null) return Integer.MIN_VALUE;
 
-        int upperBound = level.getMaxBuildHeight() - 1;
+            int upperBound = Math.min(level.getMaxBuildHeight() - 1,
+                    firstY + AUTO_ROOF_PROBE_DEPTH - 1);
         if (level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling()) {
             try {
                 upperBound = Math.min(upperBound,
@@ -408,7 +481,8 @@ public final class CaveMode {
         LevelChunk chunk = fullChunk(level, x >> 4, z >> 4);
         if (chunk == null) return Integer.MIN_VALUE;
 
-        int lowerBound = level.getMinBuildHeight();
+        int lowerBound = Math.max(level.getMinBuildHeight(),
+                startY - AUTO_FLOOR_PROBE_DEPTH + 1);
         int top = Math.min(startY, level.getMaxBuildHeight() - 1);
         LevelChunkSection[] sections = chunk.getSections();
         int firstSection = Math.min(sections.length - 1, level.getSectionIndex(top));
@@ -447,12 +521,13 @@ public final class CaveMode {
         }
     }
 
-    private record CaveContext(boolean covered, int suggestedTopY) {
+    private record CaveContext(boolean covered, int suggestedTopY, int confidence) {
     }
 
     private static final class AutoDetectionState {
         private boolean active;
         private boolean lastCovered;
+        private int lastConfidence;
         private int coveredTicks;
         private int openTicks;
         private int suggestedTopY = Integer.MIN_VALUE;

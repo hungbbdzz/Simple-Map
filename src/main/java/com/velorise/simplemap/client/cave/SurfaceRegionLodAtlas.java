@@ -13,8 +13,8 @@ import java.util.ArrayDeque;
  * GPU atlas for the M4 region-centric surface hierarchy.
  *
  * <p>Every node is a fixed 64x64 texture. Level 0 covers one 512x512 source
- * region. Each higher level groups 8x8 direct children, so its world span grows
- * by a factor of eight per level. A one-pixel gutter makes linear minification
+ * region. Each higher level groups 2x2 direct children, so its world span grows
+ * by a factor of two per level. A one-pixel gutter makes linear minification
  * safe and keeps region boundaries stable while panning.</p>
  */
 public final class SurfaceRegionLodAtlas {
@@ -89,9 +89,7 @@ public final class SurfaceRegionLodAtlas {
         int sourceX = (slot % slotColumns) * PITCH + AtlasGutter.SIZE;
         int sourceY = (slot / slotColumns) * PITCH + AtlasGutter.SIZE;
         int worldSize = MapRegionLodPolicy.worldSize(level);
-        // Region hierarchy has 8x8 direct children. CaveAtlasRegion's masks are
-        // generic 64-bit masks, so it can represent this fanout without another
-        // renderer handle type.
+        // Level 0 uses a 64-bit leaf mask; factor-2 parents use its low four bits.
         return new CaveAtlasRegion(location, sourceX, sourceY, SIZE, atlasSize,
                 level, worldSize, knownMask, completeMask);
     }

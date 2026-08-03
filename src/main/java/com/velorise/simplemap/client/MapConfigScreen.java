@@ -141,8 +141,7 @@ public class MapConfigScreen extends Screen {
                     button -> {
                         if (remoteServer && !remoteExtension) {
                             MapConfig.localCaveMapMode = (MapConfig.localCaveMapMode + 1) % 3;
-                            if (MapConfig.localCaveMapMode != 2) {
-                                CaveMode.clearManualLayer();
+                            if (MapConfig.localCaveMapMode == 0) {
                                 CaveMapManager.getInstance().deactivate();
                             }
                             MapConfig.save();
@@ -151,8 +150,7 @@ public class MapConfigScreen extends Screen {
                         }
                         ServerConfig.caveMapMode = (ServerConfig.caveMapMode + 1) % 3;
                         MapConfig.serverCaveMapMode = ServerConfig.caveMapMode;
-                        if (ServerConfig.caveMapMode != 2) {
-                            CaveMode.clearManualLayer();
+                        if (ServerConfig.caveMapMode == 0) {
                             CaveMapManager.getInstance().deactivate();
                         }
                         ServerConfig.save();
@@ -274,12 +272,15 @@ public class MapConfigScreen extends Screen {
                 .build();
         this.addRenderableWidget(minimapShapeButton);
 
-        double initialZoomVal = (MapConfig.minimapZoom - 0.05) / (2.0 - 0.05);
+        double initialZoomVal = (MapConfig.minimapZoom - MapConfig.MINIMUM_ZOOM_SCALE)
+                / (2.0 - MapConfig.MINIMUM_ZOOM_SCALE);
         minimapZoomSlider = new SimpleSlider(
                 col2X, 77, colW, 20,
                 initialZoomVal,
-                val -> String.format("Zoom: %.2fx", 0.05 + val * (2.0 - 0.05)),
-                val -> MapConfig.minimapZoom = (float) (0.05 + val * (2.0 - 0.05)));
+                val -> String.format(java.util.Locale.ROOT, "%.2fx",
+                        MapConfig.MINIMUM_ZOOM_SCALE + val * (2.0 - MapConfig.MINIMUM_ZOOM_SCALE)),
+                val -> MapConfig.minimapZoom = (float) (MapConfig.MINIMUM_ZOOM_SCALE
+                        + val * (2.0 - MapConfig.MINIMUM_ZOOM_SCALE)));
         minimapZoomSlider.setTooltip(Tooltip.create(Component.literal(
                 "Controls how much world area fits inside the minimap.")));
         this.addRenderableWidget(minimapZoomSlider);

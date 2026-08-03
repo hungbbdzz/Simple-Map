@@ -147,8 +147,8 @@ public final class M2M3CoreCheck {
 
     private static void checkSurfaceBatchPolicy() {
         require(SurfaceBatchPolicy.chooseBatchSize(MapRequestLane.FULLSCREEN,
-                        false, false, 16) == 1,
-                "cold fullscreen leaf did not stay focused");
+                        false, false, 16) == 2,
+                "cold fullscreen demand did not coalesce to 2x2");
         require(SurfaceBatchPolicy.chooseBatchSize(MapRequestLane.MINIMAP,
                         true, true, 3) == 2,
                 "warm minimap demand did not expand to 2x2");
@@ -161,9 +161,9 @@ public final class M2M3CoreCheck {
         require(SurfaceBatchPolicy.chooseBatchSize(MapRequestLane.BACKGROUND,
                         true, true, 8) == 4,
                 "ready background reconstruction did not expand cooperatively");
-        require(!SurfaceBatchPolicy.shouldBuildPage(false, false, true,
+        require(SurfaceBatchPolicy.shouldBuildPage(false, false, true,
                         MapRequestLane.FULLSCREEN),
-                "unknown non-focused foreground leaf was admitted");
+                "cold demanded foreground neighbour was skipped");
         require(SurfaceBatchPolicy.shouldBuildPage(false, true, true,
                         MapRequestLane.FULLSCREEN),
                 "ready demanded foreground leaf was skipped");
@@ -194,8 +194,8 @@ public final class M2M3CoreCheck {
         MapSurfaceDemandPolicy.trim(-1000.0, 1000.0,
                 -500.0, 500.0, fbo.policyPixelsPerBlock());
         MapSurfaceDemandPolicy.Snapshot demand = MapSurfaceDemandPolicy.snapshot();
-        require(demand.trimmed() && demand.exactActiveWindow() == 4,
-                "logical 0.29x demand policy did not enable the L1 far-zoom cap");
+        require(!demand.trimmed() && demand.exactActiveWindow() == 16,
+                "logical 0.29x demand policy did not preserve adaptive chunk work");
         require(MapRenderPlan.PHASE_L1_EXACT_UNDERLAY
                         < MapRenderPlan.branchPhase(1),
                 "L1 exact fallback was not placed below the branch");
@@ -213,13 +213,13 @@ public final class M2M3CoreCheck {
         RegionLodGraph.NodeKey baseKey = new RegionLodGraph.NodeKey(
                 stamp.sessionId(), 0, 0, 8, -1);
         RegionLodGraph.NodeKey parentKey = new RegionLodGraph.NodeKey(
-                stamp.sessionId(), 0, 1, 1, -1);
+                stamp.sessionId(), 0, 1, 4, -1);
         RegionLodGraph.NodeSnapshot base = graph.snapshot(baseKey);
         RegionLodGraph.NodeSnapshot parent = graph.snapshot(parentKey);
         require(base != null && base.state() == RegionLodGraph.State.DIRTY,
                 "base region LOD node was not dirtied");
         require(parent != null && parent.dirtyChildMask() != 0L,
-                "leaf version did not propagate into the 8x8 parent");
+                "leaf version did not propagate into the factor-2 parent");
 
         java.util.List<RegionLodGraph.Lease> coarse = graph.claimCoarseFirst(
                 stamp.sessionId(), 0, 1);

@@ -1,13 +1,11 @@
 package com.velorise.simplemap.client;
 
 /**
- * Separates the area already eligible for rendering from the smaller area that
- * may create new exact-surface work at far zoom.
+ * Defines the rolling exact-surface working set for a zoom-selected viewport.
  *
- * <p>Resident exact/branch textures are still rendered across the full viewport.
- * Only source capture, exact-leaf admission and saved-cache demand are trimmed.
- * The right edge receives a slightly larger fringe because fullscreen controls
- * and normal player attention are biased toward the centre/left of the map.</p>
+ * <p>The whole viewport remains eligible. Work volume is controlled by the
+ * bounded centre-out frontier and the selected LOD, not by cutting arbitrary
+ * strips from the screen.</p>
  */
 public final class MapSurfaceDemandPolicy {
     private static volatile Snapshot latest = Snapshot.identity();
@@ -21,41 +19,9 @@ public final class MapSurfaceDemandPolicy {
         double safeMaxX = Math.max(minX, maxX);
         double safeMinZ = Math.min(minZ, maxZ);
         double safeMaxZ = Math.max(minZ, maxZ);
-        double width = Math.max(1.0, safeMaxX - safeMinX);
-        double height = Math.max(1.0, safeMaxZ - safeMinZ);
-
-        Fractions fractions = fractions(scale);
-        if (fractions.identity()) {
-            latest = new Snapshot(false, 1.0, 0.0, 0.0, 0.0,
-                    exactActiveWindow(scale, false));
-            return new Bounds(safeMinX, safeMaxX, safeMinZ, safeMaxZ);
-        }
-
-        double trimmedMinX = safeMinX + width * fractions.left();
-        double trimmedMaxX = safeMaxX - width * fractions.right();
-        double trimmedMinZ = safeMinZ + height * fractions.vertical();
-        double trimmedMaxZ = safeMaxZ - height * fractions.vertical();
-
-        // Never collapse a cold viewport below two exact leaves in either axis.
-        double minimumSpan = MapPageLayout.PAGE_SIZE * 2.0;
-        if (trimmedMaxX - trimmedMinX < minimumSpan) {
-            double center = (safeMinX + safeMaxX) * 0.5;
-            trimmedMinX = Math.max(safeMinX, center - minimumSpan * 0.5);
-            trimmedMaxX = Math.min(safeMaxX, center + minimumSpan * 0.5);
-        }
-        if (trimmedMaxZ - trimmedMinZ < minimumSpan) {
-            double center = (safeMinZ + safeMaxZ) * 0.5;
-            trimmedMinZ = Math.max(safeMinZ, center - minimumSpan * 0.5);
-            trimmedMaxZ = Math.min(safeMaxZ, center + minimumSpan * 0.5);
-        }
-
-        double originalArea = width * height;
-        double trimmedArea = Math.max(1.0, trimmedMaxX - trimmedMinX)
-                * Math.max(1.0, trimmedMaxZ - trimmedMinZ);
-        latest = new Snapshot(true, Math.min(1.0, trimmedArea / originalArea),
-                fractions.left(), fractions.right(), fractions.vertical(),
+        latest = new Snapshot(false, 1.0, 0.0, 0.0, 0.0,
                 exactActiveWindow(scale, false));
-        return new Bounds(trimmedMinX, trimmedMaxX, trimmedMinZ, trimmedMaxZ);
+        return new Bounds(safeMinX, safeMaxX, safeMinZ, safeMaxZ);
     }
 
     /**
@@ -63,21 +29,30 @@ public final class MapSurfaceDemandPolicy {
      * remains independent and therefore continues to fill the complete viewport.
      */
     public static int exactActiveWindow(float scale, boolean pressure) {
-        if (scale < 0.125f) return 1;
-        if (scale < 0.25f) return pressure ? 1 : 2;
-        if (scale < 0.50f) return pressure ? 2 : 4;
-        return pressure ? 4 : 12;
+        return exactActiveWindow(scale, pressure, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Capacity-aware exact working set. At density-correct L1 far zoom, the
+     * 512x512 Region LOD is authoritative full-viewport coverage and exact leaves
+     * are refinement only. Keep that hot set small so exact work cannot starve the
+     * coarse disk/Region-LOD frontier. Close zoom may use a larger exact window.
+     */
+    public static int exactActiveWindow(float scale, boolean pressure,
+            int visiblePageCount) {
+        int visible = Math.max(1, visiblePageCount);
+        float safeScale = Float.isFinite(scale) && scale > 0.0f ? scale : 1.0f;
+        float projectedChunkPixels = safeScale * MapPageLayout.SUBTILE_SIZE;
+        int cap = projectedChunkPixels >= 16.0f ? 48
+                : projectedChunkPixels >= 8.0f ? 32
+                : projectedChunkPixels >= 4.0f ? 16
+                : projectedChunkPixels >= 2.0f ? 8 : 4;
+        if (pressure) cap = Math.max(2, cap / 2);
+        return Math.min(visible, cap);
     }
 
     public static Snapshot snapshot() {
         return latest;
-    }
-
-    private static Fractions fractions(float scale) {
-        if (scale >= 0.50f) return Fractions.NONE;
-        if (scale >= 0.25f) return new Fractions(0.04, 0.12, 0.05);
-        if (scale >= 0.125f) return new Fractions(0.07, 0.18, 0.08);
-        return new Fractions(0.10, 0.22, 0.12);
     }
 
     public record Bounds(double minX, double maxX, double minZ, double maxZ) {
@@ -91,11 +66,4 @@ public final class MapSurfaceDemandPolicy {
         }
     }
 
-    private record Fractions(double left, double right, double vertical) {
-        private static final Fractions NONE = new Fractions(0.0, 0.0, 0.0);
-
-        private boolean identity() {
-            return left == 0.0 && right == 0.0 && vertical == 0.0;
-        }
-    }
 }

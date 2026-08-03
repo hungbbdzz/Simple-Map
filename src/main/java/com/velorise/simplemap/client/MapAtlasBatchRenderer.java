@@ -37,14 +37,52 @@ final class MapAtlasBatchRenderer {
         drawFiltered(graphics, batches, targetPhase);
     }
 
+
+    /** Draws one phase inside a state scope owned by MapRenderPlan. */
+    static void drawPhasePrepared(List<MapRenderPlan.Batch> batches,
+            int targetPhase, Matrix4f matrix) {
+        if (batches == null || batches.isEmpty() || matrix == null) return;
+        int submissions = 0;
+        int start = firstBatchAtOrAfter(batches, targetPhase);
+        for (int batchIndex = start; batchIndex < batches.size(); batchIndex++) {
+            MapRenderPlan.Batch batch = batches.get(batchIndex);
+            if (batch.phase() > targetPhase) break;
+            float[] vertices = batch.vertices();
+            if (vertices.length == 0) continue;
+            RenderSystem.setShaderTexture(0, batch.texture());
+            BufferBuilder buffer = Tesselator.getInstance().begin(
+                    VertexFormat.Mode.QUADS,
+                    DefaultVertexFormat.POSITION_TEX);
+            for (int index = 0; index < vertices.length;
+                    index += FLOATS_PER_VERTEX) {
+                buffer.addVertex(matrix,
+                        vertices[index], vertices[index + 1], 0.0f)
+                        .setUv(vertices[index + 2], vertices[index + 3]);
+            }
+            BufferUploader.drawWithShader(buffer.buildOrThrow());
+            submissions++;
+        }
+        MapPipelineTelemetry.getInstance().recordRawBatchSubmissions(submissions);
+    }
+
     private static boolean hasPhase(List<MapRenderPlan.Batch> batches,
             int targetPhase) {
         if (batches == null || batches.isEmpty()) return false;
-        for (MapRenderPlan.Batch batch : batches) {
-            if (batch.phase() == targetPhase) return true;
-            if (batch.phase() > targetPhase) return false;
+        int index = firstBatchAtOrAfter(batches, targetPhase);
+        return index < batches.size()
+                && batches.get(index).phase() == targetPhase;
+    }
+
+    private static int firstBatchAtOrAfter(List<MapRenderPlan.Batch> batches,
+            int targetPhase) {
+        int low = 0;
+        int high = batches.size();
+        while (low < high) {
+            int middle = (low + high) >>> 1;
+            if (batches.get(middle).phase() < targetPhase) low = middle + 1;
+            else high = middle;
         }
-        return false;
+        return low;
     }
 
     private static void drawFiltered(GuiGraphics graphics,

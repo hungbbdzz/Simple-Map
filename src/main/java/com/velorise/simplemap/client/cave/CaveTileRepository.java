@@ -5,8 +5,12 @@ import com.velorise.simplemap.client.cave.v2.CaveCacheService;
 import com.velorise.simplemap.client.persistence.v2.MapPersistenceV2Service;
 import com.velorise.simplemap.client.pipeline.RevisionStamp;
 import com.velorise.simplemap.client.session.MapSessionManager;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import com.velorise.simplemap.client.CaveMode;
 import com.velorise.simplemap.client.FullCaveMapManager;
+import com.velorise.simplemap.client.MapDebugRecorder;
 import com.velorise.simplemap.client.MapRequestLane;
 import com.velorise.simplemap.client.MapWorkScheduler;
 import net.minecraft.world.level.Level;
@@ -33,6 +37,8 @@ public final class CaveTileRepository {
     private static final CaveTileRepository INSTANCE = new CaveTileRepository();
     private static final int MAX_LOADED_TILES = 8192;
     private static final int MAX_DISPLAY_TILES = 8192;
+    /** Sentinel outside every valid Minecraft build height. */
+    private static final int NO_ABSENT_LAYER = Integer.MIN_VALUE;
     private static final int DISPLAY_SAVE_BATCH_SIZE = 16;
     private static final int PAGE_SIZE = 64;
     private static final int PROJECTION_SIZE = PAGE_SIZE + 2;
@@ -64,9 +70,13 @@ public final class CaveTileRepository {
      * allocation source.
      */
     private final Map<Long, Set<DenseCaveTileKey>> displayKeysByChunk = new HashMap<>();
+    /** O(1) region presence indexes used by render-plan pending checks. */
+    private final Long2IntOpenHashMap displayRegionChunkCounts = new Long2IntOpenHashMap();
+    private final Long2IntOpenHashMap loadedDisplayRegionCounts = new Long2IntOpenHashMap();
     private final Set<DenseCaveTileKey> dirtyDisplayTiles = new HashSet<>();
     /** Exact Top-Y for a known-empty projection inside a retained band. */
-    private final Map<DenseCaveTileKey, Integer> absentDisplayTiles = new HashMap<>();
+    private final Object2IntOpenHashMap<DenseCaveTileKey> absentDisplayTiles =
+            new Object2IntOpenHashMap<>();
     /**
      * Soft-invalidated dense tiles remain renderable until a complete replacement
      * is committed. This mirrors Xaero's incremental map updates: refresh never
@@ -80,15 +90,19 @@ public final class CaveTileRepository {
     private final Map<DenseCaveTileKey, CompletableFuture<?>>
             pendingDisplaySaves = new HashMap<>();
     private final Set<Long> indexedTiles = new HashSet<>();
-    private final Map<Long, Integer> indexedRegionCounts = new HashMap<>();
+    private final Long2IntOpenHashMap indexedRegionCounts = new Long2IntOpenHashMap();
+    private final Set<Long> loadedScannedTiles = new HashSet<>();
+    private final Long2IntOpenHashMap loadedRawRegionCounts = new Long2IntOpenHashMap();
+    /** Region requests received before the asynchronous disk index is usable. */
+    private final Set<Long> deferredIndexRegionLoads = new HashSet<>();
     /** Latest random-access record for each tile stored in a packed .cvr region file. */
     private final Map<Long, CaveRegionStore.RecordPointer> regionRecords = new HashMap<>();
-    private final Map<Long, Long> pageRevisions = new HashMap<>();
-    private final Map<Long, Long> regionRevisions = new HashMap<>();
+    private final Long2LongOpenHashMap pageRevisions = new Long2LongOpenHashMap();
+    private final Long2LongOpenHashMap regionRevisions = new Long2LongOpenHashMap();
     private final Map<Long, CompletableFuture<?>> pendingLoads = new HashMap<>();
     private final Map<Long, CompletableFuture<?>> pendingSaves = new HashMap<>();
     private final Map<Long, CompletableFuture<?>> pendingCompactions = new HashMap<>();
-    private final Map<Long, Integer> regionSaveCounts = new HashMap<>();
+    private final Long2IntOpenHashMap regionSaveCounts = new Long2IntOpenHashMap();
     private final Map<PageCacheKey, ResolvedPage> resolvedPageCache =
             new LinkedHashMap<>(32, 0.75f, true);
     private final List<TileListener> listeners = new CopyOnWriteArrayList<>();
@@ -96,10 +110,12 @@ public final class CaveTileRepository {
     private final AtomicLong generation = new AtomicLong(1L);
     private long nextSaveAdmissionNanos;
     private long saveRetryDelayMs = MIN_SAVE_RETRY_MS;
+    private boolean indexRebuildPending;
 
     private volatile File directory;
 
     private CaveTileRepository() {
+        absentDisplayTiles.defaultReturnValue(NO_ABSENT_LAYER);
     }
 
     public static CaveTileRepository getInstance() {
@@ -120,6 +136,8 @@ public final class CaveTileRepository {
 
     public void setDirectory(File requested) {
         File previousDirectory;
+        File indexDirectory;
+        long indexGeneration;
         List<CaveChunkTile.Snapshot> snapshots;
         List<DenseCaveTile> displaySnapshots;
         List<CompletableFuture<?>> inFlight;
@@ -137,6 +155,8 @@ public final class CaveTileRepository {
             displayTiles.clear();
             indexedDisplayTiles.clear();
             displayKeysByChunk.clear();
+            displayRegionChunkCounts.clear();
+            loadedDisplayRegionCounts.clear();
             dirtyDisplayTiles.clear();
             absentDisplayTiles.clear();
             staleDisplayTiles.clear();
@@ -154,17 +174,23 @@ public final class CaveTileRepository {
             resolvedPageCache.clear();
             indexedTiles.clear();
             indexedRegionCounts.clear();
+            loadedScannedTiles.clear();
+            loadedRawRegionCounts.clear();
+            deferredIndexRegionLoads.clear();
             regionRecords.clear();
 
             directory = requested;
             if (directory != null && !directory.exists() && !directory.mkdirs()) {
                 LOGGER.warn("Could not create cave tile directory {}", directory);
             }
-            rebuildIndex();
-            generation.incrementAndGet();
+            indexDirectory = directory;
+            indexRebuildPending = indexDirectory != null
+                    && indexDirectory.isDirectory();
+            indexGeneration = generation.incrementAndGet();
         }
         flushSnapshotsAfter(previousDirectory, snapshots, inFlight);
         flushDisplayTilesAfter(previousDirectory, displaySnapshots, displayInFlight);
+        scheduleIndexRebuild(indexDirectory, indexGeneration);
     }
 
     public synchronized File directory() {
@@ -241,7 +267,7 @@ public final class CaveTileRepository {
         DenseCaveTileKey key = new DenseCaveTileKey(
                 chunkX, chunkZ, view, normalized);
         if (staleDisplayTiles.contains(key)) return false;
-        if (absentDisplayTiles.getOrDefault(key, Integer.MAX_VALUE) == layerY) {
+        if (absentDisplayTiles.getInt(key) == layerY) {
             return true;
         }
         DenseCaveTile loaded = displayTiles.get(key);
@@ -272,13 +298,19 @@ public final class CaveTileRepository {
                 DenseCaveTileKey key = new DenseCaveTileKey(
                         firstChunkX + localX, firstChunkZ + localZ, view, normalized);
                 if (staleDisplayTiles.contains(key)) return false;
-                if (absentDisplayTiles.getOrDefault(key, Integer.MAX_VALUE) == layerY) continue;
+                if (absentDisplayTiles.getInt(key) == layerY) continue;
                 DenseCaveTile loaded = displayTiles.get(key);
                 if (loaded == null || loaded.source().rank() < minimumSource.rank()) return false;
                 if (view != CaveView.FULL && loaded.projectionTopY() != layerY) return false;
             }
         }
         return true;
+    }
+
+    private void removeAbsentLayerLocked(DenseCaveTileKey key, int layerY) {
+        if (absentDisplayTiles.getInt(key) == layerY) {
+            absentDisplayTiles.removeInt(key);
+        }
     }
 
     private boolean hasDisplayTileSourceLocked(DenseCaveTileKey key,
@@ -298,7 +330,7 @@ public final class CaveTileRepository {
             int chunkX, int chunkZ) {
         DenseCaveTileKey key = new DenseCaveTileKey(chunkX, chunkZ, view, layerY);
         staleDisplayTiles.add(key);
-        absentDisplayTiles.remove(key);
+        absentDisplayTiles.removeInt(key);
     }
 
     public synchronized boolean isDisplayTileStale(CaveView view, int layerY,
@@ -363,9 +395,9 @@ public final class CaveTileRepository {
             if (current != null && current.source().rank() > tile.source().rank()) return false;
             if (current != null && current.source() == tile.source()
                     && current.revision() >= tile.revision()) return false;
-            displayTiles.put(key, tile);
+            putDisplayTileLocked(key, tile);
             indexDisplayKeyLocked(key);
-            absentDisplayTiles.remove(key, tile.projectionTopY());
+            removeAbsentLayerLocked(key, tile.projectionTopY());
             staleDisplayTiles.remove(key);
             if (tile.source() != DenseCaveTile.Source.DISK) dirtyDisplayTiles.add(key);
             touchLocked(tile.chunkX(), tile.chunkZ(), tile.revision());
@@ -395,9 +427,9 @@ public final class CaveTileRepository {
                 if (current != null && current.source().rank() > tile.source().rank()) continue;
                 if (current != null && current.source() == tile.source()
                         && current.revision() >= tile.revision()) continue;
-                displayTiles.put(key, tile);
+                putDisplayTileLocked(key, tile);
                 indexDisplayKeyLocked(key);
-                absentDisplayTiles.remove(key, tile.projectionTopY());
+                removeAbsentLayerLocked(key, tile.projectionTopY());
                 staleDisplayTiles.remove(key);
                 if (tile.source() != DenseCaveTile.Source.DISK) dirtyDisplayTiles.add(key);
                 touchLocked(tile.chunkX(), tile.chunkZ(), tile.revision());
@@ -419,8 +451,8 @@ public final class CaveTileRepository {
                 if (current != null && (view == CaveView.FULL
                         || current.projectionTopY() == layerY)
                         && current.source().rank() >= DenseCaveTile.Source.WORLD_SAVE.rank()) continue;
-                Integer previousAbsent = absentDisplayTiles.put(key, layerY);
-                if (previousAbsent == null || previousAbsent != layerY) {
+                int previousAbsent = absentDisplayTiles.put(key, layerY);
+                if (previousAbsent == NO_ABSENT_LAYER || previousAbsent != layerY) {
                     staleDisplayTiles.remove(key);
                     touchLocked(chunkX, chunkZ, System.nanoTime());
                     changed = true;
@@ -432,12 +464,12 @@ public final class CaveTileRepository {
     }
 
     public synchronized void invalidateDisplayTile(int chunkX, int chunkZ) {
-        Set<DenseCaveTileKey> keys = displayKeysByChunk.remove(pack(chunkX, chunkZ));
+        Set<DenseCaveTileKey> keys = removeDisplayChunkIndexLocked(chunkX, chunkZ);
         if (keys != null) {
             for (DenseCaveTileKey key : keys) {
-                displayTiles.remove(key);
+                removeDisplayTileLocked(key);
                 dirtyDisplayTiles.remove(key);
-                absentDisplayTiles.remove(key);
+                absentDisplayTiles.removeInt(key);
                 staleDisplayTiles.remove(key);
                 indexedDisplayTiles.remove(key);
                 displayRecords.remove(key);
@@ -770,17 +802,24 @@ public final class CaveTileRepository {
     }
 
     public void requestRegionLoad(int regionX, int regionZ) {
+        synchronized (this) {
+            if (indexRebuildPending) {
+                deferredIndexRegionLoads.add(pack(regionX, regionZ));
+            }
+            requestRegionLoadLocked(regionX, regionZ);
+        }
+    }
+
+    private void requestRegionLoadLocked(int regionX, int regionZ) {
         int firstChunkX = regionX << 5;
         int firstChunkZ = regionZ << 5;
-        synchronized (this) {
-            for (int dz = 0; dz < 32; dz++) {
-                for (int dx = 0; dx < 32; dx++) {
-                    int chunkX = firstChunkX + dx;
-                    int chunkZ = firstChunkZ + dz;
-                    long key = pack(chunkX, chunkZ);
-                    if (!tiles.containsKey(key) && indexedTiles.contains(key)) {
-                        requestTileLoadLocked(chunkX, chunkZ, key);
-                    }
+        for (int dz = 0; dz < 32; dz++) {
+            for (int dx = 0; dx < 32; dx++) {
+                int chunkX = firstChunkX + dx;
+                int chunkZ = firstChunkZ + dz;
+                long key = pack(chunkX, chunkZ);
+                if (!tiles.containsKey(key) && indexedTiles.contains(key)) {
+                    requestTileLoadLocked(chunkX, chunkZ, key);
                 }
             }
         }
@@ -788,33 +827,21 @@ public final class CaveTileRepository {
 
     public synchronized boolean hasRegionData(int regionX, int regionZ) {
         long regionKey = pack(regionX, regionZ);
-        if (indexedRegionCounts.getOrDefault(regionKey, 0) > 0) return true;
-        for (DenseCaveTileKey key : indexedDisplayTiles) {
-            if ((key.chunkX() >> 5) == regionX && (key.chunkZ() >> 5) == regionZ) return true;
-        }
-        for (CaveChunkTile tile : tiles.values()) {
-            if ((tile.chunkX() >> 5) == regionX && (tile.chunkZ() >> 5) == regionZ
-                    && tile.hasAnyScannedColumn()) return true;
-        }
-        for (DenseCaveTile tile : displayTiles.values()) {
-            if ((tile.chunkX() >> 5) == regionX && (tile.chunkZ() >> 5) == regionZ) return true;
-        }
-        return false;
+        return indexedRegionCounts.get(regionKey) > 0
+                || displayRegionChunkCounts.get(regionKey) > 0
+                || loadedRawRegionCounts.get(regionKey) > 0
+                || (indexRebuildPending
+                        && deferredIndexRegionLoads.contains(regionKey));
     }
 
     public synchronized boolean isRegionLoaded(int regionX, int regionZ) {
-        for (CaveChunkTile tile : tiles.values()) {
-            if ((tile.chunkX() >> 5) == regionX && (tile.chunkZ() >> 5) == regionZ
-                    && tile.hasAnyScannedColumn()) return true;
-        }
-        for (DenseCaveTile tile : displayTiles.values()) {
-            if ((tile.chunkX() >> 5) == regionX && (tile.chunkZ() >> 5) == regionZ) return true;
-        }
-        return false;
+        long regionKey = pack(regionX, regionZ);
+        return loadedRawRegionCounts.get(regionKey) > 0
+                || loadedDisplayRegionCounts.get(regionKey) > 0;
     }
 
     public synchronized long getRegionRevision(int regionX, int regionZ) {
-        return regionRevisions.getOrDefault(pack(regionX, regionZ), 0L);
+        return regionRevisions.get(pack(regionX, regionZ));
     }
 
     /**
@@ -825,8 +852,8 @@ public final class CaveTileRepository {
         long revision = 0L;
         for (int dz = -1; dz <= 1; dz++) {
             for (int dx = -1; dx <= 1; dx++) {
-                revision += pageRevisions.getOrDefault(
-                        pack(globalPageX + dx, globalPageZ + dz), 0L);
+                revision += pageRevisions.get(
+                        pack(globalPageX + dx, globalPageZ + dz));
             }
         }
         return revision;
@@ -865,8 +892,7 @@ public final class CaveTileRepository {
                     }
                     denseTiles[tileIndex] = dense;
                     archiveTiles[tileIndex] = archive;
-                    boolean knownEmpty = absentDisplayTiles.getOrDefault(
-                            displayKey, Integer.MAX_VALUE) == layerY;
+                    boolean knownEmpty = absentDisplayTiles.getInt(displayKey) == layerY;
                     knownEmptyTiles[tileIndex] = knownEmpty;
 
                     boolean central = dx >= 1 && dx <= 4 && dz >= 1 && dz <= 4;
@@ -1073,12 +1099,64 @@ public final class CaveTileRepository {
 
     public void tickSave() {
         synchronized (this) {
+            drainDeferredIndexRegionLoadLocked();
             long now = System.nanoTime();
             if (now < nextSaveAdmissionNanos) return;
 
             SaveAdmission display = scheduleDisplaySaveLocked();
             SaveAdmission raw = scheduleNextRawSaveLocked();
             updateSaveBackoffLocked(display, raw, now);
+        }
+    }
+
+    /**
+     * A compatibility region request may arrive while its dimension index is still
+     * being scanned. Admit only one representative tile per tick after the index is
+     * ready; this wakes the region without recreating the old dimension-load burst.
+     */
+    private void drainDeferredIndexRegionLoadLocked() {
+        if (indexRebuildPending || deferredIndexRegionLoads.isEmpty()) return;
+        var iterator = deferredIndexRegionLoads.iterator();
+        long regionKey = iterator.next();
+        int regionX = (int) (regionKey >> 32);
+        int regionZ = (int) regionKey;
+        if (loadedRawRegionCounts.get(regionKey) > 0
+                || loadedDisplayRegionCounts.get(regionKey) > 0) {
+            iterator.remove();
+            return;
+        }
+        if (indexedRegionCounts.get(regionKey) <= 0
+                && displayRegionChunkCounts.get(regionKey) <= 0) {
+            iterator.remove();
+            return;
+        }
+        requestOneRegionTileLoadLocked(regionX, regionZ);
+    }
+
+    private void requestOneRegionTileLoadLocked(int regionX, int regionZ) {
+        int firstChunkX = regionX << 5;
+        int firstChunkZ = regionZ << 5;
+        for (int dz = 0; dz < 32; dz++) {
+            for (int dx = 0; dx < 32; dx++) {
+                int chunkX = firstChunkX + dx;
+                int chunkZ = firstChunkZ + dz;
+                long chunkKey = pack(chunkX, chunkZ);
+                if (!tiles.containsKey(chunkKey) && indexedTiles.contains(chunkKey)
+                        && !pendingLoads.containsKey(chunkKey)) {
+                    requestTileLoadLocked(chunkX, chunkZ, chunkKey);
+                    return;
+                }
+                Set<DenseCaveTileKey> displayKeys = displayKeysByChunk.get(chunkKey);
+                if (displayKeys == null) continue;
+                for (DenseCaveTileKey displayKey : displayKeys) {
+                    if (!displayTiles.containsKey(displayKey)
+                            && indexedDisplayTiles.contains(displayKey)
+                            && !pendingDisplayLoads.containsKey(displayKey)) {
+                        requestDisplayTileLoadLocked(displayKey);
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -1138,6 +1216,8 @@ public final class CaveTileRepository {
     public synchronized void clearRuntime(boolean preserveDiskIndex) {
         generation.incrementAndGet();
         tiles.clear();
+        loadedScannedTiles.clear();
+        loadedRawRegionCounts.clear();
         displayTiles.clear();
         dirtyDisplayTiles.clear();
         absentDisplayTiles.clear();
@@ -1154,9 +1234,13 @@ public final class CaveTileRepository {
         nextSaveAdmissionNanos = 0L;
         saveRetryDelayMs = MIN_SAVE_RETRY_MS;
         if (!preserveDiskIndex) {
-            indexedTiles.clear();
-            indexedRegionCounts.clear();
-            rebuildIndex();
+            deferredIndexRegionLoads.clear();
+            clearDiskIndexLocked();
+            indexRebuildPending = directory != null && directory.isDirectory();
+            scheduleIndexRebuild(directory, generation.get());
+        } else if (indexRebuildPending) {
+            // The generation bump invalidated the previous background scan.
+            scheduleIndexRebuild(directory, generation.get());
         }
         rebuildDisplayChunkIndexLocked();
     }
@@ -1176,6 +1260,8 @@ public final class CaveTileRepository {
 
             generation.incrementAndGet();
             tiles.clear();
+            loadedScannedTiles.clear();
+            loadedRawRegionCounts.clear();
             displayTiles.clear();
             dirtyDisplayTiles.clear();
             absentDisplayTiles.clear();
@@ -1191,6 +1277,8 @@ public final class CaveTileRepository {
             regionSaveCounts.clear();
             nextSaveAdmissionNanos = 0L;
             saveRetryDelayMs = MIN_SAVE_RETRY_MS;
+            indexRebuildPending = false;
+            deferredIndexRegionLoads.clear();
             rebuildDisplayChunkIndexLocked();
         }
         // Never wait for disk IO on Minecraft's render thread during a portal or
@@ -1299,9 +1387,9 @@ public final class CaveTileRepository {
                 }
                 DenseCaveTile current = displayTiles.get(key);
                 if (current == null || current.source().rank() <= tile.source().rank()) {
-                    displayTiles.put(key, tile);
+                    putDisplayTileLocked(key, tile);
                     indexDisplayKeyLocked(key);
-                    absentDisplayTiles.remove(key, tile.projectionTopY());
+                    removeAbsentLayerLocked(key, tile.projectionTopY());
                     touchLocked(tile.chunkX(), tile.chunkZ(), tile.revision());
                     trimDisplayTilesLocked();
                 }
@@ -1528,7 +1616,7 @@ public final class CaveTileRepository {
     private void noteRegionSaveLocked(int regionX, int regionZ, int savedCount,
             File targetDirectory, long expectedGeneration) {
         long regionKey = pack(regionX, regionZ);
-        int count = regionSaveCounts.getOrDefault(regionKey, 0)
+        int count = regionSaveCounts.get(regionKey)
                 + Math.max(1, savedCount);
         if (count < REGION_COMPACTION_SAVE_INTERVAL
                 || pendingCompactions.containsKey(regionKey)
@@ -1567,8 +1655,11 @@ public final class CaveTileRepository {
                         LOGGER.warn("Could not compact cave region {},{}",
                                 regionX, regionZ, throwable);
                     }
-                    regionSaveCounts.merge(regionKey,
-                            REGION_COMPACTION_SAVE_INTERVAL, Math::max);
+                    if (regionSaveCounts.get(regionKey)
+                            < REGION_COMPACTION_SAVE_INTERVAL) {
+                        regionSaveCounts.put(regionKey,
+                                REGION_COMPACTION_SAVE_INTERVAL);
+                    }
                     return;
                 }
                 if (result == null || generation.get() != expectedGeneration
@@ -1603,12 +1694,13 @@ public final class CaveTileRepository {
     }
 
     private void touchLocked(int chunkX, int chunkZ, long tileRevision) {
+        refreshLoadedRawIndexLocked(chunkX, chunkZ);
         int globalPageX = chunkX >> 2;
         int globalPageZ = chunkZ >> 2;
         int regionX = chunkX >> 5;
         int regionZ = chunkZ >> 5;
-        pageRevisions.merge(pack(globalPageX, globalPageZ), 1L, Long::sum);
-        regionRevisions.merge(pack(regionX, regionZ), 1L, Long::sum);
+        pageRevisions.addTo(pack(globalPageX, globalPageZ), 1L);
+        regionRevisions.addTo(pack(regionX, regionZ), 1L);
         for (TileListener listener : listeners) {
             try {
                 listener.onTileChanged(chunkX, chunkZ, tileRevision);
@@ -1634,7 +1726,7 @@ public final class CaveTileRepository {
                 scheduleDisplaySaveLocked();
                 break;
             }
-            displayTiles.remove(removable);
+            removeDisplayTileLocked(removable);
             unindexDisplayKeyIfUnknownLocked(removable);
         }
     }
@@ -1663,6 +1755,7 @@ public final class CaveTileRepository {
 
             if (removableKey != null) {
                 tiles.remove(removableKey);
+                unindexLoadedRawTileLocked(removableKey);
                 continue;
             }
             if (dirtyToSave != null && !pendingSaves.containsKey(dirtyKey)) {
@@ -1673,52 +1766,129 @@ public final class CaveTileRepository {
         }
     }
 
-    private void rebuildIndex() {
+    private void clearDiskIndexLocked() {
         indexedTiles.clear();
         indexedRegionCounts.clear();
         regionRecords.clear();
         indexedDisplayTiles.clear();
         displayRecords.clear();
         displayKeysByChunk.clear();
+        displayRegionChunkCounts.clear();
+        loadedDisplayRegionCounts.clear();
         regionSaveCounts.clear();
-        File source = directory;
+    }
+
+    /**
+     * Region files can be hundreds of MiB. Rebuilding both packed indexes while
+     * changing dimensions used to block the Minecraft client thread for several
+     * seconds. Keep one IO worker reserved for visible reads and perform this
+     * maintenance on the scheduler's weak/background permit instead.
+     */
+    private void scheduleIndexRebuild(File source, long expectedGeneration) {
         if (source == null || !source.isDirectory()) return;
+        MapWorkScheduler.scheduleIo(0L, TimeUnit.MILLISECONDS,
+                MapRequestLane.BACKGROUND,
+                MapWorkScheduler.WorkType.CACHE_MAINTENANCE, -200, 160,
+                () -> source.equals(directory)
+                        && generation.get() == expectedGeneration,
+                () -> {
+                    long startedNanos = System.nanoTime();
+                    RepositoryIndex rebuilt;
+                    try {
+                        rebuilt = loadIndex(source);
+                    } catch (Throwable failure) {
+                        synchronized (this) {
+                            if (source.equals(directory)
+                                    && generation.get() == expectedGeneration) {
+                                indexRebuildPending = false;
+                            }
+                        }
+                        LOGGER.warn("Could not asynchronously rebuild cave index {}",
+                                source, failure);
+                        MapDebugRecorder.getInstance().event("CAVE_INDEX_FAILED",
+                                "directory=" + source.getName());
+                        return;
+                    }
+                    int deferredRegions;
+                    synchronized (this) {
+                        if (!source.equals(directory)
+                                || generation.get() != expectedGeneration) return;
+
+                        // A live save may finish while the scan is running. Its
+                        // pointer is newer, so never overwrite it with this snapshot.
+                        for (Map.Entry<Long, CaveRegionStore.RecordPointer> entry
+                                : rebuilt.rawRecords().entrySet()) {
+                            regionRecords.putIfAbsent(entry.getKey(), entry.getValue());
+                            CaveRegionStore.RecordPointer pointer = entry.getValue();
+                            indexTileLocked(pointer.chunkX(), pointer.chunkZ());
+                        }
+                        for (Map.Entry<DenseCaveTileKey,
+                                CaveDisplayRegionStore.RecordPointer> entry
+                                : rebuilt.displayRecords().entrySet()) {
+                            displayRecords.putIfAbsent(entry.getKey(), entry.getValue());
+                            if (indexedDisplayTiles.add(entry.getKey())) {
+                                indexDisplayKeyLocked(entry.getKey());
+                            }
+                        }
+                        for (long packed : rebuilt.legacyTiles()) {
+                            indexTileLocked((int) (packed >> 32), (int) packed);
+                        }
+                        indexRebuildPending = false;
+                        deferredRegions = deferredIndexRegionLoads.size();
+                    }
+                    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(
+                            System.nanoTime() - startedNanos);
+                    MapDebugRecorder.getInstance().event("CAVE_INDEX_READY",
+                            "raw=" + rebuilt.rawRecords().size()
+                                    + " display=" + rebuilt.displayRecords().size()
+                                    + " legacy=" + rebuilt.legacyTiles().size()
+                                    + " deferred_regions=" + deferredRegions
+                                    + " elapsed_ms=" + elapsedMs);
+                });
+    }
+
+    private static RepositoryIndex loadIndex(File source) {
+        Map<Long, CaveRegionStore.RecordPointer> rawRecords =
+                CaveRegionStore.rebuildIndex(source);
+        Map<DenseCaveTileKey, CaveDisplayRegionStore.RecordPointer> displayRecords =
+                CaveDisplayRegionStore.rebuildIndex(source);
+        Set<Long> legacyTiles = new HashSet<>();
 
         // Prefer the packed random-access region container. The latest complete
-        // record for every tile is indexed directly by byte offset.
-        regionRecords.putAll(CaveRegionStore.rebuildIndex(source));
-        for (CaveRegionStore.RecordPointer pointer : regionRecords.values()) {
-            indexTileLocked(pointer.chunkX(), pointer.chunkZ());
-        }
-
-        displayRecords.putAll(CaveDisplayRegionStore.rebuildIndex(source));
-        indexedDisplayTiles.addAll(displayRecords.keySet());
-        for (DenseCaveTileKey key : indexedDisplayTiles) indexDisplayKeyLocked(key);
-
-        // Version-3 per-chunk files remain a migration fallback. A successful save
-        // appends the tile to its .cvr region and removes the legacy small file.
+        // record for every tile is indexed by byte offset. Version-3 per-chunk
+        // files remain a migration fallback until their next successful save.
         File[] files = source.listFiles((dir, name) -> name != null
                 && name.matches("c\\.-?\\d+\\.-?\\d+\\.cvt"));
-        if (files == null) return;
-        for (File file : files) {
-            String[] parts = file.getName().split("\\.");
-            if (parts.length != 4) continue;
-            try {
-                indexTileLocked(Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
-            } catch (NumberFormatException ignored) {
+        if (files != null) {
+            for (File file : files) {
+                String[] parts = file.getName().split("\\.");
+                if (parts.length != 4) continue;
+                try {
+                    legacyTiles.add(pack(Integer.parseInt(parts[1]),
+                            Integer.parseInt(parts[2])));
+                } catch (NumberFormatException ignored) {
+                }
             }
         }
+        return new RepositoryIndex(rawRecords, displayRecords, legacyTiles);
     }
 
     private void indexTileLocked(int chunkX, int chunkZ) {
         long key = pack(chunkX, chunkZ);
         if (!indexedTiles.add(key)) return;
-        indexedRegionCounts.merge(pack(chunkX >> 5, chunkZ >> 5), 1, Integer::sum);
+        indexedRegionCounts.addTo(pack(chunkX >> 5, chunkZ >> 5), 1);
     }
 
     private void indexDisplayKeyLocked(DenseCaveTileKey key) {
-        displayKeysByChunk.computeIfAbsent(pack(key.chunkX(), key.chunkZ()),
-                ignored -> new HashSet<>()).add(key);
+        long chunkKey = pack(key.chunkX(), key.chunkZ());
+        Set<DenseCaveTileKey> keys = displayKeysByChunk.get(chunkKey);
+        if (keys == null) {
+            keys = new HashSet<>();
+            displayKeysByChunk.put(chunkKey, keys);
+            incrementRegionCount(displayRegionChunkCounts,
+                    pack(key.chunkX() >> 5, key.chunkZ() >> 5));
+        }
+        keys.add(key);
     }
 
     private void unindexDisplayKeyIfUnknownLocked(DenseCaveTileKey key) {
@@ -1727,13 +1897,86 @@ public final class CaveTileRepository {
         Set<DenseCaveTileKey> keys = displayKeysByChunk.get(chunkKey);
         if (keys == null) return;
         keys.remove(key);
-        if (keys.isEmpty()) displayKeysByChunk.remove(chunkKey);
+        if (keys.isEmpty()) {
+            displayKeysByChunk.remove(chunkKey);
+            decrementRegionCount(displayRegionChunkCounts,
+                    pack(key.chunkX() >> 5, key.chunkZ() >> 5));
+        }
     }
 
     private void rebuildDisplayChunkIndexLocked() {
         displayKeysByChunk.clear();
+        displayRegionChunkCounts.clear();
+        loadedDisplayRegionCounts.clear();
         for (DenseCaveTileKey key : indexedDisplayTiles) indexDisplayKeyLocked(key);
-        for (DenseCaveTileKey key : displayTiles.keySet()) indexDisplayKeyLocked(key);
+        for (DenseCaveTileKey key : displayTiles.keySet()) {
+            indexDisplayKeyLocked(key);
+            incrementRegionCount(loadedDisplayRegionCounts,
+                    pack(key.chunkX() >> 5, key.chunkZ() >> 5));
+        }
+    }
+
+    private void putDisplayTileLocked(DenseCaveTileKey key, DenseCaveTile tile) {
+        DenseCaveTile previous = displayTiles.put(key, tile);
+        if (previous == null) {
+            incrementRegionCount(loadedDisplayRegionCounts,
+                    pack(key.chunkX() >> 5, key.chunkZ() >> 5));
+        }
+    }
+
+    private DenseCaveTile removeDisplayTileLocked(DenseCaveTileKey key) {
+        DenseCaveTile removed = displayTiles.remove(key);
+        if (removed != null) {
+            decrementRegionCount(loadedDisplayRegionCounts,
+                    pack(key.chunkX() >> 5, key.chunkZ() >> 5));
+        }
+        return removed;
+    }
+
+    private Set<DenseCaveTileKey> removeDisplayChunkIndexLocked(
+            int chunkX, int chunkZ) {
+        Set<DenseCaveTileKey> removed = displayKeysByChunk.remove(
+                pack(chunkX, chunkZ));
+        if (removed != null && !removed.isEmpty()) {
+            decrementRegionCount(displayRegionChunkCounts,
+                    pack(chunkX >> 5, chunkZ >> 5));
+        }
+        return removed;
+    }
+
+    private void refreshLoadedRawIndexLocked(int chunkX, int chunkZ) {
+        long tileKey = pack(chunkX, chunkZ);
+        CaveChunkTile tile = tiles.get(tileKey);
+        boolean present = tile != null && tile.hasAnyScannedColumn();
+        if (present) {
+            if (loadedScannedTiles.add(tileKey)) {
+                incrementRegionCount(loadedRawRegionCounts,
+                        pack(chunkX >> 5, chunkZ >> 5));
+            }
+        } else if (loadedScannedTiles.remove(tileKey)) {
+            decrementRegionCount(loadedRawRegionCounts,
+                    pack(chunkX >> 5, chunkZ >> 5));
+        }
+    }
+
+    private void unindexLoadedRawTileLocked(long tileKey) {
+        if (!loadedScannedTiles.remove(tileKey)) return;
+        int chunkX = (int) (tileKey >> 32);
+        int chunkZ = (int) tileKey;
+        decrementRegionCount(loadedRawRegionCounts,
+                pack(chunkX >> 5, chunkZ >> 5));
+    }
+
+    private static void incrementRegionCount(Long2IntOpenHashMap counts,
+            long regionKey) {
+        counts.addTo(regionKey, 1);
+    }
+
+    private static void decrementRegionCount(Long2IntOpenHashMap counts,
+            long regionKey) {
+        int remaining = counts.get(regionKey) - 1;
+        if (remaining <= 0) counts.remove(regionKey);
+        else counts.put(regionKey, remaining);
     }
 
     private void removeIndexedTileLocked(int chunkX, int chunkZ) {
@@ -1741,7 +1984,7 @@ public final class CaveTileRepository {
         regionRecords.remove(key);
         if (!indexedTiles.remove(key)) return;
         long regionKey = pack(chunkX >> 5, chunkZ >> 5);
-        int remaining = indexedRegionCounts.getOrDefault(regionKey, 0) - 1;
+        int remaining = indexedRegionCounts.get(regionKey) - 1;
         if (remaining <= 0) indexedRegionCounts.remove(regionKey);
         else indexedRegionCounts.put(regionKey, remaining);
     }
@@ -1797,6 +2040,12 @@ public final class CaveTileRepository {
 
     private record PageCacheKey(long generation, CaveView view, int layerY,
             int projectionTopY, int globalPageX, int globalPageZ, long revision) {
+    }
+
+    private record RepositoryIndex(
+            Map<Long, CaveRegionStore.RecordPointer> rawRecords,
+            Map<DenseCaveTileKey, CaveDisplayRegionStore.RecordPointer> displayRecords,
+            Set<Long> legacyTiles) {
     }
 
     @FunctionalInterface

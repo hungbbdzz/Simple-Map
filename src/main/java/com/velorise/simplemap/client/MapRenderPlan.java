@@ -2,6 +2,10 @@ package com.velorise.simplemap.client;
 
 import com.velorise.simplemap.client.gpu.MapGpuInstancePlan;
 import com.velorise.simplemap.client.renderer.MapGpuRenderer;
+import com.mojang.blaze3d.systems.RenderSystem;
+import net.minecraft.client.renderer.GameRenderer;
+import org.joml.Matrix4f;
+import org.lwjgl.opengl.GL11;
 import com.velorise.simplemap.client.gpu.TileKey;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.resources.ResourceLocation;
@@ -40,13 +44,20 @@ final class MapRenderPlan {
     private final long builtAtNanos;
     private final int quadCount;
     private final int batchCount;
+    /**
+     * True when every exact leaf in the viewport is represented by a logical
+     * page-table key, including leaves that were non-resident while the plan was
+     * built. Such a plan is independent of atlas residency churn: publication and
+     * eviction are resolved at replay time without rebuilding world geometry.
+     */
+    private final boolean logicalExactCoverage;
 
     private MapRenderPlan(List<Batch> baseBatches, List<Batch> glowBatches,
             MapGpuInstancePlan instancePlan,
             int[] basePhases, int[] glowPhases,
             long[] pendingRegions, MapDrawResult result,
             long topologyRevision, long builtAtNanos,
-            int quadCount, int batchCount) {
+            int quadCount, int batchCount, boolean logicalExactCoverage) {
         this.baseBatches = baseBatches;
         this.glowBatches = glowBatches;
         this.instancePlan = instancePlan;
@@ -58,6 +69,7 @@ final class MapRenderPlan {
         this.builtAtNanos = builtAtNanos;
         this.quadCount = quadCount;
         this.batchCount = batchCount;
+        this.logicalExactCoverage = logicalExactCoverage;
     }
 
     void drawBase(GuiGraphics graphics) {
@@ -68,11 +80,44 @@ final class MapRenderPlan {
         drawOrdered(graphics, glowBatches, glowPhases);
     }
 
+    /** Replay inside a state scope already owned by MapRenderer. */
+    void drawBasePrepared(Matrix4f matrix) {
+        drawOrderedPrepared(baseBatches, basePhases, matrix);
+    }
+
+    /** Replay inside a state scope already owned by MapRenderer. */
+    void drawGlowPrepared(Matrix4f matrix) {
+        drawOrderedPrepared(glowBatches, glowPhases, matrix);
+    }
+
     private void drawOrdered(GuiGraphics graphics, List<Batch> batches,
             int[] phases) {
+        if (graphics == null || phases.length == 0) return;
+        /*
+         * One immutable plan used to flush GuiGraphics, query GL depth state and
+         * toggle the shader twice for every phase (page-table instances + raw atlas
+         * batches). Large cave plans therefore generated thousands of driver sync
+         * points while GPU utilisation remained low. Scope state once and preserve
+         * the same coarse-to-fine phase ordering inside it.
+         */
+        graphics.flush();
+        boolean depthWasEnabled = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+        RenderSystem.disableDepthTest();
+        try {
+            RenderSystem.setShader(GameRenderer::getPositionTexShader);
+            drawOrderedPrepared(batches, phases, graphics.pose().last().pose());
+        } finally {
+            if (depthWasEnabled) RenderSystem.enableDepthTest();
+            else RenderSystem.disableDepthTest();
+        }
+    }
+
+    private void drawOrderedPrepared(List<Batch> batches,
+            int[] phases, Matrix4f matrix) {
+        if (matrix == null || phases.length == 0) return;
         for (int phase : phases) {
-            MapGpuRenderer.drawPhase(graphics, instancePlan, phase);
-            MapAtlasBatchRenderer.drawPhase(graphics, batches, phase);
+            MapGpuRenderer.drawPhasePrepared(instancePlan, phase, matrix);
+            MapAtlasBatchRenderer.drawPhasePrepared(batches, phase, matrix);
         }
     }
 
@@ -90,6 +135,14 @@ final class MapRenderPlan {
 
     int batchCount() {
         return batchCount;
+    }
+
+    boolean logicalExactCoverage() {
+        return logicalExactCoverage;
+    }
+
+    long builtAtNanos() {
+        return builtAtNanos;
     }
 
     boolean topologyValid(long revision) {
@@ -117,14 +170,19 @@ final class MapRenderPlan {
         private static final int FLOATS_PER_VERTEX = 4;
         private static final int VERTICES_PER_QUAD = 4;
         private static final int FLOATS_PER_QUAD = FLOATS_PER_VERTEX * VERTICES_PER_QUAD;
+        private static final Comparator<Quad> QUAD_ORDER = Comparator
+                .comparingInt((Quad quad) -> quad.phase)
+                .thenComparing(Quad::texture);
 
-        private final List<Quad> quads = new ArrayList<>();
+        private final List<Quad> quads = new ArrayList<>(256);
         private final MapGpuInstancePlan.Builder instances =
                 new MapGpuInstancePlan.Builder();
-        private final java.util.LinkedHashSet<Long> pending = new java.util.LinkedHashSet<>();
+        private final long[] pending = new long[256];
+        private int pendingCount;
         private int instanceCount;
         private int exactPages;
         private int branchNodes;
+        private boolean logicalExactCoverage;
 
         boolean add(ResourceLocation texture, int phase,
                 int x, int y, int width, int height,
@@ -145,23 +203,17 @@ final class MapRenderPlan {
             return true;
         }
 
-        boolean addTile(TileKey key, ResourceLocation fallbackTexture,
-                int phase, int x, int y, int width, int height,
-                float u, float v, int uWidth, int vHeight,
-                int textureWidth, int textureHeight) {
-            if (key == null || fallbackTexture == null || width <= 0 || height <= 0
-                    || uWidth <= 0 || vHeight <= 0 || textureWidth <= 0
-                    || textureHeight <= 0
+        boolean addTile(TileKey key, int phase,
+                int x, int y, int width, int height) {
+            if (key == null || width <= 0 || height <= 0
                     || quads.size() + instanceCount >= MAX_QUADS) return false;
-            float inverseWidth = 1.0f / textureWidth;
-            float inverseHeight = 1.0f / textureHeight;
-            boolean added = instances.add(key, fallbackTexture, phase,
-                    x, y, width, height,
-                    u * inverseWidth, v * inverseHeight,
-                    (u + uWidth) * inverseWidth,
-                    (v + vHeight) * inverseHeight);
+            boolean added = instances.add(key, phase, x, y, width, height);
             if (added) instanceCount++;
             return added;
+        }
+
+        int entryCount() {
+            return quads.size() + instanceCount;
         }
 
         void exact() {
@@ -172,9 +224,17 @@ final class MapRenderPlan {
             branchNodes++;
         }
 
+        void logicalExactCoverage() {
+            logicalExactCoverage = true;
+        }
+
         void pending(int regionX, int regionZ) {
-            if (pending.size() >= 256) return;
-            pending.add(((long) regionX << 32) ^ (regionZ & 0xFFFFFFFFL));
+            if (pendingCount >= pending.length) return;
+            long packed = ((long) regionX << 32) ^ (regionZ & 0xFFFFFFFFL);
+            for (int index = 0; index < pendingCount; index++) {
+                if (pending[index] == packed) return;
+            }
+            pending[pendingCount++] = packed;
         }
 
         MapRenderPlan build(long topologyRevision) {
@@ -182,8 +242,7 @@ final class MapRenderPlan {
             // each phase. The resulting primitive batches are immutable and contain
             // normalized UVs, so replay performs no atlas arithmetic or quad object
             // allocation on the render path.
-            quads.sort(Comparator.comparingInt((Quad q) -> q.phase)
-                    .thenComparing(q -> q.texture.toString()));
+            quads.sort(QUAD_ORDER);
 
             List<Batch> base = new ArrayList<>();
             List<Batch> glow = new ArrayList<>();
@@ -210,9 +269,7 @@ final class MapRenderPlan {
                 cursor = end;
             }
 
-            long[] pendingArray = new long[pending.size()];
-            int i = 0;
-            for (Long value : pending) pendingArray[i++] = value;
+            long[] pendingArray = Arrays.copyOf(pending, pendingCount);
             MapGpuInstancePlan instancePlan = instances.build();
             List<Batch> immutableBase = List.copyOf(base);
             List<Batch> immutableGlow = List.copyOf(glow);
@@ -223,7 +280,8 @@ final class MapRenderPlan {
                     new MapDrawResult(exactPages, branchNodes, 0),
                     topologyRevision, System.nanoTime(),
                     quads.size() + instancePlan.size(),
-                    base.size() + glow.size() + (instancePlan.size() == 0 ? 0 : 1));
+                    base.size() + glow.size() + (instancePlan.size() == 0 ? 0 : 1),
+                    logicalExactCoverage);
         }
 
         private static int[] collectPhases(List<Batch> batches,

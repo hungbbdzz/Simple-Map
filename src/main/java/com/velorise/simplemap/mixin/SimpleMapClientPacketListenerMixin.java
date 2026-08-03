@@ -7,7 +7,6 @@ import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData;
-import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLightUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundSectionBlocksUpdatePacket;
 import org.spongepowered.asm.mixin.Mixin;
@@ -49,18 +48,13 @@ public abstract class SimpleMapClientPacketListenerMixin {
                 section.getX(), section.getZ());
     }
 
+    // handleLevelChunkWithLight always delegates to updateLevelChunk. Hook only
+    // this common point so one network packet cannot reset/requeue the same 16x16
+    // Surface transaction twice before the next client tick.
     @Inject(method = "updateLevelChunk", at = @At("HEAD"))
     private void simplemap$onChunkData(int chunkX, int chunkZ,
             ClientboundLevelChunkPacketData packet, CallbackInfo callback) {
         MapMutationBus.getInstance().onChunkData(chunkX, chunkZ);
-    }
-
-    @Inject(method = "handleLevelChunkWithLight",
-            at = @At(value = "INVOKE", target = ENSURE_CLIENT_THREAD,
-                    shift = At.Shift.AFTER))
-    private void simplemap$onChunkWithLight(
-            ClientboundLevelChunkWithLightPacket packet, CallbackInfo callback) {
-        MapMutationBus.getInstance().onChunkData(packet.getX(), packet.getZ());
     }
 
     @Inject(method = "handleLightUpdatePacket",

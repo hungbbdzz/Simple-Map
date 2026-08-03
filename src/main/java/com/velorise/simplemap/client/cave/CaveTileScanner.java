@@ -169,8 +169,7 @@ public final class CaveTileScanner {
             BlockPos.MutableBlockPos probe, CaveTileScanContext context) {
         int minimumY = level.getMinBuildHeight();
         int maximumY = level.getMaxBuildHeight() - 1;
-        int topY = (level.dimensionType().hasCeiling()
-                || !level.dimensionType().hasSkyLight())
+        int topY = CaveDimensionProfile.shouldScanFromWorldTop(level)
                 ? maximumY
                 : Math.max(minimumY, Math.min(maximumY,
                         level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,

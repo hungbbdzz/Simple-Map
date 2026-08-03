@@ -23,7 +23,7 @@ public final class MapBlockData {
     public static final short NO_BLOCK = -1;
 
     public static final int FILE_MAGIC   = 0x534D4150; // "SMAP"
-    public static final int FILE_VERSION = 3;
+    public static final int FILE_VERSION = 4;
 
     public static final long EMPTY_PACKED = packRaw(
             EMPTY_Y, NO_BLOCK, NO_BIOME, (byte) 0, EMPTY_Y);

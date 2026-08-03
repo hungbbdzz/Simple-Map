@@ -35,9 +35,14 @@ final class CaveChunkReadinessTracker {
     private static final int TELEPORT_CHUNK_DISTANCE = 3;
     private static final int TELEPORT_VERTICAL_DISTANCE = 32;
     private static final int LIGHT_GRACE_TICKS = 8;
-    private static final int NEIGHBOUR_DIAMETER = 3;
-    private static final int NEIGHBOUR_COUNT = NEIGHBOUR_DIAMETER * NEIGHBOUR_DIAMETER;
-    private static final int CENTRE_INDEX = 4;
+    /*
+     * Dense live projection reads only the selected LevelChunk. Earlier versions
+     * required a complete 3x3 neighbourhood even though LiveCaveChunkSource never
+     * accessed those neighbours. At a render-distance edge that delayed every
+     * route tile and produced the checkerboard/island pattern reported in Nether.
+     */
+    private static final int NEIGHBOUR_COUNT = 1;
+    private static final int CENTRE_INDEX = 0;
     private static final int MAX_OBSERVATIONS = 4096;
     private static final int MAX_MUTATION_EPOCHS = 16_384;
     private static final int MAX_LIGHT_WAITS = 4096;
@@ -116,17 +121,13 @@ final class CaveChunkReadinessTracker {
                 && level.getGameTime() < settleUntilTick;
     }
 
-    /** Invalidates all centre snapshots whose 3x3 capture contains this chunk. */
+    /** Invalidates the centre snapshot whose live data changed. */
     void markChunkChanged(int chunkX, int chunkZ) {
         long epoch = ++mutationSequence;
-        mutationEpochs.put(ChunkPos.asLong(chunkX, chunkZ), epoch);
-        for (int dz = -1; dz <= 1; dz++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                long centerKey = ChunkPos.asLong(chunkX + dx, chunkZ + dz);
-                observations.remove(centerKey);
-                lightWaitSince.remove(centerKey);
-            }
-        }
+        long key = ChunkPos.asLong(chunkX, chunkZ);
+        mutationEpochs.put(key, epoch);
+        observations.remove(key);
+        lightWaitSince.remove(key);
         trimMutationEpochs();
     }
 
@@ -237,23 +238,13 @@ final class CaveChunkReadinessTracker {
                 && expectedChunks.length == NEIGHBOUR_COUNT
                 && expectedEpochs.length == NEIGHBOUR_COUNT;
         boolean allLightCorrect = true;
-        int index = 0;
-        LevelChunk center = null;
-        for (int dz = -1; dz <= 1; dz++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                int chunkX = centerChunkX + dx;
-                int chunkZ = centerChunkZ + dz;
-                LevelChunk chunk = fullChunk(level, chunkX, chunkZ);
-                if (chunk == null) return 0;
-                if (!chunk.isLightCorrect()) allLightCorrect = false;
-                if (matches && expectedChunks[index] != chunk) matches = false;
-                long epoch = mutationEpochs.getOrDefault(
-                        ChunkPos.asLong(chunkX, chunkZ), 0L);
-                if (matches && expectedEpochs[index] != epoch) matches = false;
-                if (index == CENTRE_INDEX) center = chunk;
-                index++;
-            }
-        }
+        LevelChunk center = fullChunk(level, centerChunkX, centerChunkZ);
+        if (center == null) return 0;
+        if (!center.isLightCorrect()) allLightCorrect = false;
+        if (matches && expectedChunks[CENTRE_INDEX] != center) matches = false;
+        long epoch = mutationEpochs.getOrDefault(
+                ChunkPos.asLong(centerChunkX, centerChunkZ), 0L);
+        if (matches && expectedEpochs[CENTRE_INDEX] != epoch) matches = false;
         if (matches) {
             LevelChunkSection[] currentSections = center == null
                     ? null : center.getSections();
@@ -279,19 +270,11 @@ final class CaveChunkReadinessTracker {
             int centerChunkZ, long stableSinceTick) {
         LevelChunk[] result = new LevelChunk[NEIGHBOUR_COUNT];
         long[] epochs = new long[NEIGHBOUR_COUNT];
-        int index = 0;
-        for (int dz = -1; dz <= 1; dz++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                int chunkX = centerChunkX + dx;
-                int chunkZ = centerChunkZ + dz;
-                LevelChunk chunk = fullChunk(level, chunkX, chunkZ);
-                if (chunk == null) return null;
-                result[index] = chunk;
-                epochs[index] = mutationEpochs.getOrDefault(
-                        ChunkPos.asLong(chunkX, chunkZ), 0L);
-                index++;
-            }
-        }
+        LevelChunk chunk = fullChunk(level, centerChunkX, centerChunkZ);
+        if (chunk == null) return null;
+        result[CENTRE_INDEX] = chunk;
+        epochs[CENTRE_INDEX] = mutationEpochs.getOrDefault(
+                ChunkPos.asLong(centerChunkX, centerChunkZ), 0L);
         LevelChunkSection[] sections = result[CENTRE_INDEX].getSections().clone();
         return new Observation(result, sections, epochs, stableSinceTick);
     }

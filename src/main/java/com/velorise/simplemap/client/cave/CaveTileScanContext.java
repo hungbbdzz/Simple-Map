@@ -32,6 +32,10 @@ public final class CaveTileScanContext {
         return new CaveTileScanContext(level.getChunk(chunkX, chunkZ));
     }
 
+    static CaveTileScanContext create(LevelChunk chunk) {
+        return chunk == null ? null : new CaveTileScanContext(chunk);
+    }
+
     public LevelChunk chunk() {
         return chunk;
     }

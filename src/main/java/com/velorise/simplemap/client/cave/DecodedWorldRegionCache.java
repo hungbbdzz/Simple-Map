@@ -5,6 +5,7 @@ import com.velorise.simplemap.client.GeneratedChunkIndex;
 import com.velorise.simplemap.client.MapCancellationToken;
 import com.velorise.simplemap.client.MapPipelineStage;
 import com.velorise.simplemap.client.MapPipelineTelemetry;
+import com.velorise.simplemap.client.MapPerformanceGovernor;
 import com.velorise.simplemap.client.MapRequestLane;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.Registry;
@@ -170,6 +171,14 @@ final class DecodedWorldRegionCache {
             AdaptiveWorldSourceBudget.Snapshot budget = budgetLocked();
             int maximumInFlight = budget.maximumInFlight();
             int maximumPrefetch = budget.maximumPrefetch();
+            if (MapPerformanceGovernor.getInstance().underPressure()) {
+                // One cave page previously admitted twelve simultaneous NBT/DataFix
+                // decodes while the game was already missing its frame target.
+                // Two leaves retain IO overlap but bound the allocation burst; the
+                // page transaction is resumable and keeps all published leaves.
+                maximumInFlight = Math.min(maximumInFlight, 2);
+                maximumPrefetch = Math.min(maximumPrefetch, 1);
+            }
             if (inFlight >= maximumInFlight
                     || (!foreground && inFlightPrefetch >= maximumPrefetch)) {
                 return SourceLease.detached(Result.deferred(), pipelineTelemetry);
@@ -492,6 +501,17 @@ final class DecodedWorldRegionCache {
 
         MapRequestLane lane() {
             return lane;
+        }
+
+        /** True only for a detached lease rejected by current admission limits. */
+        boolean isImmediatelyDeferred() {
+            if (owner != null || !future.isDone()) return false;
+            try {
+                Result result = future.getNow(null);
+                return result != null && result.state() == State.DEFERRED;
+            } catch (RuntimeException failure) {
+                return false;
+            }
         }
 
         @Override

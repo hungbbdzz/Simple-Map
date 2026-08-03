@@ -9,7 +9,6 @@ public final class CavePageStyler {
     private static final int SIZE = 64;
     private static final int BORDERED_SIZE = 66;
     private static final int XAERO_GLOW_MIN_RGB_SUM = 407;
-
     private CavePageStyler() {
     }
 
@@ -241,6 +240,7 @@ public final class CavePageStyler {
         float bias = emissive ? 4.0f : 5.0f;
         return clamp(Math.round((value * lift + bias) * shade));
     }
+
 
     private static int clamp(int value) {
         return Math.max(0, Math.min(255, value));

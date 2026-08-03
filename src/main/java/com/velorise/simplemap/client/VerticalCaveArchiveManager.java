@@ -86,10 +86,16 @@ public final class VerticalCaveArchiveManager {
                         candidate.color(), (byte) 0);
             }
         }
+        return recordColumnData(blockX, blockZ,
+                builder.build(scannedMinimumY, scannedMaximumY, reachedMinimumY));
+    }
+
+    /** Commits an already-built immutable column without allocating a compatibility array. */
+    public boolean recordColumnData(int blockX, int blockZ, CaveColumnData data) {
         CaveChunkTile tile = pipeline.repository().getOrCreateLiveTile(blockX >> 4, blockZ >> 4);
         return pipeline.repository().commitColumn(tile,
                 CaveChunkTile.index(blockX & 15, blockZ & 15),
-                builder.build(scannedMinimumY, scannedMaximumY, reachedMinimumY));
+                data == null ? CaveColumnData.empty() : data);
     }
 
     public boolean hasRegionData(int regionX, int regionZ) {

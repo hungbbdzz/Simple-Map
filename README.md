@@ -306,3 +306,7 @@ Development run configurations:
 Copyright © 2026 Velorise. **All Rights Reserved.**
 
 The source code and associated assets may not be copied, modified, redistributed, or republished without prior written permission from the copyright holder.
+## Pass 34 cave mode restoration
+
+The cave control follows the fixed Xaero-style per-dimension cycle `OFF → CAVE → FULL → OFF`. Permission, cave type and AUTO/manual Top Y are independent; dimension classification no longer rewrites the selected type.
+

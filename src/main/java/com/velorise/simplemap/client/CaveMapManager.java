@@ -174,7 +174,10 @@ public final class CaveMapManager {
     }
 
     public synchronized void flushDataForDimensionSwitch() {
-        flushAndClear();
+        deferProjectionCompletions();
+        pipeline.flushForDimensionSwitch();
+        clearCompatRegions();
+        layerGeneration.incrementAndGet();
     }
 
     public synchronized void clearCache() {

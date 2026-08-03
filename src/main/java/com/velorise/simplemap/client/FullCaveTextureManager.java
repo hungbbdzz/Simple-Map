@@ -3,6 +3,7 @@ package com.velorise.simplemap.client;
 import com.velorise.simplemap.client.cave.CaveAtlasRegion;
 import com.velorise.simplemap.client.cave.CaveView;
 import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
+import com.velorise.simplemap.client.gpu.TileKey;
 import net.minecraft.resources.ResourceLocation;
 
 /** Compatibility facade for Full Cave pages produced from the shared tile archive. */
@@ -58,6 +59,10 @@ public final class FullCaveTextureManager {
         return unified.contentRevision();
     }
 
+    public long branchContentRevision() {
+        return unified.branchContentRevision();
+    }
+
     public void beginRenderBatch() {
         unified.beginRenderBatch();
     }
@@ -70,6 +75,11 @@ public final class FullCaveTextureManager {
             int pageZ, float scale) {
         return unified.peekPageRegion(CaveView.FULL, Integer.MIN_VALUE,
                 rx, rz, pageX, pageZ, scale);
+    }
+
+    public TileKey pageTileKey(int globalPageX, int globalPageZ, float scale) {
+        return unified.pageTileKey(CaveView.FULL, Integer.MIN_VALUE,
+                globalPageX, globalPageZ, scale);
     }
 
     public CaveAtlasRegion peekBranchRegion(int rx, int rz) {
@@ -114,6 +124,7 @@ public final class FullCaveTextureManager {
     }
 
     public void uploadDirtyTextures(boolean force) {
+        if (MapActivityGate.getInstance().blocksForegroundStreaming()) return;
         unified.upload(force);
     }
 

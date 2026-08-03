@@ -40,7 +40,7 @@ final class PriorityDecodeExecutor {
     }
 
     int queuedTasks() {
-        return MapWorkScheduler.snapshot().cpuQueued();
+        return MapWorkScheduler.cpuQueuedCount();
     }
 
     @FunctionalInterface

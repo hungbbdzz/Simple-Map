@@ -18,10 +18,16 @@ public final class M4RegionLodAuthorityCheck {
         require(!MapRegionLodPolicy.directProjectionEnabled(0.75f),
                 "close zoom should not capture full regions for coarse LOD");
         require(MapRegionLodPolicy.targetLevel(0.29f) == 0
-                        && MapRegionLodPolicy.targetLevel(0.03f) == 1,
+                        && MapRegionLodPolicy.targetLevel(0.03f) == 3,
                 "region hierarchy density policy changed unexpectedly");
-        require(MapRegionLodPolicy.worldSize(1) == 4096,
-                "8x8 region hierarchy world span is incorrect");
+        require(MapRegionLodPolicy.worldSize(1) == 1024,
+                "factor-2 region hierarchy world span is incorrect");
+        require(MapRegionLodPolicy.regionAuthorityOnly(0.01f),
+                "extreme far zoom did not select region-only authority");
+        require(!MapRegionLodPolicy.regionAuthorityOnly(0.29f),
+                "normal L1 far zoom incorrectly suppressed exact refinement");
+        require(MapSurfaceDemandPolicy.exactActiveWindow(0.03f, false, 10_000) == 4,
+                "far zoom chunk frontier was not kept progressively active");
 
         RevisionStamp stamp = new RevisionStamp(91L, 4L, 2L, 1L);
         RegionLodGraph graph = new RegionLodGraph(2);
@@ -33,6 +39,20 @@ public final class M4RegionLodAuthorityCheck {
                 "seeded source region is not durable dirty state");
         require(seeded.dirtyChildMask() == -1L,
                 "direct source projection did not dirty all leaf slots");
+
+        // Before a direct branch is prepared, one exact leaf may take ownership
+        // from the region-wide seed even when its page-local revision is lower.
+        // Without this handoff, every source-seeded level-0 node remains DIRTY
+        // forever because the reduced exact child can never match the seed.
+        graph.updateLeaf(stamp, 0, -3, 5, 0,
+                3L, true, true, true);
+        RegionLodGraph.NodeSnapshot refinedSeed = graph.snapshot(base);
+        require(refinedSeed.childVersionSums()[0] == 3L,
+                "unpublished direct seed blocked exact-leaf authority handoff");
+        // Re-seeding the region must not overwrite the now exact-owned child.
+        graph.requestRegion(stamp, 0, -3, 5, 15L);
+        require(graph.snapshot(base).childVersionSums()[0] == 3L,
+                "region source watermark overwrote exact-leaf authority");
 
         RegionLodGraph.Lease lease = graph.tryBegin(base);
         require(lease != null, "direct source region lease missing");
@@ -53,11 +73,11 @@ public final class M4RegionLodAuthorityCheck {
 
         // Parent state must be reconstructed from durable child propagation.
         RegionLodGraph.NodeKey parentKey = new RegionLodGraph.NodeKey(
-                stamp.sessionId(), 0, 1, Math.floorDiv(-3, 8),
-                Math.floorDiv(5, 8));
+                stamp.sessionId(), 0, 1, Math.floorDiv(-3, 2),
+                Math.floorDiv(5, 2));
         RegionLodGraph.Lease parentLease = graph.tryBegin(parentKey);
-        require(parentLease != null, "8x8 parent was not dirtied");
-        int childIndex = Math.floorMod(5, 8) * 8 + Math.floorMod(-3, 8);
+        require(parentLease != null, "factor-2 parent was not dirtied");
+        int childIndex = Math.floorMod(5, 2) * 2 + Math.floorMod(-3, 2);
         RegionLodDeriver.ChildSnapshot child =
                 new RegionLodDeriver.ChildSnapshot(childIndex,
                         parentLease.childVersionSums()[childIndex],

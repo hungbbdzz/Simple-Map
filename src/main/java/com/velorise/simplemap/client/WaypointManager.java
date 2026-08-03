@@ -11,8 +11,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -27,31 +30,65 @@ public class WaypointManager {
     public static class Waypoint {
         public final String name;
         public final double x;
+        /** Optional vertical coordinate. Old waypoint files remain valid through hasY=false. */
+        public final double y;
         public final double z;
-        public final int iconType; // -1: use custom item, 0: Red X, 1: Green House, 2: Blue Target, 3: Yellow Star
+        public final boolean hasY;
+        public final int iconType; // -1: use custom item, 0..3: legacy presets
         public final String iconItem; // Item registry ID (e.g. "minecraft:diamond_pickaxe")
         public final float scale;     // Scale multiplier (0.1 to 2.0)
         public final String dimension;
         public final boolean deathPoint;
 
-        public Waypoint(String name, double x, double z, int iconType, String iconItem, float scale, String dimension) {
-            this(name, x, z, iconType, iconItem, scale, dimension, false);
+        /** Backward-compatible X/Z constructor used by old callers and old JSON. */
+        public Waypoint(String name, double x, double z, int iconType, String iconItem,
+                float scale, String dimension) {
+            this(name, x, 0.0, z, false, iconType, iconItem, scale, dimension, false);
         }
 
-        public Waypoint(String name, double x, double z, int iconType, String iconItem, float scale,
-                String dimension, boolean deathPoint) {
+        public Waypoint(String name, double x, double z, int iconType, String iconItem,
+                float scale, String dimension, boolean deathPoint) {
+            this(name, x, 0.0, z, false, iconType, iconItem, scale, dimension, deathPoint);
+        }
+
+        public Waypoint(String name, double x, double y, double z, int iconType,
+                String iconItem, float scale, String dimension) {
+            this(name, x, y, z, true, iconType, iconItem, scale, dimension, false);
+        }
+
+        public Waypoint(String name, double x, double y, double z, int iconType,
+                String iconItem, float scale, String dimension, boolean deathPoint) {
+            this(name, x, y, z, true, iconType, iconItem, scale, dimension, deathPoint);
+        }
+
+        private Waypoint(String name, double x, double y, double z, boolean hasY,
+                int iconType, String iconItem, float scale, String dimension,
+                boolean deathPoint) {
             this.name = sanitizeText(name, "Waypoint", 64);
             this.x = clampCoordinate(x);
+            this.y = clampCoordinate(y);
             this.z = clampCoordinate(z);
+            this.hasY = hasY && Double.isFinite(y);
             this.iconType = Math.max(-1, Math.min(3, iconType));
             this.iconItem = sanitizeText(iconItem, "", 128);
             this.scale = Float.isFinite(scale) ? Math.max(0.1f, Math.min(2.0f, scale)) : 1.0f;
             this.dimension = sanitizeText(dimension, "unknown", 256);
             this.deathPoint = deathPoint;
         }
+
+        private static Waypoint loaded(Waypoint waypoint) {
+            return new Waypoint(waypoint.name, waypoint.x, waypoint.y, waypoint.z,
+                    waypoint.hasY, waypoint.iconType, waypoint.iconItem, waypoint.scale,
+                    waypoint.dimension, waypoint.deathPoint);
+        }
     }
 
     private final List<Waypoint> waypoints = new ArrayList<>();
+    /** Immutable render snapshots rebuilt only when the waypoint set mutates. */
+    private volatile List<Waypoint> allSnapshot = List.of();
+    private volatile Map<String, List<Waypoint>> dimensionSnapshots = Map.of();
+    /** Render-visible waypoint mutation generation for retained minimap frames. */
+    private final AtomicLong visualRevision = new AtomicLong();
     private File currentWaypointsFile = null;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final int MAX_WAYPOINTS = 4096;
@@ -63,6 +100,7 @@ public class WaypointManager {
         if (worldDir == null) {
             waypoints.clear();
             currentWaypointsFile = null;
+            rebuildSnapshotsLocked();
             return;
         }
         currentWaypointsFile = new File(worldDir, "waypoints.json");
@@ -71,16 +109,19 @@ public class WaypointManager {
 
     private synchronized void loadWaypoints() {
         waypoints.clear();
-        if (currentWaypointsFile == null || !currentWaypointsFile.exists()) return;
+        if (currentWaypointsFile == null || !currentWaypointsFile.exists()) {
+            rebuildSnapshotsLocked();
+            return;
+        }
 
         List<Waypoint> loaded = new ArrayList<>();
         try (var reader = Files.newBufferedReader(currentWaypointsFile.toPath(), StandardCharsets.UTF_8)) {
             Waypoint[] data = GSON.fromJson(reader, Waypoint[].class);
             if (data != null) {
                 for (Waypoint waypoint : data) {
-                    if (waypoint == null || !Double.isFinite(waypoint.x) || !Double.isFinite(waypoint.z)) continue;
-                    loaded.add(new Waypoint(waypoint.name, waypoint.x, waypoint.z, waypoint.iconType,
-                            waypoint.iconItem, waypoint.scale, waypoint.dimension, waypoint.deathPoint));
+                    if (waypoint == null || !Double.isFinite(waypoint.x)
+                            || !Double.isFinite(waypoint.z)) continue;
+                    loaded.add(Waypoint.loaded(waypoint));
                     if (loaded.size() >= MAX_WAYPOINTS) break;
                 }
             }
@@ -90,6 +131,7 @@ public class WaypointManager {
             waypoints.clear();
             quarantineCorruptFile();
         }
+        rebuildSnapshotsLocked();
     }
 
     public synchronized void saveWaypoints() {
@@ -111,25 +153,46 @@ public class WaypointManager {
         }
     }
 
-    public synchronized List<Waypoint> getAllWaypoints() {
-        return new ArrayList<>(waypoints);
+    public List<Waypoint> getAllWaypoints() {
+        return allSnapshot;
     }
 
-    public synchronized List<Waypoint> getWaypointsForDimension(String dimension) {
-        List<Waypoint> list = new ArrayList<>();
-        String requested = dimension == null ? "" : dimension;
-        for (Waypoint w : waypoints) {
-            if (requested.equals(w.dimension)) {
-                list.add(w);
-            }
-        }
-        return list;
+    public long visualRevision() {
+        return visualRevision.get();
+    }
+
+    public List<Waypoint> getWaypointsForDimension(String dimension) {
+        String requested = MapManager.getInstance().resolveDimensionResourceId(dimension);
+        return dimensionSnapshots.getOrDefault(requested, List.of());
     }
 
     public synchronized void addWaypoint(Waypoint waypoint) {
         if (waypoint == null || waypoints.size() >= MAX_WAYPOINTS) return;
         waypoints.add(waypoint);
+        rebuildSnapshotsLocked();
         saveWaypoints();
+    }
+
+    /** Replaces one waypoint atomically while preserving its list position. */
+    public synchronized boolean updateWaypoint(Waypoint original, Waypoint replacement) {
+        if (original == null || replacement == null) return false;
+        int index = waypoints.indexOf(original);
+        if (index < 0) return false;
+        waypoints.set(index, replacement);
+        rebuildSnapshotsLocked();
+        saveWaypoints();
+        return true;
+    }
+
+    /** Resolves legacy preset icons to the same item icon used by new waypoints. */
+    public static String resolveIconItemId(Waypoint waypoint) {
+        if (waypoint == null) return "minecraft:compass";
+        if (waypoint.iconType == 0) return "minecraft:red_dye";
+        if (waypoint.iconType == 1) return "minecraft:red_bed";
+        if (waypoint.iconType == 2) return "minecraft:target";
+        if (waypoint.iconType == 3) return "minecraft:nether_star";
+        return waypoint.iconItem == null || waypoint.iconItem.isBlank()
+                ? "minecraft:compass" : waypoint.iconItem;
     }
 
     public synchronized void addDeathWaypoint(double x, double y, double z, String dimension, int maximum) {
@@ -156,15 +219,35 @@ public class WaypointManager {
         if (waypoints.size() >= MAX_WAYPOINTS) return;
         String name = String.format(Locale.ROOT, "Death (%d, %d, %d)",
                 (int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z));
-        waypoints.add(new Waypoint(name, x, z, -1, "minecraft:recovery_compass", 1.0f,
+        waypoints.add(new Waypoint(name, x, y, z, -1, "minecraft:recovery_compass", 1.0f,
                 targetDimension, true));
+        rebuildSnapshotsLocked();
         saveWaypoints();
     }
 
     public synchronized void removeWaypoint(Waypoint waypoint) {
         if (waypoint == null) return;
-        waypoints.remove(waypoint);
+        if (!waypoints.remove(waypoint)) return;
+        rebuildSnapshotsLocked();
         saveWaypoints();
+    }
+
+    private void rebuildSnapshotsLocked() {
+        List<Waypoint> all = List.copyOf(waypoints);
+        Map<String, List<Waypoint>> grouped = new HashMap<>();
+        MapManager manager = MapManager.getInstance();
+        for (Waypoint waypoint : all) {
+            String dimension = manager.resolveDimensionResourceId(waypoint.dimension);
+            grouped.computeIfAbsent(dimension, ignored -> new ArrayList<>())
+                    .add(waypoint);
+        }
+        Map<String, List<Waypoint>> immutable = new HashMap<>(grouped.size());
+        for (Map.Entry<String, List<Waypoint>> entry : grouped.entrySet()) {
+            immutable.put(entry.getKey(), List.copyOf(entry.getValue()));
+        }
+        allSnapshot = all;
+        dimensionSnapshots = Map.copyOf(immutable);
+        visualRevision.incrementAndGet();
     }
 
     private static String sanitizeText(String value, String fallback, int maximumLength) {

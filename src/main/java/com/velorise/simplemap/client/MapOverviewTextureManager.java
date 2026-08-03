@@ -44,6 +44,8 @@ public final class MapOverviewTextureManager {
     private static final MapOverviewTextureManager INSTANCE = new MapOverviewTextureManager();
     private static final int MAX_TEXTURES =
             MapMemoryBudgetPolicy.overviewTextureLimit();
+    /** Short visible-first recolour sweep after a style generation change. */
+    private static final long STYLE_REFRESH_WINDOW_MS = 2_500L;
 
     private final Map<Key, TextureInfo> textures = new LinkedHashMap<>(32, 0.75f, true);
     private final Set<Key> dirty = new LinkedHashSet<>();
@@ -56,6 +58,7 @@ public final class MapOverviewTextureManager {
     /** Overview is a compatibility fallback and runs only on the shared background lane. */
     private int renderBatchDepth;
     private long lastUploadMs;
+    private volatile long styleRefreshUntilMs;
     private String streamDimension = "";
     private int streamMode = Integer.MIN_VALUE;
     private int streamLayerY = Integer.MIN_VALUE;
@@ -127,12 +130,16 @@ public final class MapOverviewTextureManager {
             streamPlan = buildSweepPlan(minRx, maxRx, minRz, maxRz);
             streamCursor = 0;
             streamRestartMs = 0L;
-        } else if (streamCursor >= streamPlan.length) {
+        } else {
             if (now < streamRestartMs) return;
-            streamCursor = 0;
+            if (streamCursor >= streamPlan.length) streamCursor = 0;
         }
 
-        int admission = overviewAdmissionBudget(safeStride);
+        // Spread one complete viewport sweep across roughly one second instead of
+        // admitting a short burst and then waking again on an exact 1 Hz boundary.
+        // The old pulse was visible as a small periodic hitch even when average FPS
+        // remained high.
+        int admission = Math.min(2, overviewAdmissionBudget(safeStride));
         int admitted = 0;
         while (streamCursor < streamPlan.length && admitted < admission) {
             long packed = streamPlan[streamCursor++];
@@ -143,7 +150,9 @@ public final class MapOverviewTextureManager {
             if (ensureSource(key, orderedPriority)) requestDirty(key);
             admitted++;
         }
-        if (streamCursor >= streamPlan.length) streamRestartMs = now + 1_000L;
+        int groups = Math.max(1, (streamPlan.length + admission - 1) / admission);
+        long cadenceMs = Math.max(20L, Math.min(200L, 1_000L / groups));
+        streamRestartMs = now + cadenceMs;
     }
 
     private static int overviewAdmissionBudget(int stride) {
@@ -153,49 +162,22 @@ public final class MapOverviewTextureManager {
         return 6;
     }
 
-    private static long[] buildSweepPlan(int minRx, int maxRx, int minRz, int maxRz) {
+    private static long[] buildSweepPlan(int minRx, int maxRx,
+            int minRz, int maxRz) {
         int width = Math.max(0, maxRx - minRx + 1);
         int height = Math.max(0, maxRz - minRz + 1);
         long[] result = new long[width * height];
-        if (result.length == 0) return result;
-        int centerRx = (minRx + maxRx) >> 1;
-        int centerRz = (minRz + maxRz) >> 1;
         int cursor = 0;
-        for (int rx = minRx; rx <= maxRx; rx++) {
-            for (int rz = minRz; rz <= maxRz; rz++) {
+        // Compatibility overview requests follow the same stable visual frontier
+        // as region authority: top-to-bottom, then left-to-right. The previous
+        // centre-distance insertion sort recreated isolated coarse islands and
+        // also spent O(n^2) work whenever the viewport changed.
+        for (int rz = minRz; rz <= maxRz; rz++) {
+            for (int rx = minRx; rx <= maxRx; rx++) {
                 result[cursor++] = pack(rx, rz);
             }
         }
-
-        for (int i = 1; i < result.length; i++) {
-            long value = result[i];
-            int j = i - 1;
-            while (j >= 0 && compareSweep(value, result[j], centerRx, centerRz) < 0) {
-                result[j + 1] = result[j];
-                j--;
-            }
-            result[j + 1] = value;
-        }
         return result;
-    }
-
-    private static int compareSweep(long first, long second, int centerRx, int centerRz) {
-        int firstX = (int) (first >> 32);
-        int firstZ = (int) first;
-        int secondX = (int) (second >> 32);
-        int secondZ = (int) second;
-        int firstDx = firstX - centerRx;
-        int firstDz = firstZ - centerRz;
-        int secondDx = secondX - centerRx;
-        int secondDz = secondZ - centerRz;
-        int distance = Integer.compare(firstDx * firstDx + firstDz * firstDz,
-                secondDx * secondDx + secondDz * secondDz);
-        if (distance != 0) return distance;
-        int ring = Integer.compare(Math.max(Math.abs(firstDx), Math.abs(firstDz)),
-                Math.max(Math.abs(secondDx), Math.abs(secondDz)));
-        if (ring != 0) return ring;
-        int byZ = Integer.compare(firstZ, secondZ);
-        return byZ != 0 ? byZ : Integer.compare(firstX, secondX);
     }
 
     private static long pack(int x, int z) {
@@ -287,7 +269,8 @@ public final class MapOverviewTextureManager {
             }
         }
         regionLodService.updateExactLeaf(stamp, regionX, regionZ,
-                leafIndex, sourceRevision, known, complete, true);
+                leafIndex, sourceRevision, known, complete, true,
+                pixels64, knownRows);
     }
 
     public void markSurfaceLeafEvicted(RevisionStamp stamp, int regionX,
@@ -516,8 +499,9 @@ public final class MapOverviewTextureManager {
                 governor.textureUploadBudgetNanos(focus) / 2);
         // M4 region authority always receives the first publication slice.
         regionLodService.publish(focus, deadline);
-        if (System.nanoTime() < deadline) {
-            surfaceLodTree.publish(focus ? 4 : 2, deadline,
+        int legacyBudget = regionLodService.legacyPublishBudget(focus);
+        if (legacyBudget > 0 && System.nanoTime() < deadline) {
+            surfaceLodTree.publish(legacyBudget, deadline,
                     preferredSurfaceBranchLevel);
         }
     }
@@ -533,15 +517,20 @@ public final class MapOverviewTextureManager {
         long now = System.currentTimeMillis();
         if (!focus && !governor.isInteracting() && now - lastUploadMs < 60L) return;
         lastUploadMs = now;
-        int budget = (focus || governor.isInteracting()) ? 2 : 1;
+        boolean styleRefresh = focus && now < styleRefreshUntilMs
+                && !governor.underPressure();
+        int budget = styleRefresh ? 6
+                : (focus || governor.isInteracting()) ? 2 : 1;
         long deadline = System.nanoTime() + Math.max(500_000L,
-                governor.textureUploadBudgetNanos(focus) / 2);
+                styleRefresh ? governor.textureUploadBudgetNanos(true)
+                        : governor.textureUploadBudgetNanos(focus) / 2);
 
         // Manual compatibility path: M4 region coverage publishes first,
         // followed by the old factor-2 refinement adapter.
         regionLodService.publish(focus, deadline);
-        if (System.nanoTime() < deadline) {
-            surfaceLodTree.publish(focus ? 4 : 2, deadline,
+        int legacyBudget = regionLodService.legacyPublishBudget(focus);
+        if (legacyBudget > 0 && System.nanoTime() < deadline) {
+            surfaceLodTree.publish(legacyBudget, deadline,
                     preferredSurfaceBranchLevel);
         }
         if (System.nanoTime() >= deadline) return;
@@ -782,7 +771,7 @@ public final class MapOverviewTextureManager {
         int bytes = size * size * Integer.BYTES;
         String residentKey = overviewResidencyKey(info.key);
         MapResidencyManager.getInstance().register(
-                residentKey, MapResidencyManager.Kind.LEGACY, bytes,
+                residentKey, MapResidencyManager.Kind.SURFACE_LEGACY, bytes,
                 () -> evictOverviewForBudget(info.key));
         MapResidencyManager.getInstance().enforceBudget(
                 residentKey, MapRequestLane.BACKGROUND);
@@ -828,10 +817,33 @@ public final class MapOverviewTextureManager {
         SurfaceLodTree.invalidatePersistentCache();
         RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
         regionLodService.invalidate(stamp);
+        styleRefreshUntilMs = System.currentTimeMillis() + STYLE_REFRESH_WINDOW_MS;
+        lastUploadMs = 0L;
+        streamCursor = 0;
+        streamRestartMs = 0L;
         String dimension = currentDimension();
         synchronized (textures) {
-            for (Key key : textures.keySet()) {
-                if (key.dimension.equals(dimension)) markDirty(key);
+            synchronized (dirty) {
+                LinkedHashSet<Key> ordered = new LinkedHashSet<>();
+                // Put the current viewport first. Existing textures stay visible
+                // while these replacement revisions are built and atomically uploaded.
+                if (dimension.equals(streamDimension) && streamPlan.length > 0) {
+                    for (long packed : streamPlan) {
+                        int rx = (int) (packed >> 32);
+                        int rz = (int) packed;
+                        Key key = new Key(dimension, streamMode, streamLayerY,
+                                rx, rz, streamStride);
+                        if (textures.containsKey(key)) ordered.add(key);
+                    }
+                }
+                ordered.addAll(dirty);
+                for (Key key : textures.keySet()) {
+                    if (!key.dimension.equals(dimension)) continue;
+                    revisions.merge(key, 1L, Long::sum);
+                    ordered.add(key);
+                }
+                dirty.clear();
+                dirty.addAll(ordered);
             }
         }
     }

@@ -46,6 +46,10 @@ final class CaveTextureAtlas {
         return storageGeneration;
     }
 
+    int availableSlotCount() {
+        return freeSlots.size();
+    }
+
     int acquireSlot() {
         RenderSystem.assertOnRenderThreadOrInit();
         initialize();
@@ -70,8 +74,12 @@ final class CaveTextureAtlas {
     }
 
     CaveAtlasRegion region(int slot, float scale) {
-        if (!initialized || slot < 0 || slot >= SLOT_COUNT || !allocatedSlots[slot]) return null;
-        int lod = lodForScale(scale);
+        return regionForLod(slot, lodForScale(scale));
+    }
+
+    CaveAtlasRegion regionForLod(int slot, int lod) {
+        if (!initialized || slot < 0 || slot >= SLOT_COUNT
+                || !allocatedSlots[slot] || lod < 0 || lod >= LOD_COUNT) return null;
         int pageSize = LOD_SIZES[lod];
         int atlasSize = pageSize * SLOT_COLUMNS;
         int sourceX = (slot % SLOT_COLUMNS) * pageSize;

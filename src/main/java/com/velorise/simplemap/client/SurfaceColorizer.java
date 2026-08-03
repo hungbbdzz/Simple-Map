@@ -77,10 +77,15 @@ public final class SurfaceColorizer {
                  * and region/chunk boundaries as false rectangular shadows. Fluids therefore
                  * keep a flat lighting layer; land and cave terrain retain full relief.
                  */
-                float shade = fluidPixel
-                        ? 1.0f
+                boolean vanillaWater = fluidPixel && colourMode == 1
+                        && !MapBlockData.isGlowing(packed);
+                float shade = vanillaWater
+                        ? vanillaWaterShade(MapBlockData.waterDepth(packed), px, pz)
+                        : fluidPixel ? 1.0f
                         : calculateShade(pixels, px, pz, SIZE, SIZE, reliefY, terrainSlopes);
-                shade *= 1.0f + microNoise(index, packed, reliefY);
+                if (!vanillaWater) {
+                    shade *= 1.0f + microNoise(index, packed, reliefY);
+                }
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
@@ -119,6 +124,32 @@ public final class SurfaceColorizer {
             int terrainSlopes,
             int profile,
             BooleanSupplier stillValid) {
+        return colorizePageWindow(pixels, tints, stride, halo,
+                worldPageStartX, worldPageStartZ, biomePalette, blockPalette,
+                biomeLookup, blockColors, tintPolicies, tintDisabledBlocks,
+                colourMode, showFlowers, terrainSlopes, profile,
+                MapPageLayout.FULL_SUBTILE_MASK, stillValid);
+    }
+
+    /**
+     * Styles only the requested Minecraft-chunk-sized parts of an exact page.
+     * The returned arrays retain page coordinates so render publication can copy
+     * the changed 16x16 rectangles directly into an existing atlas leaf.
+     */
+    public static int[] colorizePageWindow(long[] pixels, int[] tints,
+            int stride, int halo, int worldPageStartX, int worldPageStartZ,
+            List<String> biomePalette,
+            List<String> blockPalette,
+            IntFunction<Biome> biomeLookup,
+            Map<String, Integer> blockColors,
+            Map<String, BlockTintPolicy> tintPolicies,
+            Set<String> tintDisabledBlocks,
+            int colourMode,
+            boolean showFlowers,
+            int terrainSlopes,
+            int profile,
+            int requestedSubtiles,
+            BooleanSupplier stillValid) {
         int pageSize = MapPageLayout.PAGE_SIZE;
         if (stride < pageSize + halo * 2
                 || pixels == null || pixels.length != stride * stride
@@ -127,13 +158,19 @@ public final class SurfaceColorizer {
         }
 
         int[] output = new int[pageSize * pageSize];
+        int updateMask = requestedSubtiles & MapPageLayout.FULL_SUBTILE_MASK;
         for (int localZ = 0; localZ < pageSize; localZ++) {
             if ((localZ & 15) == 0 && !stillValid.getAsBoolean()) {
                 throw new java.util.concurrent.CancellationException("Stale SimpleMap page job");
             }
+            int subtileRow = (localZ / MapPageLayout.SUBTILE_SIZE)
+                    * MapPageLayout.SUBTILES_PER_PAGE;
             int pz = halo + localZ;
             int pageRow = localZ * pageSize;
             for (int localX = 0; localX < pageSize; localX++) {
+                int subtile = subtileRow
+                        + localX / MapPageLayout.SUBTILE_SIZE;
+                if ((updateMask & (1 << subtile)) == 0) continue;
                 int px = halo + localX;
                 int index = pz * stride + px;
                 long packed = pixels[index];
@@ -152,13 +189,21 @@ public final class SurfaceColorizer {
                 int blue = baseColor & 0xFF;
                 int reliefY = MapBlockData.reliefY(packed);
                 boolean fluidPixel = MapBlockData.isFluid(packed);
-                float shade = fluidPixel ? 1.0f
+                int worldX = worldPageStartX + localX;
+                int worldZ = worldPageStartZ + localZ;
+                boolean vanillaWater = fluidPixel && colourMode == 1
+                        && !MapBlockData.isGlowing(packed);
+                float shade = vanillaWater
+                        ? vanillaWaterShade(MapBlockData.waterDepth(packed), worldX, worldZ)
+                        : fluidPixel ? 1.0f
                         : calculateShade(pixels, px, pz, stride, stride,
                                 reliefY, terrainSlopes);
-                int regionLocalX = Math.floorMod(worldPageStartX + localX, SIZE);
-                int regionLocalZ = Math.floorMod(worldPageStartZ + localZ, SIZE);
-                shade *= 1.0f + microNoise(regionLocalZ * SIZE + regionLocalX,
-                        packed, reliefY);
+                int regionLocalX = Math.floorMod(worldX, SIZE);
+                int regionLocalZ = Math.floorMod(worldZ, SIZE);
+                if (!vanillaWater) {
+                    shade *= 1.0f + microNoise(regionLocalZ * SIZE + regionLocalX,
+                            packed, reliefY);
+                }
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
@@ -230,10 +275,13 @@ public final class SurfaceColorizer {
             waterAmount = Math.min(colourMode == 1 ? 0.94f : 0.92f, waterAmount);
             int mixed = mixRgb(floorColor, waterTint, waterAmount);
 
-            // Exponential attenuation gives deep water a readable dark core while
-            // preserving bottom detail in shallow rivers and shorelines.
-            float attenuation = (float) Math.pow(0.975, Math.max(0, depth - 2));
-            attenuation = Math.max(0.46f, attenuation);
+            // Accurate mode keeps smooth depth attenuation. Vanilla mode uses a
+            // gentler base because its discrete checker brightness carries the
+            // classic filled-map depth bands.
+            float attenuation = colourMode == 1
+                    ? (float) Math.pow(0.988, Math.max(0, depth - 2))
+                    : (float) Math.pow(0.975, Math.max(0, depth - 2));
+            attenuation = Math.max(colourMode == 1 ? 0.72f : 0.46f, attenuation);
             return scaleRgb(mixed, attenuation);
         }
 
@@ -375,6 +423,23 @@ public final class SurfaceColorizer {
             return fallback;
         long packed = pixels[pz * width + px];
         return MapBlockData.isEmpty(packed) ? fallback : MapBlockData.reliefY(packed);
+    }
+
+    /**
+     * Basic vanilla-map water dither. Depth selects a discrete brightness band and
+     * block parity alternates the neighbouring shade, producing the familiar
+     * checker pattern without changing the stored terrain data.
+     */
+    private static float vanillaWaterShade(int depth, int worldX, int worldZ) {
+        boolean lightCell = ((worldX ^ worldZ) & 1) == 0;
+        float centre;
+        if (depth <= 1) centre = 1.06f;
+        else if (depth <= 4) centre = 1.00f;
+        else if (depth <= 8) centre = 0.93f;
+        else if (depth <= 16) centre = 0.86f;
+        else centre = 0.79f;
+        float contrast = depth <= 2 ? 0.035f : 0.055f;
+        return centre + (lightCell ? contrast : -contrast);
     }
 
     private static float microNoise(int linearIndex, long packed, int y) {

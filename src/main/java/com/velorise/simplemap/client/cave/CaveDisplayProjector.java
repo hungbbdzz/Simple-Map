@@ -14,6 +14,8 @@ import net.minecraft.world.level.block.state.BlockState;
  */
 final class CaveDisplayProjector {
     static final int LAYER_DEPTH = 32;
+    /** Reject one-block noise pockets in column-projected cave dimensions. */
+    private static final int FULL_CAVE_MIN_HEADROOM = 2;
 
     private final CaveStateClassifier geometry = CaveStateClassifier.getInstance();
     private final MapVisualClassifier visuals = MapVisualClassifier.getInstance();
@@ -43,7 +45,24 @@ final class CaveDisplayProjector {
 
     void projectColumn(ChunkSource source, CaveView view, int layerY,
             int localX, int localZ, DenseCaveTile.Builder output) {
-        output.beginColumn();
+        ColumnCursor cursor = beginColumn(source, view, layerY,
+                localX, localZ, output);
+        while (!projectColumnSlice(source, localX, localZ, output, cursor,
+                Long.MAX_VALUE, Integer.MAX_VALUE)) {
+            // The compatibility/worker path is intentionally unbounded.
+        }
+    }
+
+    /**
+     * Starts one resumable live-column projection. A full cave column can touch
+     * hundreds of block states and invoke modded colour/collision hooks. Treating
+     * that as one indivisible operation allowed a nominal 1 ms foreground slice to
+     * hold the render thread for 80-100 ms. The display scheduler now resumes this
+     * cursor in small vertical bursts and checks its physical-frame deadline between
+     * them; worker-side callers retain the unbounded wrapper above.
+     */
+    ColumnCursor beginColumn(ChunkSource source, CaveView view, int layerY,
+            int localX, int localZ, DenseCaveTile.Builder output) {
         boolean full = view == CaveView.FULL;
         int minimumY = source.minimumY();
         int maximumY = source.maximumY() - 1;
@@ -53,31 +72,93 @@ final class CaveDisplayProjector {
         int lowY = full
                 ? minimumY
                 : Math.max(minimumY, highY + 1 - LAYER_DEPTH);
+        output.beginColumn();
+        return new ColumnCursor(full, highY, lowY);
+    }
 
-        boolean underAir = full;
-        boolean shouldEnterGround = full;
-        int openTopY = lowY;
-        int waterDepth = 0;
-        int otherFluidDepth = 0;
-        boolean sawOverlay = false;
-
-        for (int y = highY; y >= lowY; y--) {
+    boolean projectColumnSlice(ChunkSource source, int localX, int localZ,
+            DenseCaveTile.Builder output, ColumnCursor cursor,
+            long deadlineNanos, int maximumSteps) {
+        if (cursor == null || cursor.done) return true;
+        int steps = 0;
+        int safeMaximum = Math.max(1, maximumSteps);
+        while (cursor.y >= cursor.lowY && steps < safeMaximum
+                && System.nanoTime() < deadlineNanos) {
+            int y = cursor.y;
+            steps++;
+            byte sectionKind = source.sectionKind(y);
+            int sectionBottom = Math.max(cursor.lowY, source.sectionBottom(y));
+            if (sectionKind == CaveTileScanContext.ALL_AIR) {
+                if (!cursor.underAir) {
+                    cursor.openTopY = y;
+                    cursor.cavityOpenDepth = 0;
+                }
+                cursor.underAir = true;
+                cursor.cavityOpenDepth += y - sectionBottom + 1;
+                cursor.y = sectionBottom - 1;
+                continue;
+            }
+            if (sectionKind == CaveTileScanContext.ALL_SOLID_FAST) {
+                if (cursor.shouldEnterGround) {
+                    cursor.shouldEnterGround = false;
+                    cursor.underAir = false;
+                    cursor.resetCavity();
+                    output.beginColumn();
+                    cursor.y = sectionBottom - 1;
+                    continue;
+                }
+                if (!cursor.underAir) {
+                    cursor.y = sectionBottom - 1;
+                    continue;
+                }
+                if (cursor.full && cursor.cavityOpenDepth < FULL_CAVE_MIN_HEADROOM) {
+                    cursor.underAir = false;
+                    cursor.resetCavity();
+                    output.beginColumn();
+                    cursor.y = sectionBottom - 1;
+                    continue;
+                }
+                BlockState state = source.stateAt(localX, y, localZ);
+                BlockState visualState = source.visualStateAt(
+                        localX, y, localZ, state);
+                int color = source.resolveBlockColor(
+                        visualState, localX, y, localZ);
+                if (color != 0) {
+                    byte flags = visualState.getLightEmission() > 0
+                            ? DenseCaveTile.FLAG_EMISSIVE : 0;
+                    int floorLight = Math.max(visualState.getLightEmission(),
+                            source.lightAt(localX, y, localZ));
+                    output.set(localX, localZ, color, y,
+                            Math.max(y, cursor.openTopY), flags, floorLight);
+                    cursor.done = true;
+                    return true;
+                }
+                cursor.underAir = false;
+                cursor.y = sectionBottom - 1;
+                continue;
+            }
             BlockState state = source.stateAt(localX, y, localZ);
-            BlockState visualState = source.visualStateAt(localX, y, localZ);
+            BlockState visualState = source.visualStateAt(localX, y, localZ, state);
             CaveStateClassifier.StateInfo geometryInfo = geometry.info(state);
             MapVisualClassifier.VisualInfo visual = visuals.info(visualState);
             byte kind = geometryInfo.kind();
-            int stateLight = Math.max(Math.max(state.getLightEmission(),
-                    visualState.getLightEmission()), source.lightAt(localX, y, localZ));
-            int skyLight = source.skyLightAt(localX, y, localZ);
-            int visibleLayerLight = Math.max(stateLight, Math.min(12, skyLight));
+            // Lighting is expensive for live chunks. Most scanned roof/terrain
+            // blocks are discarded before they become a visible floor or overlay,
+            // so defer block/sky light reads until a pixel is actually emitted.
+            int emittedLight = Math.max(state.getLightEmission(),
+                    visualState.getLightEmission());
 
             // Match Xaero's cave-entry semantics: only real air (and fluids below)
             // opens a cavity. A torch, flower, rail, leaf or glass block embedded in
             // terrain must not manufacture an artificial one-pixel cave opening.
             if (state.isAir()) {
-                if (!underAir) openTopY = y;
-                underAir = true;
+                if (!cursor.underAir) {
+                    cursor.openTopY = y;
+                    cursor.cavityOpenDepth = 0;
+                }
+                cursor.underAir = true;
+                cursor.cavityOpenDepth++;
+                cursor.y--;
                 continue;
             }
 
@@ -85,25 +166,40 @@ final class CaveDisplayProjector {
                 // A waterlogged state can contribute both its block material and a
                 // fluid overlay. Pure fluid states stop here; waterlogged geometry
                 // continues through the normal base/overlay classification below.
-                if (!shouldEnterGround) {
-                    if (!underAir) openTopY = y;
-                    underAir = true;
+                if (!cursor.shouldEnterGround) {
+                    if (!cursor.underAir) {
+                        cursor.openTopY = y;
+                        cursor.cavityOpenDepth = 0;
+                    }
+                    cursor.underAir = true;
+                    cursor.cavityOpenDepth++;
                     int layerColor = source.resolveFluidColor(
                             visualState, localX, y, localZ);
                     byte layerFlags = DenseCaveTile.OVERLAY_FLUID;
                     if (visual.emissive()) layerFlags |= DenseCaveTile.OVERLAY_EMISSIVE;
+                    int visibleLayerLight = visibleLayerLight(source,
+                            localX, y, localZ, emittedLight);
                     output.addOverlay(layerColor, visuals.fluidOverlayOpacity(visualState), y,
                             visibleLayerLight, layerFlags);
-                    sawOverlay |= layerColor != 0;
-                    if (kind == CaveStateClassifier.WATER || visual.water()) waterDepth++;
-                    else otherFluidDepth++;
+                    cursor.sawOverlay |= layerColor != 0;
+                    if (kind == CaveStateClassifier.WATER || visual.water()) {
+                        cursor.waterDepth++;
+                    } else {
+                        cursor.otherFluidDepth++;
+                    }
                 }
-                if (visual.role() == MapVisualClassifier.Role.FLUID_OVERLAY) continue;
+                if (visual.role() == MapVisualClassifier.Role.FLUID_OVERLAY) {
+                    cursor.y--;
+                    continue;
+                }
             }
 
             // Torches and equivalent modded decorations contribute light but never
             // replace the floor material or open a cavity by themselves.
-            if (visual.role() == MapVisualClassifier.Role.INVISIBLE) continue;
+            if (visual.role() == MapVisualClassifier.Role.INVISIBLE) {
+                cursor.y--;
+                continue;
+            }
 
             boolean collisionEmpty = kind == CaveStateClassifier.AIR
                     || (kind == CaveStateClassifier.DYNAMIC
@@ -116,52 +212,120 @@ final class CaveDisplayProjector {
                 // Like Xaero's loadPixelHelp(), transparent material is collected
                 // only after the scan is already under real air/fluid. It is not an
                 // air substitute while traversing solid terrain.
-                if (shouldEnterGround || !underAir) continue;
+                if (cursor.shouldEnterGround || !cursor.underAir) {
+                    cursor.y--;
+                    continue;
+                }
                 int layerColor = source.resolveBlockColor(
                         visualState, localX, y, localZ);
                 byte layerFlags = visual.emissive()
                         ? DenseCaveTile.OVERLAY_EMISSIVE : 0;
+                int visibleLayerLight = visibleLayerLight(source,
+                        localX, y, localZ, emittedLight);
                 output.addOverlay(layerColor, visual.overlayOpacity(), y,
                         visibleLayerLight, layerFlags);
-                sawOverlay |= layerColor != 0;
+                cursor.sawOverlay |= layerColor != 0;
+                cursor.cavityOpenDepth++;
+                cursor.y--;
                 continue;
             }
 
-            if (shouldEnterGround) {
+            if (cursor.shouldEnterGround) {
                 // Surface trees/decor do not count as the terrain roof. The first
                 // opaque terrain block begins the underground search transaction.
                 if (state.is(BlockTags.LOGS) || visual.leaves()
                         || visual.flower() || state.canBeReplaced()) {
+                    cursor.y--;
                     continue;
                 }
-                shouldEnterGround = false;
-                underAir = false;
-                waterDepth = 0;
-                otherFluidDepth = 0;
-                sawOverlay = false;
+                cursor.shouldEnterGround = false;
+                cursor.underAir = false;
+                cursor.resetCavity();
                 output.beginColumn();
+                cursor.y--;
                 continue;
             }
 
-            if (!underAir) continue;
+            if (!cursor.underAir) {
+                cursor.y--;
+                continue;
+            }
+
+            if (cursor.full && cursor.cavityOpenDepth < FULL_CAVE_MIN_HEADROOM) {
+                // Tiny pockets inside Nether terrain create salt-and-pepper noise
+                // and unstable floors. Treat this solid as another roof boundary
+                // and continue to the next usable cavity in the same column.
+                cursor.underAir = false;
+                cursor.resetCavity();
+                output.beginColumn();
+                cursor.y--;
+                continue;
+            }
 
             int color = source.resolveBlockColor(visualState, localX, y, localZ);
             if (color == 0) {
-                sawOverlay = true;
+                cursor.sawOverlay = true;
+                cursor.y--;
                 continue;
             }
 
             byte flags = 0;
-            if (waterDepth > 0) flags |= DenseCaveTile.FLAG_WATER;
-            if (otherFluidDepth > 0) flags |= DenseCaveTile.FLAG_FLUID;
+            if (cursor.waterDepth > 0) flags |= DenseCaveTile.FLAG_WATER;
+            if (cursor.otherFluidDepth > 0) flags |= DenseCaveTile.FLAG_FLUID;
             if (visual.emissive()) flags |= DenseCaveTile.FLAG_EMISSIVE;
-            if (sawOverlay) flags |= DenseCaveTile.FLAG_OVERLAY;
+            if (cursor.sawOverlay) flags |= DenseCaveTile.FLAG_OVERLAY;
+            int floorLight = Math.max(emittedLight,
+                    source.lightAt(localX, y, localZ));
             output.set(localX, localZ, color, y,
-                    Math.max(y, openTopY), flags, stateLight);
-            return;
+                    Math.max(y, cursor.openTopY), flags, floorLight);
+            cursor.done = true;
+            return true;
         }
 
-        output.set(localX, localZ, 0, 0, 0, (byte) 0, 0);
+        if (cursor.y < cursor.lowY) {
+            output.set(localX, localZ, 0, 0, 0, (byte) 0, 0);
+            cursor.done = true;
+        }
+        return cursor.done;
+    }
+
+    static final class ColumnCursor {
+        private final boolean full;
+        private final int lowY;
+        private int y;
+        private boolean underAir;
+        private boolean shouldEnterGround;
+        private int openTopY;
+        private int waterDepth;
+        private int otherFluidDepth;
+        private int cavityOpenDepth;
+        private boolean sawOverlay;
+        private boolean done;
+
+        private ColumnCursor(boolean full, int highY, int lowY) {
+            this.full = full;
+            this.lowY = lowY;
+            this.y = highY;
+            this.underAir = full;
+            this.shouldEnterGround = full;
+            this.openTopY = lowY;
+        }
+
+        private void resetCavity() {
+            waterDepth = 0;
+            otherFluidDepth = 0;
+            cavityOpenDepth = 0;
+            sawOverlay = false;
+        }
+    }
+
+    private static int visibleLayerLight(ChunkSource source,
+            int localX, int y, int localZ, int emittedLight) {
+        int blockLight = Math.max(emittedLight,
+                source.lightAt(localX, y, localZ));
+        if (blockLight >= 12) return blockLight;
+        return Math.max(blockLight,
+                Math.min(12, source.skyLightAt(localX, y, localZ)));
     }
 
     interface ChunkSource {
@@ -172,8 +336,18 @@ final class CaveDisplayProjector {
         int maximumY();
         int surfaceY(int localX, int localZ);
         BlockState stateAt(int localX, int y, int localZ);
+        default byte sectionKind(int y) {
+            return CaveTileScanContext.MIXED;
+        }
+        default int sectionBottom(int y) {
+            return Math.floorDiv(y, 16) * 16;
+        }
         default BlockState visualStateAt(int localX, int y, int localZ) {
             return stateAt(localX, y, localZ);
+        }
+        default BlockState visualStateAt(int localX, int y, int localZ,
+                BlockState actualState) {
+            return visualStateAt(localX, y, localZ);
         }
         net.minecraft.world.level.BlockGetter blockGetter();
         net.minecraft.core.BlockPos position(int localX, int y, int localZ);

@@ -8,7 +8,6 @@ import java.util.Locale;
 
 /** Centralized, side-safe actions used by configurable key mappings. */
 public final class MapKeybindActions {
-    private static final float MIN_ZOOM = 0.05f;
     private static final float MAX_ZOOM = 2.0f;
     private static final float ZOOM_STEP = 1.20f;
 
@@ -43,19 +42,20 @@ public final class MapKeybindActions {
     public static void zoomIn(Minecraft mc) {
         MapConfig.minimapZoom = Math.min(MAX_ZOOM, MapConfig.minimapZoom * ZOOM_STEP);
         MapConfig.save();
-        notify(mc, String.format(Locale.ROOT, "Minimap zoom: %.2fx", MapConfig.minimapZoom));
+        notify(mc, String.format(Locale.ROOT, "%.2fx", MapConfig.minimapZoom));
     }
 
     public static void zoomOut(Minecraft mc) {
-        MapConfig.minimapZoom = Math.max(MIN_ZOOM, MapConfig.minimapZoom / ZOOM_STEP);
+        MapConfig.minimapZoom = Math.max(MapConfig.MINIMUM_ZOOM_SCALE,
+                MapConfig.minimapZoom / ZOOM_STEP);
         MapConfig.save();
-        notify(mc, String.format(Locale.ROOT, "Minimap zoom: %.2fx", MapConfig.minimapZoom));
+        notify(mc, String.format(Locale.ROOT, "%.2fx", MapConfig.minimapZoom));
     }
 
     public static void resetZoom(Minecraft mc) {
         MapConfig.minimapZoom = 1.0f;
         MapConfig.save();
-        notify(mc, "Minimap zoom: 1.00x");
+        notify(mc, "1.00x");
     }
 
     public static void cycleNightMode(Minecraft mc) {
@@ -77,19 +77,18 @@ public final class MapKeybindActions {
                     : "Cave map: disabled in local settings");
             return;
         }
-        if (MapConfig.getEffectiveCaveMapMode() == 1) {
-            notify(mc, MapConfig.serverExtensionAvailable
-                    ? "Cave map: automatic (server controlled)"
-                    : "Cave map: automatic (local setting)");
-            return;
-        }
         CaveMode.cycleCaveType(mc);
-        if (CaveMode.getCaveType(mc) == CaveMode.CaveType.OFF) {
-            CaveMapManager.getInstance().deactivate();
+        CaveMode.CaveType type = CaveMode.getCaveType(mc);
+        switch (type) {
+            case OFF -> CaveMapManager.getInstance().deactivate();
+            case LAYERED -> ChunkScanner.getInstance()
+                    .requestImmediateCaveLayerRefresh(mc);
+            case FULL -> ChunkScanner.getInstance()
+                    .requestImmediateCaveLayerRefresh(mc);
         }
-        notify(mc, "Cave map: " + switch (CaveMode.getCaveType(mc)) {
+        notify(mc, "Cave map: " + switch (type) {
             case OFF -> "OFF";
-            case LAYERED -> "LAYERED";
+            case LAYERED -> "CAVE";
             case FULL -> "FULL";
         });
     }
@@ -126,8 +125,9 @@ public final class MapKeybindActions {
 
     public static void addWaypointAtPlayer(Minecraft mc) {
         if (!ready(mc)) return;
-        mc.setScreen(new AddWaypointScreen(mc.screen, mc.player.getX(), mc.player.getZ(),
-                MapManager.getInstance().getCurrentDimensionId()));
+        mc.setScreen(new AddWaypointScreen(mc.screen,
+                mc.player.getX(), mc.player.getY(), mc.player.getZ(),
+                MapManager.getInstance().getLiveDimensionResourceId()));
     }
 
     public static void openWaypointList(Minecraft mc) {

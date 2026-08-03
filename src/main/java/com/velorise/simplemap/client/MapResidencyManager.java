@@ -1,9 +1,6 @@
 package com.velorise.simplemap.client;
 
-import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -30,6 +27,8 @@ public final class MapResidencyManager {
         CAVE_EXACT(5),
         SURFACE_BRANCH(3),
         CAVE_BRANCH(3),
+        SURFACE_LEGACY(1),
+        CAVE_LEGACY(1),
         LEGACY(1);
 
         private final int baseRank;
@@ -48,10 +47,24 @@ public final class MapResidencyManager {
     private final Map<String, Entry> entries = new ConcurrentHashMap<>();
     private final AtomicLong globalEvictions = new AtomicLong();
     private final AtomicLong budgetFailures = new AtomicLong();
+    /** O(1) resident byte accounting; never rescan the whole residency table in hot paths. */
+    private final AtomicLong residentBytes = new AtomicLong();
     /** Changes only when existing atlas UVs can become unsafe. */
     private final AtomicLong topologyRevision = new AtomicLong();
     /** Changes whenever visible resident coverage is added, updated or removed. */
     private final AtomicLong contentRevision = new AtomicLong();
+    /** Family-local coverage revisions prevent unrelated surface/cave churn rebuilding plans. */
+    private final AtomicLong surfaceContentRevision = new AtomicLong();
+    private final AtomicLong caveContentRevision = new AtomicLong();
+    /**
+     * GPU pixel publication revisions are intentionally separate from coverage.
+     * A page can upload changed texels into an already-resident atlas slot without
+     * altering render-plan geometry. Retained composition targets still need to
+     * know that their copied pixels are stale, so every exact atlas write advances
+     * the corresponding family revision.
+     */
+    private final AtomicLong surfacePixelRevision = new AtomicLong();
+    private final AtomicLong cavePixelRevision = new AtomicLong();
 
     private MapResidencyManager() {
     }
@@ -82,21 +95,43 @@ public final class MapResidencyManager {
         if (key == null) return;
         long now = System.nanoTime();
         Kind effectiveKind = kind == null ? Kind.LEGACY : kind;
-        boolean[] coverageChanged = {false};
-        entries.compute(key, (ignored, old) -> {
-            Entry entry = old == null ? new Entry() : old;
-            if (old == null || entry.kind != effectiveKind) coverageChanged[0] = true;
-            entry.kind = effectiveKind;
-            entry.estimatedBytes = Math.max(0L, estimatedBytes);
-            if (evictionHandler != null) entry.evictionHandler = evictionHandler;
-            if (entry.createdNanos == 0L) entry.createdNanos = now;
-            entry.lastResidentNanos = now;
-            if (entry.lastTouchNanos == 0L) entry.lastTouchNanos = now;
-            return entry;
-        });
-        // Pixel uploads into an existing atlas slot do not invalidate geometry/UV
-        // plans. Only newly visible coverage (or a kind/topology transition) does.
-        if (coverageChanged[0]) contentRevision.incrementAndGet();
+        long effectiveBytes = Math.max(0L, estimatedBytes);
+
+        while (true) {
+            Entry entry = entries.get(key);
+            boolean created = false;
+            if (entry == null) {
+                Entry candidate = new Entry();
+                Entry raced = entries.putIfAbsent(key, candidate);
+                entry = raced == null ? candidate : raced;
+                created = raced == null;
+            }
+
+            Kind oldKind;
+            long oldBytes;
+            synchronized (entry) {
+                // A concurrent eviction may have detached this entry after get().
+                // Retry rather than updating an orphan and corrupting byte accounting.
+                if (entries.get(key) != entry) continue;
+                oldKind = entry.kind;
+                oldBytes = entry.estimatedBytes;
+                entry.kind = effectiveKind;
+                entry.estimatedBytes = effectiveBytes;
+                if (evictionHandler != null) entry.evictionHandler = evictionHandler;
+                if (entry.createdNanos == 0L) entry.createdNanos = now;
+                entry.lastResidentNanos = now;
+                if (entry.lastTouchNanos == 0L) entry.lastTouchNanos = now;
+            }
+
+            long delta = effectiveBytes - oldBytes;
+            if (delta != 0L) residentBytes.addAndGet(delta);
+            if (created || oldKind != effectiveKind) {
+                contentRevision.incrementAndGet();
+                if (!created) incrementFamilyRevision(oldKind);
+                incrementFamilyRevision(effectiveKind);
+            }
+            return;
+        }
     }
 
     public long topologyRevision() {
@@ -107,10 +142,45 @@ public final class MapResidencyManager {
         return contentRevision.get();
     }
 
+    public long surfaceContentRevision() {
+        return surfaceContentRevision.get();
+    }
+
+    public long caveContentRevision() {
+        return caveContentRevision.get();
+    }
+
+    public long surfacePixelRevision() {
+        return surfacePixelRevision.get();
+    }
+
+    public long cavePixelRevision() {
+        return cavePixelRevision.get();
+    }
+
+    /** Records an atlas texel mutation without forcing render-plan reconstruction. */
+    public void markPixelsChanged(Kind kind) {
+        Kind effective = kind == null ? Kind.LEGACY : kind;
+        switch (effective) {
+            case SURFACE_EXACT, SURFACE_BRANCH, SURFACE_LEGACY ->
+                    surfacePixelRevision.incrementAndGet();
+            case CAVE_EXACT, CAVE_BRANCH, CAVE_LEGACY ->
+                    cavePixelRevision.incrementAndGet();
+            case LEGACY -> {
+                surfacePixelRevision.incrementAndGet();
+                cavePixelRevision.incrementAndGet();
+            }
+        }
+    }
+
     /** Call when an atlas object/storage is recreated and all cached UV plans are unsafe. */
     public void markTopologyChanged() {
         topologyRevision.incrementAndGet();
         contentRevision.incrementAndGet();
+        surfaceContentRevision.incrementAndGet();
+        caveContentRevision.incrementAndGet();
+        surfacePixelRevision.incrementAndGet();
+        cavePixelRevision.incrementAndGet();
     }
 
     /**
@@ -120,6 +190,27 @@ public final class MapResidencyManager {
      */
     public void markCoverageChanged() {
         contentRevision.incrementAndGet();
+        surfaceContentRevision.incrementAndGet();
+        caveContentRevision.incrementAndGet();
+    }
+
+    public void markCoverageChanged(Kind kind) {
+        contentRevision.incrementAndGet();
+        incrementFamilyRevision(kind);
+    }
+
+    private void incrementFamilyRevision(Kind kind) {
+        if (kind == Kind.SURFACE_EXACT || kind == Kind.SURFACE_BRANCH
+                || kind == Kind.SURFACE_LEGACY) {
+            surfaceContentRevision.incrementAndGet();
+        } else if (kind == Kind.CAVE_EXACT || kind == Kind.CAVE_BRANCH
+                || kind == Kind.CAVE_LEGACY) {
+            caveContentRevision.incrementAndGet();
+        } else {
+            // Legacy entries can participate in either projection.
+            surfaceContentRevision.incrementAndGet();
+            caveContentRevision.incrementAndGet();
+        }
     }
 
     public void touch(String key) {
@@ -128,25 +219,29 @@ public final class MapResidencyManager {
 
     public void touch(String key, MapRequestLane lane) {
         if (key == null) return;
+        Entry entry = entries.get(key);
+        if (entry == null) return;
         long now = System.nanoTime();
         MapRequestLane effective = lane == null
                 ? MapRequestLane.FULLSCREEN : lane;
-        entries.computeIfPresent(key, (ignored, entry) -> {
-            entry.lastTouchNanos = now;
-            if (effective.rank() >= entry.strongestLaneRank
-                    || now - entry.lastLaneNanos > 3_000_000_000L) {
-                entry.strongestLaneRank = effective.rank();
-                entry.lastLaneNanos = now;
-            }
-            return entry;
-        });
+        entry.lastTouchNanos = now;
+        if (effective.rank() >= entry.strongestLaneRank
+                || now - entry.lastLaneNanos > 3_000_000_000L) {
+            entry.strongestLaneRank = effective.rank();
+            entry.lastLaneNanos = now;
+        }
     }
 
     public void remove(String key) {
-        if (key != null && entries.remove(key) != null) {
-            topologyRevision.incrementAndGet();
-            contentRevision.incrementAndGet();
+        if (key == null) return;
+        Entry entry = entries.get(key);
+        if (entry == null) return;
+        synchronized (entry) {
+            if (!entries.remove(key, entry)) return;
+            residentBytes.addAndGet(-Math.max(0L, entry.estimatedBytes));
         }
+        contentRevision.incrementAndGet();
+        incrementFamilyRevision(entry.kind);
     }
 
     /** Lower values are better eviction victims. */
@@ -219,8 +314,8 @@ public final class MapResidencyManager {
         long budget = MapMemoryBudgetPolicy.residentContentBudgetBytes();
         if (budget <= 0L) return true;
         int guard = 0;
-        while (estimatedResidentBytes() > budget && guard++ < 128) {
-            long current = estimatedResidentBytes();
+        while (residentBytes.get() > budget && guard++ < 128) {
+            long current = residentBytes.get();
             boolean emergency = current > budget + budget / 10L;
             EntryCandidate victim = chooseGlobalVictim(protectedKey, emergency);
             if (victim == null) {
@@ -236,25 +331,32 @@ public final class MapResidencyManager {
                 evicted = false;
             }
             if (evicted) {
-                if (entries.remove(victim.key, entry)) {
-                    topologyRevision.incrementAndGet();
-                    contentRevision.incrementAndGet();
+                // Handlers normally call remove() themselves. If one does not,
+                // retire it here exactly once and keep byte accounting coherent.
+                if (entry != null) {
+                    synchronized (entry) {
+                        if (entries.remove(victim.key, entry)) {
+                            residentBytes.addAndGet(-Math.max(0L, entry.estimatedBytes));
+                            contentRevision.incrementAndGet();
+                            incrementFamilyRevision(entry.kind);
+                        }
+                    }
                 }
                 globalEvictions.incrementAndGet();
-            } else {
+            } else if (entry != null) {
                 // Do not spin forever on a manager that cannot evict during an
                 // active render batch. Mark it unavailable for this enforcement.
-                if (entry != null) entry.blockedUntilNanos =
-                        System.nanoTime() + 100_000_000L;
+                entry.blockedUntilNanos = System.nanoTime() + 100_000_000L;
             }
         }
-        return estimatedResidentBytes() <= budget;
+        return residentBytes.get() <= budget;
     }
 
     private EntryCandidate chooseGlobalVictim(String protectedKey,
             boolean emergency) {
         long now = System.nanoTime();
-        List<EntryCandidate> candidates = new ArrayList<>();
+        String bestKey = null;
+        long bestScore = Long.MAX_VALUE;
         for (Map.Entry<String, Entry> mapEntry : entries.entrySet()) {
             String key = mapEntry.getKey();
             Entry entry = mapEntry.getValue();
@@ -266,41 +368,39 @@ public final class MapResidencyManager {
                 if (entry.strongestLaneRank >= MapRequestLane.MINIMAP.rank()) continue;
                 if (!emergency) continue;
             }
-            candidates.add(new EntryCandidate(key, evictionScore(key)));
+            long score = evictionScore(key);
+            if (bestKey == null || score < bestScore) {
+                bestKey = key;
+                bestScore = score;
+            }
         }
-        return candidates.stream()
-                .min(Comparator.comparingLong(EntryCandidate::score))
-                .orElse(null);
+        return bestKey == null ? null : new EntryCandidate(bestKey, bestScore);
     }
 
     private long estimatedResidentBytes() {
-        long bytes = 0L;
-        for (Entry entry : entries.values()) bytes += Math.max(0L, entry.estimatedBytes);
-        return bytes;
+        return Math.max(0L, residentBytes.get());
     }
 
     public Snapshot snapshot() {
-        long bytes = 0L;
         int pinned = 0;
         for (Map.Entry<String, Entry> mapEntry : entries.entrySet()) {
-            bytes += Math.max(0L, mapEntry.getValue().estimatedBytes);
             if (isPinned(mapEntry.getKey())) pinned++;
         }
-        return new Snapshot(entries.size(), pinned, bytes,
+        return new Snapshot(entries.size(), pinned, estimatedResidentBytes(),
                 MapMemoryBudgetPolicy.residentContentBudgetBytes(),
                 globalEvictions.get(), budgetFailures.get());
     }
 
     private static final class Entry {
-        private Kind kind = Kind.LEGACY;
-        private long estimatedBytes;
-        private long createdNanos;
-        private long lastResidentNanos;
-        private long lastTouchNanos;
-        private long lastLaneNanos;
-        private long blockedUntilNanos;
-        private int strongestLaneRank;
-        private EvictionHandler evictionHandler;
+        private volatile Kind kind = Kind.LEGACY;
+        private volatile long estimatedBytes;
+        private volatile long createdNanos;
+        private volatile long lastResidentNanos;
+        private volatile long lastTouchNanos;
+        private volatile long lastLaneNanos;
+        private volatile long blockedUntilNanos;
+        private volatile int strongestLaneRank;
+        private volatile EvictionHandler evictionHandler;
     }
 
     private record EntryCandidate(String key, long score) {

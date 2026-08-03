@@ -30,7 +30,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * <p>The old factor-2 {@code SurfaceLodTree} remains a visual-quality adapter,
  * but this service owns durable region-level dirty state, direct source
- * projection, 8x8 parent derivation, CPU prepared revisions and GPU publication.
+ * projection, factor-2 parent derivation, CPU prepared revisions and GPU publication.
  * A level-0 node can therefore cover a 512x512 region before any of its 64 exact
  * pages has completed.</p>
  */
@@ -40,10 +40,21 @@ public final class RegionSurfaceLodService {
             new RegionSurfaceLodService();
     private static final int MAX_LEVEL = MapRegionLodPolicy.MAX_LEVEL;
     private static final int MAX_CPU_RECORDS = 2_048;
-    private static final int DIRECT_SCHEDULE_FOCUSED = 2;
+    private static final int DIRECT_SCHEDULE_FOCUSED = 1;
+    private static final int DIRECT_SCHEDULE_FAR_FOCUSED = 2;
     private static final int DIRECT_SCHEDULE_BACKGROUND = 1;
+    private static final int EXACT_LEVEL0_SCHEDULE_FOCUSED = 4;
+    private static final int EXACT_LEVEL0_SCHEDULE_FAR_FOCUSED = 8;
+    private static final int EXACT_LEVEL0_SCHEDULE_BACKGROUND = 1;
     private static final int PARENT_SCHEDULE_FOCUSED = 2;
+    private static final int PARENT_SCHEDULE_FAR_FOCUSED = 8;
     private static final int PARENT_SCHEDULE_BACKGROUND = 1;
+    private static final int VISIBLE_REGION_LOAD_FOCUSED = 2;
+    private static final int VISIBLE_REGION_LOAD_FAR_FOCUSED = 4;
+    private static final int VISIBLE_REGION_LOAD_BACKGROUND = 1;
+    private static final long DIRECT_BASE_RETRY_NANOS = 350_000_000L;
+    private static final long DIRECT_NULL_RETRY_NANOS = 750_000_000L;
+    private static final long DIRECT_UNCHANGED_RETRY_NANOS = 1_500_000_000L;
 
     private final RegionLodGraph graph = new RegionLodGraph(MAX_LEVEL);
     private final SurfaceRegionLodAtlas[] atlases =
@@ -59,6 +70,10 @@ public final class RegionSurfaceLodService {
 
     private volatile VisibleView visibleView = VisibleView.none();
     private long lifecycleEpoch = 1L;
+    private long visibleLoadSignature = Long.MIN_VALUE;
+    private long[] visibleRegionPlan = new long[0];
+    private int visibleLoadCursor;
+    private int directScanCursor;
 
     private RegionSurfaceLodService() {
         java.util.Arrays.fill(observedStorageGeneration, Long.MIN_VALUE);
@@ -75,12 +90,58 @@ public final class RegionSurfaceLodService {
         return graph;
     }
 
+    /**
+     * Returns a bounded compatibility-LOD publication budget for the current
+     * Surface viewport. The legacy factor-2 tree remains a bootstrap fallback,
+     * but once region authority covers most target nodes it must stop competing
+     * for the same branch GPU ledger every render frame.
+     */
+    public int legacyPublishBudget(boolean focused) {
+        VisibleView view = visibleView;
+        if (!view.current()) return focused ? 2 : 1;
+        if (!view.coarseRequired) return focused ? 2 : 1;
+        if (MapRegionLodPolicy.regionAuthorityOnly(view.scale)) return 0;
+        int level = MapRegionLodPolicy.targetLevel(view.scale);
+        int span = MapRegionLodPolicy.regionSpan(level);
+        int minNodeX = Math.floorDiv(view.minRegionX, span);
+        int maxNodeX = Math.floorDiv(view.maxRegionX, span);
+        int minNodeZ = Math.floorDiv(view.minRegionZ, span);
+        int maxNodeZ = Math.floorDiv(view.maxRegionZ, span);
+        int total = Math.max(0, maxNodeX - minNodeX + 1)
+                * Math.max(0, maxNodeZ - minNodeZ + 1);
+        if (total == 0) return focused ? 2 : 1;
+        int covered = 0;
+        int complete = 0;
+        synchronized (records) {
+            for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
+                for (int nodeX = minNodeX; nodeX <= maxNodeX; nodeX++) {
+                    RegionLodGraph.NodeKey key = new RegionLodGraph.NodeKey(
+                            view.stamp.sessionId(), PROJECTION_SURFACE,
+                            level, nodeX, nodeZ);
+                    NodeRecord record = records.get(key);
+                    if (record == null || !record.initialized
+                            || record.uploadedKnownMask == 0L) continue;
+                    covered++;
+                    if (record.uploadedCompleteMask == -1L) complete++;
+                }
+            }
+        }
+        if (complete == total) return 0;
+        if (covered * 4 >= total * 3) return 1;
+        if (covered * 2 >= total) return focused ? 2 : 1;
+        return focused ? 4 : 1;
+    }
+
     /** Updates only priority metadata; no durable dirty state is discarded. */
     public void setVisibleView(RevisionStamp stamp, float logicalScale,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
             int focusPageX, int focusPageZ) {
         if (stamp == null || !stamp.isCurrent()) {
             visibleView = VisibleView.none();
+            visibleLoadSignature = Long.MIN_VALUE;
+            visibleRegionPlan = new long[0];
+            visibleLoadCursor = 0;
+            directScanCursor = 0;
             return;
         }
         int minRegionX = Math.floorDiv(Math.min(minPageX, maxPageX),
@@ -95,9 +156,22 @@ public final class RegionSurfaceLodService {
                 MapPageLayout.PAGES_PER_REGION);
         int focusRegionZ = Math.floorDiv(focusPageZ,
                 MapPageLayout.PAGES_PER_REGION);
-        visibleView = new VisibleView(stamp, logicalScale,
+        boolean coarseRequired = MapRegionLodPolicy.directProjectionEnabled(
+                logicalScale, minPageX, maxPageX, minPageZ, maxPageZ);
+        VisibleView next = new VisibleView(stamp, logicalScale,
                 minRegionX, maxRegionX, minRegionZ, maxRegionZ,
-                focusRegionX, focusRegionZ, focusPageX, focusPageZ);
+                focusRegionX, focusRegionZ, focusPageX, focusPageZ,
+                coarseRequired);
+        long signature = visibleLoadSignature(next);
+        if (signature != visibleLoadSignature) {
+            visibleLoadSignature = signature;
+            visibleRegionPlan = buildCenterOutRegionPlan(
+                    minRegionX, maxRegionX, minRegionZ, maxRegionZ,
+                    focusRegionX, focusRegionZ);
+            visibleLoadCursor = 0;
+            directScanCursor = 0;
+        }
+        visibleView = next;
     }
 
     /**
@@ -112,8 +186,23 @@ public final class RegionSurfaceLodService {
         }
         synchronizeStorage();
         drainCompletions();
-        scheduleDirectLevel0(focused, deadlineNanos);
-        scheduleParents(focused, deadlineNanos);
+        long now = System.nanoTime();
+        long remaining = Math.max(0L, deadlineNanos - now);
+        long firstPublishDeadline = now + Math.max(120_000L, remaining / 3L);
+        // Prepared coarse coverage must be allowed onto the GPU before another
+        // full-region source probe consumes the complete branch time slice.
+        publishPrepared(focused, Math.min(deadlineNanos, firstPublishDeadline));
+        if (System.nanoTime() < deadlineNanos) {
+            long scheduleDeadline = now + Math.max(240_000L, remaining * 2L / 3L);
+            admitVisibleRegionLoads(focused,
+                    Math.min(deadlineNanos, scheduleDeadline));
+            // Coarse source coverage is the first visible result. Exact-derived
+            // replacement must not exhaust the tiny admission slice before this
+            // fallback gets a chance to start.
+            scheduleDirectLevel0(focused, Math.min(deadlineNanos, scheduleDeadline));
+            scheduleExactLevel0(focused, Math.min(deadlineNanos, scheduleDeadline));
+            scheduleParents(focused, Math.min(deadlineNanos, scheduleDeadline));
+        }
         drainCompletions();
         publishPrepared(focused, deadlineNanos);
         trimCpuRecords();
@@ -186,7 +275,33 @@ public final class RegionSurfaceLodService {
 
     public void updateExactLeaf(RevisionStamp stamp, int regionX, int regionZ,
             int leafIndex, long leafVersion, boolean known,
-            boolean complete, boolean resident) {
+            boolean complete, boolean resident, int[] pixels,
+            long[] knownRows) {
+        RegionLodDeriver.ReducedChildSnapshot reduced = known
+                ? RegionLodDeriver.reduceExactLeaf(leafIndex, leafVersion,
+                        pixels, knownRows)
+                : null;
+        RegionLodGraph.NodeKey key = stamp == null ? null
+                : new RegionLodGraph.NodeKey(stamp.sessionId(),
+                        PROJECTION_SURFACE, 0, regionX, regionZ);
+        if (key != null) {
+            synchronized (records) {
+                NodeRecord record = records.computeIfAbsent(key, NodeRecord::new);
+                if (record.exactLeaves == null) {
+                    record.exactLeaves = new RegionLodDeriver.ReducedChildSnapshot[
+                            RegionLodGraph.CHILD_COUNT];
+                }
+                RegionLodDeriver.ReducedChildSnapshot previous =
+                        record.exactLeaves[leafIndex];
+                if (reduced != null
+                        && (previous == null
+                                || reduced.revision() >= previous.revision())) {
+                    record.exactLeaves[leafIndex] = reduced;
+                } else if (!known) {
+                    record.exactLeaves[leafIndex] = null;
+                }
+            }
+        }
         graph.updateLeaf(stamp, PROJECTION_SURFACE, regionX, regionZ,
                 leafIndex, leafVersion, known, complete, resident);
     }
@@ -202,6 +317,42 @@ public final class RegionSurfaceLodService {
         RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
         return stamp == null ? RegionLodGraph.Summary.empty()
                 : graph.summary(stamp.sessionId(), PROJECTION_SURFACE);
+    }
+
+    /**
+     * Wakes the coarse hierarchy after a saved 512x512 Surface region has reached
+     * authoritative CPU memory. Exact pages are still demand-driven; this signal
+     * exists so a far-zoom viewport can obtain a stable underlay without first
+     * building all sixty-four exact leaves.
+     */
+    public void onRegionSourceAvailable(int regionX, int regionZ) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null || !stamp.isCurrent()) return;
+        MapManager.Region region = MapManager.getInstance().getRegion(
+                regionX, regionZ, false);
+        if (region == null || !region.isLoaded() || !region.hasAnyData()) return;
+        onRegionSourceWarmed(regionX, regionZ);
+        SurfaceRegionSourceDatabase.getInstance().warmLoadedRegion(
+                stamp, regionX, regionZ, MapRequestLane.FULLSCREEN);
+    }
+
+    /** Wakes a direct level-0 retry after asynchronous source warming progressed. */
+    public void onRegionSourceWarmed(int regionX, int regionZ) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null || !stamp.isCurrent()) return;
+        MapManager.Region region = MapManager.getInstance().getRegion(
+                regionX, regionZ, false);
+        if (region == null || !region.isLoaded() || !region.hasAnyData()) return;
+        RegionLodGraph.NodeKey key = new RegionLodGraph.NodeKey(
+                stamp.sessionId(), PROJECTION_SURFACE, 0, regionX, regionZ);
+        synchronized (records) {
+            NodeRecord record = records.computeIfAbsent(key, NodeRecord::new);
+            record.lastDirectAttemptNanos = 0L;
+            record.directProbeMisses = 0;
+            record.unchangedSourceAttempts = 0;
+        }
+        graph.requestRegion(stamp, PROJECTION_SURFACE,
+                regionX, regionZ, region.sourceRevision());
     }
 
     public void invalidate(RevisionStamp stamp) {
@@ -230,7 +381,60 @@ public final class RegionSurfaceLodService {
         }
         graph.clear();
         visibleView = VisibleView.none();
+        visibleLoadSignature = Long.MIN_VALUE;
+        visibleRegionPlan = new long[0];
+        visibleLoadCursor = 0;
+        directScanCursor = 0;
         for (SurfaceRegionLodAtlas atlas : atlases) atlas.resetSlots();
+    }
+
+    /**
+     * Admits saved Surface regions in deterministic screen order. Pass 12 could
+     * render a region branch once its source happened to be resident, but neither
+     * the exact demand path nor the region LOD path actually requested remote
+     * .smdat files. The result was a small ribbon of already-live chunks surrounded
+     * by permanent black space while workers and the GPU stayed idle.
+     */
+    private void admitVisibleRegionLoads(boolean focused, long deadlineNanos) {
+        VisibleView view = visibleView;
+        if (!view.current() || !view.coarseRequired
+                || System.nanoTime() >= deadlineNanos) return;
+        int total = visibleRegionPlan.length;
+        if (total == 0) return;
+        int budget = focused
+                ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
+                        ? VISIBLE_REGION_LOAD_FAR_FOCUSED
+                        : VISIBLE_REGION_LOAD_FOCUSED)
+                : VISIBLE_REGION_LOAD_BACKGROUND;
+        MapManager manager = MapManager.getInstance();
+        int admitted = 0;
+        int considered = 0;
+        /*
+         * This is a retrying visibility ring, not a one-shot discovery pass.
+         * Source-read hints can be coalesced, deferred, or invalidated when the
+         * exact viewport is rebased.  The previous monotonic cursor reached the
+         * end once and then permanently stopped asking for any region which had
+         * missed that first admission, leaving the region LOD underlay at one or
+         * two islands while exact leaves appeared across the screen.
+         */
+        if (visibleLoadCursor >= total) visibleLoadCursor = 0;
+        while (considered < total && admitted < budget
+                && System.nanoTime() < deadlineNanos) {
+            int ordinal = visibleLoadCursor++;
+            if (visibleLoadCursor >= total) visibleLoadCursor = 0;
+            considered++;
+            long packed = visibleRegionPlan[ordinal];
+            int regionX = unpackX(packed);
+            int regionZ = unpackZ(packed);
+            MapManager.Region resident = manager.getRegion(regionX, regionZ, false);
+            if (resident != null && resident.isLoaded()) continue;
+            if (!manager.hasRegionFile(regionX, regionZ)) continue;
+            int priority = MapRequestLane.FULLSCREEN.priorityBase() + 220_000
+                    - Math.min(200_000, ordinal * 128);
+            MapProcessor.getInstance().enqueueSurfaceLoad(
+                    regionX, regionZ, priority);
+            admitted++;
+        }
     }
 
     private void scheduleDirectLevel0(boolean focused, long deadlineNanos) {
@@ -239,45 +443,47 @@ public final class RegionSurfaceLodService {
         // zoom the exact pipeline and the legacy refinement adapter already own
         // visible quality, so capturing whole 512x512 regions here would only
         // recreate the M3 foreground spike that M4 is intended to remove.
-        if (!view.current()
-                || !MapRegionLodPolicy.directProjectionEnabled(view.scale)
+        if (!view.current() || !view.coarseRequired
                 || System.nanoTime() >= deadlineNanos) return;
-        int budget = focused ? DIRECT_SCHEDULE_FOCUSED
+        int budget = focused
+                ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
+                        ? DIRECT_SCHEDULE_FAR_FOCUSED
+                        : DIRECT_SCHEDULE_FOCUSED)
                 : DIRECT_SCHEDULE_BACKGROUND;
-        List<RegionCoordinate> candidates = visibleRegions(view);
+        int total = visibleRegionPlan.length;
+        if (total == 0) return;
+        if (directScanCursor >= total) directScanCursor = 0;
         int scheduled = 0;
-        for (RegionCoordinate candidate : candidates) {
-            if (scheduled >= budget || System.nanoTime() >= deadlineNanos) break;
+        int considered = 0;
+        while (considered < total && scheduled < budget
+                && System.nanoTime() < deadlineNanos) {
+            int ordinal = directScanCursor++;
+            if (directScanCursor >= total) directScanCursor = 0;
+            considered++;
+            long packed = visibleRegionPlan[ordinal];
+            int candidateX = unpackX(packed);
+            int candidateZ = unpackZ(packed);
             RegionLodGraph.NodeKey key = new RegionLodGraph.NodeKey(
                     view.stamp.sessionId(), PROJECTION_SURFACE, 0,
-                    candidate.x, candidate.z);
+                    candidateX, candidateZ);
             if (isPending(key) || !shouldAttemptDirect(key)) continue;
-
-            int focusLocalPageX = clamp(view.focusPageX
-                    - candidate.x * MapPageLayout.PAGES_PER_REGION,
-                    0, MapPageLayout.PAGES_PER_REGION - 1);
-            int focusLocalPageZ = clamp(view.focusPageZ
-                    - candidate.z * MapPageLayout.PAGES_PER_REGION,
-                    0, MapPageLayout.PAGES_PER_REGION - 1);
+            MapManager.Region region = MapManager.getInstance().getRegion(
+                    candidateX, candidateZ, false);
+            if (region == null || !region.isLoaded()) continue;
+            noteDirectProbe(key);
             MapRequestLane lane = focused
                     ? MapRequestLane.FULLSCREEN : MapRequestLane.BACKGROUND;
-            SurfaceRegionSourceDatabase.BatchSourcePlan source =
-                    SurfaceRegionSourceDatabase.getInstance().captureBatchPlan(
-                            view.stamp, candidate.x, candidate.z, 0, 0,
-                            focusLocalPageX, focusLocalPageZ,
-                            MapPageLayout.PAGES_PER_REGION,
-                            MapPageLayout.PAGES_PER_REGION,
-                            false, lane);
-            if (source == null) continue;
-            noteDirectSourceAttempt(key, source.sourceRevision());
-            RegionLodGraph.NodeKey seeded = graph.requestRegion(view.stamp,
-                    PROJECTION_SURFACE, candidate.x, candidate.z,
-                    source.sourceRevision());
-            RegionLodGraph.Lease lease = graph.tryBegin(seeded);
-            if (lease == null) {
-                source.close();
+            MapManager.RegionLodSnapshot source = region.snapshotLodLevel0();
+            if (source == null || source.knownCells() == 0) {
+                noteDirectProbeMiss(key);
                 continue;
             }
+            noteDirectSourceWatermark(key, source.sourceRevision());
+            RegionLodGraph.NodeKey seeded = graph.requestRegion(view.stamp,
+                    PROJECTION_SURFACE, candidateX, candidateZ,
+                    source.sourceRevision());
+            RegionLodGraph.Lease lease = graph.tryBegin(seeded);
+            if (lease == null) continue;
             MapStyleSnapshot style = MapTextureManager.getInstance()
                     .captureStyleSnapshot(source, view.stamp);
             long epoch = lifecycleEpoch;
@@ -289,35 +495,138 @@ public final class RegionSurfaceLodService {
                             lane.executorPriority());
             if (future == null) {
                 graph.defer(lease);
-                source.close();
                 continue;
             }
-            registerPending(new PendingTask(lease, future, source, epoch));
+            registerPending(new PendingTask(lease, future, null, epoch));
             scheduled++;
         }
+    }
+
+    private void scheduleExactLevel0(boolean focused, long deadlineNanos) {
+        VisibleView view = visibleView;
+        if (!view.current() || !view.coarseRequired
+                || System.nanoTime() >= deadlineNanos) return;
+        int budget = focused
+                ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
+                        ? EXACT_LEVEL0_SCHEDULE_FAR_FOCUSED
+                        : EXACT_LEVEL0_SCHEDULE_FOCUSED)
+                : EXACT_LEVEL0_SCHEDULE_BACKGROUND;
+        List<RegionLodGraph.Lease> leases = graph.claimLevel0RowMajor(
+                view.stamp.sessionId(), PROJECTION_SURFACE,
+                view.minRegionX, view.maxRegionX,
+                view.minRegionZ, view.maxRegionZ, budget);
+        for (RegionLodGraph.Lease lease : leases) {
+            if (System.nanoTime() >= deadlineNanos) {
+                graph.defer(lease);
+                continue;
+            }
+            Collection<RegionLodDeriver.ReducedChildSnapshot> children =
+                    exactLevel0Snapshots(lease);
+            if (children == null) {
+                graph.defer(lease);
+                continue;
+            }
+            MapRequestLane lane = focused
+                    ? MapRequestLane.FULLSCREEN : MapRequestLane.BACKGROUND;
+            long epoch = lifecycleEpoch;
+            CompletableFuture<PreparedBranch> future =
+                    MapTextureBuildWorker.tryDeriveRegionLodLevel0(
+                            lease, children,
+                            () -> epoch == lifecycleEpoch
+                                    && view.stamp.isCurrent(),
+                            lane.executorPriority());
+            if (future == null) {
+                graph.defer(lease);
+                continue;
+            }
+            registerPending(new PendingTask(lease, future, null, epoch));
+        }
+    }
+
+    private Collection<RegionLodDeriver.ReducedChildSnapshot>
+            exactLevel0Snapshots(RegionLodGraph.Lease lease) {
+        List<RegionLodDeriver.ReducedChildSnapshot> children = new ArrayList<>();
+        long[] expected = lease.childVersionSums();
+        synchronized (records) {
+            NodeRecord record = records.get(lease.key());
+            if (record == null || record.exactLeaves == null) return null;
+            for (int child = 0; child < RegionLodGraph.CHILD_COUNT; child++) {
+                if ((lease.knownMask() & (1L << child)) == 0L) continue;
+                RegionLodDeriver.ReducedChildSnapshot summary =
+                        record.exactLeaves[child];
+                if (summary == null || summary.revision() != expected[child]) {
+                    return null;
+                }
+                children.add(summary);
+            }
+        }
+        return children;
     }
 
     private void scheduleParents(boolean focused, long deadlineNanos) {
         VisibleView view = visibleView;
         if (!view.current() || System.nanoTime() >= deadlineNanos) return;
-        int budget = focused ? PARENT_SCHEDULE_FOCUSED
+        boolean regionOnly = MapRegionLodPolicy.regionAuthorityOnly(view.scale);
+        int budget = focused
+                ? (regionOnly ? PARENT_SCHEDULE_FAR_FOCUSED
+                        : PARENT_SCHEDULE_FOCUSED)
                 : PARENT_SCHEDULE_BACKGROUND;
+        int scheduled = 0;
+
+        // Build the density-selected visible parent first. This mirrors Xaero's
+        // selected-level update slice and avoids a full graph snapshot + stream +
+        // sort on every far-zoom frame.
+        int targetLevel = MapRegionLodPolicy.targetLevel(view.scale);
+        if (targetLevel > 0) {
+            int span = MapRegionLodPolicy.regionSpan(targetLevel);
+            List<RegionLodGraph.Lease> visible = graph.claimLevelRowMajor(
+                    view.stamp.sessionId(), PROJECTION_SURFACE, targetLevel,
+                    Math.floorDiv(view.minRegionX, span),
+                    Math.floorDiv(view.maxRegionX, span),
+                    Math.floorDiv(view.minRegionZ, span),
+                    Math.floorDiv(view.maxRegionZ, span), budget);
+            scheduled += scheduleParentLeases(visible, focused, deadlineNanos);
+        }
+        if (scheduled >= budget || System.nanoTime() >= deadlineNanos) return;
+
+        // Remaining capacity maintains coarser ancestors and off-target durable
+        // nodes. This path is intentionally small; the selected level above owns
+        // foreground throughput.
         List<RegionLodGraph.NodeSnapshot> candidates = graph.snapshots(
                 view.stamp.sessionId(), PROJECTION_SURFACE).stream()
                 .filter(node -> node.key().level() > 0
+                        && node.key().level() != targetLevel
                         && node.state() == RegionLodGraph.State.DIRTY
                         && node.knownMask() != 0L)
                 .sorted(Comparator
                         .comparingInt((RegionLodGraph.NodeSnapshot node) ->
                                 -node.key().level())
                         .thenComparingLong(node -> distanceToView(node.key(), view)))
+                .limit(Math.max(0, budget - scheduled))
                 .toList();
-        int scheduled = 0;
+        List<RegionLodGraph.Lease> leases = new ArrayList<>(candidates.size());
         for (RegionLodGraph.NodeSnapshot candidate : candidates) {
-            if (scheduled >= budget || System.nanoTime() >= deadlineNanos) break;
+            if (System.nanoTime() >= deadlineNanos) break;
             if (isPending(candidate.key())) continue;
             RegionLodGraph.Lease lease = graph.tryBegin(candidate.key());
-            if (lease == null) continue;
+            if (lease != null) leases.add(lease);
+        }
+        scheduleParentLeases(leases, focused, deadlineNanos);
+    }
+
+    private int scheduleParentLeases(Collection<RegionLodGraph.Lease> leases,
+            boolean focused, long deadlineNanos) {
+        if (leases == null || leases.isEmpty()) return 0;
+        int scheduled = 0;
+        for (RegionLodGraph.Lease lease : leases) {
+            if (System.nanoTime() >= deadlineNanos) {
+                graph.defer(lease);
+                continue;
+            }
+            if (isPending(lease.key())) {
+                graph.defer(lease);
+                continue;
+            }
             Collection<RegionLodDeriver.ChildSnapshot> children =
                     childSnapshots(lease);
             if (children == null) {
@@ -331,7 +640,7 @@ public final class RegionSurfaceLodService {
                     MapTextureBuildWorker.tryDeriveRegionLodParent(
                             lease, children,
                             () -> epoch == lifecycleEpoch
-                                    && view.stamp.isCurrent(),
+                                    && lease.stamp().isCurrent(),
                             lane.executorPriority());
             if (future == null) {
                 graph.defer(lease);
@@ -340,6 +649,7 @@ public final class RegionSurfaceLodService {
             registerPending(new PendingTask(lease, future, null, epoch));
             scheduled++;
         }
+        return scheduled;
     }
 
     private Collection<RegionLodDeriver.ChildSnapshot> childSnapshots(
@@ -348,10 +658,16 @@ public final class RegionSurfaceLodService {
         long[] expected = lease.childVersionSums();
         int childLevel = lease.key().level() - 1;
         synchronized (records) {
-            for (int child = 0; child < RegionLodGraph.CHILD_COUNT; child++) {
+            int childCount = RegionLodGraph.childCountForLevel(
+                    lease.key().level());
+            for (int child = 0; child < childCount; child++) {
                 if ((lease.knownMask() & (1L << child)) == 0L) continue;
-                int childX = lease.key().nodeX() * 8 + (child & 7);
-                int childZ = lease.key().nodeZ() * 8 + (child >>> 3);
+                int childX = lease.key().nodeX()
+                        * RegionLodGraph.PARENT_CHILDREN_PER_AXIS
+                        + child % RegionLodGraph.PARENT_CHILDREN_PER_AXIS;
+                int childZ = lease.key().nodeZ()
+                        * RegionLodGraph.PARENT_CHILDREN_PER_AXIS
+                        + child / RegionLodGraph.PARENT_CHILDREN_PER_AXIS;
                 RegionLodGraph.NodeKey childKey = new RegionLodGraph.NodeKey(
                         lease.key().sessionId(), lease.key().projectionId(),
                         childLevel, childX, childZ);
@@ -438,6 +754,9 @@ public final class RegionSurfaceLodService {
             if (!MapGpuBudgetController.getInstance().tryReserve(
                     MapGpuBudgetController.UploadKind.BRANCH,
                     lane, focused, bytes)) break;
+            boolean wasInitialized = record.initialized && record.slot >= 0;
+            long previousKnownMask = record.uploadedKnownMask;
+            long previousCompleteMask = record.uploadedCompleteMask;
             if (record.slot < 0) {
                 record.slot = atlases[record.key.level()].acquireSlot();
                 if (record.slot < 0) {
@@ -476,7 +795,9 @@ public final class RegionSurfaceLodService {
                     record.uploadedCompleteMask);
             if (publishedRegion != null) {
                 int flags = PageTableEntry.FLAG_LINEAR;
-                if (prepared.completeMask() == -1L) {
+                if (prepared.completeMask()
+                        == RegionLodGraph.completeMaskForLevel(
+                                prepared.key().level())) {
                     flags |= PageTableEntry.FLAG_COMPLETE;
                 }
                 SurfacePublicationService.getInstance().stage(tileKey(record.key),
@@ -492,7 +813,13 @@ public final class RegionSurfaceLodService {
                     () -> evictRecord(record.key));
             MapResidencyManager.getInstance().enforceBudget(
                     residentKey, lane);
-            MapResidencyManager.getInstance().markCoverageChanged();
+            if (wasInitialized
+                    && (previousKnownMask != record.uploadedKnownMask
+                            || previousCompleteMask
+                                    != record.uploadedCompleteMask)) {
+                MapResidencyManager.getInstance().markCoverageChanged(
+                        MapResidencyManager.Kind.SURFACE_BRANCH);
+            }
         }
     }
 
@@ -524,6 +851,11 @@ public final class RegionSurfaceLodService {
         if (leftVisible != rightVisible) return leftVisible ? -1 : 1;
         int byLevel = Integer.compare(right.key.level(), left.key.level());
         if (byLevel != 0) return byLevel;
+        if (leftVisible && rightVisible) {
+            int byZ = Integer.compare(left.key.nodeZ(), right.key.nodeZ());
+            if (byZ != 0) return byZ;
+            return Integer.compare(left.key.nodeX(), right.key.nodeX());
+        }
         return Long.compare(distanceToView(left.key, view),
                 distanceToView(right.key, view));
     }
@@ -564,7 +896,10 @@ public final class RegionSurfaceLodService {
             record.slot = -1;
             record.initialized = false;
             graph.markBranchEvicted(key, record.uploadedRevision);
-            MapResidencyManager.getInstance().markCoverageChanged();
+            // Local atlas eviction and global-budget eviction share this handler.
+            // Removing the residency entry keeps O(1) byte accounting and the
+            // surface coverage revision coherent in both cases.
+            MapResidencyManager.getInstance().remove(residencyKey(key));
             return true;
         }
     }
@@ -624,20 +959,39 @@ public final class RegionSurfaceLodService {
                     && record.uploadedRevision >= snapshot.targetRevision();
             long completeMask = residentCurrent ? record.uploadedCompleteMask
                     : preparedCurrent ? record.prepared.completeMask() : 0L;
-            if ((preparedCurrent || residentCurrent) && completeMask == -1L) {
+            if ((preparedCurrent || residentCurrent)
+                    && completeMask == RegionLodGraph.completeMaskForLevel(
+                            key.level())) {
                 return false;
             }
-            long delay = record.unchangedSourceAttempts >= 2
-                    ? 1_000_000_000L : 120_000_000L;
+            long delay = record.directProbeMisses > 0
+                    ? DIRECT_NULL_RETRY_NANOS
+                    : record.unchangedSourceAttempts >= 2
+                            ? DIRECT_UNCHANGED_RETRY_NANOS
+                            : DIRECT_BASE_RETRY_NANOS;
             return now - record.lastDirectAttemptNanos >= delay;
         }
     }
 
-    private void noteDirectSourceAttempt(RegionLodGraph.NodeKey key,
-            long sourceWatermark) {
+    private void noteDirectProbe(RegionLodGraph.NodeKey key) {
         synchronized (records) {
             NodeRecord record = records.computeIfAbsent(key, NodeRecord::new);
             record.lastDirectAttemptNanos = System.nanoTime();
+        }
+    }
+
+    private void noteDirectProbeMiss(RegionLodGraph.NodeKey key) {
+        synchronized (records) {
+            NodeRecord record = records.computeIfAbsent(key, NodeRecord::new);
+            record.directProbeMisses = Math.min(8, record.directProbeMisses + 1);
+        }
+    }
+
+    private void noteDirectSourceWatermark(RegionLodGraph.NodeKey key,
+            long sourceWatermark) {
+        synchronized (records) {
+            NodeRecord record = records.computeIfAbsent(key, NodeRecord::new);
+            record.directProbeMisses = 0;
             if (record.lastSourceWatermark == sourceWatermark) {
                 record.unchangedSourceAttempts++;
             } else {
@@ -647,25 +1001,66 @@ public final class RegionSurfaceLodService {
         }
     }
 
-    private static List<RegionCoordinate> visibleRegions(VisibleView view) {
-        List<RegionCoordinate> result = new ArrayList<>();
-        for (int z = view.minRegionZ; z <= view.maxRegionZ; z++) {
-            for (int x = view.minRegionX; x <= view.maxRegionX; x++) {
-                result.add(new RegionCoordinate(x, z));
+    private static long[] buildCenterOutRegionPlan(int minX, int maxX,
+            int minZ, int maxZ, int focusX, int focusZ) {
+        int width = Math.max(0, maxX - minX + 1);
+        int height = Math.max(0, maxZ - minZ + 1);
+        int total = width * height;
+        if (total == 0) return new long[0];
+        int centerX = clamp(focusX, minX, maxX);
+        int centerZ = clamp(focusZ, minZ, maxZ);
+        int maximumRadius = Math.max(
+                Math.max(centerX - minX, maxX - centerX),
+                Math.max(centerZ - minZ, maxZ - centerZ));
+        long[] result = new long[total];
+        int ordinal = 0;
+        for (int radius = 0; radius <= maximumRadius; radius++) {
+            int left = centerX - radius;
+            int right = centerX + radius;
+            int top = centerZ - radius;
+            int bottom = centerZ + radius;
+            if (top >= minZ && top <= maxZ) {
+                for (int x = Math.max(minX, left);
+                        x <= Math.min(maxX, right); x++) {
+                    result[ordinal++] = pack(x, top);
+                }
+            }
+            if (radius == 0) continue;
+            for (int z = Math.max(minZ, top + 1);
+                    z <= Math.min(maxZ, bottom - 1); z++) {
+                if (left >= minX && left <= maxX) {
+                    result[ordinal++] = pack(left, z);
+                }
+                if (right != left && right >= minX && right <= maxX) {
+                    result[ordinal++] = pack(right, z);
+                }
+            }
+            if (bottom >= minZ && bottom <= maxZ) {
+                for (int x = Math.max(minX, left);
+                        x <= Math.min(maxX, right); x++) {
+                    result[ordinal++] = pack(x, bottom);
+                }
             }
         }
-        result.sort(Comparator.comparingLong(region -> {
-            long dx = (long) region.x - view.focusRegionX;
-            long dz = (long) region.z - view.focusRegionZ;
-            return dx * dx + dz * dz;
-        }));
         return result;
+    }
+
+    private static long pack(int x, int z) {
+        return ((long) x << 32) ^ (z & 0xffffffffL);
+    }
+
+    private static int unpackX(long packed) {
+        return (int) (packed >> 32);
+    }
+
+    private static int unpackZ(long packed) {
+        return (int) packed;
     }
 
     private static long distanceToView(RegionLodGraph.NodeKey key,
             VisibleView view) {
         if (view == null || !view.current()) return Long.MAX_VALUE;
-        long span = pow8(key.level());
+        long span = pow2(key.level());
         long centerX = (long) key.nodeX() * span + span / 2L;
         long centerZ = (long) key.nodeZ() * span + span / 2L;
         long dx = centerX - view.focusRegionX;
@@ -673,11 +1068,21 @@ public final class RegionSurfaceLodService {
         return dx * dx + dz * dz;
     }
 
+    private static long visibleLoadSignature(VisibleView view) {
+        if (view == null || !view.current()) return Long.MIN_VALUE;
+        long hash = view.stamp.sessionId();
+        hash = hash * 31L + view.minRegionX;
+        hash = hash * 31L + view.maxRegionX;
+        hash = hash * 31L + view.minRegionZ;
+        hash = hash * 31L + view.maxRegionZ;
+        return hash;
+    }
+
     private static boolean isVisible(RegionLodGraph.NodeKey key,
             VisibleView view) {
         if (view == null || !view.current()
                 || key.sessionId() != view.stamp.sessionId()) return false;
-        long span = pow8(key.level());
+        long span = pow2(key.level());
         long minX = (long) key.nodeX() * span;
         long minZ = (long) key.nodeZ() * span;
         long maxX = minX + span - 1L;
@@ -699,10 +1104,8 @@ public final class RegionSurfaceLodService {
         return sum;
     }
 
-    private static long pow8(int level) {
-        long value = 1L;
-        for (int index = 0; index < level; index++) value *= 8L;
-        return value;
+    private static long pow2(int level) {
+        return 1L << Math.max(0, Math.min(30, level));
     }
 
     private static int clamp(int value, int min, int max) {
@@ -718,8 +1121,6 @@ public final class RegionSurfaceLodService {
         return "surface-region-lod:" + key.sessionId() + ':'
                 + key.level() + ':' + key.nodeX() + ':' + key.nodeZ();
     }
-
-    private record RegionCoordinate(int x, int z) { }
 
     private record PendingTask(RegionLodGraph.Lease lease,
             CompletableFuture<PreparedBranch> future,
@@ -742,6 +1143,8 @@ public final class RegionSurfaceLodService {
         private long lastDirectAttemptNanos;
         private long lastSourceWatermark;
         private int unchangedSourceAttempts;
+        private int directProbeMisses;
+        private RegionLodDeriver.ReducedChildSnapshot[] exactLeaves;
 
         private NodeRecord(RegionLodGraph.NodeKey key) {
             this.key = key;
@@ -751,10 +1154,10 @@ public final class RegionSurfaceLodService {
     private record VisibleView(RevisionStamp stamp, float scale,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
             int focusRegionX, int focusRegionZ,
-            int focusPageX, int focusPageZ) {
+            int focusPageX, int focusPageZ, boolean coarseRequired) {
         private static VisibleView none() {
             return new VisibleView(null, 1.0f, 0, -1, 0, -1,
-                    0, 0, 0, 0);
+                    0, 0, 0, 0, false);
         }
 
         private boolean current() {

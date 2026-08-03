@@ -55,6 +55,22 @@ public final class ExactPageStateTracker {
         return entry == null ? ExactPageState.ABSENT : entry.state;
     }
 
+    /** Removes terminal diagnostic state when the owning page cache entry retires. */
+    public synchronized void remove(String key) {
+        if (key != null) entries.remove(key);
+    }
+
+    /**
+     * Retires a transient diagnostic state only when it still matches the expected
+     * lifecycle stage. A viewport demand may expire after a page has already become
+     * CPU/GPU ready; that newer authoritative state must not be erased by cleanup.
+     */
+    public synchronized void removeIfState(String key, ExactPageState expected) {
+        if (key == null || expected == null) return;
+        Entry entry = entries.get(key);
+        if (entry != null && entry.state == expected) entries.remove(key);
+    }
+
     public synchronized Snapshot snapshot() {
         EnumMap<ExactPageState, Long> counts = new EnumMap<>(ExactPageState.class);
         for (ExactPageState state : ExactPageState.values()) counts.put(state, 0L);

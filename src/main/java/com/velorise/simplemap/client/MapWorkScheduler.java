@@ -37,6 +37,7 @@ public final class MapWorkScheduler {
     private static final int CPU_THREADS = Math.max(2,
             Math.min(4, Math.max(2, PROCESSORS / 3)));
     private static final int IO_THREADS = 2;
+    private static final MapRequestLane[] REQUEST_LANES = MapRequestLane.values();
 
     /** Cost units are deliberately coarse; they represent retained snapshots and
      * expected CPU/IO occupancy, not milliseconds. */
@@ -81,7 +82,7 @@ public final class MapWorkScheduler {
             });
 
     static {
-        for (MapRequestLane lane : MapRequestLane.values()) {
+        for (MapRequestLane lane : REQUEST_LANES) {
             VIEWPORT_EPOCHS.put(lane, new AtomicLong(1L));
             COMPLETED_BY_LANE.put(lane, new AtomicLong());
             DENIED_BY_LANE.put(lane, new AtomicLong());
@@ -115,7 +116,12 @@ public final class MapWorkScheduler {
         EXACT_BUILD(80, true),
         SOURCE_DECODE(70, false),
         SOURCE_PROJECTION(65, false),
-        BRANCH_DERIVE(45, false),
+        // Visible LOD branches are the far-zoom coverage authority and take only
+        // tens of microseconds to derive. Keeping them below source decode left
+        // them queued for 9-113 seconds while the screen remained black. Treat
+        // their snapshots as viewport-scoped and place them just above exact-page
+        // refinement; off-screen dirty state remains retained by each LOD tree.
+        BRANCH_DERIVE(85, true),
         DISK_READ(40, false),
         LEGACY_BUILD(25, true),
         DISK_WRITE(15, false),
@@ -155,10 +161,17 @@ public final class MapWorkScheduler {
 
     private static void purgeStaleViewportTasks(ThreadPoolExecutor pool,
             MapRequestLane lane, long currentEpoch) {
-        for (Runnable queued : pool.getQueue().toArray(new Runnable[0])) {
+        // PriorityBlockingQueue's weakly-consistent iterator is sufficient here:
+        // tasks added after the epoch bump already capture the new epoch, while any
+        // stale task missed by a concurrent iterator still self-cancels before run.
+        // Avoid materialising an Object[] on every page-boundary/layer handoff.
+        var iterator = pool.getQueue().iterator();
+        while (iterator.hasNext()) {
+            Runnable queued = iterator.next();
             if (!(queued instanceof PrioritizedTask task)
                     || !task.isStaleViewportTask(lane, currentEpoch)) continue;
-            if (pool.getQueue().remove(task)) task.cancelBeforeRun();
+            iterator.remove();
+            task.cancelStaleBeforeRun();
         }
     }
 
@@ -172,7 +185,7 @@ public final class MapWorkScheduler {
     }
 
     public static MapRequestLane laneForExecutorPriority(int priority) {
-        for (MapRequestLane lane : MapRequestLane.values()) {
+        for (MapRequestLane lane : REQUEST_LANES) {
             if (lane.executorPriority() == priority) return lane;
         }
         if (priority <= MapRequestLane.MINIMAP.executorPriority()) {
@@ -210,7 +223,14 @@ public final class MapWorkScheduler {
             Supplier<T> supplier) {
         if (supplier == null) return null;
         CompletableFuture<T> future = new CompletableFuture<>();
-        BooleanSupplier effectiveValid = valid == null ? () -> true : valid;
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.FULLSCREEN : lane;
+        long submittedViewportEpoch = type != null && type.viewportScoped()
+                ? viewportEpoch(effectiveLane) : Long.MIN_VALUE;
+        BooleanSupplier suppliedValid = valid == null ? () -> true : valid;
+        BooleanSupplier effectiveValid = () -> suppliedValid.getAsBoolean()
+                && (submittedViewportEpoch == Long.MIN_VALUE
+                || isViewportCurrent(effectiveLane, submittedViewportEpoch));
         boolean accepted = submit(IO, IO_QUEUED_COST, IO_ACTIVE_COST,
                 IO_SOFT_COST, IO_HARD_COST,
                 lane, type, priority, cost, () -> true, () -> {
@@ -233,7 +253,14 @@ public final class MapWorkScheduler {
             Supplier<T> supplier) {
         if (supplier == null) return null;
         CompletableFuture<T> future = new CompletableFuture<>();
-        BooleanSupplier effectiveValid = valid == null ? () -> true : valid;
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.FULLSCREEN : lane;
+        long submittedViewportEpoch = type != null && type.viewportScoped()
+                ? viewportEpoch(effectiveLane) : Long.MIN_VALUE;
+        BooleanSupplier suppliedValid = valid == null ? () -> true : valid;
+        BooleanSupplier effectiveValid = () -> suppliedValid.getAsBoolean()
+                && (submittedViewportEpoch == Long.MIN_VALUE
+                || isViewportCurrent(effectiveLane, submittedViewportEpoch));
         boolean accepted = submit(CPU, CPU_QUEUED_COST, CPU_ACTIVE_COST,
                 CPU_SOFT_COST, CPU_HARD_COST,
                 lane, type, priority, cost, () -> true, () -> {
@@ -331,15 +358,40 @@ public final class MapWorkScheduler {
         }, delay, unit);
     }
 
+    /** Allocation-free pressure probes for hot admission/governor paths. */
+    public static long cpuTotalCost() {
+        return CPU_QUEUED_COST.get() + CPU_ACTIVE_COST.get();
+    }
+
+    public static long ioTotalCost() {
+        return IO_QUEUED_COST.get() + IO_ACTIVE_COST.get();
+    }
+
+    public static int cpuActiveCount() {
+        return CPU.getActiveCount();
+    }
+
+    public static int cpuQueuedCount() {
+        return CPU.getQueue().size();
+    }
+
+    public static int ioQueuedCount() {
+        return IO.getQueue().size();
+    }
+
+    public static long ioQueuedCost() {
+        return IO_QUEUED_COST.get();
+    }
+
     public static Snapshot snapshot() {
-        int laneCount = MapRequestLane.values().length;
+        int laneCount = REQUEST_LANES.length;
         int[] cpuQueuedByLane = new int[laneCount];
         int[] ioQueuedByLane = new int[laneCount];
         long[] completedByLane = new long[laneCount];
         long[] deniedByLane = new long[laneCount];
         FairTaskQueue cpuQueue = (FairTaskQueue) CPU.getQueue();
         FairTaskQueue ioQueue = (FairTaskQueue) IO.getQueue();
-        for (MapRequestLane lane : MapRequestLane.values()) {
+        for (MapRequestLane lane : REQUEST_LANES) {
             int index = lane.ordinal();
             cpuQueuedByLane[index] = cpuQueue.queued(lane);
             ioQueuedByLane[index] = ioQueue.queued(lane);
@@ -906,6 +958,23 @@ public final class MapWorkScheduler {
         private void cancelBeforeRun() {
             releaseQueuedCost();
             releaseMemoryLease();
+        }
+
+        /**
+         * A purged CompletableFuture task still needs a terminal signal so its
+         * subsystem releases retained source views and pending-batch ownership.
+         * The future wrapper includes the submitted viewport epoch in its validity
+         * check, therefore invoking this tiny command cannot run the stale supplier.
+         */
+        private void cancelStaleBeforeRun() {
+            releaseQueuedCost();
+            releaseMemoryLease();
+            if (!mustRun) return;
+            try {
+                command.run();
+            } catch (Throwable ignoredFailure) {
+                // Future wrappers own result propagation.
+            }
         }
 
         @Override

@@ -70,6 +70,50 @@ public final class MapLightManager {
         }
     }
 
+    /**
+     * Commits one contiguous row-major slice of a 16x16 chunk under a single
+     * region lock. Light packets used to call {@link #setLight} for every column,
+     * causing up to 256 lock/unlock and dirty-notification cycles per chunk.
+     */
+    public void setChunkLightSlice(int chunkX, int chunkZ, int startColumn,
+            byte[] source, int sourceOffset, int count) {
+        setChunkLightSlice(chunkX, chunkZ, startColumn,
+                source, sourceOffset, count, true);
+    }
+
+    /**
+     * Batched light commit with optional downstream invalidation. Geometry chunk
+     * transactions pass {@code false} and publish Surface/source dirtiness once at
+     * cursor 256; light-only packets retain the immediate default path.
+     */
+    public boolean setChunkLightSlice(int chunkX, int chunkZ, int startColumn,
+            byte[] source, int sourceOffset, int count, boolean publishDirty) {
+        if (source == null || startColumn < 0 || startColumn >= 256
+                || sourceOffset < 0 || count <= 0
+                || sourceOffset + count > source.length) return false;
+        int safeCount = Math.min(count, 256 - startColumn);
+        int blockX = chunkX << 4;
+        int blockZ = chunkZ << 4;
+        int rx = blockX >> 9;
+        int rz = blockZ >> 9;
+        LightRegion region = getRegion(rx, rz, true);
+        if (region == null) return false;
+        int localChunkX = (blockX & 511) >>> 4;
+        int localChunkZ = (blockZ & 511) >>> 4;
+        if (!region.setChunkSlice(localChunkX, localChunkZ, startColumn,
+                source, sourceOffset, safeCount)) return false;
+        synchronized (dirtyRegions) {
+            dirtyRegions.add(key(rx, rz));
+        }
+        if (publishDirty) {
+            MapTextureManager.getInstance().markPageDirtyForChunk(chunkX, chunkZ);
+            int localChunkIndex = localChunkZ * 32 + localChunkX;
+            SurfaceRegionSourceDatabase.getInstance().markChunkDirty(
+                    rx, rz, localChunkIndex);
+        }
+        return true;
+    }
+
     public LightRegion getRegion(int rx, int rz, boolean create) {
         String key = key(rx, rz);
         synchronized (regions) {
@@ -496,6 +540,31 @@ public final class MapLightManager {
                 levels[index] = (byte) clamped;
                 if (!loaded) modifiedBeforeLoad.set(index);
                 return true;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private boolean setChunkSlice(int localChunkX, int localChunkZ,
+                int startColumn, byte[] source, int sourceOffset, int count) {
+            lock.lock();
+            try {
+                if (closed) return false;
+                boolean changed = false;
+                for (int index = 0; index < count; index++) {
+                    int column = startColumn + index;
+                    int localX = column & 15;
+                    int localZ = column >>> 4;
+                    int destination = (localChunkZ * 16 + localZ) * 512
+                            + localChunkX * 16 + localX;
+                    int light = source[sourceOffset + index] & 0xFF;
+                    int clamped = Math.max(0, Math.min(15, light));
+                    if ((levels[destination] & 0xFF) == clamped) continue;
+                    levels[destination] = (byte) clamped;
+                    if (!loaded) modifiedBeforeLoad.set(destination);
+                    changed = true;
+                }
+                return changed;
             } finally {
                 lock.unlock();
             }

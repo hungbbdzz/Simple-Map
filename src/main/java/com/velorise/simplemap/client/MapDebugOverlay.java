@@ -56,12 +56,21 @@ public final class MapDebugOverlay {
         var gpu = s.gpu();
         var fullscreenFbo = FullscreenMapFramebufferRenderer.getInstance().snapshot();
         lines.add(new Line(String.format(Locale.ROOT,
-                "Branch GPU %.3f ms deny/bootstrap %d/%d  FBO frames/fallback %d/%d",
+                "Branch GPU %.3f ms deny/bootstrap %d/%d  Full FBO draw/reuse/coalesce/fallback %d/%d/%d/%d",
                 gpu.branchPredictionNanos() / 1_000_000.0,
                 gpu.branchDeniedReservations(), gpu.branchBootstrapAdmissions(),
-                fullscreenFbo.renderedFrames(), fullscreenFbo.fallbackFrames()),
+                fullscreenFbo.redrawFrames(), fullscreenFbo.reuseFrames(),
+                fullscreenFbo.coalescedFrames(), fullscreenFbo.fallbackFrames()),
                 gpu.branchBootstrapAdmissions() > 0L || render.branchNodes() > 0
                         ? 0xFFB9D7B0 : 0xFFFFB45C));
+        var minimapFbo = MinimapFramebufferRenderer.getInstance().snapshot();
+        lines.add(new Line(String.format(Locale.ROOT,
+                "Minimap FBO redraw/reuse/coalesce/fallback %d/%d/%d/%d  realloc %d",
+                minimapFbo.redrawFrames(), minimapFbo.reuseFrames(),
+                minimapFbo.coalescedFrames(), minimapFbo.fallbackFrames(),
+                minimapFbo.reallocations()),
+                minimapFbo.disabled() || minimapFbo.fallbackFrames() > 0L
+                        ? 0xFFFFB45C : 0xFFB9D7B0));
         var demand = MapSurfaceDemandPolicy.snapshot();
         lines.add(new Line(String.format(Locale.ROOT,
                 "Surface demand area %.0f%% trim L/R/V %.0f/%.0f/%.0f%% exactWindow %d",

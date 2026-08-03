@@ -35,6 +35,11 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource {
     private static final BlockState AIR = Blocks.AIR.defaultBlockState();
+    /** Palettes repeat the same ids across thousands of sections. */
+    private static final ConcurrentHashMap<String, Block> BLOCK_ID_CACHE =
+            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, ResourceLocation> RESOURCE_ID_CACHE =
+            new ConcurrentHashMap<>();
 
     private final int chunkX;
     private final int chunkZ;
@@ -162,6 +167,15 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
     @Override
     public BlockState visualStateAt(int localX, int y, int localZ) {
         BlockState actual = stateAt(localX, y, localZ);
+        return visualStateAt(localX, y, localZ, actual);
+    }
+
+    @Override
+    public BlockState visualStateAt(int localX, int y, int localZ,
+            BlockState actual) {
+        // The overwhelming majority of chunks have no block entities. Avoid
+        // boxing one Integer key for every scanned cave block in that common case.
+        if (blockEntities.isEmpty()) return actual;
         int key = blockEntityKey(localX, y, localZ, minimumY);
         CompoundTag tag = blockEntities.get(key);
         if (tag == null) return actual;
@@ -476,9 +490,10 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
                 biomePalette = new Biome[biomePaletteTag.size()];
                 for (int i = 0; i < biomePalette.length; i++) {
                     try {
-                        biomePalette[i] = biomeRegistry == null ? null
-                                : biomeRegistry.get(ResourceLocation.parse(
-                                        biomePaletteTag.getString(i)));
+                        ResourceLocation biomeId = cachedResourceId(
+                                biomePaletteTag.getString(i));
+                        biomePalette[i] = biomeRegistry == null || biomeId == null
+                                ? null : biomeRegistry.get(biomeId);
                     } catch (Throwable ignored) {
                         biomePalette[i] = null;
                     }
@@ -568,14 +583,12 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
     }
 
     private static BlockState decodeState(CompoundTag stateTag) {
-        ResourceLocation id;
-        try {
-            id = ResourceLocation.parse(stateTag.getString("Name"));
-        } catch (Throwable ignored) {
-            id = null;
-        }
-        Block block = id == null ? Blocks.AIR : BuiltInRegistries.BLOCK.get(id);
-        if (block == null) block = Blocks.AIR;
+        String serializedId = stateTag.getString("Name");
+        Block block = BLOCK_ID_CACHE.computeIfAbsent(serializedId, name -> {
+            ResourceLocation id = cachedResourceId(name);
+            Block resolved = id == null ? Blocks.AIR : BuiltInRegistries.BLOCK.get(id);
+            return resolved == null ? Blocks.AIR : resolved;
+        });
         BlockState state = block.defaultBlockState();
         CompoundTag properties = stateTag.getCompound("Properties");
         for (String name : properties.getAllKeys()) {
@@ -584,6 +597,15 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
             state = applyProperty(state, property, properties.getString(name));
         }
         return state;
+    }
+
+    private static ResourceLocation cachedResourceId(String serialized) {
+        if (serialized == null || serialized.isBlank()) return null;
+        try {
+            return RESOURCE_ID_CACHE.computeIfAbsent(serialized, ResourceLocation::parse);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
     }
 
     private static <T extends Comparable<T>> BlockState applyProperty(
