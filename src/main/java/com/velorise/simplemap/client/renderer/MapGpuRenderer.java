@@ -3,6 +3,7 @@ package com.velorise.simplemap.client.renderer;
 import com.velorise.simplemap.client.gpu.MapGpuInstancePlan;
 import com.velorise.simplemap.client.gpu.MapGpuInstanceRenderer;
 import net.minecraft.client.gui.GuiGraphics;
+import org.joml.Matrix4f;
 
 /** M11 renderer facade: logical plans no longer know atlas ownership. */
 public final class MapGpuRenderer {
@@ -15,5 +16,10 @@ public final class MapGpuRenderer {
     public static void drawPhase(GuiGraphics graphics,
             MapGpuInstancePlan plan, int phase) {
         MapGpuInstanceRenderer.drawPhase(graphics, plan, phase);
+    }
+
+    public static void drawPhasePrepared(MapGpuInstancePlan plan,
+            int phase, Matrix4f matrix) {
+        MapGpuInstanceRenderer.drawPhasePrepared(plan, phase, matrix);
     }
 }

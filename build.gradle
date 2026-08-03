@@ -84,7 +84,11 @@ dependencies {
 // sources exist but no framework tests are discovered, so allow this
 // intentional no-test suite while keeping the JavaExec checks below active.
 tasks.named('test', Test) {
-    failOnNoDiscoveredTests = false
+    // Added by newer Gradle releases; the checked-in 8.10.2 wrapper does not
+    // expose it. Keep one build file valid on both sides of that API boundary.
+    if (delegate.hasProperty('failOnNoDiscoveredTests')) {
+        delegate.setProperty('failOnNoDiscoveredTests', false)
+    }
 }
 
 jar {
@@ -125,8 +129,183 @@ tasks.register('architectureStackCheck', JavaExec) {
     mainClass = 'com.velorise.simplemap.client.ArchitectureStackCheck'
 }
 
+// Surface fullscreen/minimap demand uses primitive centre-out buffers.
+tasks.register('viewportLoadPlannerCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.MapViewLoadPlannerCheck'
+}
+
+// Cave foreground stages must preserve one centre-out ordinal authority.
+tasks.register('caveLoadHierarchyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveLoadHierarchyCheck'
+}
+
+// AUTO dimension topology must not let repeated End-island roofs become a
+// persistent cave world, and each Layered cache key must own one immutable Top Y.
+tasks.register('caveDimensionEvidenceCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveDimensionEvidenceCheck'
+}
+
+tasks.register('caveLayerBandCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveLayerBandCheck'
+}
+
+tasks.register('adaptiveDimensionLoadCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.AdaptiveDimensionLoadPolicyCheck'
+}
+
+// Retained minimap invalidation must react to atlas pixel writes without
+// rebuilding for sub-texel movement or camera rotation.
+tasks.register('retainedMinimapFramePolicyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedMinimapFramePolicyCheck'
+}
+
+// Logical instance plans must remain compact, phase-sorted and independent
+// from atlas texture/UV residency state.
+tasks.register('mapGpuInstancePlanCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.gpu.MapGpuInstancePlanCheck'
+}
+
+
+// Sustained movement must keep exact mutation work bounded around the visible
+// frontier and must not create Surface scans for unload-only observations.
+tasks.register('movementMutationPolicyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.MovementMutationPolicyCheck'
+}
+
+
+// Retained off-screen composition has one viewport-demand owner; atlas replay
+// must not publish a second, differently guarded planning rectangle.
+tasks.register('viewportDemandPublicationPolicyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.ViewportDemandPublicationPolicyCheck'
+}
+
+// Immutable revision metadata is reused until a session generation changes.
+tasks.register('mapSessionStampCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.session.MapSessionStampCheck'
+}
+
+// Incremental Layered-Cave leaves publish as bounded page batches.
+tasks.register('caveTilePublicationPolicyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveTilePublicationPolicyCheck'
+}
+
 // Aggregate static/state gate for the complete region-centric architecture stack.
+
 tasks.register('architectureAllCheck') {
     dependsOn tasks.named('m2m4CoreCheck')
     dependsOn tasks.named('architectureStackCheck')
+    dependsOn tasks.named('mapSessionStampCheck')
+    dependsOn tasks.named('viewportLoadPlannerCheck')
+    dependsOn tasks.named('caveLoadHierarchyCheck')
+    dependsOn tasks.named('caveDimensionEvidenceCheck')
+    dependsOn tasks.named('caveLayerBandCheck')
+    dependsOn tasks.named('caveTilePublicationPolicyCheck')
+    dependsOn tasks.named('adaptiveDimensionLoadCheck')
+    dependsOn tasks.named('retainedMinimapFramePolicyCheck')
+    dependsOn tasks.named('mapGpuInstancePlanCheck')
+    dependsOn tasks.named('movementMutationPolicyCheck')
+    dependsOn tasks.named('viewportDemandPublicationPolicyCheck')
+}
+
+// PASS41: ensure static cached enum arrays initialize before the cave singleton.
+tasks.register('caveTextureManagerStaticInitCheck', JavaExec) {
+    group = 'verification'
+    description = 'Verifies UnifiedCaveTextureManager static initialization order.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveTextureManagerStaticInitCheck'
+    dependsOn testClasses
+}
+
+// PASS41: align incremental Layered fullscreen commits into shared redraw batches.
+tasks.register('caveViewportPublicationPolicyCheck', JavaExec) {
+    group = 'verification'
+    description = 'Verifies shared Layered-Cave viewport publication cadence.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveViewportPublicationPolicyCheck'
+    dependsOn testClasses
+}
+
+// PASS41: known-empty Cave projections use primitive int storage on render hot paths.
+tasks.register('caveAbsentDisplayPrimitiveIndexCheck', JavaExec) {
+    group = 'verification'
+    description = 'Verifies primitive known-empty Cave projection authority.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveAbsentDisplayPrimitiveIndexCheck'
+    dependsOn testClasses
+}
+
+// Runtime-validated PASS46 policy checks.
+tasks.register('surfaceCaptureFrameAllowanceCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.SurfaceCaptureFrameAllowanceCheck'
+    dependsOn testClasses
+}
+
+tasks.register('retainedFullscreenFramePolicyCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedFullscreenFramePolicyCheck'
+    dependsOn testClasses
+}
+
+tasks.register('retainedViewportCompositionCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedViewportCompositionCheck'
+    dependsOn testClasses
+}
+
+tasks.register('framePacingHardGateCheck', JavaExec) {
+    group = 'verification'
+    description = 'Verifies runtime-validated movement, viewport and lease constants.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.FramePacingHardGateCheck'
+    dependsOn testClasses
+}
+
+tasks.named('architectureAllCheck') {
+    dependsOn tasks.named('surfaceCaptureFrameAllowanceCheck')
+    dependsOn tasks.named('retainedFullscreenFramePolicyCheck')
+    dependsOn tasks.named('retainedViewportCompositionCheck')
+    dependsOn tasks.named('framePacingHardGateCheck')
+    dependsOn tasks.named('caveTextureManagerStaticInitCheck')
+    dependsOn tasks.named('caveViewportPublicationPolicyCheck')
+    dependsOn tasks.named('caveAbsentDisplayPrimitiveIndexCheck')
+}
+
+
+// Minecraft 1.21 RenderTarget.clear() unbinds the target. Both retained paths
+// must bind it again before replaying terrain into the texture.
+tasks.register('retainedFramebufferBindingCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedFramebufferBindingCheck'
+    dependsOn testClasses
+}
+
+tasks.named('architectureAllCheck') {
+    dependsOn tasks.named('retainedFramebufferBindingCheck')
 }

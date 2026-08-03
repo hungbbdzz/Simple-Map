@@ -92,15 +92,11 @@ public final class MapPersistenceV2Service {
             try {
                 RegionContainerV2.Header header = new RegionContainerV2.Header(
                         worldIdentity, regionX, regionZ, 1);
-                RegionContainerV2.append(path, header, record);
-                RegionContainerV2.ReadResult verify = RegionContainerV2.read(path);
-                if (!verify.latest().containsKey(record.key())) {
-                    throw new IOException("SMR2 record validation failed");
-                }
+                boolean recovered = RegionContainerV2.append(path, header, record);
                 synchronized (this) {
                     if (surface) surfaceCommitted++;
                     else caveCommitted++;
-                    if (verify.truncatedOrCorruptTail()) recoveries++;
+                    if (recovered) recoveries++;
                 }
                 if (path.toFile().length() > 32L * 1024L * 1024L) {
                     RegionContainerV2.compact(path);
@@ -129,6 +125,8 @@ public final class MapPersistenceV2Service {
             for (long pixel : region.pixels()) output.writeLong(pixel);
             output.writeInt(region.tints().length);
             for (int tint : region.tints()) output.writeInt(tint);
+            output.writeInt(region.completeChunks().length);
+            for (long word : region.completeChunks()) output.writeLong(word);
             writeStrings(output, region.biomePalette());
             writeStrings(output, region.blockPalette());
         }

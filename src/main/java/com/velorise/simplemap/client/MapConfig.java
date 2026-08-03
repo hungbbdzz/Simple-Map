@@ -21,6 +21,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 public class MapConfig {
+    /** Temporary common zoom-out floor for fullscreen and minimap views. */
+    public static final float MINIMUM_ZOOM_SCALE = 0.1f;
+
     private static final Logger LOGGER = LogManager.getLogger();
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final int CURRENT_PERFORMANCE_DEFAULTS_VERSION = 1;
@@ -106,6 +109,8 @@ public class MapConfig {
     public static boolean fastFullscreenLoading = false;
     /** Local cave policy used when the connected server has no Simple Map extension. */
     public static int localCaveMapMode = 2; // 0 = OFF, 1 = AUTO, 2 = ON
+    /** Explicit OFF/LAYERED/FULL selection persisted independently for each dimension. */
+    public static Map<String, String> caveDimensionModes = new LinkedHashMap<>();
 
     // Compass letter (N/E/S/W) display config
     public static boolean compassLettersVisible = true;
@@ -185,7 +190,7 @@ public class MapConfig {
                 minimapOffsetY = data.minimapOffsetY;
             }
             minimapSize = Math.max(16, Math.min(150, data.minimapSize));
-            minimapZoom = Math.max(0.05f, Math.min(2.0f, data.minimapZoom));
+            minimapZoom = Math.max(MINIMUM_ZOOM_SCALE, Math.min(2.0f, data.minimapZoom));
             if (data.scanEngineVersion < 2) {
                 // One-time migration: old configs often carried 500/1000 DOTS,
                 // which made already-loaded chunks look missing.
@@ -269,6 +274,21 @@ public class MapConfig {
             localCaveMapMode = data.localCaveMapMode == null
                 ? 2
                 : Math.max(0, Math.min(2, data.localCaveMapMode));
+            caveDimensionModes = new LinkedHashMap<>();
+            if (data.caveDimensionModes != null) {
+                for (Map.Entry<String, String> entry : data.caveDimensionModes.entrySet()) {
+                    String dimension = entry.getKey();
+                    String mode = entry.getValue();
+                    if (dimension == null || mode == null
+                            || !dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) continue;
+                    String normalized = mode.toUpperCase(java.util.Locale.ROOT);
+                    if (normalized.equals("OFF") || normalized.equals("LAYERED")
+                            || normalized.equals("FULL")) {
+                        caveDimensionModes.put(dimension, normalized);
+                    }
+                    if (caveDimensionModes.size() == 256) break;
+                }
+            }
         } catch (Exception exception) {
             LOGGER.error("Failed to load map config; preserving the unreadable file and restoring defaults", exception);
             quarantineCorruptConfig();
@@ -337,6 +357,7 @@ public class MapConfig {
                 data.fastFullscreenLoading = fastFullscreenLoading;
                 data.performanceDefaultsVersion = CURRENT_PERFORMANCE_DEFAULTS_VERSION;
                 data.localCaveMapMode = localCaveMapMode;
+                data.caveDimensionModes = new LinkedHashMap<>(caveDimensionModes);
                 GSON.toJson(data, writer);
             }
             moveReplacing(temporary, target);
@@ -425,6 +446,7 @@ public class MapConfig {
         blockColorOverrides = new LinkedHashMap<>();
         fastFullscreenLoading = false;
         localCaveMapMode = 2;
+        caveDimensionModes = new LinkedHashMap<>();
         compassLettersVisible = true;
         compassLetterColor = 0xFFFFFFFF;
     }
@@ -480,6 +502,7 @@ public class MapConfig {
         Boolean fastFullscreenLoading = false;
         Integer performanceDefaultsVersion;
         Integer localCaveMapMode = 2;
+        Map<String, String> caveDimensionModes = new LinkedHashMap<>();
     }
 
     /**

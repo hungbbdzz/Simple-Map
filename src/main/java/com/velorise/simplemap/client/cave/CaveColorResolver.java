@@ -5,10 +5,7 @@ import com.velorise.simplemap.client.BlockTintPolicy;
 import com.velorise.simplemap.client.MapConfig;
 import com.velorise.simplemap.client.MapTextureManager;
 import com.velorise.simplemap.client.MapVisualClassifier;
-import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.Level;
@@ -123,20 +120,8 @@ public final class CaveColorResolver {
     public int resolveDenseFluid(Level level, BlockPos.MutableBlockPos pos,
             BlockState state) {
         if (state.getFluidState().is(FluidTags.WATER)) {
-            int waterRgb = -1;
-            try {
-                waterRgb = Minecraft.getInstance().getBlockColors()
-                        .getColor(state, level, pos, 0);
-            } catch (Throwable ignored) {
-            }
-            if (waterRgb == -1) {
-                try {
-                    waterRgb = BiomeColors.getWaterColor(
-                            level.getBiome(pos).value()) & 0x00FFFFFF;
-                } catch (Throwable ignored) {
-                    waterRgb = MapColor.WATER.col;
-                }
-            }
+            int waterRgb = liveBiomeTint(level, pos,
+                    BlockTintPolicy.NONE, true);
             return rgbToAbgr(waterRgb);
         }
         return blockColor(level, pos, state, false);
@@ -152,14 +137,27 @@ public final class CaveColorResolver {
         MapTextureManager textures = MapTextureManager.getInstance();
         int rgb = 0;
         if (MapConfig.blockColourMode == 0) {
-            int sampled = textures.resolveBlockColor(blockId, 0);
-            if (sampled != 0 && sampled != 0xFFFFFFFF) rgb = sampled & 0x00FFFFFF;
+            /*
+             * Cave projection is a render-thread deadline path. Resolving a cache
+             * miss here used to parse model JSON and decode a PNG synchronously;
+             * the first uncommon cave palette could therefore hold one frame for
+             * hundreds of milliseconds. Surface/style preparation remains the
+             * owner of accurate texture sampling. Cave consumes that cache when it
+             * is warm and falls back to the block's constant MapColor otherwise.
+             */
+            Integer sampled = textures.getBlockColor(blockId);
+            if (sampled != null && sampled != 0 && sampled != 0xFFFFFFFF) {
+                rgb = sampled & 0x00FFFFFF;
+            }
             if (visual.fixedTextureColor() && rgb == 0) rgb = 0xE0A1B8;
 
             if (!visual.fixedTextureColor()) {
-                BlockTintPolicy policy = visualClassifier.tintPolicy(state);
+                // Static/tag tint metadata is allocation-free. Model tint probing
+                // is another resource-I/O operation and is deliberately excluded
+                // from the live Cave writer.
+                BlockTintPolicy policy = visual.tintPolicy();
                 if (policy != BlockTintPolicy.NONE) {
-                    int tint = liveTint(level, pos, state);
+                    int tint = liveBiomeTint(level, pos, policy, false);
                     if (tint != -1) {
                         if (rgb == 0) rgb = tint & 0x00FFFFFF;
                         else rgb = applyBiomeTint(
@@ -170,7 +168,8 @@ public final class CaveColorResolver {
                 }
             }
         } else {
-            int tint = liveTint(level, pos, state);
+            int tint = liveBiomeTint(level, pos, visual.tintPolicy(),
+                    visual.water());
             if (tint != -1) rgb = tint & 0x00FFFFFF;
         }
 
@@ -180,10 +179,6 @@ public final class CaveColorResolver {
                 if (mapColor != MapColor.NONE) rgb = mapColor.col & 0x00FFFFFF;
             } catch (Throwable ignored) {
             }
-        }
-        if (rgb == 0) {
-            int sampled = textures.resolveBlockColor(blockId, MapConfig.blockColourMode);
-            if (sampled != 0 && sampled != 0xFFFFFFFF) rgb = sampled & 0x00FFFFFF;
         }
         if (rgb == 0) rgb = fallbackColor(state);
 
@@ -261,11 +256,20 @@ public final class CaveColorResolver {
         return rgbToAbgr(rgb);
     }
 
-    private static int liveTint(Level level, BlockPos pos, BlockState state) {
+    /**
+     * Cave projection needs one stable biome sample, not Minecraft's render-only
+     * blended BlockTintCache lookup. The latter expands a cold water/foliage pixel
+     * into dozens of getNoiseBiome calls and was the dominant sampled render-thread
+     * stack during a layer transition.
+     */
+    private static int liveBiomeTint(Level level, BlockPos pos,
+            BlockTintPolicy policy, boolean water) {
         try {
-            return Minecraft.getInstance().getBlockColors().getColor(state, level, pos, 0);
+            Biome biome = level.getBiome(pos).value();
+            if (water) return BiomeColors.getWaterColor(biome) & 0x00FFFFFF;
+            return biomeTint(policy, biome);
         } catch (Throwable ignored) {
-            return -1;
+            return water ? MapColor.WATER.col : -1;
         }
     }
 
@@ -305,14 +309,8 @@ public final class CaveColorResolver {
     }
 
     private int waterOverlay(Level level, BlockPos waterPos, int floorAbgr, int depth) {
-        BlockState waterState = level.getBlockState(waterPos);
-        int waterRgb = -1;
-        try {
-            waterRgb = Minecraft.getInstance().getBlockColors()
-                    .getColor(waterState, level, waterPos, 0);
-        } catch (Throwable ignored) {
-        }
-        if (waterRgb == -1) waterRgb = MapColor.WATER.col;
+        int waterRgb = liveBiomeTint(level, waterPos,
+                BlockTintPolicy.NONE, true);
         return blendWater(floorAbgr, waterRgb, depth, true);
     }
 

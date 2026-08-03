@@ -1,10 +1,13 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.MapDebugRecorder;
 import com.velorise.simplemap.client.MapRequestLane;
 import net.minecraft.world.level.Level;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
@@ -20,18 +23,45 @@ import java.util.PriorityQueue;
  * LIVE.</p>
  */
 final class CaveDisplayScheduler {
-    private static final int MAX_TASKS = 512;
-    private static final int COLUMN_BURST = 12;
+    /*
+     * A live tile costs 256 vertical column projections. A 512-entry backlog was
+     * over 130k columns and took many seconds to drain after opening/switching a
+     * dimension, while making every viewport handoff touch a huge cold queue. Eight
+     * 64x64 pages are enough build-ahead; the rolling page frontier revisits work
+     * that could not be admitted.
+     */
+    private static final int MAX_TASKS = 128;
+    /**
+     * Primitive packet-arrival frontier. It deliberately owns only the newest
+     * travel history: one chunk is completed coherently before the next becomes
+     * foreground demand, while the bounded FIFO drops cold history behind a very
+     * fast player instead of creating an unbounded post-travel backlog.
+     */
+    private static final int MAX_LOADED_CHUNK_FRONTIER = 192;
+    private static final int MAX_HEAD_RETRY_PULSES = 160;
+    private static final int LOADED_CHUNKS_ADMITTED_PER_PULSE = 6;
+    private static final int LOADED_CHUNKS_INSPECTED_PER_PULSE = 24;
+    private static final int COLUMN_BURST = 8;
+    /** Deadline checks inside one vertical column, not merely between columns. */
+    private static final int COLUMN_VERTICAL_BURST = 8;
     private static final long VIEWPORT_REFRESH_NANOS = 150_000_000L;
 
     private final CaveTileRepository repository;
     private final CaveChunkReadinessTracker readiness;
     private final CaveDisplayProjector projector = new CaveDisplayProjector();
-    private final PriorityQueue<Task> queue = new PriorityQueue<>();
-    private final PriorityQueue<Task> deferred = new PriorityQueue<>(
-            Comparator.comparingLong((Task task) -> task.retryAfterTick)
-                    .thenComparingLong(task -> task.sequence));
+    /*
+     * Queue entries are immutable scheduling snapshots. Viewport handoff used to
+     * remove and reinsert every retained Task directly in PriorityQueue. Since
+     * PriorityQueue.remove(Object) is linear, a 512-task cave viewport turned one
+     * small pan into O(n^2) client-thread work. Versioned entries make reprioritizing
+     * and cancellation O(log n): stale heap entries are discarded lazily.
+     */
+    private final PriorityQueue<ReadyEntry> queue = new PriorityQueue<>();
+    private final PriorityQueue<DeferredEntry> deferred = new PriorityQueue<>();
     private final Map<TaskKey, Task> queued = new HashMap<>();
+    private final LongArrayFIFOQueue loadedChunkFrontier = new LongArrayFIFOQueue();
+    private final LongOpenHashSet loadedChunkSet = new LongOpenHashSet();
+    private final Long2IntOpenHashMap loadedChunkAttempts = new Long2IntOpenHashMap();
     private long sequence;
     private CaveView activeView;
     /** Retained 16-block identity. */
@@ -54,6 +84,9 @@ final class CaveDisplayScheduler {
         queue.clear();
         queued.clear();
         deferred.clear();
+        loadedChunkFrontier.clear();
+        loadedChunkSet.clear();
+        loadedChunkAttempts.clear();
         activeView = null;
         activeLayerY = Integer.MIN_VALUE;
         activeProjectionTopY = Integer.MIN_VALUE;
@@ -70,8 +103,83 @@ final class CaveDisplayScheduler {
         queue.clear();
         queued.clear();
         deferred.clear();
+        loadedChunkFrontier.clear();
+        loadedChunkSet.clear();
+        loadedChunkAttempts.clear();
         for (ViewportState state : viewports.values()) state.clear();
     }
+
+    /** Packet path: append one primitive key and perform no projection work. */
+    void enqueueLoadedChunk(int chunkX, int chunkZ) {
+        long key = packChunk(chunkX, chunkZ);
+        if (!loadedChunkSet.add(key)) return;
+        while (loadedChunkFrontier.size() >= MAX_LOADED_CHUNK_FRONTIER) {
+            long dropped = loadedChunkFrontier.dequeueLong();
+            loadedChunkSet.remove(dropped);
+            loadedChunkAttempts.remove(dropped);
+        }
+        loadedChunkFrontier.enqueue(key);
+    }
+
+    /**
+     * Promotes a tiny fair active set from the loaded-chunk frontier.
+     *
+     * <p>The former single sticky head preserved atomic tiles but one light/section
+     * readiness wait could block every later chunk on the route. Four centre-biased
+     * transactions are enough to hide that latency while still preventing hundreds
+     * of quarter-built tiles. Keys rotate after admission and disappear only after
+     * the selected projection is transactionally published.</p>
+     */
+    void admitLoadedChunk(Level level, CaveView view, int layerY,
+            double centerChunkX, double centerChunkZ, int basePriority) {
+        activateMode(view, layerY);
+        int admitted = 0;
+        int inspected = 0;
+        int available = loadedChunkFrontier.size();
+        int admissionBudget = CaveModeTransitionPolicy.loadedFrontierBudget(
+                LOADED_CHUNKS_ADMITTED_PER_PULSE);
+        while (!loadedChunkFrontier.isEmpty()
+                && admitted < admissionBudget
+                && inspected < Math.min(available,
+                        LOADED_CHUNKS_INSPECTED_PER_PULSE)) {
+            long key = loadedChunkFrontier.dequeueLong();
+            inspected++;
+            if (!loadedChunkSet.contains(key)) continue;
+            int chunkX = unpackChunkX(key);
+            int chunkZ = unpackChunkZ(key);
+            if (!level.hasChunk(chunkX, chunkZ)
+                    || repository.hasFreshDisplayTileSource(view, layerY,
+                            chunkX, chunkZ, DenseCaveTile.Source.LIVE)) {
+                loadedChunkSet.remove(key);
+                loadedChunkAttempts.remove(key);
+                continue;
+            }
+            double dx = chunkX - centerChunkX;
+            double dz = chunkZ - centerChunkZ;
+            int distancePenalty = (int) Math.min(120_000.0D,
+                    (dx * dx + dz * dz) * 500.0D);
+            enqueue(chunkX, chunkZ, view, layerY,
+                    basePriority + 400_000 - distancePenalty,
+                    null, -1, false);
+            admitted++;
+            int attempts = loadedChunkAttempts.addTo(key, 1) + 1;
+            if (attempts >= MAX_HEAD_RETRY_PULSES) {
+                loadedChunkAttempts.put(key, 0);
+            }
+            loadedChunkFrontier.enqueue(key);
+        }
+    }
+
+    int loadedChunkFrontierSize() {
+        return loadedChunkFrontier.size();
+    }
+
+    private static long packChunk(int chunkX, int chunkZ) {
+        return ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
+    }
+
+    private static int unpackChunkX(long key) { return (int) (key >> 32); }
+    private static int unpackChunkZ(long key) { return (int) key; }
 
     void cancelChunk(int chunkX, int chunkZ) {
         var iterator = queued.entrySet().iterator();
@@ -80,25 +188,6 @@ final class CaveDisplayScheduler {
             if (task.key.chunkX() != chunkX || task.key.chunkZ() != chunkZ) continue;
             task.cancelled = true;
             iterator.remove();
-        }
-    }
-
-    void enqueueAround(Level level, CaveView view, int layerY,
-            int centerChunkX, int centerChunkZ, int radius, int basePriority) {
-        activateMode(view, layerY);
-        int safeRadius = Math.max(0, radius);
-        for (int ring = 0; ring <= safeRadius; ring++) {
-            for (int dz = -ring; dz <= ring; dz++) {
-                for (int dx = -ring; dx <= ring; dx++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
-                    int chunkX = centerChunkX + dx;
-                    int chunkZ = centerChunkZ + dz;
-                    if (!level.hasChunk(chunkX, chunkZ)) continue;
-                    int distance = dx * dx + dz * dz;
-                    enqueue(chunkX, chunkZ, view, layerY,
-                            basePriority - distance * 100, null, -1, false);
-                }
-            }
         }
     }
 
@@ -117,17 +206,37 @@ final class CaveDisplayScheduler {
         if (!changed && now - state.lastEnqueueNanos < VIEWPORT_REFRESH_NANOS) return;
         state.update(view, normalizedLayer, layerY,
                 minChunkX, maxChunkX, minChunkZ, maxChunkZ,
-                centerChunkX, centerChunkZ, now, changed);
+                centerChunkX, centerChunkZ, effectiveLane, now, changed);
 
         if (changed) {
+            int retained = 0;
+            int cancelled = 0;
             var iterator = queued.entrySet().iterator();
             while (iterator.hasNext()) {
                 Task task = iterator.next().getValue();
-                if (!task.viewportDemand || task.persistentDemand || task.hasStarted()
-                        || wantedByAnyViewport(task, now)) continue;
-                task.cancelled = true;
+                if (!task.viewportDemand || task.persistentDemand) continue;
+                if (state.contains(task)) {
+                    task.priority = state.viewportPriority(task, basePriority,
+                            effectiveLane);
+                    task.sequence = sequence++;
+                    if (!task.deferredState) offerReady(task);
+                    retained++;
+                    continue;
+                }
+                if (wantedByOtherViewport(task, now, effectiveLane)) continue;
+                cancelQueuedTask(task);
                 iterator.remove();
+                cancelled++;
             }
+            if (effectiveLane == MapRequestLane.FULLSCREEN) {
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_LIVE_VIEWPORT_HANDOFF", 100L)) {
+                    recorder.event("CAVE_LIVE_VIEWPORT_HANDOFF",
+                            "retained=" + retained + " cancelled=" + cancelled
+                                    + " queued=" + queued.size());
+                }
+            }
+            compactQueuesIfNeeded();
         }
 
         if (effectiveLane == MapRequestLane.FULLSCREEN) {
@@ -144,7 +253,7 @@ final class CaveDisplayScheduler {
                 state.completedCycles++;
             }
             int pageBudget = com.velorise.simplemap.client.MapPerformanceGovernor
-                    .getInstance().underPressure() ? 1 : 2;
+                    .getInstance().underPressure() ? 2 : 4;
             for (int page = 0; page < pageBudget
                     && state.fullscreenPageCursor < totalPages; page++) {
                 int ordinal = state.fullscreenPageCursor++;
@@ -173,28 +282,37 @@ final class CaveDisplayScheduler {
             return;
         }
 
-        int centerX = (int) Math.floor(centerChunkX);
-        int centerZ = (int) Math.floor(centerChunkZ);
-        int maximumRing = Math.max(
-                Math.max(Math.abs(centerX - minChunkX), Math.abs(maxChunkX - centerX)),
-                Math.max(Math.abs(centerZ - minChunkZ), Math.abs(maxChunkZ - centerZ)));
-        for (int ring = 0; ring <= maximumRing; ring++) {
-            for (int dz = -ring; dz <= ring; dz++) {
-                for (int dx = -ring; dx <= ring; dx++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
-                    int chunkX = centerX + dx;
-                    int chunkZ = centerZ + dz;
-                    if (chunkX < minChunkX || chunkX > maxChunkX
-                            || chunkZ < minChunkZ || chunkZ > maxChunkZ
-                            || !level.hasChunk(chunkX, chunkZ)) continue;
-                    double exactDx = chunkX - centerChunkX;
-                    double exactDz = chunkZ - centerChunkZ;
-                    int distance = (int) Math.min(900_000.0,
-                            (exactDx * exactDx + exactDz * exactDz) * 1_000.0);
-                    enqueue(chunkX, chunkZ, view, layerY,
-                            basePriority - distance, effectiveLane, -1, false);
-                }
-            }
+        /*
+         * HUD/minimap demand used to rewalk the complete render-distance rectangle
+         * on every 150 ms refresh. A 27x27 window means 729 hasChunk calls, TaskKey
+         * allocations and HashMap probes before one cave column is projected. Keep
+         * a stable centre-out primitive plan and admit only a small rolling slice.
+         * Fresh tiles are skipped, and the cursor wraps so deferred/unavailable
+         * chunks are revisited without one large client-thread burst.
+         */
+        int totalChunks = state.chunkPlan.length;
+        if (totalChunks <= 0) return;
+        if (state.chunkCursor >= totalChunks) {
+            state.chunkCursor = 0;
+            state.completedCycles++;
+        }
+        int chunkBudget = com.velorise.simplemap.client.MapPerformanceGovernor
+                .getInstance().underPressure() ? 12 : 36;
+        chunkBudget = CaveModeTransitionPolicy.viewportChunkBudget(chunkBudget);
+        int considered = 0;
+        while (considered < chunkBudget && state.chunkCursor < totalChunks) {
+            int ordinal = state.chunkCursor++;
+            considered++;
+            long packedChunk = state.chunkPlan[ordinal];
+            int chunkX = CaveLoadHierarchy.x(packedChunk);
+            int chunkZ = CaveLoadHierarchy.z(packedChunk);
+            if (!level.hasChunk(chunkX, chunkZ)
+                    || repository.hasFreshDisplayTileSource(view, layerY,
+                            chunkX, chunkZ, DenseCaveTile.Source.LIVE)) continue;
+            enqueue(chunkX, chunkZ, view, layerY,
+                    state.viewportPriority(chunkX, chunkZ, basePriority,
+                            effectiveLane),
+                    effectiveLane, -1, false);
         }
     }
 
@@ -228,12 +346,13 @@ final class CaveDisplayScheduler {
         if (existing != null) {
             boolean retargeted = existing.projectionTopY != layerY;
             boolean priorityChanged = priority > existing.priority;
-            boolean wasDeferred = deferred.remove(existing);
-            boolean wasReady = queue.remove(existing);
             if (retargeted) {
-                // Same 16-block band: retain page/atlas/LOD identity, but restart
-                // this unpublished transaction for the new exact Top-Y.
-                existing.retarget(layerY);
+                // Inside one 16-block band, a transaction that already consumed
+                // client-thread scan time is allowed to finish as fallback. Queue
+                // the newest exact Top-Y as a follow-up instead of throwing the
+                // partial work away. An untouched task can be retargeted in place.
+                if (existing.hasStarted()) existing.requestFollowUp(layerY);
+                else existing.retarget(layerY);
                 existing.retryAfterTick = 0L;
             }
             existing.priority = Math.max(existing.priority, priority);
@@ -251,12 +370,11 @@ final class CaveDisplayScheduler {
             }
             if (retargeted) {
                 existing.sequence = sequence++;
-                queue.offer(existing);
-            } else if (wasDeferred) {
-                deferred.offer(existing);
-            } else if (wasReady || priorityChanged) {
+                existing.retryAfterTick = 0L;
+                offerReady(existing);
+            } else if (!existing.deferredState && priorityChanged) {
                 existing.sequence = sequence++;
-                queue.offer(existing);
+                offerReady(existing);
             }
             return;
         }
@@ -266,7 +384,7 @@ final class CaveDisplayScheduler {
                 viewportLane != null, fullProjection);
         if (!fullProjection) task.addPatchColumn(patchColumn);
         queued.put(key, task);
-        queue.offer(task);
+        offerReady(task);
     }
 
     /**
@@ -289,8 +407,6 @@ final class CaveDisplayScheduler {
         if (victim == null) return false;
         victim.cancelled = true;
         queued.remove(victim.key, victim);
-        queue.remove(victim);
-        deferred.remove(victim);
         return true;
     }
 
@@ -302,7 +418,6 @@ final class CaveDisplayScheduler {
             if (task == null) break;
             boolean viewportRelevant = task.persistentDemand
                     || !task.viewportDemand
-                    || task.hasStarted()
                     || wantedByAnyViewport(task, System.nanoTime());
             if (!repository.isGenerationCurrent(task.repositoryGeneration)
                     || !viewportRelevant) {
@@ -345,17 +460,28 @@ final class CaveDisplayScheduler {
             }
 
             int burst = 0;
-            while (task.hasRemainingColumns() && burst < COLUMN_BURST
+            while (task.hasRemainingWork() && burst < COLUMN_BURST
                     && System.nanoTime() < deadlineNanos) {
-                int column = task.takeNextColumn();
-                if (column < 0) break;
-                projector.projectColumn(task.source, task.key.view(), task.projectionTopY,
-                        column & 15, column >>> 4, task.builder);
+                if (task.activeColumn < 0) {
+                    task.activeColumn = task.takeNextColumn();
+                    if (task.activeColumn < 0) break;
+                    task.columnCursor = projector.beginColumn(task.source,
+                            task.key.view(), task.projectionTopY,
+                            task.activeColumn & 15, task.activeColumn >>> 4,
+                            task.builder);
+                }
+                boolean completedColumn = projector.projectColumnSlice(task.source,
+                        task.activeColumn & 15, task.activeColumn >>> 4,
+                        task.builder, task.columnCursor, deadlineNanos,
+                        COLUMN_VERTICAL_BURST);
+                if (!completedColumn) break;
+                task.activeColumn = -1;
+                task.columnCursor = null;
                 columns++;
                 burst++;
             }
 
-            if (!task.hasRemainingColumns()) {
+            if (!task.hasRemainingWork()) {
                 if (!readiness.stillValid(level, task.snapshot)) {
                     defer(task, gameTick, true);
                     continue;
@@ -371,7 +497,21 @@ final class CaveDisplayScheduler {
                 DenseCaveTile tile = task.builder.build(task.key.chunkX(),
                         task.key.chunkZ(), task.key.view(), task.key.layerY(),
                         task.projectionTopY, System.nanoTime(), DenseCaveTile.Source.LIVE);
-                repository.commitDisplayTile(tile, task.repositoryGeneration);
+                DenseCaveTile current = repository.getLoadedDisplayTile(
+                        task.key.view(), task.key.layerY(), task.key.chunkX(),
+                        task.key.chunkZ());
+                boolean obsoleteFallback = task.key.view() == CaveView.LAYERED
+                        && task.projectionTopY != activeProjectionTopY;
+                boolean newerProjectionVisible = obsoleteFallback && current != null
+                        && current.projectionTopY() == activeProjectionTopY;
+                if (!newerProjectionVisible) {
+                    repository.commitDisplayTile(tile, task.repositoryGeneration);
+                }
+                if (task.hasFollowUp()) {
+                    task.activateFollowUp();
+                    task.priority += 2_000;
+                    requeue(task);
+                }
             } else {
                 task.priority += 2_000;
                 requeue(task);
@@ -387,11 +527,13 @@ final class CaveDisplayScheduler {
 
     private void promoteDeferred(long gameTick) {
         while (true) {
-            Task task = deferred.peek();
-            if (task == null || task.retryAfterTick > gameTick) return;
+            DeferredEntry entry = deferred.peek();
+            if (entry == null || entry.retryAfterTick > gameTick) return;
             deferred.poll();
-            if (task.cancelled || queued.get(task.key) != task) continue;
-            queue.offer(task);
+            Task task = entry.task;
+            if (!entry.current() || task.cancelled
+                    || queued.get(task.key) != task) continue;
+            offerReady(task);
         }
     }
 
@@ -401,18 +543,58 @@ final class CaveDisplayScheduler {
         task.priority = Math.max(Integer.MIN_VALUE + 10_000, task.priority - 4_000);
         task.sequence = sequence++;
         queued.put(task.key, task);
-        deferred.offer(task);
+        offerDeferred(task);
     }
 
     private void requeue(Task task) {
         task.sequence = sequence++;
         queued.put(task.key, task);
-        queue.offer(task);
+        offerReady(task);
+    }
+
+    private void offerReady(Task task) {
+        task.deferredState = false;
+        int version = ++task.scheduleVersion;
+        queue.offer(new ReadyEntry(task, task.priority, task.sequence, version));
+    }
+
+    private void offerDeferred(Task task) {
+        task.deferredState = true;
+        int version = ++task.scheduleVersion;
+        deferred.offer(new DeferredEntry(task, task.retryAfterTick,
+                task.sequence, version));
+    }
+
+    /** Bounds stale lazy entries after a fast pan/zoom burst. */
+    private void compactQueuesIfNeeded() {
+        int live = queued.size();
+        int maximumEntries = Math.max(64, live * 3 + 32);
+        if (queue.size() > maximumEntries) {
+            queue.clear();
+            for (Task task : queued.values()) {
+                if (!task.cancelled && !task.deferredState) {
+                    queue.offer(new ReadyEntry(task, task.priority,
+                            task.sequence, task.scheduleVersion));
+                }
+            }
+        }
+        if (deferred.size() > maximumEntries) {
+            deferred.clear();
+            for (Task task : queued.values()) {
+                if (!task.cancelled && task.deferredState) {
+                    deferred.offer(new DeferredEntry(task, task.retryAfterTick,
+                            task.sequence, task.scheduleVersion));
+                }
+            }
+        }
     }
 
     private void activateMode(CaveView view, int layerY) {
         int normalized = DenseCaveTile.normalizeLayer(view, layerY);
         if (view == activeView && normalized == activeLayerY) {
+            // Xaero keeps one cache layer for the whole 16-block band. Changing
+            // the exact Top-Y inside that band retargets unpublished transactions,
+            // but it must not clear/cancel the already visible layer working set.
             activeProjectionTopY = layerY;
             return;
         }
@@ -421,17 +603,31 @@ final class CaveDisplayScheduler {
         activeProjectionTopY = layerY;
         for (ViewportState state : viewports.values()) state.clear();
 
-        // Do not clear all work. Transactions that already started may finish and
-        // publish into their retained band; idle viewport tasks from another band
-        // are cancelled lazily without touching resident textures.
+        // Crossing a band, mode or dimension changes semantic cache identity.
+        // Only then cancel work that cannot contribute to the newly selected layer.
         var iterator = queued.entrySet().iterator();
         while (iterator.hasNext()) {
             Task task = iterator.next().getValue();
-            if (!task.viewportDemand || task.persistentDemand || task.hasStarted()) continue;
             if (task.key.view() == view && task.key.layerY() == normalized) continue;
-            task.cancelled = true;
+            cancelQueuedTask(task);
             iterator.remove();
         }
+    }
+
+    private void cancelQueuedTask(Task task) {
+        if (task == null) return;
+        task.cancelled = true;
+    }
+
+    private boolean wantedByOtherViewport(Task task, long nowNanos,
+            MapRequestLane excludedLane) {
+        for (Map.Entry<MapRequestLane, ViewportState> entry : viewports.entrySet()) {
+            MapRequestLane lane = entry.getKey();
+            if (lane == excludedLane) continue;
+            ViewportState state = entry.getValue();
+            if (state.isFresh(nowNanos, lane) && state.contains(task)) return true;
+        }
+        return false;
     }
 
     private boolean wantedByAnyViewport(Task task, long nowNanos) {
@@ -454,6 +650,10 @@ final class CaveDisplayScheduler {
         private long lastEnqueueNanos;
         private long[] pagePlan = new long[0];
         private int fullscreenPageCursor;
+        private long[] chunkPlan = new long[0];
+        private int chunkCursor;
+        private double centerChunkX;
+        private double centerChunkZ;
         private long completedCycles;
 
         private boolean matchesShape(CaveView view, int layerY, int projectionTopY,
@@ -467,31 +667,42 @@ final class CaveDisplayScheduler {
         private void update(CaveView view, int layerY, int projectionTopY,
                 int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ,
                 double centerChunkX, double centerChunkZ,
-                long nowNanos, boolean changed) {
+                MapRequestLane lane, long nowNanos, boolean changed) {
             if (changed) {
-                int previousMinPageX = Math.floorDiv(this.minChunkX, 4);
-                int previousMaxPageX = Math.floorDiv(this.maxChunkX, 4);
-                int previousMinPageZ = Math.floorDiv(this.minChunkZ, 4);
-                int previousMaxPageZ = Math.floorDiv(this.maxChunkZ, 4);
-                int minPageX = Math.floorDiv(minChunkX, 4);
-                int maxPageX = Math.floorDiv(maxChunkX, 4);
-                int minPageZ = Math.floorDiv(minChunkZ, 4);
-                int maxPageZ = Math.floorDiv(maxChunkZ, 4);
-                boolean continuousPan = this.view == view && this.layerY == layerY
-                        && this.projectionTopY == projectionTopY
-                        && rectanglesOverlap(previousMinPageX, previousMaxPageX,
-                                previousMinPageZ, previousMaxPageZ,
-                                minPageX, maxPageX, minPageZ, maxPageZ);
-                int centerPageX = clamp((int) Math.floor(centerChunkX / 4.0),
-                        minPageX, maxPageX);
-                int centerPageZ = clamp((int) Math.floor(centerChunkZ / 4.0),
-                        minPageZ, maxPageZ);
-                pagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
-                        minPageX, maxPageX, minPageZ, maxPageZ,
-                        centerPageX, centerPageZ, true, continuousPan,
-                        previousMinPageX, previousMaxPageX,
-                        previousMinPageZ, previousMaxPageZ);
-                fullscreenPageCursor = 0;
+                if (lane == MapRequestLane.FULLSCREEN) {
+                    int previousMinPageX = Math.floorDiv(this.minChunkX, 4);
+                    int previousMaxPageX = Math.floorDiv(this.maxChunkX, 4);
+                    int previousMinPageZ = Math.floorDiv(this.minChunkZ, 4);
+                    int previousMaxPageZ = Math.floorDiv(this.maxChunkZ, 4);
+                    int minPageX = Math.floorDiv(minChunkX, 4);
+                    int maxPageX = Math.floorDiv(maxChunkX, 4);
+                    int minPageZ = Math.floorDiv(minChunkZ, 4);
+                    int maxPageZ = Math.floorDiv(maxChunkZ, 4);
+                    boolean continuousPan = this.view == view && this.layerY == layerY
+                            && this.projectionTopY == projectionTopY
+                            && rectanglesOverlap(previousMinPageX, previousMaxPageX,
+                                    previousMinPageZ, previousMaxPageZ,
+                                    minPageX, maxPageX, minPageZ, maxPageZ);
+                    int centerPageX = clamp((int) Math.floor(centerChunkX / 4.0),
+                            minPageX, maxPageX);
+                    int centerPageZ = clamp((int) Math.floor(centerChunkZ / 4.0),
+                            minPageZ, maxPageZ);
+                    pagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
+                            minPageX, maxPageX, minPageZ, maxPageZ,
+                            centerPageX, centerPageZ, true, continuousPan,
+                            previousMinPageX, previousMaxPageX,
+                            previousMinPageZ, previousMaxPageZ);
+                    fullscreenPageCursor = 0;
+                    chunkPlan = new long[0];
+                    chunkCursor = 0;
+                } else {
+                    chunkPlan = CaveLoadHierarchy.buildRegionPlan(
+                            minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                            centerChunkX, centerChunkZ);
+                    chunkCursor = 0;
+                    pagePlan = new long[0];
+                    fullscreenPageCursor = 0;
+                }
                 completedCycles = 0L;
             }
             this.view = view;
@@ -501,6 +712,8 @@ final class CaveDisplayScheduler {
             this.maxChunkX = maxChunkX;
             this.minChunkZ = minChunkZ;
             this.maxChunkZ = maxChunkZ;
+            this.centerChunkX = centerChunkX;
+            this.centerChunkZ = centerChunkZ;
             this.lastEnqueueNanos = nowNanos;
         }
 
@@ -515,9 +728,57 @@ final class CaveDisplayScheduler {
                     && firstMinZ <= secondMaxZ && firstMaxZ >= secondMinZ;
         }
 
+        private int viewportPriority(Task task, int basePriority,
+                MapRequestLane lane) {
+            return viewportPriority(task.key.chunkX(), task.key.chunkZ(),
+                    basePriority, lane);
+        }
+
+        private int viewportPriority(int chunkX, int chunkZ, int basePriority,
+                MapRequestLane lane) {
+            if (lane != MapRequestLane.FULLSCREEN) {
+                double dx = chunkX - centerChunkX;
+                double dz = chunkZ - centerChunkZ;
+                int distance = (int) Math.min(900_000.0,
+                        (dx * dx + dz * dz) * 1_000.0);
+                return basePriority - distance;
+            }
+            return fullscreenPriority(chunkX, chunkZ, basePriority);
+        }
+
+        private int fullscreenPriority(int chunkX, int chunkZ, int basePriority) {
+            int pageX = Math.floorDiv(chunkX, 4);
+            int pageZ = Math.floorDiv(chunkZ, 4);
+            int minPageX = Math.floorDiv(minChunkX, 4);
+            int maxPageX = Math.floorDiv(maxChunkX, 4);
+            int minPageZ = Math.floorDiv(minChunkZ, 4);
+            int maxPageZ = Math.floorDiv(maxChunkZ, 4);
+            int centerPageX = clamp((int) Math.floor(centerChunkX / 4.0),
+                    minPageX, maxPageX);
+            int centerPageZ = clamp((int) Math.floor(centerChunkZ / 4.0),
+                    minPageZ, maxPageZ);
+            int ordinal = CaveLoadHierarchy.centerOutOrdinal(
+                    minPageX, maxPageX, minPageZ, maxPageZ,
+                    centerPageX, centerPageZ, pageX, pageZ);
+            if (ordinal < 0) ordinal = 0;
+
+            // A page is only revealed transactionally, but completing its four-by-four
+            // chunk set centre-out reduces the time until the visible page becomes
+            // authoritative. Retained tasks keep the same ordering after a viewport
+            // handoff instead of reverting to the old top-left row-major priority.
+            int localX = Math.floorMod(chunkX, 4);
+            int localZ = Math.floorMod(chunkZ, 4);
+            double localDx = localX - 1.5D;
+            double localDz = localZ - 1.5D;
+            int localDistancePenalty = (int) Math.round(
+                    (localDx * localDx + localDz * localDz) * 1_000.0D);
+            return basePriority + 220_000 - ordinal * 250
+                    - localDistancePenalty;
+        }
+
         private boolean contains(Task task) {
             return task.key.view() == view && task.key.layerY() == layerY
-                    && task.projectionTopY == projectionTopY
+                    && task.isRelevantToProjection(projectionTopY)
                     && task.key.chunkX() >= minChunkX - 1
                     && task.key.chunkX() <= maxChunkX + 1
                     && task.key.chunkZ() >= minChunkZ - 1
@@ -538,27 +799,60 @@ final class CaveDisplayScheduler {
             lastEnqueueNanos = 0L;
             pagePlan = new long[0];
             fullscreenPageCursor = 0;
+            chunkPlan = new long[0];
+            chunkCursor = 0;
+            centerChunkX = 0.0;
+            centerChunkZ = 0.0;
             completedCycles = 0L;
         }
     }
 
     private Task pollValid() {
         while (true) {
-            Task task = queue.poll();
-            if (task == null) return null;
-            if (task.cancelled) continue;
+            ReadyEntry entry = queue.poll();
+            if (entry == null) return null;
+            Task task = entry.task;
+            if (!entry.current() || task.cancelled || task.deferredState) continue;
             if (!queued.remove(task.key, task)) continue;
             return task;
+        }
+    }
+
+    private record ReadyEntry(Task task, int priority, long sequence,
+            int version) implements Comparable<ReadyEntry> {
+        private boolean current() {
+            return task.scheduleVersion == version;
+        }
+
+        @Override
+        public int compareTo(ReadyEntry other) {
+            int byPriority = Integer.compare(other.priority, priority);
+            return byPriority != 0 ? byPriority
+                    : Long.compare(sequence, other.sequence);
+        }
+    }
+
+    private record DeferredEntry(Task task, long retryAfterTick, long sequence,
+            int version) implements Comparable<DeferredEntry> {
+        private boolean current() {
+            return task.scheduleVersion == version && task.deferredState;
+        }
+
+        @Override
+        public int compareTo(DeferredEntry other) {
+            int byRetry = Long.compare(retryAfterTick, other.retryAfterTick);
+            return byRetry != 0 ? byRetry : Long.compare(sequence, other.sequence);
         }
     }
 
     private record TaskKey(int chunkX, int chunkZ, CaveView view, int layerY) {
     }
 
-    private static final class Task implements Comparable<Task> {
+    private static final class Task {
         private final TaskKey key;
         private final long repositoryGeneration;
         private int projectionTopY;
+        private int followUpProjectionTopY = Integer.MIN_VALUE;
         private final long[] requestedColumns = new long[4];
         private final long[] completedColumns = new long[4];
         private boolean viewportDemand;
@@ -575,6 +869,10 @@ final class CaveDisplayScheduler {
         private LiveCaveChunkSource source;
         private boolean fullProjection;
         private boolean cancelled;
+        private boolean deferredState;
+        private int scheduleVersion;
+        private int activeColumn = -1;
+        private CaveDisplayProjector.ColumnCursor columnCursor;
 
         private Task(TaskKey key, int projectionTopY, int priority, long sequence,
                 long repositoryGeneration, boolean viewportDemand,
@@ -595,10 +893,33 @@ final class CaveDisplayScheduler {
 
         private void retarget(int projectionTopY) {
             this.projectionTopY = projectionTopY;
+            this.followUpProjectionTopY = Integer.MIN_VALUE;
             this.fullProjection = true;
             Arrays.fill(requestedColumns, 0L);
             Arrays.fill(completedColumns, 0L);
             restartProjection();
+        }
+
+        private void requestFollowUp(int projectionTopY) {
+            if (projectionTopY != this.projectionTopY) {
+                this.followUpProjectionTopY = projectionTopY;
+            }
+        }
+
+        private boolean hasFollowUp() {
+            return followUpProjectionTopY != Integer.MIN_VALUE
+                    && followUpProjectionTopY != projectionTopY;
+        }
+
+        private boolean isRelevantToProjection(int projectionTopY) {
+            return this.projectionTopY == projectionTopY
+                    || this.followUpProjectionTopY == projectionTopY;
+        }
+
+        private void activateFollowUp() {
+            int nextProjection = followUpProjectionTopY;
+            followUpProjectionTopY = Integer.MIN_VALUE;
+            retarget(nextProjection);
         }
 
         private void addPatchColumn(int column) {
@@ -637,6 +958,10 @@ final class CaveDisplayScheduler {
             return false;
         }
 
+        private boolean hasRemainingWork() {
+            return activeColumn >= 0 || hasRemainingColumns();
+        }
+
         private int takeNextColumn() {
             if (fullProjection) {
                 if (nextFullColumn >= DenseCaveTile.COLUMN_COUNT) return -1;
@@ -665,13 +990,10 @@ final class CaveDisplayScheduler {
             nextFullColumn = 0;
             patchCursor = 0;
             processedColumns = 0;
+            activeColumn = -1;
+            columnCursor = null;
             Arrays.fill(completedColumns, 0L);
         }
 
-        @Override
-        public int compareTo(Task other) {
-            int byPriority = Integer.compare(other.priority, priority);
-            return byPriority != 0 ? byPriority : Long.compare(sequence, other.sequence);
-        }
     }
 }

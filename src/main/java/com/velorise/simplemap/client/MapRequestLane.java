@@ -6,8 +6,8 @@ package com.velorise.simplemap.client;
  * priority values win when multiple viewports request the same page.
  */
 public enum MapRequestLane {
-    MINIMAP(4, 2_000_000, 0, 1_250L),
-    FULLSCREEN(3, 1_250_000, 1, 1_250L),
+    MINIMAP(4, 2_000_000, 0, 10_000L),
+    FULLSCREEN(3, 1_250_000, 1, 10_000L),
     BACKGROUND(2, 350_000, 2, 5_000L),
     PREFETCH(1, 100_000, 3, 10_000L);
 

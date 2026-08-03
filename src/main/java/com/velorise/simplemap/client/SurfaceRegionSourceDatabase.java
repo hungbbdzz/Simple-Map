@@ -3,6 +3,8 @@ package com.velorise.simplemap.client;
 import com.velorise.simplemap.client.pipeline.MapWorkGraph;
 import com.velorise.simplemap.client.pipeline.RevisionStamp;
 import com.velorise.simplemap.client.session.MapSessionManager;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import net.minecraft.client.Minecraft;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -14,6 +16,9 @@ import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -28,13 +33,27 @@ public final class SurfaceRegionSourceDatabase {
             new SurfaceRegionSourceDatabase();
 
     private static final int MAX_SOURCE_REGIONS = 24;
+    private static final int MAX_CAPTURE_REGIONS = 4;
+    // Chunk completion wakes the affected capture immediately. Keep only a slow
+    // safety retry for unchanged partial windows; rebuilding the same incomplete
+    // palette/remap transaction twice per second was a major allocation spike.
+    private static final long UNCHANGED_PARTIAL_RETRY_NANOS = 4_000_000_000L;
     private static final long CHUNK_SOURCE_BYTES = 4_608L;
+    private static final int MAX_REGION_WARM_IN_FLIGHT = 2;
+    private static final ThreadLocal<CaptureScratch> CAPTURE_SCRATCH =
+            ThreadLocal.withInitial(CaptureScratch::new);
     private final LinkedHashMap<SourceKey, SurfaceRegionSource> sources =
             new LinkedHashMap<>(32, 0.75f, true);
     private final Set<SurfaceRegionSource> retiredSources =
             new LinkedHashSet<>();
-    private long captureWindowStartedNanos;
-    private int captureWindowRemaining;
+    private final Set<SourceKey> warmingRegions =
+            ConcurrentHashMap.newKeySet();
+    private final AtomicInteger warmingRegionCount = new AtomicInteger();
+    /** Last materialized coverage per focused batch; avoids rebuilding unchanged partials. */
+    private final Long2ObjectOpenHashMap<BatchProgressState> batchProgress =
+            new Long2ObjectOpenHashMap<>(128);
+    private final SurfaceCaptureFrameAllowance captureAllowance =
+            new SurfaceCaptureFrameAllowance();
     private final AtomicLong captureAttempts = new AtomicLong();
     private final AtomicLong captureReady = new AtomicLong();
     private final AtomicLong captureDeferred = new AtomicLong();
@@ -154,6 +173,74 @@ public final class SurfaceRegionSourceDatabase {
         }
     }
 
+    /**
+     * Publishes one complete live 16x16 Surface chunk directly into the retained
+     * source database. The old path waited for a later page capture probe to notice
+     * that MapManager had finally reached 256 columns, which produced thousands of
+     * partial/deferred probes while Cave source was already advancing by chunk.
+     */
+    public boolean publishCompletedChunk(RevisionStamp stamp, int chunkX,
+            int chunkZ, MapRequestLane lane) {
+        if (stamp == null || !stamp.isCurrent()) return false;
+        int regionX = Math.floorDiv(chunkX, SurfaceRegionSource.CHUNKS_PER_AXIS);
+        int regionZ = Math.floorDiv(chunkZ, SurfaceRegionSource.CHUNKS_PER_AXIS);
+        int localChunkX = Math.floorMod(chunkX, SurfaceRegionSource.CHUNKS_PER_AXIS);
+        int localChunkZ = Math.floorMod(chunkZ, SurfaceRegionSource.CHUNKS_PER_AXIS);
+        MapManager.Region region = MapManager.getInstance().getRegion(
+                regionX, regionZ, false);
+        if (region == null || !region.isLoaded()
+                || !region.isChunkSurfaceComplete(localChunkX, localChunkZ)) {
+            return false;
+        }
+        SourceKey key = new SourceKey(stamp.sessionId(), regionX, regionZ);
+        SurfaceRegionSource source = getOrCreateSource(key, stamp,
+                regionX, regionZ);
+        MapManager.RegionSourcePalette palette =
+                region.snapshotSourcePaletteIfChanged(source.paletteRevision());
+        if (palette != null) source.updatePalette(palette);
+        long revision = region.chunkRevision(localChunkX, localChunkZ);
+        if (!source.needsCapture(localChunkX, localChunkZ, revision)) return true;
+        int localPageX = localChunkX >>> 2;
+        int localPageZ = localChunkZ >>> 2;
+        boolean leafWasReady = source.leafSourceReady(localPageX, localPageZ);
+
+        byte[] light = null;
+        MapLightManager.LightRegion lightRegion = MapLightManager.getInstance()
+                .getRegion(regionX, regionZ, false);
+        if (lightRegion != null && lightRegion.isLoaded()) {
+            light = lightRegion.snapshotWindow(localChunkX << 4,
+                    localChunkZ << 4, 16, 16);
+        }
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.BACKGROUND : lane;
+        MapMemoryLeaseManager.Lease lease = acquireChunkLease(key, effectiveLane);
+        if (lease == null) return false;
+        MapManager.RegionChunkSnapshot captured = region.snapshotChunk(
+                localChunkX, localChunkZ, light);
+        if (captured == null) {
+            lease.close();
+            return false;
+        }
+        boolean committed = source.commit(ChunkSnapshot.takeOwnership(
+                captured.localChunkX(), captured.localChunkZ(),
+                captured.sourceRevision(), captured.packedPixelsUnsafe(),
+                captured.tintsUnsafe(), captured.lightLevelsUnsafe()), lease);
+        if (!committed) return false;
+        int localChunkIndex = localChunkZ * SurfaceRegionSource.CHUNKS_PER_AXIS
+                + localChunkX;
+        MapWorkGraph.getInstance().clearSourceChunkDirty(stamp,
+                regionX, regionZ, localChunkIndex);
+        MapTextureManager.getInstance().wakeRegionCaptureForChunk(chunkX, chunkZ);
+        if (!leafWasReady && source.leafSourceReady(localPageX, localPageZ)) {
+            Minecraft minecraft = Minecraft.getInstance();
+            Runnable wakeLod = () -> RegionSurfaceLodService.getInstance()
+                    .onRegionSourceWarmed(regionX, regionZ);
+            if (minecraft.isSameThread()) wakeLod.run();
+            else minecraft.execute(wakeLod);
+        }
+        return true;
+    }
+
     public boolean isLeafSourceReady(RevisionStamp stamp, int regionX,
             int regionZ, int localPageX, int localPageZ) {
         if (stamp == null) return false;
@@ -162,6 +249,93 @@ public final class SurfaceRegionSourceDatabase {
                     stamp.sessionId(), regionX, regionZ));
             return source != null && source.leafSourceReady(localPageX, localPageZ);
         }
+    }
+
+    /**
+     * Copies a loaded saved region into the retained 16x16 source database on a
+     * worker thread. Pass 12 populated this database only through render-thread
+     * capture attempts capped at a few dozen chunks, so a 512x512 region could
+     * take many seconds before its coarse LOD had useful coverage. The region
+     * arrays are SimpleMap-owned and lock-protected, so warming them off-thread is
+     * safe and keeps Minecraft Level/Chunk objects out of background work.
+     */
+    public boolean warmLoadedRegion(RevisionStamp stamp, int regionX,
+            int regionZ, MapRequestLane lane) {
+        if (stamp == null || !stamp.isCurrent()) return false;
+        SourceKey key = new SourceKey(stamp.sessionId(), regionX, regionZ);
+        if (!warmingRegions.add(key)) return true;
+        if (warmingRegionCount.incrementAndGet() > MAX_REGION_WARM_IN_FLIGHT) {
+            releaseWarmRegion(key);
+            return false;
+        }
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.FULLSCREEN : lane;
+        CompletableFuture<Integer> future = MapWorkScheduler.tryCpuFuture(
+                effectiveLane, MapWorkScheduler.WorkType.SOURCE_DECODE,
+                effectiveLane.priorityBase() + 120_000, 48,
+                stamp::isCurrent,
+                () -> warmLoadedRegionNow(stamp, key, effectiveLane));
+        if (future == null) {
+            releaseWarmRegion(key);
+            return false;
+        }
+        future.whenComplete((captured, failure) -> {
+            releaseWarmRegion(key);
+            if (failure == null && captured != null && captured > 0
+                    && stamp.isCurrent()) {
+                Minecraft.getInstance().execute(() ->
+                        RegionSurfaceLodService.getInstance()
+                                .onRegionSourceWarmed(key.regionX(), key.regionZ()));
+            }
+        });
+        return true;
+    }
+
+    private void releaseWarmRegion(SourceKey key) {
+        warmingRegions.remove(key);
+        warmingRegionCount.updateAndGet(value -> Math.max(0, value - 1));
+    }
+
+    private int warmLoadedRegionNow(RevisionStamp stamp, SourceKey key,
+            MapRequestLane lane) {
+        MapManager.Region region = MapManager.getInstance().getRegion(
+                key.regionX(), key.regionZ(), false);
+        if (region == null || !region.isLoaded() || !stamp.isCurrent()) return 0;
+        SurfaceRegionSource source = getOrCreateSource(key, stamp,
+                key.regionX(), key.regionZ());
+        MapManager.RegionSourcePalette palette =
+                region.snapshotSourcePaletteIfChanged(source.paletteRevision());
+        if (palette != null) source.updatePalette(palette);
+        int captured = 0;
+        for (int chunkZ = 0; chunkZ < 32 && stamp.isCurrent(); chunkZ++) {
+            for (int chunkX = 0; chunkX < 32 && stamp.isCurrent(); chunkX++) {
+                long revision = region.chunkRevision(chunkX, chunkZ);
+                if (!source.needsCapture(chunkX, chunkZ, revision)
+                        || !region.isChunkSurfaceComplete(chunkX, chunkZ)) {
+                    continue;
+                }
+                MapMemoryLeaseManager.Lease chunkLease =
+                        acquireChunkLease(key, lane);
+                if (chunkLease == null) return captured;
+                MapManager.RegionChunkSnapshot snapshot =
+                        region.snapshotChunk(chunkX, chunkZ, null);
+                if (snapshot == null) {
+                    chunkLease.close();
+                    continue;
+                }
+                boolean committed = source.commit(ChunkSnapshot.takeOwnership(
+                        snapshot.localChunkX(), snapshot.localChunkZ(),
+                        snapshot.sourceRevision(), snapshot.packedPixelsUnsafe(),
+                        snapshot.tintsUnsafe(), snapshot.lightLevelsUnsafe()),
+                        chunkLease);
+                if (committed) {
+                    captured++;
+                    MapWorkGraph.getInstance().clearSourceChunkDirty(stamp,
+                            key.regionX(), key.regionZ(), chunkZ * 32 + chunkX);
+                }
+            }
+        }
+        return captured;
     }
 
     public void clearSession(long sessionId) {
@@ -175,6 +349,11 @@ public final class SurfaceRegionSourceDatabase {
             }
             if (sources.isEmpty()) resetDebugCounters();
         }
+        synchronized (batchProgress) {
+            batchProgress.clear();
+        }
+        resetCaptureAllowance();
+        warmingRegions.removeIf(key -> key.sessionId() == sessionId);
     }
 
     public void clear() {
@@ -185,6 +364,12 @@ public final class SurfaceRegionSourceDatabase {
             sources.clear();
             resetDebugCounters();
         }
+        synchronized (batchProgress) {
+            batchProgress.clear();
+        }
+        resetCaptureAllowance();
+        warmingRegions.clear();
+        warmingRegionCount.set(0);
     }
 
     /**
@@ -207,21 +392,14 @@ public final class SurfaceRegionSourceDatabase {
                 || batchPageZ + pagesHigh > MapPageLayout.PAGES_PER_REGION) {
             return null;
         }
-        int halo = MapPageLayout.PAGE_HALO;
-        int width = pagesWide * MapPageLayout.PAGE_SIZE + halo * 2;
-        int height = pagesHigh * MapPageLayout.PAGE_SIZE + halo * 2;
-        long bytes = (long) width * height
-                * (Long.BYTES + Integer.BYTES + Byte.BYTES);
-        MapMemoryLeaseManager.Lease memoryLease =
-                MapMemoryLeaseManager.tryAcquire(
-                        MapMemoryLeaseManager.Category.PENDING_SOURCE,
-                        bytes, lane);
-        if (memoryLease == null) return null;
-        int[] remainingCaptures = new int[] { claimCaptureAllowance(lane) };
-        SurfaceRegionSource.Probe[] probes = null;
-        SurfaceRegionSource.View[] views = null;
 
+        CaptureScratch scratch = CAPTURE_SCRATCH.get();
+        MapMemoryLeaseManager.Lease memoryLease = null;
+        boolean viewsTransferred = false;
         try {
+            int halo = MapPageLayout.PAGE_HALO;
+            int width = pagesWide * MapPageLayout.PAGE_SIZE + halo * 2;
+            int height = pagesHigh * MapPageLayout.PAGE_SIZE + halo * 2;
             int worldPageStartX = (regionX * MapPageLayout.PAGES_PER_REGION
                     + batchPageX) * MapPageLayout.PAGE_SIZE;
             int worldPageStartZ = (regionZ * MapPageLayout.PAGES_PER_REGION
@@ -245,58 +423,68 @@ public final class SurfaceRegionSourceDatabase {
             int sourceRegionWidth = maxRegionX - minRegionX + 1;
             int sourceRegionHeight = maxRegionZ - minRegionZ + 1;
             int sourceRegionCount = sourceRegionWidth * sourceRegionHeight;
-            probes = new SurfaceRegionSource.Probe[sourceRegionCount];
-            long[] coordinatePlan = new long[sourceRegionCount];
+            if (sourceRegionCount <= 0 || sourceRegionCount > MAX_CAPTURE_REGIONS) {
+                return null;
+            }
+            scratch.begin(sourceRegionCount, claimCaptureAllowance(lane),
+                    captureAttemptBudgetNanos(lane));
+
             int coordinateCount = 0;
-            for (int sourceRegionZ = minRegionZ; sourceRegionZ <= maxRegionZ; sourceRegionZ++) {
-                for (int sourceRegionX = minRegionX; sourceRegionX <= maxRegionX; sourceRegionX++) {
-                    coordinatePlan[coordinateCount++] = packRegion(
+            for (int sourceRegionZ = minRegionZ; sourceRegionZ <= maxRegionZ;
+                    sourceRegionZ++) {
+                for (int sourceRegionX = minRegionX; sourceRegionX <= maxRegionX;
+                        sourceRegionX++) {
+                    scratch.coordinatePlan[coordinateCount++] = packRegion(
                             sourceRegionX, sourceRegionZ);
                 }
             }
             int focusWorldX = focusWorldStartX + MapPageLayout.PAGE_SIZE / 2;
             int focusWorldZ = focusWorldStartZ + MapPageLayout.PAGE_SIZE / 2;
-            // A batch window crosses at most four 512x512 regions. Sort the
-            // primitive packed coordinates in-place instead of allocating a list,
-            // record objects and comparator captures for every rejected attempt.
             for (int i = 1; i < coordinateCount; i++) {
-                long candidate = coordinatePlan[i];
+                long candidate = scratch.coordinatePlan[i];
                 long candidateDistance = regionDistanceSquared(
                         unpackRegionX(candidate), unpackRegionZ(candidate),
                         focusWorldX, focusWorldZ);
                 int insertion = i;
                 while (insertion > 0) {
-                    long previous = coordinatePlan[insertion - 1];
+                    long previous = scratch.coordinatePlan[insertion - 1];
                     long previousDistance = regionDistanceSquared(
                             unpackRegionX(previous), unpackRegionZ(previous),
                             focusWorldX, focusWorldZ);
                     if (previousDistance <= candidateDistance) break;
-                    coordinatePlan[insertion] = previous;
+                    scratch.coordinatePlan[insertion] = previous;
                     insertion--;
                 }
-                coordinatePlan[insertion] = candidate;
+                scratch.coordinatePlan[insertion] = candidate;
             }
+
             for (int coordinateIndex = 0; coordinateIndex < coordinateCount;
                     coordinateIndex++) {
-                long packedCoordinate = coordinatePlan[coordinateIndex];
+                long packedCoordinate = scratch.coordinatePlan[coordinateIndex];
                 int sourceRegionX = unpackRegionX(packedCoordinate);
                 int sourceRegionZ = unpackRegionZ(packedCoordinate);
+                int probeIndex = probeIndex(sourceRegionX, sourceRegionZ,
+                        minRegionX, minRegionZ, sourceRegionWidth);
                 SurfaceRegionSource.Probe probe = refreshAndProbe(stamp,
                         sourceRegionX, sourceRegionZ, windowStartX,
                         windowStartZ, windowEndX, windowEndZ,
                         focusWorldStartX, focusWorldStartZ,
                         focusWorldEndX, focusWorldEndZ,
-                        includeLight, lane, remainingCaptures);
-                probes[probeIndex(sourceRegionX, sourceRegionZ,
-                        minRegionX, minRegionZ, sourceRegionWidth)] = probe;
+                        includeLight, lane, scratch.captureBudget);
+                scratch.probes[probeIndex] = probe;
+                if (probe != null) {
+                    probe.copyReadinessUnsafe(scratch.presentMasks,
+                            scratch.dirtyMasks,
+                            probeIndex * SurfaceRegionSource.DIRTY_WORDS,
+                            scratch.revisions, probeIndex * 2);
+                }
             }
 
-            Readiness readiness = inspectReadiness(probes,
+            Readiness readiness = inspectReadiness(scratch,
                     minRegionX, minRegionZ, sourceRegionWidth, sourceRegionHeight,
-                    minRegionX, maxRegionX,
-                    minRegionZ, maxRegionZ, windowStartX, windowStartZ,
-                    windowEndX, windowEndZ);
-            Readiness focusBodyReadiness = inspectReadiness(probes,
+                    minRegionX, maxRegionX, minRegionZ, maxRegionZ,
+                    windowStartX, windowStartZ, windowEndX, windowEndZ);
+            Readiness focusBodyReadiness = inspectReadiness(scratch,
                     minRegionX, minRegionZ, sourceRegionWidth, sourceRegionHeight,
                     Math.floorDiv(focusWorldStartX, MapPageLayout.REGION_SIZE),
                     Math.floorDiv(focusWorldEndX, MapPageLayout.REGION_SIZE),
@@ -304,7 +492,7 @@ public final class SurfaceRegionSourceDatabase {
                     Math.floorDiv(focusWorldEndZ, MapPageLayout.REGION_SIZE),
                     focusWorldStartX, focusWorldStartZ,
                     focusWorldEndX, focusWorldEndZ);
-            Readiness focusReadiness = inspectReadiness(probes,
+            Readiness focusReadiness = inspectReadiness(scratch,
                     minRegionX, minRegionZ, sourceRegionWidth, sourceRegionHeight,
                     Math.floorDiv(focusWorldStartX - halo, MapPageLayout.REGION_SIZE),
                     Math.floorDiv(focusWorldEndX + halo, MapPageLayout.REGION_SIZE),
@@ -312,9 +500,14 @@ public final class SurfaceRegionSourceDatabase {
                     Math.floorDiv(focusWorldEndZ + halo, MapPageLayout.REGION_SIZE),
                     focusWorldStartX - halo, focusWorldStartZ - halo,
                     focusWorldEndX + halo, focusWorldEndZ + halo);
-            // A halo-only hit must not release an all-UNKNOWN focused page. At
-            // least one body chunk is required for progressive publication.
-            boolean pipelineReady = focusBodyReadiness.presentChunks() > 0;
+
+            // Publication follows the Minecraft chunk, not the 64x64 storage page.
+            // MapTextureManager already turns every complete 16x16 body chunk into
+            // a subtile bit and uploads only those bits. Holding this plan until all
+            // sixteen chunks exist defeated that path and left End/remote maps black.
+            // Unknown chunks stay masked; previously published subtiles stay visible.
+            boolean pipelineReady = focusBodyReadiness.requiredChunks() > 0
+                    && focusBodyReadiness.presentChunks() > 0;
             boolean strictReady = readiness.missingChunks() == 0
                     && readiness.dirtyChunks() == 0;
             lastRequiredChunks = readiness.requiredChunks();
@@ -327,90 +520,98 @@ public final class SurfaceRegionSourceDatabase {
             missingRegionsTotal.addAndGet(readiness.missingRegions());
             missingChunksTotal.addAndGet(readiness.missingChunks());
             dirtyChunksTotal.addAndGet(readiness.dirtyChunks());
-            String batchId = regionX + "," + regionZ + ":" + batchPageX + ","
-                    + batchPageZ + ":" + pagesWide + "x" + pagesHigh;
+
             if (!pipelineReady) {
                 captureDeferred.incrementAndGet();
-                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
-                if (recorder.shouldEmitEvent("BATCH_SOURCE_DEFERRED:" + batchId,
-                        1000L)) {
-                    recorder.event("BATCH_SOURCE_DEFERRED",
-                            "batch=" + batchId + " required="
-                                    + readiness.requiredChunks() + " present="
-                                    + readiness.presentChunks() + " missing="
-                                    + readiness.missingChunks() + " dirty="
-                                    + readiness.dirtyChunks() + " body_present="
-                                    + focusBodyReadiness.presentChunks() + " body_missing="
-                                    + focusBodyReadiness.missingChunks() + " body_dirty="
-                                    + focusBodyReadiness.dirtyChunks() + " focus_present="
-                                    + focusReadiness.presentChunks() + " focus_missing="
-                                    + focusReadiness.missingChunks() + " focus_dirty="
-                                    + focusReadiness.dirtyChunks());
-                }
-                closeProbes(probes);
-                memoryLease.close();
+                emitReadinessEvent("BATCH_SOURCE_DEFERRED", stamp,
+                        regionX, regionZ, batchPageX, batchPageZ,
+                        pagesWide, pagesHigh, readiness,
+                        focusBodyReadiness, focusReadiness);
                 return null;
             }
+
+            long progressSignature = mixFingerprint(readiness.fingerprint()
+                    ^ Long.rotateLeft(focusBodyReadiness.fingerprint(), 17)
+                    ^ Long.rotateLeft(focusReadiness.fingerprint(), 39)
+                    ^ stamp.sourceGeneration()
+                    ^ Long.rotateLeft(stamp.styleGeneration(), 11)
+                    ^ Long.rotateLeft(stamp.projectionGeneration(), 29));
+            long progressKey = batchProgressKey(stamp.sessionId(), regionX, regionZ,
+                    batchPageX, batchPageZ, focusPageX, focusPageZ,
+                    pagesWide, pagesHigh, includeLight);
+            long nowNanos = System.nanoTime();
+            if (!shouldMaterializeBatch(progressKey, stamp.sessionId(), regionX,
+                    regionZ, batchPageX, batchPageZ, focusPageX, focusPageZ,
+                    pagesWide, pagesHigh, includeLight, progressSignature,
+                    strictReady, nowNanos)) {
+                captureDeferred.incrementAndGet();
+                return null;
+            }
+
+            long bytes = (long) width * height
+                    * (Long.BYTES + Integer.BYTES + Byte.BYTES + Byte.BYTES);
+            memoryLease = MapMemoryLeaseManager.tryAcquire(
+                    MapMemoryLeaseManager.Category.PENDING_SOURCE,
+                    bytes, lane);
+            if (memoryLease == null) return null;
+
             if (strictReady) {
                 captureReady.incrementAndGet();
             } else {
                 partialReady.incrementAndGet();
-                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
-                if (recorder.shouldEmitEvent("BATCH_PARTIAL_READY:" + batchId,
-                        1000L)) {
-                    recorder.event("BATCH_PARTIAL_READY",
-                            "batch=" + batchId + " body_present="
-                                    + focusBodyReadiness.presentChunks() + " body_missing="
-                                    + focusBodyReadiness.missingChunks() + " body_dirty="
-                                    + focusBodyReadiness.dirtyChunks() + " focus_present="
-                                    + focusReadiness.presentChunks() + " focus_missing="
-                                    + focusReadiness.missingChunks() + " focus_dirty="
-                                    + focusReadiness.dirtyChunks() + " batch_present="
-                                    + readiness.presentChunks() + " batch_missing="
-                                    + readiness.missingChunks() + " batch_dirty="
-                                    + readiness.dirtyChunks());
-                }
+                emitReadinessEvent("BATCH_PARTIAL_READY", stamp,
+                        regionX, regionZ, batchPageX, batchPageZ,
+                        pagesWide, pagesHigh, readiness,
+                        focusBodyReadiness, focusReadiness);
             }
 
             List<String> biomePalette = new ArrayList<>();
             List<String> blockPalette = new ArrayList<>();
             Map<String, Integer> biomeIds = new HashMap<>();
             Map<String, Integer> blockIds = new HashMap<>();
-            List<RegionSlice> slices = new ArrayList<>(sourceRegionCount);
+            RegionSlice[] slices = new RegionSlice[sourceRegionCount];
+            int sliceCount = 0;
             long sourceRevision = 0L;
-            views = new SurfaceRegionSource.View[sourceRegionCount];
-            for (int index = 0; index < probes.length; index++) {
-                SurfaceRegionSource.Probe probe = probes[index];
-                if (probe != null) views[index] = probe.acquireView();
+            for (int index = 0; index < sourceRegionCount; index++) {
+                SurfaceRegionSource.Probe probe = scratch.probes[index];
+                if (probe != null) scratch.views[index] = probe.acquireView();
             }
-            closeProbes(probes);
-            probes = null;
-            for (int index = 0; index < views.length; index++) {
-                SurfaceRegionSource.View view = views[index];
+            scratch.closeProbes(sourceRegionCount);
+            for (int index = 0; index < sourceRegionCount; index++) {
+                SurfaceRegionSource.View view = scratch.views[index];
                 if (view == null) continue;
                 int coordinateX = minRegionX + index % sourceRegionWidth;
                 int coordinateZ = minRegionZ + index / sourceRegionWidth;
-                RegionCoordinate coordinate = new RegionCoordinate(
-                        coordinateX, coordinateZ);
                 sourceRevision = Math.max(sourceRevision, view.sourceRevision());
                 int[] biomeRemap = buildBiomeRemap(view.biomePaletteUnsafe(),
                         biomePalette, biomeIds);
                 int[] blockRemap = buildBlockRemap(view.blockPaletteUnsafe(),
                         blockPalette, blockIds);
-                slices.add(new RegionSlice(coordinate, view, biomeRemap, blockRemap));
+                slices[sliceCount++] = new RegionSlice(
+                        new RegionCoordinate(coordinateX, coordinateZ),
+                        view, biomeRemap, blockRemap);
             }
-
-            return new BatchSourcePlan(stamp, regionX, regionZ,
+            RegionSlice[] retainedSlices = sliceCount == slices.length
+                    ? slices : Arrays.copyOf(slices, sliceCount);
+            BatchSourcePlan plan = new BatchSourcePlan(stamp, regionX, regionZ,
                     batchPageX, batchPageZ, pagesWide, pagesHigh,
                     worldPageStartX, worldPageStartZ, width, height, halo,
-                    Math.max(1L, sourceRevision), slices.toArray(RegionSlice[]::new),
+                    Math.max(1L, sourceRevision), retainedSlices,
                     List.copyOf(biomePalette), List.copyOf(blockPalette), memoryLease);
+            memoryLease = null;
+            viewsTransferred = true;
+            markBatchMaterialized(progressKey, stamp.sessionId(), regionX, regionZ,
+                    batchPageX, batchPageZ, focusPageX, focusPageZ,
+                    pagesWide, pagesHigh, includeLight, progressSignature,
+                    strictReady, nowNanos);
+            return plan;
         } catch (RuntimeException | Error failure) {
-            closeProbes(probes);
-            closeViews(views);
-            memoryLease.close();
             throw failure;
         } finally {
+            scratch.closeProbes(MAX_CAPTURE_REGIONS);
+            if (!viewsTransferred) scratch.closeViews(MAX_CAPTURE_REGIONS);
+            else scratch.clearViews(MAX_CAPTURE_REGIONS);
+            if (memoryLease != null) memoryLease.close();
             MapPipelineTelemetry.getInstance().recordStageNanos(
                     MapPipelineStage.SURFACE_CAPTURE,
                     System.nanoTime() - startedNanos);
@@ -421,7 +622,8 @@ public final class SurfaceRegionSourceDatabase {
             int regionX, int regionZ, int windowStartX, int windowStartZ,
             int windowEndX, int windowEndZ, int focusWorldStartX,
             int focusWorldStartZ, int focusWorldEndX, int focusWorldEndZ,
-            boolean includeLight, MapRequestLane lane, int[] remainingCaptures) {
+            boolean includeLight, MapRequestLane lane,
+            CaptureBudget remainingCaptures) {
         MapManager.Region region = MapManager.getInstance().getRegion(regionX, regionZ, false);
         if (region == null || !region.isLoaded()) return null;
         SourceKey key = new SourceKey(stamp.sessionId(), regionX, regionZ);
@@ -471,7 +673,9 @@ public final class SurfaceRegionSourceDatabase {
                 for (int dz = -ring; dz <= ring; dz++) {
                     for (int dx = -ring; dx <= ring; dx++) {
                         if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
-                        if (remainingCaptures == null || remainingCaptures[0] <= 0) {
+                        if (remainingCaptures == null
+                                || remainingCaptures.remaining <= 0
+                                || System.nanoTime() >= remainingCaptures.deadlineNanos) {
                             break capture;
                         }
                         int chunkX = focusChunkX + dx;
@@ -497,11 +701,11 @@ public final class SurfaceRegionSourceDatabase {
             MapRequestLane lane, SurfaceRegionSource source,
             MapManager.Region region, MapLightManager.LightRegion lightRegion,
             int regionX, int regionZ, int chunkX, int chunkZ,
-            int[] remainingCaptures) {
+            CaptureBudget remainingCaptures) {
         // The live scanner can be part-way through a 16x16 chunk. Capturing that
         // transient state made a page look resident after only a few columns.
         if (!region.isChunkSurfaceComplete(chunkX, chunkZ)) return;
-        remainingCaptures[0]--;
+        remainingCaptures.remaining--;
         byte[] light = null;
         if (lightRegion != null && lightRegion.isLoaded()) {
             light = lightRegion.snapshotWindow(chunkX * 16, chunkZ * 16, 16, 16);
@@ -546,40 +750,42 @@ public final class SurfaceRegionSourceDatabase {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
-    private synchronized int claimCaptureAllowance(MapRequestLane lane) {
-        long now = System.nanoTime();
+    /**
+     * Opens the source-capture allowance for one actual rendered frame. A slow
+     * 35-60 ms frame must not refill a nominal 16 ms wall-clock window two or
+     * three times while the same physical frame is still executing.
+     */
+    public void beginPublicationFrame(long frameId) {
+        captureAllowance.beginFrame(frameId);
+    }
+
+    private int claimCaptureAllowance(MapRequestLane lane) {
+        return captureAllowance.claim(lane == MapRequestLane.MINIMAP,
+                MapPerformanceGovernor.getInstance().underPressure(),
+                System.nanoTime());
+    }
+
+    private void resetCaptureAllowance() {
+        captureAllowance.reset();
+    }
+
+    /**
+     * Count limits alone cannot protect frame time because a newly completed
+     * water/modded chunk can cost far more than a cached flat chunk. Each capture
+     * attempt therefore gets a short wall-clock slice in addition to the shared
+     * per-frame chunk allowance.
+     */
+    private static long captureAttemptBudgetNanos(MapRequestLane lane) {
         boolean pressured = MapPerformanceGovernor.getInstance().underPressure();
-        if (captureWindowStartedNanos == 0L
-                || now - captureWindowStartedNanos >= 16_000_000L) {
-            captureWindowStartedNanos = now;
-            captureWindowRemaining = pressured
-                    ? (lane == MapRequestLane.MINIMAP ? 16 : 8)
-                    : (lane == MapRequestLane.MINIMAP ? 64 : 48);
+        if (pressured) {
+            return lane == MapRequestLane.MINIMAP ? 450_000L : 250_000L;
         }
-        int requested = pressured
-                ? (lane == MapRequestLane.MINIMAP ? 8 : 4)
-                : (lane == MapRequestLane.MINIMAP ? 32 : 24);
-        int granted = Math.min(requested, captureWindowRemaining);
-        captureWindowRemaining -= granted;
-        return granted;
+        if (lane == MapRequestLane.MINIMAP) return 1_000_000L;
+        if (lane == MapRequestLane.FULLSCREEN) return 750_000L;
+        return 400_000L;
     }
 
-    private static void closeViews(SurfaceRegionSource.View[] views) {
-        if (views == null) return;
-        for (SurfaceRegionSource.View view : views) {
-            if (view != null) view.close();
-        }
-    }
-
-    private static void closeProbes(SurfaceRegionSource.Probe[] probes) {
-        if (probes == null) return;
-        for (SurfaceRegionSource.Probe probe : probes) {
-            if (probe != null) probe.close();
-        }
-    }
-
-    private static Readiness inspectReadiness(
-            SurfaceRegionSource.Probe[] probes,
+    private static Readiness inspectReadiness(CaptureScratch scratch,
             int probeMinRegionX, int probeMinRegionZ,
             int probeRegionWidth, int probeRegionHeight,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
@@ -589,16 +795,17 @@ public final class SurfaceRegionSourceDatabase {
         int missing = 0;
         int dirty = 0;
         int missingRegions = 0;
+        long fingerprint = 0x9E3779B97F4A7C15L;
         for (int regionZ = minRegionZ; regionZ <= maxRegionZ; regionZ++) {
             for (int regionX = minRegionX; regionX <= maxRegionX; regionX++) {
                 int relativeRegionX = regionX - probeMinRegionX;
                 int relativeRegionZ = regionZ - probeMinRegionZ;
-                SurfaceRegionSource.Probe probe = relativeRegionX < 0
+                int regionIndex = relativeRegionX < 0
                         || relativeRegionX >= probeRegionWidth
                         || relativeRegionZ < 0
                         || relativeRegionZ >= probeRegionHeight
-                        ? null : probes[relativeRegionZ * probeRegionWidth
-                                + relativeRegionX];
+                        ? -1 : relativeRegionZ * probeRegionWidth
+                                + relativeRegionX;
                 int regionWorldX = regionX * MapPageLayout.REGION_SIZE;
                 int regionWorldZ = regionZ * MapPageLayout.REGION_SIZE;
                 int minX = Math.max(0, windowStartX - regionWorldX);
@@ -608,24 +815,130 @@ public final class SurfaceRegionSourceDatabase {
                 int maxZ = Math.min(MapPageLayout.REGION_SIZE - 1,
                         windowEndZ - regionWorldZ);
                 if (minX > maxX || minZ > maxZ) continue;
-                if (probe == null) missingRegions++;
+                if (regionIndex < 0 || scratch.probes[regionIndex] == null) {
+                    missingRegions++;
+                    fingerprint = mixFingerprint(fingerprint
+                            ^ packRegion(regionX, regionZ));
+                } else {
+                    fingerprint = mixFingerprint(fingerprint
+                            ^ scratch.revisions[regionIndex * 2]
+                            ^ Long.rotateLeft(
+                                    scratch.revisions[regionIndex * 2 + 1], 23));
+                }
                 for (int chunkZ = minZ >>> 4; chunkZ <= maxZ >>> 4; chunkZ++) {
                     for (int chunkX = minX >>> 4; chunkX <= maxX >>> 4; chunkX++) {
                         required++;
-                        int state = probe == null ? 0
-                                : probe.chunkReadinessUnsafe(chunkX, chunkZ);
-                        if (state == 0) {
-                            missing++;
-                        } else if (state == 1) {
-                            dirty++;
-                        } else {
-                            present++;
+                        int state = 0;
+                        if (regionIndex >= 0 && scratch.probes[regionIndex] != null) {
+                            int chunkIndex = chunkZ * SurfaceRegionSource.CHUNKS_PER_AXIS
+                                    + chunkX;
+                            int wordIndex = regionIndex
+                                    * SurfaceRegionSource.DIRTY_WORDS
+                                    + (chunkIndex >>> 6);
+                            long bit = 1L << (chunkIndex & 63);
+                            if ((scratch.presentMasks[wordIndex] & bit) != 0L) {
+                                state = (scratch.dirtyMasks[wordIndex] & bit) != 0L
+                                        ? 1 : 2;
+                            }
                         }
+                        if (state == 0) missing++;
+                        else if (state == 1) dirty++;
+                        else present++;
+                        long position = ((long) (regionZ - minRegionZ) << 24)
+                                ^ ((long) (regionX - minRegionX) << 16)
+                                ^ ((long) chunkZ << 8) ^ chunkX;
+                        fingerprint = mixFingerprint(fingerprint
+                                ^ (position << 2) ^ state);
                     }
                 }
             }
         }
-        return new Readiness(required, present, missing, dirty, missingRegions);
+        return new Readiness(required, present, missing, dirty, missingRegions,
+                fingerprint);
+    }
+
+    private void emitReadinessEvent(String type, RevisionStamp stamp,
+            int regionX, int regionZ, int batchPageX, int batchPageZ,
+            int pagesWide, int pagesHigh, Readiness readiness,
+            Readiness focusBodyReadiness, Readiness focusReadiness) {
+        String batchId = regionX + "," + regionZ + ":" + batchPageX + ","
+                + batchPageZ + ":" + pagesWide + "x" + pagesHigh;
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (!recorder.shouldEmitEvent(type + ':' + batchId, 1000L)) return;
+        recorder.event(type,
+                "batch=" + batchId + " session=" + stamp.sessionId()
+                        + " required=" + readiness.requiredChunks()
+                        + " present=" + readiness.presentChunks()
+                        + " missing=" + readiness.missingChunks()
+                        + " dirty=" + readiness.dirtyChunks()
+                        + " body_present=" + focusBodyReadiness.presentChunks()
+                        + " body_missing=" + focusBodyReadiness.missingChunks()
+                        + " body_dirty=" + focusBodyReadiness.dirtyChunks()
+                        + " focus_present=" + focusReadiness.presentChunks()
+                        + " focus_missing=" + focusReadiness.missingChunks()
+                        + " focus_dirty=" + focusReadiness.dirtyChunks());
+    }
+
+    private boolean shouldMaterializeBatch(long key, long sessionId,
+            int regionX, int regionZ, int batchPageX, int batchPageZ,
+            int focusPageX, int focusPageZ, int pagesWide, int pagesHigh,
+            boolean includeLight, long signature, boolean strictReady,
+            long nowNanos) {
+        synchronized (batchProgress) {
+            BatchProgressState state = batchProgress.get(key);
+            if (state == null || !state.matches(sessionId, regionX, regionZ,
+                    batchPageX, batchPageZ, focusPageX, focusPageZ,
+                    pagesWide, pagesHigh, includeLight)) {
+                return true;
+            }
+            if (state.signature != signature || (strictReady && !state.strictReady)) {
+                return true;
+            }
+            return nowNanos - state.materializedNanos
+                    >= UNCHANGED_PARTIAL_RETRY_NANOS;
+        }
+    }
+
+    private void markBatchMaterialized(long key, long sessionId,
+            int regionX, int regionZ, int batchPageX, int batchPageZ,
+            int focusPageX, int focusPageZ, int pagesWide, int pagesHigh,
+            boolean includeLight, long signature, boolean strictReady,
+            long nowNanos) {
+        synchronized (batchProgress) {
+            batchProgress.put(key, new BatchProgressState(sessionId,
+                    regionX, regionZ, batchPageX, batchPageZ,
+                    focusPageX, focusPageZ, pagesWide, pagesHigh,
+                    includeLight, signature, strictReady, nowNanos));
+            if (batchProgress.size() > 512) {
+                var iterator = batchProgress.long2ObjectEntrySet().iterator();
+                while (batchProgress.size() > 384 && iterator.hasNext()) {
+                    iterator.next();
+                    iterator.remove();
+                }
+            }
+        }
+    }
+
+    private static long batchProgressKey(long sessionId, int regionX, int regionZ,
+            int batchPageX, int batchPageZ, int focusPageX, int focusPageZ,
+            int pagesWide, int pagesHigh, boolean includeLight) {
+        long value = sessionId;
+        value = mixFingerprint(value ^ regionX);
+        value = mixFingerprint(value ^ Long.rotateLeft(regionZ, 13));
+        value = mixFingerprint(value ^ ((long) batchPageX << 3) ^ batchPageZ);
+        value = mixFingerprint(value ^ ((long) focusPageX << 11)
+                ^ ((long) focusPageZ << 15));
+        value = mixFingerprint(value ^ ((long) pagesWide << 19)
+                ^ ((long) pagesHigh << 23) ^ (includeLight ? 1L << 31 : 0L));
+        return value;
+    }
+
+    private static long mixFingerprint(long value) {
+        value ^= value >>> 30;
+        value *= 0xBF58476D1CE4E5B9L;
+        value ^= value >>> 27;
+        value *= 0x94D049BB133111EBL;
+        return value ^ (value >>> 31);
     }
 
     private static int probeIndex(int regionX, int regionZ,
@@ -664,7 +977,122 @@ public final class SurfaceRegionSourceDatabase {
     }
 
     private record Readiness(int requiredChunks, int presentChunks,
-            int missingChunks, int dirtyChunks, int missingRegions) { }
+            int missingChunks, int dirtyChunks, int missingRegions,
+            long fingerprint) { }
+
+    private static final class CaptureBudget {
+        private int remaining;
+        private long deadlineNanos;
+    }
+
+    private static final class CaptureScratch {
+        private final SurfaceRegionSource.Probe[] probes =
+                new SurfaceRegionSource.Probe[MAX_CAPTURE_REGIONS];
+        private final SurfaceRegionSource.View[] views =
+                new SurfaceRegionSource.View[MAX_CAPTURE_REGIONS];
+        private final long[] coordinatePlan = new long[MAX_CAPTURE_REGIONS];
+        private final long[] presentMasks = new long[MAX_CAPTURE_REGIONS
+                * SurfaceRegionSource.DIRTY_WORDS];
+        private final long[] dirtyMasks = new long[MAX_CAPTURE_REGIONS
+                * SurfaceRegionSource.DIRTY_WORDS];
+        /** source revision + palette revision for each region. */
+        private final long[] revisions = new long[MAX_CAPTURE_REGIONS * 2];
+        private final CaptureBudget captureBudget = new CaptureBudget();
+
+        private void begin(int regionCount, int captureAllowance,
+                long timeBudgetNanos) {
+            closeProbes(MAX_CAPTURE_REGIONS);
+            closeViews(MAX_CAPTURE_REGIONS);
+            Arrays.fill(coordinatePlan, 0L);
+            Arrays.fill(presentMasks, 0L);
+            Arrays.fill(dirtyMasks, 0L);
+            Arrays.fill(revisions, 0L);
+            captureBudget.remaining = Math.max(0, captureAllowance);
+            long now = System.nanoTime();
+            long budget = Math.max(100_000L, timeBudgetNanos);
+            captureBudget.deadlineNanos = now > Long.MAX_VALUE - budget
+                    ? Long.MAX_VALUE : now + budget;
+            for (int index = regionCount; index < MAX_CAPTURE_REGIONS; index++) {
+                probes[index] = null;
+                views[index] = null;
+            }
+        }
+
+        private void closeProbes(int count) {
+            int limit = Math.min(count, probes.length);
+            for (int index = 0; index < limit; index++) {
+                SurfaceRegionSource.Probe probe = probes[index];
+                probes[index] = null;
+                if (probe != null) probe.close();
+            }
+        }
+
+        private void closeViews(int count) {
+            int limit = Math.min(count, views.length);
+            for (int index = 0; index < limit; index++) {
+                SurfaceRegionSource.View view = views[index];
+                views[index] = null;
+                if (view != null) view.close();
+            }
+        }
+
+        private void clearViews(int count) {
+            int limit = Math.min(count, views.length);
+            for (int index = 0; index < limit; index++) views[index] = null;
+        }
+    }
+
+    private static final class BatchProgressState {
+        private final long sessionId;
+        private final int regionX;
+        private final int regionZ;
+        private final int batchPageX;
+        private final int batchPageZ;
+        private final int focusPageX;
+        private final int focusPageZ;
+        private final int pagesWide;
+        private final int pagesHigh;
+        private final boolean includeLight;
+        private final long signature;
+        private final boolean strictReady;
+        private final long materializedNanos;
+
+        private BatchProgressState(long sessionId, int regionX, int regionZ,
+                int batchPageX, int batchPageZ, int focusPageX, int focusPageZ,
+                int pagesWide, int pagesHigh, boolean includeLight,
+                long signature, boolean strictReady, long materializedNanos) {
+            this.sessionId = sessionId;
+            this.regionX = regionX;
+            this.regionZ = regionZ;
+            this.batchPageX = batchPageX;
+            this.batchPageZ = batchPageZ;
+            this.focusPageX = focusPageX;
+            this.focusPageZ = focusPageZ;
+            this.pagesWide = pagesWide;
+            this.pagesHigh = pagesHigh;
+            this.includeLight = includeLight;
+            this.signature = signature;
+            this.strictReady = strictReady;
+            this.materializedNanos = materializedNanos;
+        }
+
+        private boolean matches(long candidateSessionId, int candidateRegionX,
+                int candidateRegionZ, int candidateBatchPageX,
+                int candidateBatchPageZ, int candidateFocusPageX,
+                int candidateFocusPageZ, int candidatePagesWide,
+                int candidatePagesHigh, boolean candidateIncludeLight) {
+            return sessionId == candidateSessionId
+                    && regionX == candidateRegionX
+                    && regionZ == candidateRegionZ
+                    && batchPageX == candidateBatchPageX
+                    && batchPageZ == candidateBatchPageZ
+                    && focusPageX == candidateFocusPageX
+                    && focusPageZ == candidateFocusPageZ
+                    && pagesWide == candidatePagesWide
+                    && pagesHigh == candidatePagesHigh
+                    && includeLight == candidateIncludeLight;
+        }
+    }
 
     private SurfaceRegionSource getOrCreateSource(SourceKey key,
             RevisionStamp stamp, int regionX, int regionZ) {
@@ -736,7 +1164,8 @@ public final class SurfaceRegionSourceDatabase {
             SurfaceRegionSource.View view, int windowStartX, int windowStartZ,
             int destinationWidth, int destinationHeight,
             long[] destinationPixels, int[] destinationTints,
-            byte[] destinationLights, int[] biomeRemap, int[] blockRemap,
+            byte[] destinationLights, byte[] destinationKnown,
+            int[] biomeRemap, int[] blockRemap,
             BooleanSupplier valid) {
         int regionStartX = coordinate.regionX * MapPageLayout.REGION_SIZE;
         int regionStartZ = coordinate.regionZ * MapPageLayout.REGION_SIZE;
@@ -775,6 +1204,7 @@ public final class SurfaceRegionSourceDatabase {
                         int sourceIndex = sourceRow + worldX - chunkWorldX;
                         int destinationIndex = destinationRow + worldX - windowStartX;
                         long packed = sourcePixels[sourceIndex];
+                        destinationKnown[destinationIndex] = 1;
                         destinationTints[destinationIndex] = sourceTints[sourceIndex];
                         destinationLights[destinationIndex] = sourceLights[sourceIndex];
                         if (MapBlockData.isEmpty(packed)) continue;
@@ -886,7 +1316,8 @@ public final class SurfaceRegionSourceDatabase {
             this.height = height;
             this.halo = halo;
             this.sourceRevision = sourceRevision;
-            this.slices = Arrays.copyOf(slices, slices.length);
+            // captureBatchPlan passes a fresh, exact-sized array owned by this plan.
+            this.slices = slices;
             this.biomePalette = biomePalette;
             this.blockPalette = blockPalette;
             this.memoryLease = memoryLease;
@@ -920,6 +1351,7 @@ public final class SurfaceRegionSourceDatabase {
                 long[] pixels = new long[stride * height];
                 int[] tints = new int[stride * height];
                 byte[] lights = new byte[stride * height];
+                byte[] known = new byte[stride * height];
                 Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
                 Arrays.fill(tints, SurfaceTintData.UNKNOWN);
                 int windowStartX = worldPageStartX - halo;
@@ -930,10 +1362,10 @@ public final class SurfaceRegionSourceDatabase {
                     }
                     copyRegionIntersection(slice.coordinate(), slice.view(),
                             windowStartX, windowStartZ, stride, height,
-                            pixels, tints, lights, slice.biomeRemap(),
+                            pixels, tints, lights, known, slice.biomeRemap(),
                             slice.blockRemap(), valid);
                 }
-                return new AssembledBatchWindow(this, pixels, tints, lights);
+                return new AssembledBatchWindow(this, pixels, tints, lights, known);
             } finally {
                 MapPipelineTelemetry.getInstance().recordStageNanos(
                         MapPipelineStage.SURFACE_ASSEMBLY,
@@ -968,13 +1400,15 @@ public final class SurfaceRegionSourceDatabase {
         private final long[] pixels;
         private final int[] tints;
         private final byte[] light;
+        private final byte[] known;
 
         private AssembledBatchWindow(BatchSourcePlan plan, long[] pixels,
-                int[] tints, byte[] light) {
+                int[] tints, byte[] light, byte[] known) {
             this.plan = plan;
             this.pixels = pixels;
             this.tints = tints;
             this.light = light;
+            this.known = known;
         }
 
         RevisionStamp stamp() { return plan.stamp(); }
@@ -995,5 +1429,6 @@ public final class SurfaceRegionSourceDatabase {
         long[] pixelsUnsafe() { return pixels; }
         int[] tintsUnsafe() { return tints; }
         byte[] lightUnsafe() { return light; }
+        byte[] knownUnsafe() { return known; }
     }
 }

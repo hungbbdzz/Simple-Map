@@ -4,19 +4,35 @@ import com.velorise.simplemap.SimpleMap;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.resources.ResourceLocation;
 import org.joml.Matrix4f;
 
 public class MinimapRenderer {
     private static final MinimapRenderer INSTANCE = new MinimapRenderer();
+    private static final ResourceLocation PLAYER_OFF_MAP_TEXTURE =
+            ResourceLocation.fromNamespaceAndPath(
+                    "minecraft", "textures/map/decorations/player_off_map.png");
+    private static final ResourceLocation RED_X_TEXTURE =
+            ResourceLocation.fromNamespaceAndPath(
+                    "minecraft", "textures/map/decorations/red_x.png");
+    private static final int CIRCLE_SEGMENTS = 64;
+    private static final float[] CIRCLE_COS = new float[CIRCLE_SEGMENTS + 1];
+    private static final float[] CIRCLE_SIN = new float[CIRCLE_SEGMENTS + 1];
+    static {
+        for (int index = 0; index <= CIRCLE_SEGMENTS; index++) {
+            double angle = index * (Math.PI * 2.0 / CIRCLE_SEGMENTS);
+            CIRCLE_COS[index] = (float) Math.cos(angle);
+            CIRCLE_SIN[index] = (float) Math.sin(angle);
+        }
+    }
+    private int cachedCoordinateX = Integer.MIN_VALUE;
+    private int cachedCoordinateY = Integer.MIN_VALUE;
+    private int cachedCoordinateZ = Integer.MIN_VALUE;
+    private String cachedCoordinates = "";
     private static final long CAVE_ZOOM_ANIMATION_NANOS = 1_000_000_000L;
     private static final float CAVE_ZOOM_MULTIPLIER = 1.55f;
-    /**
-     * The retained FBO compositor is kept for later validation, but direct exact-leaf
-     * rendering is the stable default. A submitted draw is not proof that an FBO
-     * contains visible pixels, which previously let an opaque black target suppress
-     * the working direct path.
-     */
-    private static final boolean USE_EXPERIMENTAL_FRAMEBUFFER = false;
+    /** Both square and circular minimaps use the retained north-up composition. */
+    private static final boolean USE_RETAINED_FRAMEBUFFER = true;
 
     private boolean caveAnimationInitialized;
     private boolean lastCaveActive;
@@ -136,6 +152,17 @@ public class MinimapRenderer {
         double interpZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
         com.velorise.simplemap.client.minimap.MinimapService.getInstance()
                 .update(interpX, interpZ, effectiveZoom);
+        // Retained rendering can reuse the same texture for many visual frames,
+        // but tick-side visible demand expires after 500 ms. Refresh only the
+        // lightweight viewport intent here so stable FBO reuse never suspends
+        // scanning/IO/publication around a stationary player.
+        double demandFactor = MinimapFramebufferRenderer.demandCoverageFactor(
+                MapConfig.minimapRotate);
+        double demandHalf = (size * 0.5 / Math.max(0.0001f, effectiveZoom))
+                * demandFactor;
+        MapViewportCoordinator.getInstance().submitMinimap(
+                interpX - demandHalf, interpX + demandHalf,
+                interpZ - demandHalf, interpZ + demandHalf, effectiveZoom);
 
         if (MapConfig.minimapCircle) {
             renderCircularMinimap(guiGraphics, mc, player, x, y, size, borderThickness, tHalf,
@@ -182,8 +209,7 @@ public class MinimapRenderer {
 
         // 3. Draw coordinate overlay text with dynamic scale and position
         if (MapConfig.coordsEnabled) {
-            String coords = String.format("%d, %d, %d", (int) Math.floor(player.getX()),
-                    (int) Math.floor(player.getY()), (int) Math.floor(player.getZ()));
+            String coords = coordinateText(player);
             int textWidth = (int) (mc.font.width(coords) * MapConfig.coordsScale);
             int textHeight = (int) (9 * MapConfig.coordsScale);
 
@@ -220,32 +246,38 @@ public class MinimapRenderer {
     }
 
 
+    private String coordinateText(Player player) {
+        int x = (int) Math.floor(player.getX());
+        int y = (int) Math.floor(player.getY());
+        int z = (int) Math.floor(player.getZ());
+        if (x == cachedCoordinateX && y == cachedCoordinateY
+                && z == cachedCoordinateZ) return cachedCoordinates;
+        cachedCoordinateX = x;
+        cachedCoordinateY = y;
+        cachedCoordinateZ = z;
+        cachedCoordinates = x + ", " + y + ", " + z;
+        return cachedCoordinates;
+    }
+
     private void renderMapContent(GuiGraphics guiGraphics, int x, int y, int size,
             double centerX, double centerZ, float effectiveZoom, float partialTick) {
-        if (USE_EXPERIMENTAL_FRAMEBUFFER) {
+        if (USE_RETAINED_FRAMEBUFFER) {
             boolean rendered = MinimapFramebufferRenderer.getInstance().render(
                     guiGraphics, x, y, size, centerX, centerZ, effectiveZoom,
                     MapConfig.minimapRotate, partialTick);
             if (rendered) return;
         }
 
-        // Render exact leaves directly into the HUD target. This is the same basic
-        // contract used by Xaero's minimap support: leaf texture residency decides
-        // visibility, while an off-screen compositor is only an optional effect layer.
-        boolean depthWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
-                org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-        org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-        try {
-            guiGraphics.fill(x, y, x + size, y + size, 0xFF080A0C);
-            MapRenderer.getInstance().drawMap(
-                    guiGraphics, x, y, size, size, centerX, centerZ, effectiveZoom,
-                    false, MapConfig.minimapRotate, true, 0, 0, partialTick);
-            guiGraphics.flush();
-        } finally {
-            if (depthWasEnabled) org.lwjgl.opengl.GL11.glEnable(
-                    org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-            else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-        }
+        // This fallback is reached only after a framebuffer/render failure. The
+        // circular path keeps its active stencil test, so direct terrain replay is
+        // still clipped correctly when retained composition is unavailable.
+        // MapRenderer owns the single depth/blend/flush scope for direct atlas
+        // replay. Wrapping it again here added another synchronous GL state query and
+        // flush to every HUD frame without changing visibility.
+        guiGraphics.fill(x, y, x + size, y + size, 0xFF080A0C);
+        MapRenderer.getInstance().drawMap(
+                guiGraphics, x, y, size, size, centerX, centerZ, effectiveZoom,
+                false, MapConfig.minimapRotate, true, 0, 0, partialTick);
     }
 
     private void renderCircularMinimap(GuiGraphics guiGraphics, Minecraft mc, Player player,
@@ -255,15 +287,37 @@ public class MinimapRenderer {
         float cx = x + radius;
         float cy = y + radius;
         float clipRadius = radius - tHalf;
-        boolean depthWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-        boolean stencilWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-        int previousStencilFunc = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_FUNC);
-        int previousStencilRef = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_REF);
-        int previousStencilValueMask = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_VALUE_MASK);
-        int previousStencilWriteMask = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_WRITEMASK);
-        int previousStencilFail = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_FAIL);
-        int previousStencilDepthFail = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_FAIL);
-        int previousStencilDepthPass = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_PASS);
+        boolean depthWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
+                org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        boolean stencilWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
+                org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+        // Stencil is disabled in the normal GUI path. Querying seven additional GL
+        // values every minimap frame forced driver synchronization even though
+        // there was no state to preserve. Pay that compatibility cost only when a
+        // previous renderer actually left stencil enabled.
+        int previousStencilFunc = org.lwjgl.opengl.GL11.GL_ALWAYS;
+        int previousStencilRef = 0;
+        int previousStencilValueMask = 0xFF;
+        int previousStencilWriteMask = 0xFF;
+        int previousStencilFail = org.lwjgl.opengl.GL11.GL_KEEP;
+        int previousStencilDepthFail = org.lwjgl.opengl.GL11.GL_KEEP;
+        int previousStencilDepthPass = org.lwjgl.opengl.GL11.GL_KEEP;
+        if (stencilWasEnabled) {
+            previousStencilFunc = org.lwjgl.opengl.GL11.glGetInteger(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_FUNC);
+            previousStencilRef = org.lwjgl.opengl.GL11.glGetInteger(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_REF);
+            previousStencilValueMask = org.lwjgl.opengl.GL11.glGetInteger(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_VALUE_MASK);
+            previousStencilWriteMask = org.lwjgl.opengl.GL11.glGetInteger(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_WRITEMASK);
+            previousStencilFail = org.lwjgl.opengl.GL11.glGetInteger(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_FAIL);
+            previousStencilDepthFail = org.lwjgl.opengl.GL11.glGetInteger(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_FAIL);
+            previousStencilDepthPass = org.lwjgl.opengl.GL11.glGetInteger(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_PASS);
+        }
 
         mc.getMainRenderTarget().enableStencil();
         try {
@@ -277,12 +331,10 @@ public class MinimapRenderer {
             org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
 
             float maskRadius = clipRadius + 1.5f;
-            for (int dy = -(int) Math.ceil(maskRadius); dy <= (int) Math.ceil(maskRadius); dy++) {
-                float squared = maskRadius * maskRadius - dy * dy;
-                if (squared < 0.0f) continue;
-                float dx = (float) Math.sqrt(squared);
-                fillFloat(guiGraphics, cx - dx, cy + dy, cx + dx, cy + dy + 1.0f, 0xFFFFFFFF);
-            }
+            // One buffered 64-segment fan replaces ~2*radius individual GUI fill
+            // commands and square-root calculations on every HUD frame.
+            drawSolidCircle(guiGraphics, cx, cy, maskRadius,
+                    CIRCLE_SEGMENTS, 0xFFFFFFFF);
             guiGraphics.flush();
 
             org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
@@ -309,9 +361,9 @@ public class MinimapRenderer {
 
         MapRenderer.getInstance().drawMinimapPlayerOverlay(
                 guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
-        drawCircleRing(guiGraphics, cx, cy, clipRadius, radius, 64, MapConfig.minimapRingColor);
-        drawCircleRing(guiGraphics, cx, cy, radius, radius + borderThickness, 64, MapConfig.minimapRingColor);
-        drawCircleRing(guiGraphics, cx, cy, radius + borderThickness, radius + borderThickness + 1, 64,
+        drawCircleRing(guiGraphics, cx, cy, clipRadius, radius, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
+        drawCircleRing(guiGraphics, cx, cy, radius, radius + borderThickness, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
+        drawCircleRing(guiGraphics, cx, cy, radius + borderThickness, radius + borderThickness + 1, CIRCLE_SEGMENTS,
                 0xFF000000);
         guiGraphics.flush();
         drawCompassDirections(guiGraphics, mc, cx, cy, radius, borderThickness, player, true, partialTick);
@@ -448,21 +500,51 @@ public class MinimapRenderer {
         int markerSize = Math.max(2, (int) (8 * MapConfig.pinScale));
         int halfSize = markerSize / 2;
 
+        // The route and marker are live HUD overlays. They are deliberately not
+        // baked into the retained map framebuffer, otherwise exact player motion
+        // invalidates every atlas replay while a pin is active. A short screen-space
+        // dotted segment has bounded cost independent of world distance.
+        float routeDX = iconX - cx;
+        float routeDZ = iconZ - cy;
+        float routeLength = (float) Math.sqrt(routeDX * routeDX + routeDZ * routeDZ);
+        if (routeLength > markerSize + 6.0f) {
+            int pointerColor = MapRenderer.getInstance().getActualPointerColor(
+                    MapConfig.playerPointerColor);
+            int routeColor = (pointerColor & 0x00FFFFFF) | 0xCC000000;
+            float nx = routeDX / routeLength;
+            float nz = routeDZ / routeLength;
+            float start = 6.0f;
+            float end = Math.max(start, routeLength - halfSize - 2.0f);
+            float step = Math.max(5.0f, 7.0f * Math.max(0.6f, MapConfig.pinScale));
+            for (float distance = start; distance < end; distance += step) {
+                int dotX = Math.round(cx + nx * distance);
+                int dotY = Math.round(cy + nz * distance);
+                guiGraphics.fill(dotX, dotY, dotX + 1, dotY + 1, routeColor);
+            }
+        }
+
+        com.mojang.blaze3d.systems.RenderSystem.enableBlend();
+        com.mojang.blaze3d.systems.RenderSystem.defaultBlendFunc();
         if (offMap) {
-            net.minecraft.resources.ResourceLocation offMapTexture = net.minecraft.resources.ResourceLocation
-                    .fromNamespaceAndPath("minecraft", "textures/map/decorations/player_off_map.png");
-            com.mojang.blaze3d.systems.RenderSystem.enableBlend();
-            com.mojang.blaze3d.systems.RenderSystem.defaultBlendFunc();
             com.mojang.blaze3d.systems.RenderSystem.setShaderColor(1.0f, 0.0f, 0.0f, 1.0f);
-            guiGraphics.blit(offMapTexture, (int) iconX - halfSize, (int) iconZ - halfSize, markerSize, markerSize,
+            guiGraphics.blit(PLAYER_OFF_MAP_TEXTURE,
+                    (int) iconX - halfSize, (int) iconZ - halfSize, markerSize, markerSize,
                     0.0f, 0.0f, 8, 8, 8, 8);
             com.mojang.blaze3d.systems.RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
+        } else {
+            guiGraphics.blit(RED_X_TEXTURE,
+                    (int) iconX - halfSize, (int) iconZ - halfSize,
+                    markerSize, markerSize, 0.0f, 0.0f, 8, 8, 8, 8);
         }
 
         double dist3D = Math.sqrt(worldDX * worldDX + worldDZ * worldDZ);
-        String label = dist3D >= 1000
-                ? String.format("%.1fk blocks", dist3D / 1000.0)
-                : (int) dist3D + "m";
+        String label;
+        if (dist3D >= 1000) {
+            long tenths = Math.round(dist3D / 100.0);
+            label = (tenths / 10) + "." + Math.abs(tenths % 10) + "k blocks";
+        } else {
+            label = (int) dist3D + "m";
+        }
         Minecraft mc = Minecraft.getInstance();
 
         float textScale = 0.6f * (MapConfig.pinScale / 0.5f);
@@ -492,13 +574,19 @@ public class MinimapRenderer {
 
         double angleStep = 2.0 * Math.PI / numSegments;
         for (int i = 0; i < numSegments; i++) {
-            double angle1 = i * angleStep;
-            double angle2 = (i + 1) * angleStep;
+            float cos1 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_COS[i] : (float) Math.cos(i * angleStep);
+            float sin1 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_SIN[i] : (float) Math.sin(i * angleStep);
+            float cos2 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_COS[i + 1] : (float) Math.cos((i + 1) * angleStep);
+            float sin2 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_SIN[i + 1] : (float) Math.sin((i + 1) * angleStep);
 
-            float x1 = (float) (cx + radius * Math.cos(angle1));
-            float y1 = (float) (cy + radius * Math.sin(angle1));
-            float x2 = (float) (cx + radius * Math.cos(angle2));
-            float y2 = (float) (cy + radius * Math.sin(angle2));
+            float x1 = cx + radius * cos1;
+            float y1 = cy + radius * sin1;
+            float x2 = cx + radius * cos2;
+            float y2 = cy + radius * sin2;
 
             // Degenerate Quad (4 vertices representing a triangle)
             consumer.addVertex(matrix, cx, cy, 0.0f).setColor(r, g, b, a);
@@ -506,22 +594,6 @@ public class MinimapRenderer {
             consumer.addVertex(matrix, x2, y2, 0.0f).setColor(r, g, b, a);
             consumer.addVertex(matrix, cx, cy, 0.0f).setColor(r, g, b, a);
         }
-    }
-
-    private void fillFloat(GuiGraphics guiGraphics, float minX, float minY, float maxX, float maxY, int color) {
-        float a = ((color >> 24) & 0xFF) / 255.0f;
-        float r = ((color >> 16) & 0xFF) / 255.0f;
-        float g = ((color >> 8) & 0xFF) / 255.0f;
-        float b = (color & 0xFF) / 255.0f;
-
-        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
-        com.mojang.blaze3d.vertex.VertexConsumer consumer = guiGraphics.bufferSource()
-                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
-
-        consumer.addVertex(matrix, minX, minY, 0.0f).setColor(r, g, b, a);
-        consumer.addVertex(matrix, minX, maxY, 0.0f).setColor(r, g, b, a);
-        consumer.addVertex(matrix, maxX, maxY, 0.0f).setColor(r, g, b, a);
-        consumer.addVertex(matrix, maxX, minY, 0.0f).setColor(r, g, b, a);
     }
 
     private void drawCircleRing(GuiGraphics guiGraphics, float cx, float cy, float r1, float r2, int numSegments,
@@ -538,13 +610,14 @@ public class MinimapRenderer {
 
         double angleStep = 2.0 * Math.PI / numSegments;
         for (int i = 0; i < numSegments; i++) {
-            double angle1 = i * angleStep;
-            double angle2 = (i + 1) * angleStep;
-
-            float cos1 = (float) Math.cos(angle1);
-            float sin1 = (float) Math.sin(angle1);
-            float cos2 = (float) Math.cos(angle2);
-            float sin2 = (float) Math.sin(angle2);
+            float cos1 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_COS[i] : (float) Math.cos(i * angleStep);
+            float sin1 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_SIN[i] : (float) Math.sin(i * angleStep);
+            float cos2 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_COS[i + 1] : (float) Math.cos((i + 1) * angleStep);
+            float sin2 = numSegments == CIRCLE_SEGMENTS
+                    ? CIRCLE_SIN[i + 1] : (float) Math.sin((i + 1) * angleStep);
 
             consumer.addVertex(matrix, cx + r1 * cos1, cy + r1 * sin1, 0.0f).setColor(r, g, b, a);
             consumer.addVertex(matrix, cx + r1 * cos2, cy + r1 * sin2, 0.0f).setColor(r, g, b, a);

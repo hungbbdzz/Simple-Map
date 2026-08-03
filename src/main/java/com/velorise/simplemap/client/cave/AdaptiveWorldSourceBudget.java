@@ -33,16 +33,21 @@ final class AdaptiveWorldSourceBudget {
         target = clamp(target, MIN_TARGET, MAX_TARGET);
 
         int cpu = Math.max(1, processors);
-        int baseInFlight = Math.max(12, Math.min(128, cpu * 10));
-        if (pressure >= 0.94D) baseInFlight = Math.max(4, baseInFlight / 8);
-        else if (pressure >= 0.89D) baseInFlight = Math.max(6, baseInFlight / 4);
-        else if (pressure >= 0.82D) baseInFlight = Math.max(10, baseInFlight / 2);
+        // Anvil reads complete in bursts. Allowing cpu*10 (often 120+) futures
+        // released equally many palette/DataFix tasks at once and produced the
+        // observed decode queue/CPU spikes. A few reads per CPU retain IO overlap
+        // while preserving a bounded handoff to the four shared CPU workers.
+        int baseInFlight = Math.max(4, Math.min(16, cpu * 2));
+        if (pressure >= 0.94D) baseInFlight = Math.max(3, baseInFlight / 6);
+        else if (pressure >= 0.89D) baseInFlight = Math.max(4, baseInFlight / 3);
+        else if (pressure >= 0.82D) baseInFlight = Math.max(6, baseInFlight / 2);
 
         // Foreground cave/surface requests must not be starved by speculative
         // viewport prefetch. Backlog can expand admission slightly while heap is
         // healthy, but never beyond the CPU-derived ceiling.
         int demand = Math.max(0, pendingForeground) + Math.max(0, pendingBackground) / 4;
-        int maximumInFlight = Math.min(160, baseInFlight + Math.min(baseInFlight / 2, demand / 8));
+        int maximumInFlight = Math.min(20,
+                baseInFlight + Math.min(Math.max(1, baseInFlight / 4), demand / 12));
         int maximumPrefetch = Math.max(2, maximumInFlight / (pressure >= 0.82D ? 4 : 2));
         return new Snapshot(target, maximumInFlight, maximumPrefetch, pressure, headroom);
     }

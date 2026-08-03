@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
 import com.velorise.simplemap.client.MapGpuBudgetController;
+import com.velorise.simplemap.client.MapPerformanceGovernor;
 import com.velorise.simplemap.client.MapRequestLane;
 import com.velorise.simplemap.client.MapResidencyManager;
 import com.velorise.simplemap.client.MapWorkScheduler;
@@ -30,6 +31,7 @@ public final class SurfaceLodTree {
     private static final int VISIBLE_QUEUE_SCAN_BUDGET = 512;
     public static final int MAX_LEVEL = 7;
     private static final long FULL_ROW = -1L;
+    private static final long GPU_RETRY_MAX_NANOS = 160_000_000L;
     /** Clean leaf authority is LRU-bounded; dirty state is never discarded. */
     private static final int MAX_RETAINED_LEAF_STATES = 16_384;
 
@@ -56,6 +58,8 @@ public final class SurfaceLodTree {
             new ConcurrentLinkedQueue<>();
     private final MapPipelineTelemetry pipelineTelemetry = MapPipelineTelemetry.getInstance();
     private final LodBranchDiskCache diskCache = LodBranchDiskCache.getInstance();
+    private long gpuAdmissionRetryAfterNanos;
+    private int gpuAdmissionFailures;
     private long loadGeneration = 1L;
     /** Latest fullscreen Surface demand used only to prioritize branch work. */
     private volatile VisibleWindow visibleWindow = VisibleWindow.none();
@@ -467,25 +471,54 @@ public final class SurfaceLodTree {
         return published;
     }
 
+    private static long branchGpuRetryDelayNanos(int failures) {
+        long base = MapPerformanceGovernor.getInstance().underPressure()
+                ? 48_000_000L : 24_000_000L;
+        int shift = Math.max(0, Math.min(3, failures - 1));
+        return Math.min(GPU_RETRY_MAX_NANOS, base << shift);
+    }
+
     private int publishDirtyNodes(int budget, long deadlineNanos,
             int preferredLevel) {
         int published = 0;
-        while (published < budget && System.nanoTime() < deadlineNanos) {
+        int considered = 0;
+        int scanLimit = Math.max(8, budget * 4);
+        while (published < budget && considered++ < scanLimit
+                && System.nanoTime() < deadlineNanos) {
             NodeKey key = pollDirty(preferredLevel);
             if (key == null) break;
             dirtySet.remove(key);
             Node node = nodes.get(key);
             if (node == null || !node.isDirty() || node.knownMask == 0L) continue;
-            if (!ensureSlot(node)) {
+            long now = System.nanoTime();
+            if (gpuAdmissionRetryAfterNanos > now) {
                 enqueue(key);
                 break;
+            }
+            if (node.nextUploadAttemptNanos > now) {
+                enqueue(key);
+                continue;
+            }
+            if (!ensureSlot(node)) {
+                enqueue(key);
+                continue;
             }
             if (!MapGpuBudgetController.getInstance().tryReserve(
                     MapGpuBudgetController.UploadKind.BRANCH,
                     MapRequestLane.FULLSCREEN, false)) {
+                node.uploadReservationFailures++;
+                node.nextUploadAttemptNanos = now + branchGpuRetryDelayNanos(
+                        node.uploadReservationFailures);
+                gpuAdmissionFailures = Math.min(8, gpuAdmissionFailures + 1);
+                gpuAdmissionRetryAfterNanos = now + branchGpuRetryDelayNanos(
+                        gpuAdmissionFailures);
                 enqueue(key);
                 break;
             }
+            node.uploadReservationFailures = 0;
+            node.nextUploadAttemptNanos = 0L;
+            gpuAdmissionFailures = 0;
+            gpuAdmissionRetryAfterNanos = 0L;
             boolean wasInitialized = node.initialized;
             long oldUploadedKnownMask = node.uploadedKnownMask;
             long oldUploadedCompleteMask = node.uploadedCompleteMask;
@@ -512,7 +545,8 @@ public final class SurfaceLodTree {
                     node.uploadedChildRevisions, 0, node.childRevisions.length);
             if (wasInitialized && (oldUploadedKnownMask != node.uploadedKnownMask
                     || oldUploadedCompleteMask != node.uploadedCompleteMask)) {
-                MapResidencyManager.getInstance().markCoverageChanged();
+                MapResidencyManager.getInstance().markCoverageChanged(
+                        MapResidencyManager.Kind.SURFACE_BRANCH);
             }
             saveNode(node);
             published++;
@@ -618,25 +652,14 @@ public final class SurfaceLodTree {
     }
 
     private static int reduceSurface(int[] pixels, long[] rows, int x, int y) {
-        int[] values = {
-                pixels[y * 64 + x], pixels[y * 64 + x + 1],
-                pixels[(y + 1) * 64 + x], pixels[(y + 1) * 64 + x + 1]
-        };
-        boolean[] known = {
-                (rows[y] & (1L << x)) != 0L,
-                (rows[y] & (1L << (x + 1))) != 0L,
-                (rows[y + 1] & (1L << x)) != 0L,
-                (rows[y + 1] & (1L << (x + 1))) != 0L
-        };
-        return reduceVisible(values, known);
-    }
-
-    private static int reduceVisible(int[] values, boolean[] known) {
         long red = 0L, green = 0L, blue = 0L, weight = 0L;
         int maximumAlpha = 0;
-        for (int i = 0; i < values.length; i++) {
-            if (!known[i]) continue;
-            int value = values[i];
+        // Four scalar samples; avoids two short-lived arrays for every LOD texel.
+        for (int child = 0; child < 4; child++) {
+            int sourceX = x + (child & 1);
+            int sourceY = y + (child >>> 1);
+            if ((rows[sourceY] & (1L << sourceX)) == 0L) continue;
+            int value = pixels[sourceY * 64 + sourceX];
             int alpha = (value >>> 24) & 0xFF;
             if (value == 0 || alpha == 0) continue;
             red += (long) (value & 0xFF) * alpha;
@@ -976,6 +999,8 @@ public final class SurfaceLodTree {
         private int dirtyMinY = 64;
         private int dirtyMaxX = -1;
         private int dirtyMaxY = -1;
+        private long nextUploadAttemptNanos;
+        private int uploadReservationFailures;
         private boolean initialized;
 
         private Node(NodeKey key) {

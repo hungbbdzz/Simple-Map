@@ -12,6 +12,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.zip.CRC32;
@@ -26,6 +27,9 @@ public final class RegionContainerV2 {
     private static final int RECORD_MAGIC = 0x52454332; // REC2
     private static final int VERSION = 2;
     private static final int MAX_RECORD_BYTES = 64 * 1024 * 1024;
+    /** Single-writer append state; avoids rescanning a multi-MiB container before
+     * every record while still detecting external replacement/truncation. */
+    private static final Map<Path, AppendState> APPEND_STATES = new HashMap<>();
 
     public enum RecordType {
         SURFACE_SOURCE(1, true),
@@ -57,7 +61,7 @@ public final class RegionContainerV2 {
 
     private RegionContainerV2() { }
 
-    public static synchronized void append(Path path, Header header,
+    public static synchronized boolean append(Path path, Header header,
             Record record) throws IOException {
         if (path == null || header == null || record == null
                 || record.key() == null || record.key().type() == null
@@ -65,23 +69,32 @@ public final class RegionContainerV2 {
                 || record.payload().length > MAX_RECORD_BYTES) {
             throw new IllegalArgumentException("invalid region container append");
         }
-        Files.createDirectories(path.toAbsolutePath().getParent());
-        boolean create = !Files.exists(path) || Files.size(path) == 0L;
-        if (!create) {
-            ReadResult existing = read(path);
+        Path identity = path.toAbsolutePath().normalize();
+        Files.createDirectories(identity.getParent());
+        long size = Files.exists(identity) ? Files.size(identity) : 0L;
+        boolean create = size == 0L;
+        boolean recovered = false;
+        AppendState state = APPEND_STATES.get(identity);
+        if (!create && (state == null || state.fileSize() != size
+                || !sameHeader(state.header(), header))) {
+            ReadResult existing = read(identity);
             if (existing.header() == null || !sameHeader(existing.header(), header)) {
                 throw new IOException("SMR2 header identity mismatch");
             }
             if (existing.truncatedOrCorruptTail()) {
-                try (FileChannel channel = FileChannel.open(path,
+                try (FileChannel channel = FileChannel.open(identity,
                         StandardOpenOption.WRITE)) {
                     channel.truncate(existing.validBytes());
                     channel.force(true);
                 }
+                size = existing.validBytes();
+                recovered = true;
             }
+            state = new AppendState(existing.header(), size);
+            APPEND_STATES.put(identity, state);
         }
         try (DataOutputStream output = new DataOutputStream(
-                new BufferedOutputStream(Files.newOutputStream(path,
+                new BufferedOutputStream(Files.newOutputStream(identity,
                         StandardOpenOption.CREATE, StandardOpenOption.APPEND)))) {
             if (create) writeHeader(output, header);
             CRC32 crc = new CRC32();
@@ -96,6 +109,8 @@ public final class RegionContainerV2 {
             output.write(record.payload());
             output.flush();
         }
+        APPEND_STATES.put(identity, new AppendState(header, Files.size(identity)));
+        return recovered;
     }
 
     public static ReadResult read(Path path) throws IOException {
@@ -161,9 +176,11 @@ public final class RegionContainerV2 {
     }
 
     public static synchronized void compact(Path path) throws IOException {
-        ReadResult result = read(path);
+        Path identity = path.toAbsolutePath().normalize();
+        APPEND_STATES.remove(identity);
+        ReadResult result = read(identity);
         if (result.header() == null) return;
-        Path temporary = path.resolveSibling(path.getFileName() + ".compact.tmp");
+        Path temporary = identity.resolveSibling(identity.getFileName() + ".compact.tmp");
         Files.deleteIfExists(temporary);
         boolean first = true;
         for (Record record : result.latest().values()) {
@@ -184,11 +201,13 @@ public final class RegionContainerV2 {
             }
         }
         try {
-            Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING,
+            Files.move(temporary, identity, StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException unsupported) {
-            Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(temporary, identity, StandardCopyOption.REPLACE_EXISTING);
         }
+        APPEND_STATES.remove(temporary.toAbsolutePath().normalize());
+        APPEND_STATES.remove(identity);
     }
 
 
@@ -216,6 +235,8 @@ public final class RegionContainerV2 {
         return new Header(input.readLong(), input.readInt(), input.readInt(),
                 input.readInt());
     }
+
+    private record AppendState(Header header, long fileSize) { }
 
     private static final class CountingInputStream extends java.io.FilterInputStream {
         private long count;

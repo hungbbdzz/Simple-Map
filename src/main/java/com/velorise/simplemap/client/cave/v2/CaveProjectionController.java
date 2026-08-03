@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.cave.v2;
 
 import com.velorise.simplemap.client.MapRequestLane;
+import com.velorise.simplemap.client.CaveTextureManager;
 import com.velorise.simplemap.client.cave.projection.CaveProjectionServiceV2;
 import com.velorise.simplemap.client.cave.CaveView;
 import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
@@ -15,8 +16,15 @@ public final class CaveProjectionController {
     public void request(CaveView view, int layerY,
             double minX, double maxX, double minZ, double maxZ,
             float scale, double focusX, double focusZ, MapRequestLane lane) {
-        UnifiedCaveTextureManager.getInstance().requestVisiblePages(view, layerY,
-                minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
+        if (view == CaveView.LAYERED) {
+            // The facade owns Xaero-style loading/loaded layer handoff. Requesting
+            // the unified atlas directly exposed old and new bands page-by-page.
+            CaveTextureManager.getInstance().requestVisiblePages(layerY,
+                    minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
+        } else {
+            UnifiedCaveTextureManager.getInstance().requestVisiblePages(view, layerY,
+                    minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
+        }
         int chunkX = ((int) Math.floor(focusX)) >> 4;
         int chunkZ = ((int) Math.floor(focusZ)) >> 4;
         if (view == CaveView.FULL) {

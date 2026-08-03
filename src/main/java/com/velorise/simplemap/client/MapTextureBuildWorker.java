@@ -6,6 +6,7 @@ import com.velorise.simplemap.client.lod.PreparedBranch;
 import com.velorise.simplemap.client.lod.RegionLodGraph;
 
 import java.util.List;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntFunction;
@@ -112,6 +113,44 @@ final class MapTextureBuildWorker {
             boolean showFlowers, int terrainSlopes, byte[] light,
             int profile, long revision, BooleanSupplier stillValid,
             int executorPriority, RevisionStamp stamp) {
+        return tryBuildSurfacePage(pixels, tints, null, stride, halo,
+                worldPageStartX, worldPageStartZ, biomePalette, blockPalette,
+                biomeLookup, blockColors, tintPolicies, tintDisabledBlocks,
+                colourMode, showFlowers, terrainSlopes, light, profile, revision,
+                stillValid, executorPriority, stamp);
+    }
+
+    static CompletableFuture<PreparedPair> tryBuildSurfacePage(
+            long[] pixels, int[] tints, byte[] known, int stride, int halo,
+            int worldPageStartX, int worldPageStartZ,
+            List<String> biomePalette, List<String> blockPalette,
+            IntFunction<Biome> biomeLookup,
+            java.util.Map<String, Integer> blockColors,
+            java.util.Map<String, BlockTintPolicy> tintPolicies,
+            java.util.Set<String> tintDisabledBlocks, int colourMode,
+            boolean showFlowers, int terrainSlopes, byte[] light,
+            int profile, long revision, BooleanSupplier stillValid,
+            int executorPriority, RevisionStamp stamp) {
+        return tryBuildSurfacePage(pixels, tints, known, stride, halo,
+                worldPageStartX, worldPageStartZ, biomePalette, blockPalette,
+                biomeLookup, blockColors, tintPolicies, tintDisabledBlocks,
+                colourMode, showFlowers, terrainSlopes, light, profile, revision,
+                stillValid, executorPriority, stamp,
+                MapPageLayout.FULL_SUBTILE_MASK);
+    }
+
+    static CompletableFuture<PreparedPair> tryBuildSurfacePage(
+            long[] pixels, int[] tints, byte[] known, int stride, int halo,
+            int worldPageStartX, int worldPageStartZ,
+            List<String> biomePalette, List<String> blockPalette,
+            IntFunction<Biome> biomeLookup,
+            java.util.Map<String, Integer> blockColors,
+            java.util.Map<String, BlockTintPolicy> tintPolicies,
+            java.util.Set<String> tintDisabledBlocks, int colourMode,
+            boolean showFlowers, int terrainSlopes, byte[] light,
+            int profile, long revision, BooleanSupplier stillValid,
+            int executorPriority, RevisionStamp stamp,
+            int requestedSubtileMask) {
         MapRequestLane lane = MapWorkScheduler.laneForExecutorPriority(executorPriority);
         MapWorkScheduler.WorkType type = lane == MapRequestLane.MINIMAP
                 ? MapWorkScheduler.WorkType.MINIMAP_EXACT
@@ -119,15 +158,27 @@ final class MapTextureBuildWorker {
         return submit(lane, type, lane.priorityBase(), 8, stillValid, () -> {
             BooleanSupplier valid = guarded(stillValid);
             check(valid);
+            long[] knownRows = known == null
+                    ? buildKnownRowsForPageWindow(pixels, stride, halo)
+                    : buildKnownRowsForPageWindow(known, stride, halo);
+            int updateSubtiles = requestedSubtileMask
+                    & MapPageLayout.completeSubtileMask(knownRows);
             int[] pageStyled = SurfaceColorizer.colorizePageWindow(
                     pixels, tints, stride, halo, worldPageStartX, worldPageStartZ,
                     biomePalette, blockPalette, biomeLookup, blockColors,
                     tintPolicies, tintDisabledBlocks, colourMode, showFlowers,
-                    terrainSlopes, profile, valid);
-            byte[] pageLight = buildSmoothedLightPageWindow(light, stride, halo, valid);
+                    terrainSlopes, profile, updateSubtiles, valid);
+            byte[] pageLight = buildSmoothedLightPageWindow(light, stride, halo,
+                    updateSubtiles, valid);
             int[] pageGlow = new int[pageStyled.length];
             for (int i = 0; i < pageStyled.length; i++) {
                 if ((i & 1023) == 0) check(valid);
+                int localX = i % MapPageLayout.PAGE_SIZE;
+                int localZ = i / MapPageLayout.PAGE_SIZE;
+                int subtile = MapPageLayout.subtileIndex(
+                        localX / MapPageLayout.SUBTILE_SIZE,
+                        localZ / MapPageLayout.SUBTILE_SIZE);
+                if ((updateSubtiles & (1 << subtile)) == 0) continue;
                 int color = pageStyled[i];
                 int level = pageLight == null ? 0 : pageLight[i] & 0xFF;
                 int alpha = color == 0 || level == 0 ? 0
@@ -137,20 +188,22 @@ final class MapTextureBuildWorker {
                 pageGlow[i] = (warm & 0x00FFFFFF) | (alpha << 24);
             }
             return new PreparedPair(pageStyled, pageGlow, revision,
-                    new long[][] { buildKnownRowsForPageWindow(pixels, stride, halo) },
-                    stamp);
+                    new long[][] { knownRows }, stamp, updateSubtiles);
         });
     }
 
     static CompletableFuture<PreparedSurfaceRegionBatch> tryBuildSurfaceBatch(
             SurfaceRegionSourceDatabase.BatchSourcePlan sourcePlan,
             MapStyleSnapshot style, long[] pageRevisions,
-            boolean[] activePages, BooleanSupplier stillValid,
+            boolean[] activePages, int[] requestedSubtileMasks,
+            BooleanSupplier stillValid,
             int executorPriority) {
         if (sourcePlan == null || style == null || pageRevisions == null
                 || activePages == null || pageRevisions.length
                         != sourcePlan.pagesWide() * sourcePlan.pagesHigh()
-                || activePages.length != pageRevisions.length) {
+                || activePages.length != pageRevisions.length
+                || requestedSubtileMasks == null
+                || requestedSubtileMasks.length != pageRevisions.length) {
             return null;
         }
         MapRequestLane lane = MapWorkScheduler.laneForExecutorPriority(executorPriority);
@@ -179,6 +232,7 @@ final class MapTextureBuildWorker {
             long[] pixels = new long[compactPixels];
             int[] tints = new int[compactPixels];
             byte[] lights = new byte[compactPixels];
+            byte[] known = new byte[compactPixels];
             byte[] smoothedLights = new byte[MapPageLayout.PAGE_SIZE
                     * MapPageLayout.PAGE_SIZE];
             IntFunction<Biome> biomeLookup = style.biomeLookup();
@@ -201,11 +255,17 @@ final class MapTextureBuildWorker {
                                 tints, to, compactStride);
                         System.arraycopy(source.lightUnsafe(), from,
                                 lights, to, compactStride);
+                        System.arraycopy(source.knownUnsafe(), from,
+                                known, to, compactStride);
                     }
                     int worldPageStartX = source.worldPageStartX()
                             + pageX * MapPageLayout.PAGE_SIZE;
                     int worldPageStartZ = source.worldPageStartZ()
                             + pageZ * MapPageLayout.PAGE_SIZE;
+                    long[] knownRows = buildKnownRowsForPageWindow(
+                            known, compactStride, halo);
+                    int updateSubtiles = requestedSubtileMasks[pageIndex]
+                            & MapPageLayout.completeSubtileMask(knownRows);
                     int[] styled = SurfaceColorizer.colorizePageWindow(
                             pixels, tints, compactStride, halo,
                             worldPageStartX, worldPageStartZ,
@@ -213,11 +273,18 @@ final class MapTextureBuildWorker {
                             style.blockColors(), style.tintPolicies(),
                             style.tintDisabledBlocks(), style.colourMode(),
                             style.showFlowers(), style.terrainSlopes(),
-                            style.profile(), valid);
+                            style.profile(), updateSubtiles, valid);
                     byte[] smoothed = buildSmoothedLightPageWindowInto(
-                            lights, compactStride, halo, valid, smoothedLights);
+                            lights, compactStride, halo, valid, smoothedLights,
+                            updateSubtiles);
                     int[] glow = new int[styled.length];
                     for (int index = 0; index < styled.length; index++) {
+                        int localX = index % MapPageLayout.PAGE_SIZE;
+                        int localZ = index / MapPageLayout.PAGE_SIZE;
+                        int subtile = MapPageLayout.subtileIndex(
+                                localX / MapPageLayout.SUBTILE_SIZE,
+                                localZ / MapPageLayout.SUBTILE_SIZE);
+                        if ((updateSubtiles & (1 << subtile)) == 0) continue;
                         int color = styled[index];
                         int level = smoothed == null ? 0 : smoothed[index] & 0xFF;
                         int alpha = color == 0 || level == 0 ? 0
@@ -228,9 +295,7 @@ final class MapTextureBuildWorker {
                     }
                     prepared[pageIndex] = new PreparedPair(styled, glow,
                             pageRevisions[pageIndex], new long[][] {
-                                    buildKnownRowsForPageWindow(
-                                            pixels, compactStride, halo) },
-                            source.stamp());
+                                    knownRows }, source.stamp(), updateSubtiles);
                 }
             }
             return new PreparedSurfaceRegionBatch(source.stamp(),
@@ -241,107 +306,76 @@ final class MapTextureBuildWorker {
     }
 
     /**
-     * Direct M4 projection for one 512x512 source region. It produces the
-     * level-0 region branch without waiting for 64 exact pages to be built or
-     * uploaded first. All colorization and reduction happens on the shared CPU
-     * scheduler; the render thread only validates and publishes the result.
+     * Lightweight direct projection from the already resident region. The source
+     * is sampled at the final level-0 density before it leaves the region lock, so
+     * this path allocates and colorizes 66x66 cells instead of assembling the
+     * complete 514x514 region window merely to discard 63/64 of it.
      */
     static CompletableFuture<PreparedBranch> tryBuildRegionLodLevel0(
-            RegionLodGraph.Lease lease,
-            SurfaceRegionSourceDatabase.BatchSourcePlan sourcePlan,
+            RegionLodGraph.Lease lease, MapManager.RegionLodSnapshot source,
             MapStyleSnapshot style, BooleanSupplier stillValid,
             int executorPriority) {
-        if (lease == null || sourcePlan == null || style == null
-                || lease.key().level() != 0
-                || sourcePlan.pagesWide() != MapPageLayout.PAGES_PER_REGION
-                || sourcePlan.pagesHigh() != MapPageLayout.PAGES_PER_REGION) {
+        if (lease == null || source == null || style == null
+                || lease.key().level() != 0 || source.stride() != 66
+                || source.halo() != 1
+                || source.pixelsUnsafe().length != 66 * 66
+                || source.tintsUnsafe().length != 66 * 66
+                || source.knownUnsafe().length != 66 * 66) {
             return null;
         }
         MapRequestLane lane = MapWorkScheduler.laneForExecutorPriority(
                 executorPriority);
         return submit(lane, MapWorkScheduler.WorkType.SOURCE_PROJECTION,
-                lane.priorityBase(), 96, stillValid, () -> {
+                lane.priorityBase(), 12, stillValid, () -> {
             BooleanSupplier valid = guarded(stillValid);
-            SurfaceRegionSourceDatabase.AssembledBatchWindow source =
-                    sourcePlan.assemble(valid);
-            int[] output = new int[64 * 64];
-            long[] outputKnownRows = new long[64];
-            long[] outputCompleteRows = new long[64];
+            check(valid);
+            int[] output = SurfaceColorizer.colorizePageWindow(
+                    source.pixelsUnsafe(), source.tintsUnsafe(), source.stride(),
+                    source.halo(), source.regionX() * MapPageLayout.REGION_SIZE,
+                    source.regionZ() * MapPageLayout.REGION_SIZE,
+                    Arrays.asList(source.biomePaletteUnsafe()),
+                    Arrays.asList(source.blockPaletteUnsafe()),
+                    style.biomeLookup(), style.blockColors(),
+                    style.tintPolicies(), style.tintDisabledBlocks(),
+                    style.colourMode(), style.showFlowers(),
+                    style.terrainSlopes(), style.profile(), valid);
+
+            long[] knownRows = new long[64];
+            byte[] known = source.knownUnsafe();
+            int stride = source.stride();
+            int halo = source.halo();
+            for (int y = 0; y < 64; y++) {
+                if ((y & 15) == 0) check(valid);
+                long row = 0L;
+                int offset = (y + halo) * stride + halo;
+                for (int x = 0; x < 64; x++) {
+                    if (known[offset + x] != 0) row |= 1L << x;
+                }
+                knownRows[y] = row;
+            }
+
             long knownMask = 0L;
             long completeMask = 0L;
-            int compactStride = MapPageLayout.PAGE_SNAPSHOT_SIZE;
-            int compactPixels = compactStride * compactStride;
-            int halo = source.halo();
-            long[] pixels = new long[compactPixels];
-            int[] tints = new int[compactPixels];
-            byte[] lights = new byte[compactPixels];
-
-            for (int pageZ = 0; pageZ < MapPageLayout.PAGES_PER_REGION; pageZ++) {
-                for (int pageX = 0; pageX < MapPageLayout.PAGES_PER_REGION; pageX++) {
-                    check(valid);
-                    int pageIndex = pageZ * MapPageLayout.PAGES_PER_REGION + pageX;
-                    int sourceX = pageX * MapPageLayout.PAGE_SIZE;
-                    int sourceZ = pageZ * MapPageLayout.PAGE_SIZE;
-                    for (int z = 0; z < compactStride; z++) {
-                        int from = (sourceZ + z) * source.stride() + sourceX;
-                        int to = z * compactStride;
-                        System.arraycopy(source.pixelsUnsafe(), from,
-                                pixels, to, compactStride);
-                        System.arraycopy(source.tintsUnsafe(), from,
-                                tints, to, compactStride);
-                        System.arraycopy(source.lightUnsafe(), from,
-                                lights, to, compactStride);
+            for (int childZ = 0; childZ < 8; childZ++) {
+                for (int childX = 0; childX < 8; childX++) {
+                    long segment = 0xFFL << (childX * 8);
+                    boolean any = false;
+                    boolean all = true;
+                    int firstY = childZ * 8;
+                    for (int y = firstY; y < firstY + 8; y++) {
+                        long rowSegment = knownRows[y] & segment;
+                        any |= rowSegment != 0L;
+                        all &= rowSegment == segment;
                     }
-                    int worldPageStartX = source.worldPageStartX()
-                            + pageX * MapPageLayout.PAGE_SIZE;
-                    int worldPageStartZ = source.worldPageStartZ()
-                            + pageZ * MapPageLayout.PAGE_SIZE;
-                    int[] styled = SurfaceColorizer.colorizePageWindow(
-                            pixels, tints, compactStride, halo,
-                            worldPageStartX, worldPageStartZ,
-                            source.biomePalette(), source.blockPalette(),
-                            style.biomeLookup(), style.blockColors(),
-                            style.tintPolicies(), style.tintDisabledBlocks(),
-                            style.colourMode(), style.showFlowers(),
-                            style.terrainSlopes(), style.profile(), valid);
-                    long[] knownRows = buildKnownRowsForPageWindow(
-                            pixels, compactStride, halo);
-                    boolean leafKnown = false;
-                    boolean leafComplete = true;
-                    for (int row = 0; row < 64; row++) {
-                        leafKnown |= knownRows[row] != 0L;
-                        leafComplete &= knownRows[row] == -1L;
-                    }
-                    long leafBit = 1L << pageIndex;
-                    if (leafKnown) knownMask |= leafBit;
-                    if (leafComplete) completeMask |= leafBit;
-
-                    int destinationBaseX = pageX * 8;
-                    int destinationBaseY = pageZ * 8;
-                    for (int outY = 0; outY < 8; outY++) {
-                        int destinationY = destinationBaseY + outY;
-                        for (int outX = 0; outX < 8; outX++) {
-                            int destinationX = destinationBaseX + outX;
-                            ReducedSurfaceCell reduced = reduceSurfaceCell(
-                                    styled, knownRows, outX * 8, outY * 8);
-                            if (reduced.known()) {
-                                output[destinationY * 64 + destinationX] =
-                                        reduced.color();
-                                outputKnownRows[destinationY] |=
-                                        1L << destinationX;
-                            }
-                            if (reduced.complete()) {
-                                outputCompleteRows[destinationY] |=
-                                        1L << destinationX;
-                            }
-                        }
-                    }
+                    long bit = 1L << (childZ * 8 + childX);
+                    if (any) knownMask |= bit;
+                    if (all) completeMask |= bit;
                 }
             }
             int[] dirty = regionLodDirtyRect(lease.dirtyChildMask());
             return new PreparedBranch(lease.key(), lease.stamp(),
                     lease.revision(), 64, 64, output, knownMask,
-                    completeMask, outputKnownRows, outputCompleteRows,
+                    completeMask, knownRows, Arrays.copyOf(knownRows, 64),
                     lease.childVersionSums(), dirty[0], dirty[1],
                     dirty[2], dirty[3]);
         });
@@ -360,41 +394,17 @@ final class MapTextureBuildWorker {
                         lease, children, guarded(stillValid)));
     }
 
-    private static ReducedSurfaceCell reduceSurfaceCell(int[] styled,
-            long[] knownRows, int startX, int startY) {
-        long alpha = 0L;
-        long red = 0L;
-        long green = 0L;
-        long blue = 0L;
-        int colored = 0;
-        boolean known = false;
-        boolean complete = true;
-        for (int y = 0; y < 8; y++) {
-            long knownRow = knownRows[startY + y];
-            int row = (startY + y) * 64;
-            for (int x = 0; x < 8; x++) {
-                boolean cellKnown = (knownRow & (1L << (startX + x))) != 0L;
-                known |= cellKnown;
-                complete &= cellKnown;
-                if (!cellKnown) continue;
-                int color = styled[row + startX + x];
-                int a = color >>> 24;
-                if (a == 0) continue;
-                colored++;
-                alpha += a;
-                blue += (color >>> 16) & 0xFF;
-                green += (color >>> 8) & 0xFF;
-                red += color & 0xFF;
-            }
-        }
-        if (!known) return new ReducedSurfaceCell(false, false, 0);
-        if (colored == 0) return new ReducedSurfaceCell(true, complete, 0);
-        int a = (int) (alpha / colored);
-        int b = (int) (blue / colored);
-        int g = (int) (green / colored);
-        int r = (int) (red / colored);
-        return new ReducedSurfaceCell(true, complete,
-                (a << 24) | (b << 16) | (g << 8) | r);
+    static CompletableFuture<PreparedBranch> tryDeriveRegionLodLevel0(
+            RegionLodGraph.Lease lease,
+            java.util.Collection<com.velorise.simplemap.client.lod.RegionLodDeriver.ReducedChildSnapshot> children,
+            BooleanSupplier stillValid, int executorPriority) {
+        if (lease == null || lease.key().level() != 0) return null;
+        MapRequestLane lane = MapWorkScheduler.laneForExecutorPriority(
+                executorPriority);
+        return submit(lane, MapWorkScheduler.WorkType.BRANCH_DERIVE,
+                lane.priorityBase(), 16, stillValid,
+                () -> com.velorise.simplemap.client.lod.RegionLodDeriver
+                        .deriveLevel0(lease, children, guarded(stillValid)));
     }
 
     private static int[] regionLodDirtyRect(long dirtyChildMask) {
@@ -417,9 +427,6 @@ final class MapTextureBuildWorker {
         return maxX < minX ? new int[] { 0, 0, 63, 63 }
                 : new int[] { minX, minY, maxX, maxY };
     }
-
-    private record ReducedSurfaceCell(boolean known, boolean complete,
-            int color) { }
 
     static CompletableFuture<PreparedSingle> tryBuildCavePage(
             int[] source, short[] heights, int pageX, int pageZ,
@@ -468,19 +475,20 @@ final class MapTextureBuildWorker {
     private static <T> CompletableFuture<T> submit(MapRequestLane lane,
             MapWorkScheduler.WorkType type, int priority, int cost,
             BooleanSupplier stillValid, Supplier<T> supplier) {
-        CompletableFuture<T> future = new CompletableFuture<>();
-        BooleanSupplier valid = () -> !future.isCancelled()
-                && (stillValid == null || stillValid.getAsBoolean());
-        boolean accepted = MapWorkScheduler.tryCpu(lane, type, priority, cost,
-                valid, () -> {
-                    try {
-                        check(valid);
-                        future.complete(supplier.get());
-                    } catch (Throwable throwable) {
-                        future.completeExceptionally(throwable);
-                    }
-                });
-        return accepted ? future : null;
+        if (supplier == null) return null;
+        BooleanSupplier valid = stillValid == null ? () -> true : stillValid;
+        /*
+         * Viewport-scoped tasks may be purged before a worker starts them. The old
+         * tryCpu wrapper left its manually-created future permanently incomplete in
+         * that case, so pendingSurfaceBatches/page.pending accumulated while the
+         * scheduler itself reported zero queued work. tryCpuFuture deliberately runs
+         * a tiny terminal command for invalid tasks and cancels the future, allowing
+         * all ownership/requeue callbacks to release their state.
+         */
+        return MapWorkScheduler.tryCpuFuture(lane, type, priority, cost, valid, () -> {
+            check(valid);
+            return supplier.get();
+        });
     }
 
     private static BooleanSupplier guarded(BooleanSupplier valid) {
@@ -530,13 +538,27 @@ final class MapTextureBuildWorker {
 
     private static byte[] buildSmoothedLightPageWindow(byte[] levels, int stride,
             int halo, BooleanSupplier valid) {
+        return buildSmoothedLightPageWindow(levels, stride, halo,
+                MapPageLayout.FULL_SUBTILE_MASK, valid);
+    }
+
+    private static byte[] buildSmoothedLightPageWindow(byte[] levels, int stride,
+            int halo, int requestedSubtiles, BooleanSupplier valid) {
         if (levels == null) return null;
         return buildSmoothedLightPageWindowInto(levels, stride, halo, valid,
-                new byte[MapPageLayout.PAGE_SIZE * MapPageLayout.PAGE_SIZE]);
+                new byte[MapPageLayout.PAGE_SIZE * MapPageLayout.PAGE_SIZE],
+                requestedSubtiles);
     }
 
     private static byte[] buildSmoothedLightPageWindowInto(byte[] levels,
             int stride, int halo, BooleanSupplier valid, byte[] result) {
+        return buildSmoothedLightPageWindowInto(levels, stride, halo, valid,
+                result, MapPageLayout.FULL_SUBTILE_MASK);
+    }
+
+    private static byte[] buildSmoothedLightPageWindowInto(byte[] levels,
+            int stride, int halo, BooleanSupplier valid, byte[] result,
+            int requestedSubtiles) {
         if (levels == null) return null;
         int pageSize = MapPageLayout.PAGE_SIZE;
         if (levels.length != stride * stride || stride < pageSize + halo * 2
@@ -547,8 +569,13 @@ final class MapTextureBuildWorker {
             if ((localZ & 15) == 0 && !valid.getAsBoolean()) {
                 throw new java.util.concurrent.CancellationException();
             }
+            int subtileRow = (localZ / MapPageLayout.SUBTILE_SIZE)
+                    * MapPageLayout.SUBTILES_PER_PAGE;
             int z = halo + localZ;
             for (int localX = 0; localX < pageSize; localX++) {
+                int subtile = subtileRow
+                        + localX / MapPageLayout.SUBTILE_SIZE;
+                if ((requestedSubtiles & (1 << subtile)) == 0) continue;
                 int x = halo + localX;
                 int weighted = 0;
                 int weight = 0;
@@ -595,6 +622,24 @@ final class MapTextureBuildWorker {
         return rows;
     }
 
+    /** Coverage is independent of material: a scanned void column is still known. */
+    private static long[] buildKnownRowsForPageWindow(byte[] knownPixels,
+            int stride, int halo) {
+        long[] rows = new long[MapPageLayout.PAGE_SIZE];
+        int pageSize = MapPageLayout.PAGE_SIZE;
+        if (knownPixels == null || knownPixels.length != stride * stride
+                || stride < pageSize + halo * 2) return rows;
+        for (int localZ = 0; localZ < pageSize; localZ++) {
+            int row = (halo + localZ) * stride + halo;
+            long mask = 0L;
+            for (int localX = 0; localX < pageSize; localX++) {
+                if (knownPixels[row + localX] != 0) mask |= 1L << localX;
+            }
+            rows[localZ] = mask;
+        }
+        return rows;
+    }
+
     private static int tintTowardWarmLight(int abgr, int light) {
         if (abgr == 0 || light <= 6) return abgr;
         float strength = Math.min(0.60f, ((light - 6) / 9.0f) * 0.60f);
@@ -630,10 +675,18 @@ final class MapTextureBuildWorker {
     }
 
     record PreparedPair(int[] styled, int[] glow, long revision,
-            long[][] pageKnownRows, RevisionStamp stamp) {
+            long[][] pageKnownRows, RevisionStamp stamp,
+            int updateSubtileMask) {
         PreparedPair(int[] styled, int[] glow, long revision,
                 long[][] pageKnownRows) {
-            this(styled, glow, revision, pageKnownRows, null);
+            this(styled, glow, revision, pageKnownRows, null,
+                    MapPageLayout.FULL_SUBTILE_MASK);
+        }
+
+        PreparedPair(int[] styled, int[] glow, long revision,
+                long[][] pageKnownRows, RevisionStamp stamp) {
+            this(styled, glow, revision, pageKnownRows, stamp,
+                    MapPageLayout.FULL_SUBTILE_MASK);
         }
     }
 

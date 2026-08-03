@@ -27,10 +27,11 @@ public final class SurfaceBatchPolicy {
             if (demand >= 6) return 4;
             return demand >= 2 ? 2 : 1;
         }
-        if (!initialized && !sourceReady) return 1;
         int demand = Math.max(0, demandedInFourByFour);
         if (effective == MapRequestLane.MINIMAP) return demand >= 2 ? 2 : 1;
-        if (demand >= 6) return 4;
+        // Cold fullscreen demand starts with a 2x2 source transaction. Widen to
+        // 4x4 only after retained source coverage proves the larger batch useful.
+        if (sourceReady && demand >= 8) return 4;
         return demand >= 2 ? 2 : 1;
     }
 
@@ -41,6 +42,7 @@ public final class SurfaceBatchPolicy {
                 ? MapRequestLane.BACKGROUND : lane;
         boolean reconstructionLane = effective == MapRequestLane.BACKGROUND
                 || effective == MapRequestLane.PREFETCH;
-        return sourceReady && (hasDemand || reconstructionLane);
+        if (reconstructionLane) return sourceReady;
+        return hasDemand;
     }
 }

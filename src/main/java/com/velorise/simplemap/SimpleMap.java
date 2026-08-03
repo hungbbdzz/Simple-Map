@@ -10,11 +10,13 @@ import com.velorise.simplemap.client.DimensionTeleportTransition;
 import com.velorise.simplemap.client.FullCaveTextureManager;
 import com.velorise.simplemap.client.MapLightManager;
 import com.velorise.simplemap.client.MapArchitectureCoordinator;
+import com.velorise.simplemap.client.MapActivityGate;
 import com.velorise.simplemap.client.MapKeybindActions;
 import com.velorise.simplemap.client.MapConfig;
 import com.velorise.simplemap.client.MapConfigScreen;
 import com.velorise.simplemap.client.MapDebugOverlay;
 import com.velorise.simplemap.client.MapDebugRecorder;
+import com.velorise.simplemap.client.MapForegroundWriter;
 import com.velorise.simplemap.client.MapManager;
 import com.velorise.simplemap.client.MapMutationBus;
 import com.velorise.simplemap.client.MapObservationScheduler;
@@ -409,6 +411,9 @@ public class SimpleMap {
             Minecraft mc = Minecraft.getInstance();
             if (mc.level == null || mc.player == null) return;
             DimensionTeleportTransition.tick();
+            // Movement must be sampled before save, mutation, scan, cave and GPU
+            // admission so every producer observes the same hard-gate epoch.
+            MapActivityGate.getInstance().update(mc);
 
             // 1. Tick MapManager to update active directory and auto-save dirty regions
             MapManager.getInstance().updateWorldAndDimension(mc);
@@ -531,20 +536,26 @@ public class SimpleMap {
 
         @SubscribeEvent
         public static void onRenderGui(RenderGuiEvent.Post event) {
-            // Track frame time for the adaptive performance governor.
-            MapPerformanceGovernor.getInstance().onFrame();
-            // Render the Minimap HUD overlay
-            MinimapRenderer.getInstance().renderHUD(event.getGuiGraphics(), 1.0f);
-            // Cross-dimension map teleports use a short generic pixel transition.
-            // Vanilla/modded dimensions still perform their normal server-side change.
-            DimensionTeleportTransition.render(event.getGuiGraphics());
             Minecraft mc = Minecraft.getInstance();
-            if (mc.level != null && mc.player != null) {
-                long frameId = ++mapRenderFrameId;
-                MapPublicationCoordinator.getInstance().drainFrame(frameId);
-                MapArchitectureCoordinator.getInstance().onFrameBoundary(frameId);
-            }
+            /*
+             * RenderGui and ScreenEvent are not guaranteed to advance as one paired
+             * callback on every Minecraft screen. Give each physical frame exactly
+             * one owner: HUD frames are owned here, screen frames by onRenderScreen.
+             * Reusing the last HUD frame id while a screen was open caused the
+             * publication coordinator to reject every later cave upload as a
+             * duplicate frame until the screen changed or closed.
+             */
             if (mc.screen == null) {
+                MapPerformanceGovernor.getInstance().onFrame();
+                MapForegroundWriter.getInstance().onFrame(mc,
+                        SimpleMap.isMapUnlocked(mc.player));
+                MinimapRenderer.getInstance().renderHUD(event.getGuiGraphics(), 1.0f);
+                DimensionTeleportTransition.render(event.getGuiGraphics());
+                if (mc.level != null && mc.player != null) {
+                    long frameId = ++mapRenderFrameId;
+                    MapPublicationCoordinator.getInstance().drainFrame(frameId);
+                    MapArchitectureCoordinator.getInstance().onFrameBoundary(frameId);
+                }
                 MapDebugOverlay.render(event.getGuiGraphics());
             }
         }
@@ -552,14 +563,17 @@ public class SimpleMap {
         @SubscribeEvent
         public static void onRenderScreen(ScreenEvent.Render.Post event) {
             MapPerformanceGovernor.getInstance().onFrame();
+            Minecraft mc = Minecraft.getInstance();
+            if (event.getScreen() instanceof MapScreen) {
+                MapForegroundWriter.getInstance().onFrame(mc,
+                        SimpleMap.isMapUnlocked(mc.player));
+            }
             if (MinimapRenderer.isAllowedScreenForMinimap(event.getScreen())) {
                 MinimapRenderer.getInstance().renderHUD(
                         event.getGuiGraphics(), event.getPartialTick(), true);
             }
-            Minecraft mc = Minecraft.getInstance();
             if (mc.level != null && mc.player != null) {
-                long frameId = mapRenderFrameId;
-                if (frameId == 0L) frameId = ++mapRenderFrameId;
+                long frameId = ++mapRenderFrameId;
                 MapPublicationCoordinator.getInstance().drainFrame(frameId);
                 MapArchitectureCoordinator.getInstance().onFrameBoundary(frameId);
             }
@@ -587,6 +601,7 @@ public class SimpleMap {
             // GPU resources during the same logout event.
             MapManager.getInstance().flushAndClear();
             MapObservationScheduler.getInstance().reset();
+            MapForegroundWriter.getInstance().reset();
             CaveMode.clearManualLayer();
             MapConfig.serverExtensionAvailable = false;
             MapConfig.serverCaveMapMode = 0;

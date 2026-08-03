@@ -68,8 +68,9 @@ public final class ClientNetworkHandler {
             MapConfig.serverExtensionAvailable = true;
             MapConfig.serverRequireMapBook = payload.requireMapBook();
             MapConfig.serverCaveMapMode = Math.max(0, Math.min(2, payload.caveMapMode()));
-            if (MapConfig.serverCaveMapMode != 2) {
-                CaveMode.clearManualLayer();
+            if (MapConfig.serverCaveMapMode == 0) {
+                // Server permission gates rendering only. Preserve the per-dimension
+                // OFF/CAVE/FULL type and manual cave start for the next allowed world.
                 CaveMapManager.getInstance().deactivate();
             }
             LOGGER.info("SimpleMap synced server config: requireBook={}, caveMode={}",

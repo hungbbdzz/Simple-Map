@@ -28,8 +28,9 @@ public final class ArchitectureStackCheck {
         caveArchiveAndProjectionShareOneSource();
         regionContainerRecoversFromCorruptTail();
         architectureBoundariesAreDeterministic();
-        viewportDemandIsDeltaFirst();
+        viewportDemandIsCenterFirst();
         chunkGranularSurfacePublicationIsCoherent();
+        surfaceVoidCoverageIsIndependent();
         System.out.println("Simple Map M5-M11 + chunk-granular architecture checks passed");
     }
 
@@ -136,21 +137,20 @@ public final class ArchitectureStackCheck {
         require(LodSelector.surfaceLevel(0.06f) == 3, "far zoom did not cap at L3");
         MapSurfaceDemandPolicy.Bounds bounds = MapSurfaceDemandPolicy.trim(
                 0.0, 1000.0, 0.0, 1000.0, 0.29f);
-        require(bounds.maxX() - bounds.minX() < 1000.0,
-                "far fullscreen demand was not trimmed");
-        require(MapSurfaceDemandPolicy.snapshot().rightFraction()
-                        > MapSurfaceDemandPolicy.snapshot().leftFraction(),
-                "right fringe policy lost its asymmetric priority");
+        require(bounds.maxX() - bounds.minX() == 1000.0,
+                "zoom policy clipped part of the visible viewport");
+        require(!MapSurfaceDemandPolicy.snapshot().trimmed(),
+                "fullscreen demand should be controlled by LOD, not edge trimming");
     }
 
-    private static void viewportDemandIsDeltaFirst() {
+    private static void viewportDemandIsCenterFirst() {
         MapViewportDemandPolicy.Bounds trimmed =
                 MapViewportDemandPolicy.trimEdgeSlivers(
                         10.0, 502.0, -502.0, -10.0,
                         MapRequestLane.FULLSCREEN);
-        require(trimmed.minX() == 64.0 && trimmed.maxX() == 448.0
-                        && trimmed.minZ() == -448.0 && trimmed.maxZ() == -64.0,
-                "fullscreen incomplete edge leaves were not excluded");
+        require(trimmed.minX() == 10.0 && trimmed.maxX() == 502.0
+                        && trimmed.minZ() == -502.0 && trimmed.maxZ() == -10.0,
+                "fullscreen viewport was locked to 64-block page boundaries");
         MapViewportDemandPolicy.Bounds minimap =
                 MapViewportDemandPolicy.trimEdgeSlivers(
                         10.0, 502.0, 10.0, 502.0,
@@ -159,16 +159,20 @@ public final class ArchitectureStackCheck {
                 "minimap demand was incorrectly trimmed");
 
         MapViewLoadPlanner.State planner = new MapViewLoadPlanner.State();
-        MapViewLoadPlanner.Page[] pages =
-                new MapViewLoadPlanner.Page[MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE];
+        long[] pages =
+                new long[MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE];
         planner.configure("overworld", 0, 4, 0, 3);
         planner.configure("overworld", 1, 5, 0, 3);
         int count = planner.fillCurrentFullscreenSlice(pages);
         require(planner.retainedOverlap() && count == 20,
                 "continuous pan did not retain overlap");
-        for (int index = 0; index < 4; index++) {
-            require(pages[index].x() == 5,
-                    "newly exposed edge was not admitted before retained pages");
+        require(MapViewLoadPlanner.packedX(pages[0]) == 3
+                        && MapViewLoadPlanner.packedZ(pages[0]) == 1,
+                "fullscreen demand did not begin at viewport centre");
+        for (int index = 0; index < 9; index++) {
+            require(Math.max(Math.abs(MapViewLoadPlanner.packedX(pages[index]) - 3),
+                    Math.abs(MapViewLoadPlanner.packedZ(pages[index]) - 1)) <= 1,
+                    "first fullscreen ring escaped the inspected area");
         }
     }
 
@@ -192,6 +196,20 @@ public final class ArchitectureStackCheck {
         require(MapPageLayout.completeSubtileMask(rows)
                         == MapPageLayout.FULL_SUBTILE_MASK,
                 "complete 64x64 page did not expose all sixteen chunks");
+    }
+
+    private static void surfaceVoidCoverageIsIndependent() {
+        int regionSize = SurfaceChunkCoverage.CHUNKS_PER_AXIS * 16;
+        long[] pixels = new long[regionSize * regionSize];
+        java.util.Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
+        long[] legacy = SurfaceChunkCoverage.inferLegacy(pixels, regionSize,
+                MapBlockData.EMPTY_PACKED);
+        require(!SurfaceChunkCoverage.isComplete(legacy, 0),
+                "unobserved legacy void was incorrectly marked complete");
+        require(SurfaceChunkCoverage.markComplete(legacy, 0),
+                "completed void scan did not publish coverage");
+        require(SurfaceChunkCoverage.isComplete(legacy, 0),
+                "known-void coverage still depended on terrain material");
     }
 
     private static void require(boolean condition, String message) {

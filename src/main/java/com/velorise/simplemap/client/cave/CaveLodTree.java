@@ -1,6 +1,8 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.MapDebugRecorder;
 import com.velorise.simplemap.client.MapGpuBudgetController;
+import com.velorise.simplemap.client.MapPerformanceGovernor;
 import com.velorise.simplemap.client.MapRequestLane;
 import com.velorise.simplemap.client.MapResidencyManager;
 
@@ -8,11 +10,14 @@ import com.velorise.simplemap.client.MapPipelineStage;
 import com.velorise.simplemap.client.MapPipelineTelemetry;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -27,6 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
 final class CaveLodTree {
     static final int MAX_LEVEL = 7;
     private static final long FULL_ROW = -1L;
+    private static final long GPU_RETRY_MAX_NANOS = 160_000_000L;
     /** Xaero admits only a couple of branch-cache requests per render pass. */
     private static final int MAX_DISK_LOADS_PER_WINDOW = 2;
     private static final long DISK_LOAD_WINDOW_NANOS = 16_000_000L;
@@ -48,9 +54,98 @@ final class CaveLodTree {
     private int diskLoadsInWindow;
     /** Cave-only render revision; surface/background atlas traffic must not rebuild cave plans. */
     private final AtomicLong contentRevision = new AtomicLong();
+    /*
+     * Render traversal must be cache-only. The mutable LOD tree can drain disk
+     * results, derive parents, reorder its access-order map and enqueue uploads;
+     * doing any of that from MapRenderer caused 0.3-1.0 second zoom stalls.
+     * These concurrent snapshots expose only the last GPU-published branch and
+     * lightweight CPU-known metadata. Misses are handed back to the owner thread
+     * through deduplicated queues instead of mutating the tree on the render path.
+     */
+    private final ConcurrentHashMap<NodeKey, CaveAtlasRegion> publishedRegions =
+            new ConcurrentHashMap<>();
+    private final Set<NodeKey> knownRenderNodes = ConcurrentHashMap.newKeySet();
+    private final ConcurrentLinkedQueue<NodeKey> renderRequests =
+            new ConcurrentLinkedQueue<>();
+    private final Set<NodeKey> queuedRenderRequests = ConcurrentHashMap.newKeySet();
+    private final ConcurrentLinkedQueue<NodeKey> renderTouches =
+            new ConcurrentLinkedQueue<>();
+    private final Set<NodeKey> queuedRenderTouches = ConcurrentHashMap.newKeySet();
+    private long gpuAdmissionRetryAfterNanos;
+    private int gpuAdmissionFailures;
 
     long contentRevision() {
         return contentRevision.get();
+    }
+
+    /** Lock-free, side-effect-free branch lookup used by render-plan building. */
+    CaveAtlasRegion peekPublished(String dimension, CaveView view, int layerY,
+            int level, int nodeX, int nodeZ) {
+        if (level < 1 || level > MAX_LEVEL) return null;
+        NodeKey key = new NodeKey(dimension, view, layerY, level, nodeX, nodeZ);
+        CaveAtlasRegion region = publishedRegions.get(key);
+        if (region != null) {
+            queueRenderTouch(key);
+            return region;
+        }
+        queueRenderRequest(key);
+        return null;
+    }
+
+    /**
+     * CPU-known branch metadata snapshot. This intentionally does not consult the
+     * disk cache or drain completed disk reads on the render thread.
+     */
+    boolean hasDataSnapshot(String dimension, CaveView view, int layerY,
+            int level, int nodeX, int nodeZ) {
+        if (level < 1 || level > MAX_LEVEL) return false;
+        NodeKey key = new NodeKey(dimension, view, layerY, level, nodeX, nodeZ);
+        boolean known = knownRenderNodes.contains(key) || publishedRegions.containsKey(key);
+        if (!known) queueRenderRequest(key);
+        return known;
+    }
+
+    private void queueRenderRequest(NodeKey key) {
+        if (key != null && queuedRenderRequests.add(key)) renderRequests.offer(key);
+    }
+
+    private void queueRenderTouch(NodeKey key) {
+        if (key != null && queuedRenderTouches.add(key)) renderTouches.offer(key);
+    }
+
+    /** Owner-thread bridge for render cache misses and residency touches. */
+    private void drainRenderSignals(int budget) {
+        int remaining = Math.max(8, budget);
+        while (remaining-- > 0) {
+            NodeKey key = renderRequests.poll();
+            if (key == null) break;
+            queuedRenderRequests.remove(key);
+            Node node = nodes.get(key);
+            if (node == null) {
+                requestDiskLoad(key);
+                continue;
+            }
+            if (node.knownMask == 0L) continue;
+            knownRenderNodes.add(key);
+            if (node.initialized && node.atlasSlot >= 0
+                    && node.uploadedKnownMask != 0L) {
+                CaveAtlasRegion region = atlases[key.level()].region(node.atlasSlot,
+                        node.uploadedKnownMask, node.uploadedCompleteMask);
+                if (region != null) publishedRegions.put(key, region);
+            } else {
+                node.markFullDirty();
+                enqueue(key);
+            }
+        }
+        remaining = Math.max(8, budget);
+        while (remaining-- > 0) {
+            NodeKey key = renderTouches.poll();
+            if (key == null) break;
+            queuedRenderTouches.remove(key);
+            if (publishedRegions.containsKey(key)) {
+                MapResidencyManager.getInstance().touch(residencyKey(key));
+            }
+        }
     }
 
     CaveLodTree() {
@@ -74,6 +169,7 @@ final class CaveLodTree {
         if (!reallocated) return;
         MapResidencyManager.getInstance().markTopologyChanged();
         contentRevision.incrementAndGet();
+        publishedRegions.clear();
         for (Node node : nodes.values()) {
             node.initialized = false;
             node.markFullDirty();
@@ -111,8 +207,56 @@ final class CaveLodTree {
         Node node = nodes.get(key);
         if (node == null) requestDiskLoad(key);
         if (node != null && node.knownMask != 0L) return true;
+        if (view == CaveView.LAYERED) return false;
         LodBranchDiskCache.Metadata metadata = diskCache.metadata(diskKey(key));
         return metadata != null && metadata.knownMask() != 0L;
+    }
+
+    /**
+     * Drops one in-memory Layered branch hierarchy when exact Top-Y changes inside
+     * its retained 16-block band. The branch disk format is band-keyed and cannot
+     * prove which exact Top-Y produced a snapshot, so Layered branches are rebuilt
+     * from current exact pages instead of reloading a semantically stale underlay.
+     */
+    void invalidateLayer(String dimension, CaveView view, int layerY) {
+        boolean changed = false;
+        Iterator<Map.Entry<NodeKey, Node>> iterator = nodes.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<NodeKey, Node> entry = iterator.next();
+            NodeKey key = entry.getKey();
+            if (!key.dimension().equals(dimension)
+                    || key.view() != view || key.layerY() != layerY) continue;
+            entry.getValue().close();
+            iterator.remove();
+            dirtySet.remove(key);
+            changed = true;
+        }
+        dirtyQueue.removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        publishedRegions.keySet().removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        knownRenderNodes.removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        queuedRenderRequests.removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        renderRequests.removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        queuedRenderTouches.removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        renderTouches.removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        loadingFromDisk.removeIf(key -> key.dimension().equals(dimension)
+                && key.view() == view && key.layerY() == layerY);
+        loadedFromDisk.removeIf(loaded -> loaded.key.dimension().equals(dimension)
+                && loaded.key.view() == view && loaded.key.layerY() == layerY);
+        synchronized (pendingPageUpdates) {
+            pendingPageUpdates.entrySet().removeIf(entry -> {
+                PageUpdateKey key = entry.getKey();
+                return key.dimension().equals(dimension)
+                        && key.view() == view && key.layerY() == layerY;
+            });
+        }
+        if (changed) contentRevision.incrementAndGet();
     }
 
     /**
@@ -168,6 +312,85 @@ final class CaveLodTree {
             }
         }
         pipelineTelemetry.recordBranchUpdateQueued();
+    }
+
+    /**
+     * Moves current fullscreen branch inputs ahead of valid offscreen cache work.
+     * Source updates are never discarded; pan only changes the bounded derive order.
+     * This is the branch equivalent of Xaero selecting a small visible candidate
+     * slice instead of restarting every region transaction.
+     */
+    void prioritizeViewport(String dimension, CaveView view, int layerY,
+            int minPageX, int maxPageX, int minPageZ, int maxPageZ) {
+        int visibleCount = 0;
+        int deferredCount = 0;
+        int visibleDirty = 0;
+        int deferredDirty = 0;
+        synchronized (pendingPageUpdates) {
+            if (pendingPageUpdates.size() >= 2) {
+                ArrayList<PageUpdate> visible = new ArrayList<>();
+                ArrayList<PageUpdate> deferred = new ArrayList<>();
+                for (PageUpdate update : pendingPageUpdates.values()) {
+                    PageUpdateKey key = update.key();
+                    boolean current = key.dimension().equals(dimension)
+                            && key.view() == view && key.layerY() == layerY
+                            && key.globalPageX() >= minPageX
+                            && key.globalPageX() <= maxPageX
+                            && key.globalPageZ() >= minPageZ
+                            && key.globalPageZ() <= maxPageZ;
+                    (current ? visible : deferred).add(update);
+                }
+                if (!visible.isEmpty() && !deferred.isEmpty()) {
+                    visible.sort(Comparator
+                            .comparingInt((PageUpdate update) ->
+                                    update.key().globalPageZ())
+                            .thenComparingInt(update ->
+                                    update.key().globalPageX()));
+                    pendingPageUpdates.clear();
+                    for (PageUpdate update : visible) {
+                        pendingPageUpdates.put(update.key(), update);
+                    }
+                    for (PageUpdate update : deferred) {
+                        pendingPageUpdates.put(update.key(), update);
+                    }
+                    visibleCount = visible.size();
+                    deferredCount = deferred.size();
+                }
+            }
+        }
+
+        if (dirtyQueue.size() > 1) {
+            ArrayDeque<NodeKey> visible = new ArrayDeque<>();
+            ArrayDeque<NodeKey> deferred = new ArrayDeque<>();
+            for (NodeKey key : dirtyQueue) {
+                int spanPages = 1 << key.level();
+                int nodeMinPageX = key.nodeX() * spanPages;
+                int nodeMaxPageX = nodeMinPageX + spanPages - 1;
+                int nodeMinPageZ = key.nodeZ() * spanPages;
+                int nodeMaxPageZ = nodeMinPageZ + spanPages - 1;
+                boolean current = key.dimension().equals(dimension)
+                        && key.view() == view && key.layerY() == layerY
+                        && nodeMinPageX <= maxPageX && nodeMaxPageX >= minPageX
+                        && nodeMinPageZ <= maxPageZ && nodeMaxPageZ >= minPageZ;
+                (current ? visible : deferred).addLast(key);
+            }
+            if (!visible.isEmpty() && !deferred.isEmpty()) {
+                dirtyQueue.clear();
+                dirtyQueue.addAll(visible);
+                dirtyQueue.addAll(deferred);
+                visibleDirty = visible.size();
+                deferredDirty = deferred.size();
+            }
+        }
+
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent("CAVE_BRANCH_VIEWPORT_REBASED", 100L)) {
+            recorder.event("CAVE_BRANCH_VIEWPORT_REBASED",
+                    "visible_updates=" + visibleCount
+                            + " deferred_updates=" + deferredCount
+                            + " visible_dirty=" + visibleDirty
+                            + " deferred_dirty=" + deferredDirty);
+        }
     }
 
     private void applyPageUpdate(PageUpdate update) {
@@ -260,26 +483,56 @@ final class CaveLodTree {
         return derived;
     }
 
+    private static long branchGpuRetryDelayNanos(int failures) {
+        long base = MapPerformanceGovernor.getInstance().underPressure()
+                ? 48_000_000L : 24_000_000L;
+        int shift = Math.max(0, Math.min(3, failures - 1));
+        return Math.min(GPU_RETRY_MAX_NANOS, base << shift);
+    }
+
     int publish(int budget, long deadlineNanos) {
+        drainRenderSignals(Math.max(32, budget * 16));
         drainDiskLoads();
-        drainPendingPageUpdates(Math.max(1, Math.min(2, budget)), deadlineNanos);
+        drainPendingPageUpdates(Math.max(2, Math.min(8, budget * 2)), deadlineNanos);
         int published = 0;
-        while (published < budget && System.nanoTime() < deadlineNanos) {
+        int considered = 0;
+        int scanLimit = Math.max(8, budget * 4);
+        while (published < budget && considered++ < scanLimit
+                && System.nanoTime() < deadlineNanos) {
             NodeKey key = dirtyQueue.pollFirst();
             if (key == null) break;
             dirtySet.remove(key);
             Node node = nodes.get(key);
             if (node == null || !node.isDirty() || node.knownMask == 0L) continue;
-            if (!ensureSlot(node)) {
+            long now = System.nanoTime();
+            if (gpuAdmissionRetryAfterNanos > now) {
                 enqueue(key);
                 break;
+            }
+            if (node.nextUploadAttemptNanos > now) {
+                enqueue(key);
+                continue;
+            }
+            if (!ensureSlot(node)) {
+                enqueue(key);
+                continue;
             }
             if (!MapGpuBudgetController.getInstance().tryReserve(
                     MapGpuBudgetController.UploadKind.BRANCH,
                     MapRequestLane.FULLSCREEN, false)) {
+                node.uploadReservationFailures++;
+                node.nextUploadAttemptNanos = now + branchGpuRetryDelayNanos(
+                        node.uploadReservationFailures);
+                gpuAdmissionFailures = Math.min(8, gpuAdmissionFailures + 1);
+                gpuAdmissionRetryAfterNanos = now + branchGpuRetryDelayNanos(
+                        gpuAdmissionFailures);
                 enqueue(key);
                 break;
             }
+            node.uploadReservationFailures = 0;
+            node.nextUploadAttemptNanos = 0L;
+            gpuAdmissionFailures = 0;
+            gpuAdmissionRetryAfterNanos = 0L;
             long uploadStart = System.nanoTime();
             atlases[node.key.level()].upload(node.atlasSlot, node.pixels, node.dirtyRect());
             long uploadNanos = System.nanoTime() - uploadStart;
@@ -301,17 +554,49 @@ final class CaveLodTree {
             node.uploadedCompleteMask = node.completeMask;
             System.arraycopy(node.childRevisions, 0,
                     node.uploadedChildRevisions, 0, node.childRevisions.length);
-            contentRevision.incrementAndGet();
+            knownRenderNodes.add(node.key);
+            CaveAtlasRegion publishedRegion = atlases[node.key.level()].region(
+                    node.atlasSlot, node.uploadedKnownMask, node.uploadedCompleteMask);
+            CaveAtlasRegion previousRegion = publishedRegion == null
+                    ? publishedRegions.remove(node.key)
+                    : publishedRegions.put(node.key, publishedRegion);
+            // A branch upload can be a pure pixel refresh at the same atlas slot.
+            // Rebuild the render hierarchy only when residency or coverage masks
+            // change; texture content itself is already visible to the cached plan.
+            if (!sameRenderTopology(previousRegion, publishedRegion)) {
+                contentRevision.incrementAndGet();
+            }
             saveNode(node);
             published++;
         }
         return published;
     }
 
+    private static boolean sameRenderTopology(CaveAtlasRegion left,
+            CaveAtlasRegion right) {
+        if (left == right) return true;
+        if (left == null || right == null) return false;
+        return left.texture().equals(right.texture())
+                && Float.compare(left.sourceX(), right.sourceX()) == 0
+                && Float.compare(left.sourceY(), right.sourceY()) == 0
+                && left.sourceSize() == right.sourceSize()
+                && left.atlasSize() == right.atlasSize()
+                && left.level() == right.level()
+                && left.worldSize() == right.worldSize()
+                && left.knownMask() == right.knownMask()
+                && left.completeMask() == right.completeMask();
+    }
+
     void clear() {
         if (!nodes.isEmpty()) contentRevision.incrementAndGet();
         for (Node node : nodes.values()) node.close();
         nodes.clear();
+        publishedRegions.clear();
+        knownRenderNodes.clear();
+        renderRequests.clear();
+        queuedRenderRequests.clear();
+        renderTouches.clear();
+        queuedRenderTouches.clear();
         dirtyQueue.clear();
         dirtySet.clear();
         loadGeneration++;
@@ -404,28 +689,16 @@ final class CaveLodTree {
     }
 
     private static int reduceCave(int[] pixels, long[] rows, int x, int y) {
-        int[] values = {
-                pixels[y * 64 + x], pixels[y * 64 + x + 1],
-                pixels[(y + 1) * 64 + x], pixels[(y + 1) * 64 + x + 1]
-        };
-        boolean[] known = {
-                (rows[y] & (1L << x)) != 0L,
-                (rows[y] & (1L << (x + 1))) != 0L,
-                (rows[y + 1] & (1L << x)) != 0L,
-                (rows[y + 1] & (1L << (x + 1))) != 0L
-        };
-        return reduceCaveValues(values, known);
-    }
-
-    /** Occupancy-preserving reduction: any visible child leaves a visible parent. */
-    private static int reduceCaveValues(int[] values, boolean[] known) {
         long red = 0L, green = 0L, blue = 0L, weight = 0L;
         int best = 0;
         int bestScore = -1;
         int maximumAlpha = 0;
-        for (int i = 0; i < values.length; i++) {
-            if (!known[i]) continue;
-            int value = values[i];
+        // Four scalar samples; never allocate int[4]/boolean[4] per output texel.
+        for (int child = 0; child < 4; child++) {
+            int sourceX = x + (child & 1);
+            int sourceY = y + (child >>> 1);
+            if ((rows[sourceY] & (1L << sourceX)) == 0L) continue;
+            int value = pixels[sourceY * 64 + sourceX];
             int alpha = (value >>> 24) & 0xFF;
             if (value == 0 || alpha == 0) continue;
             int r = value & 0xFF;
@@ -493,6 +766,7 @@ final class CaveLodTree {
     }
 
     private void requestDiskLoad(NodeKey key) {
+        if (key.view() == CaveView.LAYERED) return;
         if (nodes.containsKey(key) && nodes.get(key).knownMask != 0L) return;
         if (!diskCache.mayContain(diskKey(key))) return;
         if (loadingFromDisk.contains(key)) return;
@@ -520,6 +794,7 @@ final class CaveLodTree {
         while ((loaded = loadedFromDisk.poll()) != null) {
             loadingFromDisk.remove(loaded.key);
             if (loaded.generation != loadGeneration) continue;
+            if (loaded.key.view() == CaveView.LAYERED) continue;
             LodBranchDiskCache.Snapshot snapshot = loaded.snapshot;
             if (snapshot == null || snapshot.knownMask() == 0L) continue;
             Node node = nodes.computeIfAbsent(loaded.key, Node::new);
@@ -544,6 +819,7 @@ final class CaveLodTree {
     }
 
     private void saveNode(Node node) {
+        if (node.key.view() == CaveView.LAYERED) return;
         diskCache.saveAsync(diskKey(node.key), new LodBranchDiskCache.Snapshot(
                 node.pixels, node.knownRows, node.completeRows,
                 node.knownMask, node.completeMask, node.revision));
@@ -570,6 +846,7 @@ final class CaveLodTree {
         MapResidencyManager.getInstance().remove(residencyKey(key));
         node.atlasSlot = -1;
         node.initialized = false;
+        publishedRegions.remove(key);
         contentRevision.incrementAndGet();
         return true;
     }
@@ -646,6 +923,7 @@ final class CaveLodTree {
         MapResidencyManager.getInstance().remove(victimKey);
         retired.atlasSlot = -1;
         retired.initialized = false;
+        publishedRegions.remove(retired.key);
         contentRevision.incrementAndGet();
         return true;
     }
@@ -659,12 +937,16 @@ final class CaveLodTree {
             if (node.atlasSlot >= 0 || node.isDirty()) continue;
             iterator.remove();
             dirtySet.remove(node.key);
+            publishedRegions.remove(node.key);
+            knownRenderNodes.remove(node.key);
             return true;
         }
         return false;
     }
 
     private void enqueue(NodeKey key) {
+        Node node = nodes.get(key);
+        if (node != null && node.knownMask != 0L) knownRenderNodes.add(key);
         if (dirtySet.add(key)) dirtyQueue.addLast(key);
     }
 
@@ -704,6 +986,8 @@ final class CaveLodTree {
         private int dirtyMinY = 64;
         private int dirtyMaxX = -1;
         private int dirtyMaxY = -1;
+        private long nextUploadAttemptNanos;
+        private int uploadReservationFailures;
         private boolean initialized;
 
         private Node(NodeKey key) {

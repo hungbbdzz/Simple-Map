@@ -1,9 +1,16 @@
 package com.velorise.simplemap.client;
 
 import com.velorise.simplemap.client.cave.CavePipeline;
+import com.velorise.simplemap.client.cave.CaveColumnData;
+import com.velorise.simplemap.client.cave.CaveDimensionProfile;
 import com.velorise.simplemap.client.cave.CaveStateClassifier;
 import com.velorise.simplemap.client.cave.CaveView;
 import com.velorise.simplemap.client.cave.DenseCaveTile;
+import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.session.MapSessionManager;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
@@ -13,6 +20,7 @@ import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.material.MapColor;
 import org.apache.logging.log4j.LogManager;
@@ -23,8 +31,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -38,6 +44,15 @@ public class ChunkScanner {
     private static final int UNKNOWN_SURFACE_SCAN_ATTEMPTS = 12;
     // Do not restart an in-progress chunk every time the player walks a few blocks.
     private static final int NORMAL_REANCHOR_DISTANCE = 24;
+    /** Surface catch-up keeps its chunk cursor across ordinary movement. */
+    private static final int SURFACE_REANCHOR_CHUNKS = 4;
+    /** Xaero-style transaction size: scan a bounded part, publish once per slice. */
+    private static final int SURFACE_CHUNK_SLICE = 64;
+    private static final int SURFACE_QUEUE_STALE_RADIUS_CHUNKS = 8;
+    /** Packet-loaded chunks are queued as primitive keys; newest travel data wins. */
+    private static final int LOADED_SURFACE_QUEUE_LIMIT = 384;
+    /** Surface remains authoritative even while a cave projection is selected. */
+    private static final long SURFACE_DURING_CAVE_BUDGET_NANOS = 900_000L;
     private static final int BASE_VERTICAL_COST = 24;
     private static final int UNDERGROUND_SOLID_RUN = 3;
     // Increase per-tick nano budgets to allow broader scanning for larger explored areas
@@ -58,6 +73,8 @@ public class ChunkScanner {
     /** Avoid restarting the vertical pass whenever the player merely crosses one chunk border. */
     private static final int VERTICAL_ARCHIVE_REANCHOR_CHUNKS = 3;
     private static final long CAVE_PIXEL_NOT_FOUND = Long.MIN_VALUE;
+    /** Impossible Minecraft Surface height encoding used only as a scanner sentinel. */
+    private static final long SURFACE_DATA_UNAVAILABLE = Long.MIN_VALUE + 1L;
 
     private static final ChunkScanner INSTANCE = new ChunkScanner();
 
@@ -87,6 +104,19 @@ public class ChunkScanner {
     private final Map<String, MovementState> movementStates = new HashMap<>();
     private final Map<String, Integer> immediateCursors = new HashMap<>();
     private final Map<String, Integer> urgentChunkCursors = new HashMap<>();
+    /**
+     * Xaero-style packet ingress: network handlers append only a primitive chunk
+     * key. The client tick later captures the chunk in deadline-checked 64-column
+     * slices. No 256-column scan or mutation object is created in the packet path.
+     */
+    private final LongArrayFIFOQueue loadedSurfaceChunks = new LongArrayFIFOQueue();
+    private final LongOpenHashSet loadedSurfaceChunkSet = new LongOpenHashSet();
+    private final Long2IntOpenHashMap loadedSurfaceChunkCursors =
+            new Long2IntOpenHashMap();
+    /** Centre-out 5x5 foreground seed, refreshed on chunk changes and every 250 ms. */
+    private int foregroundSeedChunkX = Integer.MIN_VALUE;
+    private int foregroundSeedChunkZ = Integer.MIN_VALUE;
+    private long foregroundSeedNanos;
     private final Map<String, ViewportScanState> viewportScans = new HashMap<>();
     private final Map<String, NormalScanState> verticalArchiveScans = new HashMap<>();
     /** Recently edited columns are rebuilt before the normal outward archive pass. */
@@ -107,6 +137,12 @@ public class ChunkScanner {
         movementStates.clear();
         immediateCursors.clear();
         urgentChunkCursors.clear();
+        loadedSurfaceChunks.clear();
+        loadedSurfaceChunkSet.clear();
+        loadedSurfaceChunkCursors.clear();
+        foregroundSeedChunkX = Integer.MIN_VALUE;
+        foregroundSeedChunkZ = Integer.MIN_VALUE;
+        foregroundSeedNanos = 0L;
         viewportScans.clear();
         verticalArchiveScans.clear();
         verticalArchivePriority.clear();
@@ -123,12 +159,78 @@ public class ChunkScanner {
     }
 
     /**
+     * Cheap packet ingress used by the chunk-data mixin. The complete chunk is not
+     * scanned here; it is resumed later by the foreground writer. Capping the FIFO
+     * drops old chunks behind a fast traveller instead of creating an unbounded
+     * catch-up backlog.
+     */
+    public void enqueueLoadedSurfaceChunk(int chunkX, int chunkZ) {
+        long key = packChunk(chunkX, chunkZ);
+        if (!loadedSurfaceChunkSet.add(key)) return;
+        while (loadedSurfaceChunks.size() >= LOADED_SURFACE_QUEUE_LIMIT) {
+            long dropped = loadedSurfaceChunks.dequeueLong();
+            loadedSurfaceChunkSet.remove(dropped);
+            loadedSurfaceChunkCursors.remove(dropped);
+        }
+        loadedSurfaceChunks.enqueue(key);
+    }
+
+    private static long packChunk(int chunkX, int chunkZ) {
+        return ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
+    }
+
+    private static int unpackChunkX(long key) { return (int) (key >> 32); }
+    private static int unpackChunkZ(long key) { return (int) key; }
+
+    /**
+     * Seeds one coherent loaded neighbourhood into the same primitive queue used by
+     * packet ingress. Packet order starts at the render-distance edge; this small
+     * centre-out seed guarantees that the visible route becomes a compact ribbon
+     * instead of disconnected islands. Existing cursors are preserved.
+     */
+    private void seedForegroundSurfaceNeighborhood(Minecraft minecraft) {
+        if (minecraft == null || minecraft.level == null || minecraft.player == null) return;
+        int centerChunkX = minecraft.player.getBlockX() >> 4;
+        int centerChunkZ = minecraft.player.getBlockZ() >> 4;
+        long now = System.nanoTime();
+        if (centerChunkX == foregroundSeedChunkX
+                && centerChunkZ == foregroundSeedChunkZ
+                && now - foregroundSeedNanos < 250_000_000L) {
+            return;
+        }
+        foregroundSeedChunkX = centerChunkX;
+        foregroundSeedChunkZ = centerChunkZ;
+        foregroundSeedNanos = now;
+        for (int packed : getChunkOrder(32)) { // 5x5 chunks, centre first
+            int chunkX = centerChunkX + (short) (packed >>> 16);
+            int chunkZ = centerChunkZ + (short) packed;
+            if (!minecraft.level.hasChunk(chunkX, chunkZ)) continue;
+            if (!shouldRescanExplored()
+                    && MapManager.getInstance().isChunkSurfaceComplete(chunkX, chunkZ)) {
+                publishCompletedSurfaceChunk(chunkX, chunkZ, MapRequestLane.MINIMAP);
+                continue;
+            }
+            enqueueLoadedSurfaceChunk(chunkX, chunkZ);
+        }
+    }
+
+    /**
      * Scans a time-bounded amount of work per tick. Loaded chunks are completed
      * from the player outward; the legacy random-dot reveal path is no longer used.
      */
     public void scanAroundPlayerUniform(Minecraft mc, int maxRadius) {
+        scanAroundPlayerUniform(mc, maxRadius, false);
+    }
+
+    /**
+     * @param suppressSurfaceFallback true while packet mutation already owns a
+     *        substantial authoritative chunk backlog.
+     */
+    public void scanAroundPlayerUniform(Minecraft mc, int maxRadius,
+            boolean suppressSurfaceFallback) {
+        if (MapActivityGate.getInstance().blocksForegroundStreaming()) return;
         if (mc.level == null || mc.player == null
-                || !MapManager.getInstance().isViewingLiveDimension())
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level))
             return;
 
         boolean caveActive = CaveMode.isActive(mc);
@@ -137,35 +239,122 @@ public class ChunkScanner {
             int layerY = CaveMode.getLayerY(mc);
             if (!CaveMode.isFullView(mc)) CaveMapManager.getInstance().setActiveLayer(layerY);
             CavePipeline.getInstance().scanAroundPlayer(mc, maxRadius);
+            // Display mode must not decide what the durable Surface archive learns.
+            // Packet-driven chunks and this small rolling lane continue completing
+            // 16x16 surface tiles while Layered/Full Cave is selected.
+            if (!suppressSurfaceFallback) {
+                seedForegroundSurfaceNeighborhood(mc);
+                long surfaceStarted = System.nanoTime();
+                long surfaceBudget = surfaceDuringCaveBudget(mc);
+                long surfaceDeadline = surfaceStarted + surfaceBudget;
+                long surfaceUrgentDeadline = surfaceStarted
+                        + foregroundUrgentSlice(surfaceBudget);
+                // The player chunk and the chunk ahead of movement are useful on
+                // screen immediately. Reserve the remaining slice for the sticky
+                // FIFO so Surface history continues while Cave is selected.
+                scanUrgentLoadedChunks(mc, 0, false, false, surfaceUrgentDeadline);
+                scanQueuedSurfaceChunks(mc, surfaceDeadline);
+                scanNearestChunks(mc, Math.max(16, maxRadius), Integer.MAX_VALUE,
+                        0, false, false, surfaceDeadline);
+            }
             return;
         }
+
+        // The mutation writer will complete these chunks transactionally. Running
+        // the fallback scanner as well only restarts the same source reads.
+        if (suppressSurfaceFallback) return;
 
         int centerBlockX = (int) Math.floor(mc.player.getX());
         int centerBlockZ = (int) Math.floor(mc.player.getZ());
         int effectiveRadius = getAdaptiveRadius(mc, maxRadius, viewKey(mc, false, false, 0));
         int radiusSq = effectiveRadius * effectiveRadius;
-        long deadline = System.nanoTime() + scanBudget(mc, false);
+        seedForegroundSurfaceNeighborhood(mc);
+        long scanStarted = System.nanoTime();
+        long totalBudget = scanBudget(mc, false);
+        long deadline = scanStarted + totalBudget;
+        long urgentDeadline = scanStarted + foregroundUrgentSlice(totalBudget);
 
         // 1. Scan immediate small 13x13 circular region (radius = 6) around the player
         // instantly to capture direct player interactions (building/mining)
-        scanImmediate(mc, centerBlockX, centerBlockZ, IMMEDIATE_RADIUS,
-                0, false, false, deadline);
-        scanUrgentLoadedChunks(mc, 0, false, false, deadline);
+        // Direct block/chunk packets are the steady-state dirty authority. The
+        // immediate 13x13 reread is retained only for explicit migration/refresh;
+        // otherwise it repeatedly consumes the same near-player columns and delays
+        // completion of newly loaded chunks ahead of movement.
+        if (shouldRescanExplored()) {
+            scanImmediate(mc, centerBlockX, centerBlockZ, IMMEDIATE_RADIUS,
+                    0, false, false, deadline);
+        }
+        scanUrgentLoadedChunks(mc, 0, false, false, urgentDeadline);
+        // Then finish packet-loaded chunks transactionally. Reserving part of the
+        // deadline for the FIFO prevents the current/ahead chunk from monopolising
+        // every pulse and leaving one-page gaps behind a fast player.
+        // This preserves travel
+        // history without letting old render-distance edge packets win over the
+        // current player neighbourhood.
+        scanQueuedSurfaceChunks(mc, deadline);
 
         int samplesTarget = resolveSampleTarget(false);
         scanNearestChunks(mc, effectiveRadius, samplesTarget, 0, false, false, deadline);
 
         // Light changes more often than terrain color. Refresh a small independent
         // sample of already explored, loaded positions without enabling full rescans.
-        int lightSamples = Math.min(128, Math.max(16, samplesTarget / 8));
-        for (int i = 0; i < lightSamples && System.nanoTime() < deadline; i++) {
-            int dx = random.nextInt(2 * effectiveRadius + 1) - effectiveRadius;
-            int dz = random.nextInt(2 * effectiveRadius + 1) - effectiveRadius;
-            if (dx * dx + dz * dz <= radiusSq) {
-                scanLightIfLoaded(mc, centerBlockX + dx, centerBlockZ + dz);
+        if (MapConfig.minimapNightMode != 0) {
+            int lightSamples = Math.min(64, Math.max(8, samplesTarget / 16));
+            for (int i = 0; i < lightSamples && System.nanoTime() < deadline; i++) {
+                int dx = random.nextInt(2 * effectiveRadius + 1) - effectiveRadius;
+                int dz = random.nextInt(2 * effectiveRadius + 1) - effectiveRadius;
+                if (dx * dx + dz * dz <= radiusSq) {
+                    scanLightIfLoaded(mc, centerBlockX + dx, centerBlockZ + dz);
+                }
             }
         }
-        CavePipeline.getInstance().scanBackgroundAroundPlayer(mc, effectiveRadius);
+        if (MapPerformanceGovernor.getInstance().allowBackgroundWork(mc)) {
+            CavePipeline.getInstance().scanBackgroundAroundPlayer(mc, effectiveRadius);
+        }
+    }
+
+    /**
+     * Extra render-frame Surface pulse used by {@link MapForegroundWriter}.
+     *
+     * <p>This deliberately excludes random light refresh, saved-world reads and
+     * broad nearest-chunk discovery. It only resumes the player corridor and the
+     * bounded packet frontier, so calling it more often than the 20 Hz client tick
+     * increases useful travel throughput without multiplying unrelated work.</p>
+     */
+    public void scanSurfaceForegroundFrame(Minecraft minecraft,
+            long budgetNanos) {
+        if (budgetNanos <= 0L || minecraft == null || minecraft.level == null
+                || minecraft.player == null
+                || !MapManager.getInstance().acceptsLiveLevel(minecraft.level)
+                || MapActivityGate.getInstance().blocksForegroundStreaming()) {
+            return;
+        }
+        seedForegroundSurfaceNeighborhood(minecraft);
+        long started = System.nanoTime();
+        long deadline = started + budgetNanos;
+        long urgentDeadline = started + foregroundUrgentSlice(budgetNanos);
+        scanUrgentLoadedChunks(minecraft, 0, false, false, urgentDeadline);
+        if (System.nanoTime() < deadline) {
+            scanQueuedSurfaceChunks(minecraft, deadline);
+        }
+    }
+
+    private static long foregroundUrgentSlice(long totalBudget) {
+        if (totalBudget <= 0L) return 0L;
+        // 58% urgent / 42% sticky completion. The minimum still guarantees one
+        // deadline-checked row on very pressured frames.
+        return Math.min(totalBudget, Math.max(140_000L,
+                totalBudget * 58L / 100L));
+    }
+
+    private long surfaceDuringCaveBudget(Minecraft minecraft) {
+        MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
+        long governed = governor.gameplayScanBudgetNanos(false);
+        if (governed <= 0L) return 0L;
+        if (minecraft != null && minecraft.screen instanceof MapScreen) {
+            return Math.min(500_000L, governed);
+        }
+        return Math.min(SURFACE_DURING_CAVE_BUDGET_NANOS, governed);
     }
 
     private void synchronizeCaveModeRevision() {
@@ -188,17 +377,11 @@ public class ChunkScanner {
             // the previous band as a page fallback and warm the new band near-player
             // first; neither path performs a global clear.
             CavePipeline.getInstance().retargetLayer(minecraft, nextTopY);
-        } else {
-            normalScans.clear();
-            immediateCursors.clear();
-            urgentChunkCursors.clear();
-            viewportScans.clear();
-            verticalArchiveScans.clear();
-            CavePipeline.getInstance().resetScanState();
-            if (nextView != CaveView.LAYERED) {
-                forcedRescanUntilNanos = Math.max(forcedRescanUntilNanos,
-                        System.nanoTime() + 3_000_000_000L);
-            }
+        } else if (active) {
+            // Type switches are cache selections, not destructive refreshes.
+            // CaveDisplayScheduler.activateMode() cancels only incompatible
+            // unpublished tasks; retained Surface/Layered/FULL data stays warm.
+            CavePipeline.getInstance().primeCurrentView(minecraft);
         }
         observedCaveView = nextView;
         observedCaveBandY = nextBand;
@@ -367,7 +550,8 @@ public class ChunkScanner {
         BlockPos.MutableBlockPos openPos = scratch.position(0, blockX, undergroundStartY, blockZ);
         BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, undergroundStartY, blockZ);
         BlockPos.MutableBlockPos runPos = scratch.position(2, blockX, undergroundStartY, blockZ);
-        List<VerticalCaveArchiveManager.Candidate> candidates = new ArrayList<>();
+        CaveColumnData.Builder builder = scratch.caveColumnBuilder;
+        builder.reset();
 
         boolean reachedMinimumY = true;
         for (int openY = undergroundStartY; openY > minimumY; openY--) {
@@ -376,18 +560,16 @@ public class ChunkScanner {
             if (pixel == CAVE_PIXEL_NOT_FOUND || cavePixelColor(pixel) == 0
                     || cavePixelY(pixel) == FullCaveMapManager.NO_SURFACE) continue;
 
-            // Store the complete vertical cavity interval, not only the floor Y.
-            // A 32-block layer may intersect the middle of a tall cavern while its
-            // floor lies below the band's lower edge. Floor-only candidates made
-            // those caverns collapse into a few isolated pixels.
-            int runCeilingY = undergroundStartY;
-            int runTopY = findCavityRunTop(level, runPos, openY, cavePixelY(pixel),
-                    runCeilingY);
-            if (candidates.isEmpty()
-                    || candidates.get(candidates.size() - 1).bottomY() != cavePixelY(pixel)) {
-                candidates.add(new VerticalCaveArchiveManager.Candidate(
-                        runTopY, cavePixelY(pixel), cavePixelColor(pixel)));
-            }
+            // Archive directly into one reusable primitive writer. The previous
+            // path allocated an ArrayList, one Candidate object per cavity, a
+            // Candidate[] and a second builder for every X/Z column. Runs are
+            // already discovered highest-first and the scanner deliberately stops
+            // at 96, below CaveColumnData.MAX_RUNS, so collection reduction could
+            // never contribute useful output here.
+            int floorY = cavePixelY(pixel);
+            int runTopY = findCavityRunTop(level, runPos, openY, floorY,
+                    undergroundStartY);
+            builder.add(runTopY, floorY, cavePixelColor(pixel), (byte) 0);
 
             openPos.setY(openY);
             var fluid = level.getBlockState(openPos).getFluidState();
@@ -399,17 +581,16 @@ public class ChunkScanner {
                     openY--;
                 }
             } else {
-                openY = Math.min(openY, cavePixelY(pixel));
+                openY = Math.min(openY, floorY);
             }
-            if (candidates.size() >= 96) {
+            if (builder.count() >= 96) {
                 reachedMinimumY = false;
                 break;
             }
         }
 
-        VerticalCaveArchiveManager.Candidate[] compact = reduceVerticalCandidates(candidates);
-        return archive.recordColumn(blockX, blockZ, compact,
-                minimumY, undergroundStartY, reachedMinimumY);
+        return archive.recordColumnData(blockX, blockZ,
+                builder.build(minimumY, undergroundStartY, reachedMinimumY));
     }
 
     private int findCavityRunTop(Level level, BlockPos.MutableBlockPos probe,
@@ -422,51 +603,6 @@ public class ChunkScanner {
             topY = y;
         }
         return Math.max(floorY, topY);
-    }
-
-    private VerticalCaveArchiveManager.Candidate[] reduceVerticalCandidates(
-            List<VerticalCaveArchiveManager.Candidate> candidates) {
-        int maximum = VerticalCaveArchiveManager.MAX_SURFACES_PER_COLUMN;
-        if (candidates.size() <= maximum) {
-            return candidates.toArray(VerticalCaveArchiveManager.Candidate[]::new);
-        }
-        // Preserve both ends of every 16-block Y bucket before filling spare
-        // slots. Any 32-block Top-Y query that contains a discovered floor then
-        // retains at least one representative instead of losing it to uniform
-        // down-sampling in cave-dense modded dimensions.
-        Map<Integer, VerticalCaveArchiveManager.Candidate> highestByBucket = new LinkedHashMap<>();
-        Map<Integer, VerticalCaveArchiveManager.Candidate> lowestByBucket = new LinkedHashMap<>();
-        for (VerticalCaveArchiveManager.Candidate candidate : candidates) {
-            int bucket = Math.floorDiv(candidate.topY(), 16);
-            highestByBucket.putIfAbsent(bucket, candidate);
-            lowestByBucket.put(bucket, candidate);
-        }
-
-        LinkedHashSet<VerticalCaveArchiveManager.Candidate> selected = new LinkedHashSet<>();
-        for (VerticalCaveArchiveManager.Candidate candidate : candidates) {
-            int bucket = Math.floorDiv(candidate.topY(), 16);
-            if (candidate.equals(highestByBucket.get(bucket))
-                    || candidate.equals(lowestByBucket.get(bucket))) {
-                selected.add(candidate);
-            }
-        }
-        if (selected.size() > maximum) {
-            List<VerticalCaveArchiveManager.Candidate> extrema = new ArrayList<>(selected);
-            selected.clear();
-            for (int slot = 0; slot < maximum; slot++) {
-                int index = Math.round(slot * (extrema.size() - 1.0f) / (maximum - 1.0f));
-                selected.add(extrema.get(index));
-            }
-        } else {
-            for (VerticalCaveArchiveManager.Candidate candidate : candidates) {
-                if (selected.size() >= maximum) break;
-                selected.add(candidate);
-            }
-        }
-        return selected.stream()
-                .sorted((first, second) -> Short.compare(second.topY(), first.topY()))
-                .limit(maximum)
-                .toArray(VerticalCaveArchiveManager.Candidate[]::new);
     }
 
     /**
@@ -502,26 +638,165 @@ public class ChunkScanner {
 
 
 
-    /** Completes the player chunk first, plus the chunk in the movement direction. */
+    private void scanQueuedSurfaceChunks(Minecraft mc, long deadline) {
+        int playerChunkX = mc.player == null ? 0 : mc.player.getBlockX() >> 4;
+        int playerChunkZ = mc.player == null ? 0 : mc.player.getBlockZ() >> 4;
+        while (!loadedSurfaceChunks.isEmpty() && System.nanoTime() < deadline) {
+            selectNearestSurfaceQueueHead(playerChunkX, playerChunkZ);
+            long key = loadedSurfaceChunks.firstLong();
+            // An urgent pass can complete a queued chunk before FIFO ownership
+            // reaches it. Keep the primitive queue append-only and discard that
+            // stale entry in O(1) here instead of rescanning the chunk.
+            if (!loadedSurfaceChunkSet.contains(key)) {
+                loadedSurfaceChunks.dequeueLong();
+                loadedSurfaceChunkCursors.remove(key);
+                continue;
+            }
+            int chunkX = unpackChunkX(key);
+            int chunkZ = unpackChunkZ(key);
+            if (mc.level == null || !mc.level.hasChunk(chunkX, chunkZ)) {
+                loadedSurfaceChunks.dequeueLong();
+                loadedSurfaceChunkSet.remove(key);
+                loadedSurfaceChunkCursors.remove(key);
+                continue;
+            }
+            int cursor = loadedSurfaceChunkCursors.get(key);
+            // Packet order begins at the render-distance edge. Drop untouched work
+            // that has already fallen behind the traveller, but always finish a
+            // transaction once one row has been sampled so visible chunks remain
+            // atomic rather than becoming horizontal stripes.
+            int queueRadius = SURFACE_QUEUE_STALE_RADIUS_CHUNKS;
+            if (cursor == 0
+                    && (Math.abs(chunkX - playerChunkX) > queueRadius
+                            || Math.abs(chunkZ - playerChunkZ) > queueRadius)) {
+                loadedSurfaceChunks.dequeueLong();
+                loadedSurfaceChunkSet.remove(key);
+                loadedSurfaceChunkCursors.remove(key);
+                continue;
+            }
+            if (!shouldRescanExplored()
+                    && MapManager.getInstance().isChunkSurfaceComplete(chunkX, chunkZ)) {
+                publishCompletedSurfaceChunk(chunkX, chunkZ, MapRequestLane.MINIMAP);
+                loadedSurfaceChunks.dequeueLong();
+                loadedSurfaceChunkSet.remove(key);
+                loadedSurfaceChunkCursors.remove(key);
+                continue;
+            }
+            int next = scanSurfaceChunkSlice(mc.level, chunkX, chunkZ, cursor,
+                    SURFACE_CHUNK_SLICE, deadline, MapRequestLane.MINIMAP);
+            if (next >= 256) {
+                loadedSurfaceChunks.dequeueLong();
+                loadedSurfaceChunkSet.remove(key);
+                loadedSurfaceChunkCursors.remove(key);
+            } else {
+                loadedSurfaceChunkCursors.put(key, next);
+                // Preserve FIFO ownership until this transaction is complete. This
+                // avoids 25/50/75%-complete pages spread across hundreds of chunks.
+                if (next == cursor) return;
+            }
+        }
+    }
+
+    /**
+     * Packet order is not spatial order. Inspect a bounded prefix and rotate the
+     * nearest (or already-started) chunk to the head without allocating/sorting.
+     * This produces a compact route ribbon instead of isolated render-distance
+     * edge chunks while preserving one atomic transaction at a time.
+     */
+    private void selectNearestSurfaceQueueHead(int playerChunkX,
+            int playerChunkZ) {
+        int inspect = Math.min(24, loadedSurfaceChunks.size());
+        if (inspect <= 1) return;
+        long selected = 0L;
+        long selectedScore = Long.MAX_VALUE;
+        int retained = 0;
+        for (int index = 0; index < inspect; index++) {
+            long key = loadedSurfaceChunks.dequeueLong();
+            if (!loadedSurfaceChunkSet.contains(key)) {
+                loadedSurfaceChunkCursors.remove(key);
+                continue;
+            }
+            loadedSurfaceChunks.enqueue(key);
+            retained++;
+            int chunkX = unpackChunkX(key);
+            int chunkZ = unpackChunkZ(key);
+            long dx = chunkX - (long) playerChunkX;
+            long dz = chunkZ - (long) playerChunkZ;
+            long score = dx * dx + dz * dz;
+            int cursor = loadedSurfaceChunkCursors.get(key);
+            if (cursor > 0) score -= 1_000_000L + cursor * 1_000L;
+            if (score < selectedScore) {
+                selectedScore = score;
+                selected = key;
+            }
+        }
+        if (retained == 0 || !loadedSurfaceChunkSet.contains(selected)) return;
+        int rotations = loadedSurfaceChunks.size();
+        while (rotations-- > 0 && loadedSurfaceChunks.firstLong() != selected) {
+            loadedSurfaceChunks.enqueue(loadedSurfaceChunks.dequeueLong());
+        }
+    }
+
+    /** Completes the player chunk first, then two chunks in the movement direction. */
     private void scanUrgentLoadedChunks(Minecraft mc, int layerY, boolean cave,
             boolean fullView, long deadline) {
         int playerChunkX = ((int) Math.floor(mc.player.getX())) >> 4;
         int playerChunkZ = ((int) Math.floor(mc.player.getZ())) >> 4;
-        int directionX = (int) Math.signum(mc.player.getDeltaMovement().x);
-        int directionZ = (int) Math.signum(mc.player.getDeltaMovement().z);
-        scanUrgentChunk(mc, playerChunkX, playerChunkZ, layerY, cave, fullView, deadline);
-        if (!cave && System.nanoTime() < deadline && (directionX != 0 || directionZ != 0)) {
-            scanUrgentChunk(mc, playerChunkX + directionX, playerChunkZ + directionZ,
+        double velocityX = mc.player.getDeltaMovement().x;
+        double velocityZ = mc.player.getDeltaMovement().z;
+        int directionX = (int) Math.signum(velocityX);
+        int directionZ = (int) Math.signum(velocityZ);
+        // Prefer the dominant axis. A diagonal sign/sign target is often a corner
+        // chunk that the player never enters and leaves two orthogonal gaps.
+        if (Math.abs(velocityX) > Math.abs(velocityZ) * 1.5D) directionZ = 0;
+        else if (Math.abs(velocityZ) > Math.abs(velocityX) * 1.5D) directionX = 0;
+        boolean currentComplete = scanUrgentChunk(mc, playerChunkX, playerChunkZ,
+                layerY, cave, fullView, deadline);
+        if (!cave && currentComplete && System.nanoTime() < deadline
+                && (directionX != 0 || directionZ != 0)) {
+            boolean firstAheadComplete = scanUrgentChunk(mc,
+                    playerChunkX + directionX, playerChunkZ + directionZ,
                     layerY, false, false, deadline);
+            if (firstAheadComplete && System.nanoTime() < deadline) {
+                scanUrgentChunk(mc, playerChunkX + directionX * 2,
+                        playerChunkZ + directionZ * 2,
+                        layerY, false, false, deadline);
+            }
         }
     }
 
-    private void scanUrgentChunk(Minecraft mc, int chunkX, int chunkZ, int layerY,
+    private boolean scanUrgentChunk(Minecraft mc, int chunkX, int chunkZ, int layerY,
             boolean cave, boolean fullView, long deadline) {
-        if (!mc.level.hasChunk(chunkX, chunkZ)) return;
+        if (!mc.level.hasChunk(chunkX, chunkZ)) return false;
         String key = viewKey(mc, cave, fullView, layerY) + ":urgent:" + chunkX + ',' + chunkZ;
+        if (!cave) {
+            long chunkKey = packChunk(chunkX, chunkZ);
+            // Surface has one cursor authority shared by packet FIFO, player/ahead
+            // priority and later nearest-chunk traversal. The previous independent
+            // urgent cursor repeatedly rescanned rows 0..63 before FIFO resumed,
+            // roughly halving useful travel throughput while preserving the same
+            // CPU cost.
+            int cursor = loadedSurfaceChunkCursors.get(chunkKey);
+            if (!shouldRescanExplored()
+                    && MapManager.getInstance().isChunkSurfaceComplete(chunkX, chunkZ)) {
+                publishCompletedSurfaceChunk(chunkX, chunkZ, MapRequestLane.MINIMAP);
+                loadedSurfaceChunkCursors.remove(chunkKey);
+                loadedSurfaceChunkSet.remove(chunkKey);
+                return true;
+            }
+            int next = scanSurfaceChunkSlice(mc.level, chunkX, chunkZ,
+                    cursor, 256 - cursor, deadline);
+            if (next >= 256) {
+                loadedSurfaceChunkCursors.remove(chunkKey);
+                loadedSurfaceChunkSet.remove(chunkKey);
+                return true;
+            } else if (next > cursor) {
+                loadedSurfaceChunkCursors.put(chunkKey, next);
+            }
+            return false;
+        }
         int cursor = urgentChunkCursors.getOrDefault(key, 0);
-        int maximum = cave && shouldRescanExplored() ? 256 : (cave ? 96 : 256);
+        int maximum = shouldRescanExplored() ? 256 : 96;
         int processed = 0;
         int visited = 0;
         while (visited < 256 && processed < maximum && System.nanoTime() < deadline) {
@@ -529,12 +804,13 @@ public class ChunkScanner {
             visited++;
             int blockX = (chunkX << 4) + (pixel & 15);
             int blockZ = (chunkZ << 4) + (pixel >>> 4);
-            if (!shouldRescanExplored() && isExplored(blockX, blockZ, cave, fullView)) continue;
-            scanPixel(mc, blockX, blockZ, layerY, cave, fullView);
+            if (!shouldRescanExplored() && isExplored(blockX, blockZ, true, fullView)) continue;
+            scanPixel(mc, blockX, blockZ, layerY, true, fullView);
             processed++;
         }
         urgentChunkCursors.put(key, cursor & 255);
         if (urgentChunkCursors.size() > 256) urgentChunkCursors.clear();
+        return false;
     }
 
     /**
@@ -564,8 +840,9 @@ public class ChunkScanner {
     public void scanVisibleArea(Minecraft mc, double minX, double maxX,
             double minZ, double maxZ, float scale,
             double focusX, double focusZ, MapRequestLane lane) {
+        if (MapActivityGate.getInstance().blocksForegroundStreaming()) return;
         if (mc == null || mc.level == null || mc.player == null
-                || !MapManager.getInstance().isViewingLiveDimension()) return;
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         boolean cave = CaveMode.isActive(mc);
         synchronizeCaveModeRevision();
         boolean fullView = cave && CaveMode.isFullView(mc);
@@ -574,6 +851,15 @@ public class ChunkScanner {
         if (cave) {
             CavePipeline.getInstance().scanVisibleArea(mc, minX, maxX, minZ, maxZ,
                     scale, focusX, focusZ, lane);
+            // MapScreen suppresses the normal LIVE_CRITICAL lane. Keep a tiny
+            // player-local Surface writer alive here as well, otherwise leaving a
+            // Cave view open makes the Surface archive fall permanently behind the
+            // same already-generated Minecraft chunks.
+            int renderDistance = mc.options.renderDistance().get();
+            int surfaceRadius = Math.max(16, (renderDistance - 1) * 16);
+            long surfaceDeadline = System.nanoTime() + surfaceDuringCaveBudget(mc);
+            scanNearestChunks(mc, surfaceRadius, Integer.MAX_VALUE,
+                    0, false, false, surfaceDeadline);
             return;
         }
 
@@ -701,19 +987,21 @@ public class ChunkScanner {
                 state.pixelCursor = 0;
                 continue;
             }
-            int burstVisited = 0;
-            while (burstVisited < pixelsPerChunkBurst && state.pixelCursor < 256
-                    && visitedPixels < MAP_SCREEN_MAX_VISITED_PIXELS
-                    && System.nanoTime() < deadline) {
-                int pixel = state.pixelCursor++;
-                visitedPixels++;
-                burstVisited++;
-                int blockX = (chunkX << 4) + (pixel & 15);
-                int blockZ = (chunkZ << 4) + (pixel >>> 4);
-                if (!shouldRescanExplored() && isExplored(blockX, blockZ, cave, fullView)) continue;
-                scanPixel(mc, blockX, blockZ, layerY, cave, fullView);
+            if (state.pixelCursor == 0 && !shouldRescanExplored()
+                    && MapManager.getInstance().isChunkSurfaceComplete(chunkX, chunkZ)) {
+                publishCompletedSurfaceChunk(chunkX, chunkZ, effectiveLane);
+                state.chunkCursor++;
+                visitedPixels += 256;
+                continue;
             }
-            if (state.pixelCursor >= 256) {
+            int previous = state.pixelCursor;
+            int requested = Math.min(pixelsPerChunkBurst,
+                    MAP_SCREEN_MAX_VISITED_PIXELS - visitedPixels);
+            state.pixelCursor = scanSurfaceChunkSlice(mc.level, chunkX, chunkZ,
+                    previous, requested, deadline, effectiveLane);
+            int advanced = Math.max(0, state.pixelCursor - previous);
+            visitedPixels += advanced;
+            if (advanced == 0 || state.pixelCursor >= 256) {
                 state.pixelCursor = 0;
                 state.chunkCursor++;
             }
@@ -726,6 +1014,7 @@ public class ChunkScanner {
      * uncached player region receives a tiny one-chunk prime.
      */
     public void requestImmediateCaveLayerRefresh(Minecraft mc) {
+        if (MapActivityGate.getInstance().blocksMapWork()) return;
         if (mc == null || mc.level == null || mc.player == null) return;
         if (!mc.isSameThread()) {
             mc.execute(() -> requestImmediateCaveLayerRefresh(mc));
@@ -747,7 +1036,10 @@ public class ChunkScanner {
         if (retainedLayerTransition) {
             CavePipeline.getInstance().retargetLayer(mc, topY);
         } else {
-            CavePipeline.getInstance().resetScanState();
+            // Preserve the warm cache from the previous Cave type. The selected
+            // mode is primed centre-out by the bounded foreground writer instead
+            // of synchronously clearing queues and rebuilding the whole viewport.
+            CavePipeline.getInstance().primeCurrentView(mc);
         }
         observedCaveView = view;
         observedCaveBandY = bandY;
@@ -757,6 +1049,7 @@ public class ChunkScanner {
 
     /** Refresh now reuses the normal chunk pipeline instead of a separate circle scan. */
     public void requestRefresh(Minecraft mc) {
+        if (MapActivityGate.getInstance().blocksMapWork()) return;
         if (!MapManager.getInstance().isViewingLiveDimension()) return;
         forcedRescanUntilNanos = System.nanoTime() + 2_000_000_000L;
         normalScans.clear();
@@ -778,12 +1071,29 @@ public class ChunkScanner {
         NormalScanState state = normalScans.computeIfAbsent(key, ignored -> new NormalScanState());
         long deltaX = (long) playerX - state.anchorX;
         long deltaZ = (long) playerZ - state.anchorZ;
-        if (state.radius < 0
-                || deltaX * deltaX + deltaZ * deltaZ > NORMAL_REANCHOR_DISTANCE * NORMAL_REANCHOR_DISTANCE) {
+        int playerChunkX = playerX >> 4;
+        int playerChunkZ = playerZ >> 4;
+        boolean reanchor = state.radius < 0;
+        if (!reanchor && cave) {
+            reanchor = deltaX * deltaX + deltaZ * deltaZ
+                    > NORMAL_REANCHOR_DISTANCE * NORMAL_REANCHOR_DISTANCE;
+        } else if (!reanchor) {
+            reanchor = Math.abs(playerChunkX - state.anchorChunkX)
+                    > SURFACE_REANCHOR_CHUNKS
+                    || Math.abs(playerChunkZ - state.anchorChunkZ)
+                    > SURFACE_REANCHOR_CHUNKS;
+        }
+        if (reanchor && !cave && state.pixelIndex != 0) {
+            // Finish the current 16x16 transaction before moving the traversal
+            // anchor. Abandoning a 64/128/192-column tile on every fast reanchor
+            // was another reason Surface lagged behind generated chunks.
+            reanchor = false;
+        }
+        if (reanchor) {
             state.anchorX = playerX;
             state.anchorZ = playerZ;
-            state.anchorChunkX = playerX >> 4;
-            state.anchorChunkZ = playerZ >> 4;
+            state.anchorChunkX = playerChunkX;
+            state.anchorChunkZ = playerChunkZ;
             state.chunkIndex = 0;
             state.pixelIndex = 0;
         }
@@ -815,6 +1125,53 @@ public class ChunkScanner {
                 continue;
             }
 
+            if (!cave) {
+                preloadKnownRegionForChunk(chunkX << 4, chunkZ << 4,
+                        false, false);
+                long chunkKey = packChunk(chunkX, chunkZ);
+                if (loadedSurfaceChunkSet.contains(chunkKey)
+                        || loadedSurfaceChunkCursors.containsKey(chunkKey)) {
+                    // Packet/urgent travel ownership already carries the persistent
+                    // cursor for this chunk. A second nearest-scan cursor would
+                    // duplicate rows and publish no additional map coverage.
+                    state.chunkIndex++;
+                    state.pixelIndex = 0;
+                    inspected += 16;
+                    continue;
+                }
+                if (state.pixelIndex == 0 && !shouldRescanExplored()
+                        && MapManager.getInstance().isChunkSurfaceComplete(
+                                chunkX, chunkZ)) {
+                    publishCompletedSurfaceChunk(chunkX, chunkZ,
+                            MapRequestLane.MINIMAP);
+                    state.chunkIndex++;
+                    inspected += 256;
+                    continue;
+                }
+                int requested = samplesTarget == Integer.MAX_VALUE
+                        ? SURFACE_CHUNK_SLICE
+                        : Math.min(SURFACE_CHUNK_SLICE,
+                                Math.max(1, samplesTarget - processed));
+                int previous = state.pixelIndex;
+                int next = scanSurfaceChunkSlice(mc.level, chunkX, chunkZ,
+                        previous, requested, deadline);
+                int advanced = Math.max(0, next - previous);
+                if (advanced == 0) {
+                    state.chunkIndex++;
+                    state.pixelIndex = 0;
+                    inspected += 16;
+                    continue;
+                }
+                state.pixelIndex = next;
+                if (state.pixelIndex >= 256) {
+                    state.pixelIndex = 0;
+                    state.chunkIndex++;
+                }
+                processed += advanced;
+                inspected += advanced;
+                continue;
+            }
+
             int pixel = state.pixelIndex++;
             if (state.pixelIndex >= 256) {
                 state.pixelIndex = 0;
@@ -823,9 +1180,10 @@ public class ChunkScanner {
             inspected++;
             int blockX = (chunkX << 4) + (pixel & 15);
             int blockZ = (chunkZ << 4) + (pixel >>> 4);
-            preloadKnownRegionForChunk(blockX, blockZ, cave, fullView);
-            if (isExplored(blockX, blockZ, cave, fullView) && !shouldRescanExplored()) continue;
-            scanPixel(mc, blockX, blockZ, layerY, cave, fullView);
+            preloadKnownRegionForChunk(blockX, blockZ, true, fullView);
+            if (isExplored(blockX, blockZ, true, fullView)
+                    && !shouldRescanExplored()) continue;
+            scanPixel(mc, blockX, blockZ, layerY, true, fullView);
             processed++;
         }
     }
@@ -896,10 +1254,10 @@ public class ChunkScanner {
         long governed = governor.gameplayScanBudgetNanos(cave);
         if (governed <= 0L) return 0L;
         long base = cave ? CAVE_SCAN_BUDGET_NANOS : SURFACE_SCAN_BUDGET_NANOS;
-        // ChunkScanner performs several cheap surface columns per observation unit;
-        // a small multiplier preserves throughput while keeping the governor in
-        // control of the aggregate client-thread slice.
-        return Math.min(base, Math.max(350_000L, governed * 4L));
+        // The governor budget is the aggregate client-thread deadline. Multiplying
+        // it by four silently turned a nominal 0.7-1.5 ms slice into 2.8-6 ms and
+        // made a 125 FPS (8 ms) target impossible before rendering even began.
+        return Math.min(base, Math.max(80_000L, governed));
     }
 
     private int resolveSampleTarget(boolean cave) {
@@ -1657,12 +2015,16 @@ public class ChunkScanner {
     }
 
     private void updateSurfaceLight(Level level, int blockX, int surfaceY, int blockZ) {
+        MapLightManager.getInstance().setLight(blockX, blockZ,
+                sampleSurfaceLight(level, blockX, surfaceY, blockZ));
+    }
+
+    private int sampleSurfaceLight(Level level, int blockX, int surfaceY, int blockZ) {
         BlockPos.MutableBlockPos lightPos = scanScratch.get().position(3,
                 blockX, surfaceY, blockZ);
         int light = level.getBrightness(LightLayer.BLOCK, lightPos);
         lightPos.setY(surfaceY + 1);
-        light = Math.max(light, level.getBrightness(LightLayer.BLOCK, lightPos));
-        MapLightManager.getInstance().setLight(blockX, blockZ, light);
+        return Math.max(light, level.getBrightness(LightLayer.BLOCK, lightPos));
     }
 
     /**
@@ -1678,6 +2040,100 @@ public class ChunkScanner {
         scanBlockColumn(level, blockX, blockZ, false);
     }
 
+    private void publishCompletedSurfaceChunk(int chunkX, int chunkZ,
+            MapRequestLane lane) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp != null) {
+            SurfaceRegionSourceDatabase.getInstance().publishCompletedChunk(
+                    stamp, chunkX, chunkZ, lane);
+        }
+    }
+
+    /**
+     * Scans a contiguous row-major chunk slice and commits it once. This mirrors
+     * Xaero's chunk writer semantics without copying its code: packets mark chunk
+     * work, the writer completes a bounded chunk transaction, and retained source
+     * becomes visible only after a complete 16x16 payload exists.
+     *
+     * @return the next row-major column cursor
+     */
+    public int scanSurfaceChunkSlice(Level level, int chunkX, int chunkZ,
+            int startColumn, int maximumColumns) {
+        return scanSurfaceChunkSlice(level, chunkX, chunkZ, startColumn,
+                maximumColumns, Long.MAX_VALUE, MapRequestLane.MINIMAP);
+    }
+
+    /** Deadline-aware form used by live and mutation schedulers. */
+    public int scanSurfaceChunkSlice(Level level, int chunkX, int chunkZ,
+            int startColumn, int maximumColumns, long deadlineNanos) {
+        return scanSurfaceChunkSlice(level, chunkX, chunkZ, startColumn,
+                maximumColumns, deadlineNanos, MapRequestLane.MINIMAP);
+    }
+
+    /** Deadline-aware form that preserves the requesting viewport lane. */
+    private int scanSurfaceChunkSlice(Level level, int chunkX, int chunkZ,
+            int startColumn, int maximumColumns, long deadlineNanos,
+            MapRequestLane publicationLane) {
+        MapManager manager = MapManager.getInstance();
+        if (level == null || !level.isClientSide() || maximumColumns <= 0
+                || !manager.acceptsLiveLevel(level)) {
+            return Math.max(0, startColumn);
+        }
+        int start = Math.max(0, Math.min(256, startColumn));
+        int requestedEnd = Math.min(256, start + maximumColumns);
+        if (start >= requestedEnd || !level.hasChunk(chunkX, chunkZ)) return start;
+        GeneratedChunkIndex.getInstance().markLive(level, chunkX, chunkZ);
+        LevelChunk loadedChunk = level.getChunk(chunkX, chunkZ);
+        ScanScratch scratch = scanScratch.get();
+        int blockStartX = chunkX << 4;
+        int blockStartZ = chunkZ << 4;
+        MapManager.Region targetRegion = manager.getRegion(
+                blockStartX >> 9, blockStartZ >> 9, true);
+        if (targetRegion == null || !targetRegion.isLoaded()) return start;
+        scratch.beginSurfaceSlice(level, targetRegion);
+        int requestedCount = requestedEnd - start;
+        java.util.Arrays.fill(scratch.surfaceValid, 0, requestedCount, false);
+        int count = 0;
+        for (; count < requestedCount; count++) {
+            // One 16-column row is the smallest useful travel pulse. At 20 client
+            // ticks/s this guarantees the player chunk completes in at most 0.8 s,
+            // faster than normal sprint/flight crosses a chunk, while the deadline
+            // still pre-empts before a second row when Minecraft is pressured.
+            if (count > 0 && (count & 15) == 0
+                    && System.nanoTime() >= deadlineNanos) break;
+            int column = start + count;
+            int blockX = blockStartX + (column & 15);
+            int blockZ = blockStartZ + (column >>> 4);
+            long packed = buildPackedBlockData(level, loadedChunk, targetRegion,
+                    blockX, blockZ, true, scratch.surfaceSample);
+            if (packed == SURFACE_DATA_UNAVAILABLE) break;
+            scratch.surfacePacked[count] = packed;
+            scratch.surfaceTints[count] = scratch.surfaceSample.tint;
+            scratch.lightLevels[count] = scratch.surfaceSample.light;
+            scratch.surfaceValid[count] = true;
+        }
+        if (count <= 0) return start;
+        // Recheck after sampling. A UI dimension switch can invalidate ownership
+        // before this slice reaches its transactional commit boundary.
+        if (!manager.acceptsLiveLevel(level)) return start;
+        manager.commitSurfaceChunkSlice(chunkX, chunkZ, start,
+                scratch.surfacePacked, scratch.surfaceTints,
+                scratch.surfaceValid, 0, count);
+        MapLightManager.getInstance().setChunkLightSlice(chunkX, chunkZ, start,
+                scratch.lightLevels, 0, count, false);
+        int next = start + count;
+        if (next >= 256) {
+            MapManager.SurfaceChunkCommit completed = manager
+                    .finishSurfaceChunkTransaction(chunkX, chunkZ);
+            if (completed.chunkComplete()) {
+                publishCompletedSurfaceChunk(chunkX, chunkZ,
+                        publicationLane == null ? MapRequestLane.MINIMAP
+                                : publicationLane);
+            }
+        }
+        return next;
+    }
+
     /** Light-only packet path: preserve geometry and update the surface light cache. */
     public void scanSurfaceLightColumn(Level level, int blockX, int blockZ) {
         if (level == null || !level.isClientSide()) return;
@@ -1687,8 +2143,42 @@ public class ChunkScanner {
         updateSurfaceLight(level, blockX, surfaceY, blockZ);
     }
 
+    /**
+     * Incremental light-packet path. Samples a bounded row-major chunk slice and
+     * publishes it to the light cache as one transaction, preserving the mutation
+     * deadline while avoiding per-column cache locks and dirty notifications.
+     *
+     * @return the next row-major column cursor
+     */
+    public int scanSurfaceLightChunkSlice(Level level, int chunkX, int chunkZ,
+            int startColumn, int maximumColumns) {
+        if (level == null || !level.isClientSide() || maximumColumns <= 0
+                || !MapManager.getInstance().acceptsLiveLevel(level)) {
+            return Math.max(0, startColumn);
+        }
+        int start = Math.max(0, Math.min(256, startColumn));
+        int end = Math.min(256, start + maximumColumns);
+        if (start >= end || !level.hasChunk(chunkX, chunkZ)) return start;
+        ScanScratch scratch = scanScratch.get();
+        int blockStartX = chunkX << 4;
+        int blockStartZ = chunkZ << 4;
+        for (int column = start; column < end; column++) {
+            int blockX = blockStartX + (column & 15);
+            int blockZ = blockStartZ + (column >>> 4);
+            long data = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
+            int surfaceY = !MapBlockData.isEmpty(data)
+                    ? MapBlockData.topY(data) : getHighestY(level, blockX, blockZ);
+            scratch.lightLevels[column - start] = (byte) sampleSurfaceLight(
+                    level, blockX, surfaceY, blockZ);
+        }
+        MapLightManager.getInstance().setChunkLightSlice(chunkX, chunkZ, start,
+                scratch.lightLevels, 0, end - start);
+        return end;
+    }
+
     private void scanBlockColumn(Level level, int blockX, int blockZ, boolean invalidateCave) {
-        if (!level.isClientSide()) return;
+        if (!level.isClientSide()
+                || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         try {
             GeneratedChunkIndex.getInstance().markLive(level, blockX >> 4, blockZ >> 4);
             MapBlockData data = buildBlockData(level, blockX, blockZ);
@@ -1728,28 +2218,60 @@ public class ChunkScanner {
     }
 
     /** Captures the exact tint returned by Minecraft/modded BlockColors at this pixel. */
-    private int resolveSurfaceTint(Level level, int blockX, int blockZ, MapBlockData data) {
-        if (level == null || data == null || data.isEmpty()) return SurfaceTintData.UNKNOWN;
-        // Water tint is derived later from persisted biome IDs. Capturing the live
-        // BlockColors value here can bake a temporary chunk-edge blend while adjacent
-        // chunks are still loading. NONE marks this pixel as fully scanned without
-        // storing that unstable colour; SurfaceColorizer deliberately ignores it for
-        // non-glowing fluids.
-        if (data.isFluid() && !data.isGlowing()) return SurfaceTintData.NONE;
+    private int resolveSurfaceTint(Level level, int blockX, int blockZ,
+            MapBlockData data) {
+        return data == null ? SurfaceTintData.UNKNOWN
+                : resolveSurfaceTint(level, blockX, blockZ, data.pack());
+    }
+
+    /** Allocation-free tint path for chunk transactions. */
+    private int resolveSurfaceTint(Level level, int blockX, int blockZ,
+            long packedData) {
+        if (level == null || packedData == SURFACE_DATA_UNAVAILABLE
+                || MapBlockData.isEmpty(packedData)) return SurfaceTintData.UNKNOWN;
+        if (MapBlockData.isFluid(packedData)
+                && !MapBlockData.isGlowing(packedData)) return SurfaceTintData.NONE;
         BlockPos.MutableBlockPos pos = scanScratch.get().position(2,
-                blockX, data.topY, blockZ);
+                blockX, MapBlockData.topY(packedData), blockZ);
         BlockState state = level.getBlockState(pos);
         state = blockEntityVisuals.resolveLive(level, pos, state);
-        /* Cherry leaves carry their pink colour in the texture itself. Persisting the
-         * generic leaves BlockColors result can turn the cached surface green or make
-         * it look identical to the grass below. Match Xaero's fixed-colour foliage
-         * handling: keep the sampled texture and explicitly disable biome tint. */
         MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
         if (visual.fixedTextureColor()) return SurfaceTintData.NONE;
         String blockId = visual.blockId();
-        if (BrokenBlockTintCache.getInstance().isBroken(blockId)) return SurfaceTintData.NONE;
+        if (BrokenBlockTintCache.getInstance().isBroken(blockId)) {
+            return SurfaceTintData.NONE;
+        }
         try {
-            int tint = Minecraft.getInstance().getBlockColors().getColor(state, level, pos, 0);
+            int tint = Minecraft.getInstance().getBlockColors().getColor(
+                    state, level, pos, 0);
+            return SurfaceTintData.fromProviderResult(tint);
+        } catch (Throwable throwable) {
+            BrokenBlockTintCache.getInstance().markBroken(blockId);
+            return SurfaceTintData.NONE;
+        }
+    }
+
+    /**
+     * Prepared-state tint path used by the 16x16 writer. The previous chunk path
+     * fetched the top BlockState, resolved block-entity camouflage and classified
+     * the same block a second time after {@link #buildPackedBlockData}; doing that
+     * for every column was a measurable part of the Surface catch-up deficit.
+     */
+    private int resolveSurfaceTint(Level level, BlockPos.MutableBlockPos pos,
+            BlockState visibleState, MapVisualClassifier.VisualInfo visual,
+            boolean fluid, boolean glowing) {
+        if (level == null || visibleState == null || visual == null) {
+            return SurfaceTintData.UNKNOWN;
+        }
+        if (fluid && !glowing) return SurfaceTintData.NONE;
+        if (visual.fixedTextureColor()) return SurfaceTintData.NONE;
+        String blockId = visual.blockId();
+        if (BrokenBlockTintCache.getInstance().isBroken(blockId)) {
+            return SurfaceTintData.NONE;
+        }
+        try {
+            int tint = Minecraft.getInstance().getBlockColors().getColor(
+                    visibleState, level, pos, 0);
             return SurfaceTintData.fromProviderResult(tint);
         } catch (Throwable throwable) {
             BrokenBlockTintCache.getInstance().markBroken(blockId);
@@ -1763,16 +2285,51 @@ public class ChunkScanner {
      * block was found.
      */
     private MapBlockData buildBlockData(Level level, int blockX, int blockZ) {
-        if (!level.hasChunk(blockX >> 4, blockZ >> 4)) return null;
-        int surfaceY = getHighestY(level, blockX, blockZ);
-        BlockPos.MutableBlockPos pos = scanScratch.get().position(0,
+        long packed = buildPackedBlockData(level, null,
+                blockX, blockZ, false);
+        return packed == SURFACE_DATA_UNAVAILABLE
+                ? null : MapBlockData.unpack(packed);
+    }
+
+    private long buildPackedBlockData(Level level, LevelChunk loadedChunk,
+            int blockX, int blockZ, boolean chunkKnownLoaded) {
+        return buildPackedBlockData(level, loadedChunk, null,
+                blockX, blockZ, chunkKnownLoaded, null);
+    }
+
+    /**
+     * Combined Surface column capture. When {@code output} is supplied this method
+     * also computes tint and light from the already-resolved state, eliminating a
+     * second block-state lookup, a second block-entity resolution and one duplicate
+     * block-light sample per column.
+     */
+    private long buildPackedBlockData(Level level, LevelChunk loadedChunk,
+            MapManager.Region preparedRegion, int blockX, int blockZ,
+            boolean chunkKnownLoaded, SurfaceColumnSample output) {
+        if (output != null) output.reset();
+        if (!chunkKnownLoaded && !level.hasChunk(blockX >> 4, blockZ >> 4)) {
+            return SURFACE_DATA_UNAVAILABLE;
+        }
+        ScanScratch scratch = scanScratch.get();
+        SurfaceTopSample top = resolveSurfaceTop(level, loadedChunk,
+                blockX, blockZ, scratch);
+        int surfaceY = top.surfaceY;
+        BlockPos.MutableBlockPos pos = scratch.position(0,
                 blockX, surfaceY, blockZ);
-        BlockState actualVisibleState = level.getBlockState(pos);
-        BlockState visibleState = blockEntityVisuals.resolveLive(level, pos, actualVisibleState);
-        boolean fluid = !actualVisibleState.getFluidState().isEmpty();
-        if (!isVisibleMapSurface(level, pos, visibleState)) {
-            return new MapBlockData(MapBlockData.EMPTY_Y, MapBlockData.NO_BLOCK,
-                    MapBlockData.NO_BIOME, (byte) 0, MapBlockData.EMPTY_Y);
+        BlockState actualVisibleState = top.actualState;
+        BlockState visibleState = top.visibleState;
+        MapVisualClassifier.VisualInfo visual = top.visual;
+        boolean fluid = actualVisibleState != null
+                && !actualVisibleState.getFluidState().isEmpty();
+        if (!top.visible || actualVisibleState == null
+                || visibleState == null || visual == null) {
+            if (output != null) {
+                output.packed = MapBlockData.EMPTY_PACKED;
+                output.tint = SurfaceTintData.UNKNOWN;
+                output.light = (byte) sampleSurfaceLight(
+                        level, blockX, surfaceY, blockZ);
+            }
+            return MapBlockData.EMPTY_PACKED;
         }
 
         int floorY = surfaceY;
@@ -1787,7 +2344,8 @@ public class ChunkScanner {
             // palette and render as a dark/empty-looking hole.
             for (int y = surfaceY; y >= level.getMinBuildHeight(); y--) {
                 pos.setY(y);
-                BlockState candidate = level.getBlockState(pos);
+                BlockState candidate = loadedChunk == null
+                        ? level.getBlockState(pos) : loadedChunk.getBlockState(pos);
                 BlockState candidateVisual = blockEntityVisuals.resolveLive(level, pos, candidate);
                 boolean candidateWater = candidate.getFluidState()
                         .is(net.minecraft.tags.FluidTags.WATER);
@@ -1813,12 +2371,145 @@ public class ChunkScanner {
             }
         }
 
-        String blockId = visualClassifier.info(paletteState).blockId();
+        MapVisualClassifier.VisualInfo paletteVisual = paletteState == visibleState
+                ? visual : visualClassifier.info(paletteState);
+        String blockId = paletteVisual.blockId();
         pos.setY(surfaceY);
+        String biomeId = resolveSurfaceBiomeId(level, pos, scratch);
+
+        MapManager.Region region = preparedRegion;
+        if (region == null) {
+            int rx = blockX >> 9;
+            int rz = blockZ >> 9;
+            region = MapManager.getInstance().getRegion(rx, rz, true);
+        }
+        if (region == null || !region.isLoaded()) return SURFACE_DATA_UNAVAILABLE;
+        long paletteIndices = scratch.surfacePaletteIndices(
+                region, biomeId, blockId);
+        int biomeIdx = (int) (paletteIndices >>> 32);
+        int blockIdx = (int) paletteIndices;
+
+        boolean leaves = !fluid && visual.leaves();
+        boolean flower = !fluid && visual.flower();
+        boolean glowing = lava || (!water && visual.emissive());
+        BlockPos.MutableBlockPos lightPos = scratch.position(3,
+                blockX, surfaceY, blockZ);
+        int surfaceLight = level.getBrightness(LightLayer.BLOCK, lightPos);
+        lightPos.setY(surfaceY + 1);
+        int blockLight = level.getBrightness(LightLayer.BLOCK, lightPos);
+
+        int flags = Math.max(0, Math.min(15, blockLight));
+        if (glowing) flags |= 0x10;
+        if (fluid) flags |= 0x20;
+        if (flower) flags |= 0x40;
+        if (leaves) flags |= 0x80;
+        long packed = MapBlockData.packRaw((short) surfaceY, (short) blockIdx,
+                (byte) biomeIdx, (byte) flags, (short) floorY);
+        if (output != null) {
+            pos.setY(surfaceY);
+            output.packed = packed;
+            output.tint = resolveSurfaceTint(level, pos, visibleState,
+                    visual, fluid, glowing);
+            output.light = (byte) Math.max(surfaceLight, blockLight);
+        }
+        return packed;
+    }
+
+    /**
+     * Resolves the visible top state once for the chunk writer. The old path first
+     * searched for the Y coordinate and then fetched/resolved/classified the same
+     * winning state again. Keeping the winning state in scratch removes that second
+     * block lookup from nearly every Surface pixel.
+     */
+    private SurfaceTopSample resolveSurfaceTop(Level level,
+            LevelChunk loadedChunk, int blockX, int blockZ,
+            ScanScratch scratch) {
+        SurfaceTopSample output = scratch.surfaceTop;
+        output.reset();
+        int minimumY = level.getMinBuildHeight();
+        BlockPos.MutableBlockPos probe = scratch.position(1,
+                blockX, minimumY, blockZ);
+
+        if (isCaveLikeDimension(level)) {
+            boolean foundAir = false;
+            for (int y = level.getMaxBuildHeight() - 1; y >= minimumY; y--) {
+                probe.setY(y);
+                BlockState state = loadedChunk == null
+                        ? level.getBlockState(probe)
+                        : loadedChunk.getBlockState(probe);
+                if (!foundAir) {
+                    if (state.isAir()) foundAir = true;
+                    continue;
+                }
+                if (isVisibleMapSurface(level, probe, state)) {
+                    captureSurfaceTop(output, level, probe, y, state, true);
+                    return output;
+                }
+            }
+        } else {
+            int highestY = loadedChunk == null
+                    ? level.getHeight(Heightmap.Types.WORLD_SURFACE,
+                            blockX, blockZ)
+                    : loadedChunk.getHeight(Heightmap.Types.WORLD_SURFACE,
+                            blockX & 15, blockZ & 15);
+            for (int y = highestY; y >= minimumY; y--) {
+                probe.setY(y);
+                BlockState state = loadedChunk == null
+                        ? level.getBlockState(probe)
+                        : loadedChunk.getBlockState(probe);
+                if (isVisibleMapSurface(level, probe, state)) {
+                    captureSurfaceTop(output, level, probe, y, state, true);
+                    return output;
+                }
+            }
+        }
+
+        // Preserve the legacy minimum-height fallback. buildPackedBlockData will
+        // turn a non-visible fallback into EMPTY_PACKED exactly as before.
+        probe.setY(minimumY);
+        BlockState fallback = loadedChunk == null
+                ? level.getBlockState(probe)
+                : loadedChunk.getBlockState(probe);
+        captureSurfaceTop(output, level, probe, minimumY, fallback,
+                isVisibleMapSurface(level, probe, fallback));
+        return output;
+    }
+
+    private void captureSurfaceTop(SurfaceTopSample output, Level level,
+            BlockPos.MutableBlockPos position, int y, BlockState state,
+            boolean visible) {
+        output.surfaceY = y;
+        output.actualState = state;
+        output.visibleState = blockEntityVisuals.resolveLive(
+                level, position, state);
+        output.visual = output.visibleState == null ? null
+                : visualClassifier.info(output.visibleState);
+        output.visible = visible && output.visibleState != null
+                && isVisibleMapSurface(level, position, output.visibleState);
+    }
+
+    /**
+     * Biomes are sampled on Minecraft's quart grid. A 16x16 chunk therefore tends
+     * to reuse the same few biome holders dozens of times. Keep a tiny direct-mapped
+     * cache in the scanner scratch instead of constructing Optional/registry paths
+     * for every map pixel.
+     */
+    private String resolveSurfaceBiomeId(Level level,
+            BlockPos.MutableBlockPos position, ScanScratch scratch) {
+        scratch.beginSurfaceLevel(level);
+        int quartX = position.getX() >> 2;
+        int quartY = position.getY() >> 2;
+        int quartZ = position.getZ() >> 2;
+        long key = ((long) (quartX & 0x03FF_FFFF) << 38)
+                | ((long) (quartZ & 0x03FF_FFFF) << 12)
+                | (quartY & 0xFFFL);
+        String cached = scratch.surfaceBiome(key);
+        if (cached != null) return cached;
         String biomeId = "minecraft:plains";
         try {
-            Holder<Biome> biomeHolder = level.getBiome(pos);
-            java.util.Optional<net.minecraft.resources.ResourceKey<Biome>> keyOpt = biomeHolder.unwrapKey();
+            Holder<Biome> biomeHolder = level.getBiome(position);
+            java.util.Optional<net.minecraft.resources.ResourceKey<Biome>> keyOpt =
+                    biomeHolder.unwrapKey();
             if (keyOpt.isPresent()) {
                 ResourceLocation location = keyOpt.get().location();
                 biomeId = biomeIdStrings.get(location);
@@ -1829,24 +2520,8 @@ public class ChunkScanner {
             }
         } catch (Exception ignored) {
         }
-
-        int rx = blockX >> 9;
-        int rz = blockZ >> 9;
-        MapManager.Region region = MapManager.getInstance().getRegion(rx, rz, true);
-        if (region == null || !region.isLoaded()) return null;
-        int biomeIdx = region.getOrAddBiomeIndex(biomeId);
-        int blockIdx = region.getOrAddBlockIndex(blockId);
-
-        MapVisualClassifier.VisualInfo visual = visualClassifier.info(visibleState);
-        boolean leaves = !fluid && visual.leaves();
-        boolean flower = !fluid && visual.flower();
-        boolean glowing = lava || (!water && visual.emissive());
-        BlockPos.MutableBlockPos lightPos = scanScratch.get().position(3,
-                blockX, surfaceY + 1, blockZ);
-        int blockLight = level.getBrightness(LightLayer.BLOCK, lightPos);
-
-        return MapBlockData.create(surfaceY, floorY, blockIdx, biomeIdx,
-                blockLight, glowing, fluid, flower, leaves);
+        scratch.putSurfaceBiome(key, biomeId);
+        return biomeId;
     }
 
     /**
@@ -1858,8 +2533,7 @@ public class ChunkScanner {
      * through air and water reconstructs the land/seabed cutoff once per X/Z column.</p>
      */
     private static boolean isCaveLikeDimension(Level level) {
-        return level.dimensionType().hasCeiling()
-                || !level.dimensionType().hasSkyLight();
+        return CaveDimensionProfile.shouldScanFromWorldTop(level);
     }
 
     private int getReliableCaveSurfaceCutoff(Level level, int blockX, int blockZ) {
@@ -1888,6 +2562,11 @@ public class ChunkScanner {
     }
 
     private int getHighestY(Level level, int blockX, int blockZ) {
+        return getHighestY(level, null, blockX, blockZ);
+    }
+
+    private int getHighestY(Level level, LevelChunk loadedChunk,
+            int blockX, int blockZ) {
         boolean isCaveLike = isCaveLikeDimension(level);
         int minBuildHeight = level.getMinBuildHeight();
         BlockPos.MutableBlockPos pos = scanScratch.get().position(1,
@@ -1898,7 +2577,8 @@ public class ChunkScanner {
             boolean foundAir = false;
             for (int y = startY; y >= minBuildHeight; y--) {
                 pos.setY(y);
-                BlockState state = level.getBlockState(pos);
+                BlockState state = loadedChunk == null
+                        ? level.getBlockState(pos) : loadedChunk.getBlockState(pos);
                 if (!foundAir) {
                     if (state.isAir()) {
                         foundAir = true;
@@ -1911,10 +2591,14 @@ public class ChunkScanner {
             }
             return minBuildHeight;
         } else {
-            int highestY = level.getHeight(Heightmap.Types.WORLD_SURFACE, blockX, blockZ);
+            int highestY = loadedChunk == null
+                    ? level.getHeight(Heightmap.Types.WORLD_SURFACE, blockX, blockZ)
+                    : loadedChunk.getHeight(Heightmap.Types.WORLD_SURFACE,
+                            blockX & 15, blockZ & 15);
             for (int y = highestY; y >= minBuildHeight; y--) {
                 pos.setY(y);
-                BlockState state = level.getBlockState(pos);
+                BlockState state = loadedChunk == null
+                        ? level.getBlockState(pos) : loadedChunk.getBlockState(pos);
                 if (isVisibleMapSurface(level, pos, state)) {
                     return y;
                 }
@@ -2201,6 +2885,7 @@ public class ChunkScanner {
     }
 
     private static final class ScanScratch {
+        private static final int SURFACE_CACHE_SIZE = 64;
         private final BlockPos.MutableBlockPos[] positions = {
                 new BlockPos.MutableBlockPos(),
                 new BlockPos.MutableBlockPos(),
@@ -2208,9 +2893,101 @@ public class ChunkScanner {
                 new BlockPos.MutableBlockPos()
         };
         private final WaterFloor waterFloor = new WaterFloor();
+        private final SurfaceColumnSample surfaceSample = new SurfaceColumnSample();
+        private final SurfaceTopSample surfaceTop = new SurfaceTopSample();
+        private final CaveColumnData.Builder caveColumnBuilder =
+                new CaveColumnData.Builder();
+        private final byte[] lightLevels = new byte[256];
+        private final long[] surfacePacked = new long[256];
+        private final int[] surfaceTints = new int[256];
+        private final boolean[] surfaceValid = new boolean[256];
+        private final long[] biomeKeys = new long[SURFACE_CACHE_SIZE];
+        private final String[] biomeValues = new String[SURFACE_CACHE_SIZE];
+        private final String[] paletteBiomeIds = new String[SURFACE_CACHE_SIZE];
+        private final String[] paletteBlockIds = new String[SURFACE_CACHE_SIZE];
+        private final long[] paletteValues = new long[SURFACE_CACHE_SIZE];
+        private MapManager.Region paletteRegion;
+        private Level surfaceLevel;
 
         private BlockPos.MutableBlockPos position(int slot, int x, int y, int z) {
             return positions[slot].set(x, y, z);
+        }
+
+        private void beginSurfaceLevel(Level level) {
+            if (surfaceLevel == level) return;
+            surfaceLevel = level;
+            paletteRegion = null;
+            java.util.Arrays.fill(biomeValues, null);
+            java.util.Arrays.fill(paletteBiomeIds, null);
+            java.util.Arrays.fill(paletteBlockIds, null);
+        }
+
+        private void beginSurfaceSlice(Level level, MapManager.Region region) {
+            beginSurfaceLevel(level);
+            if (paletteRegion == region) return;
+            paletteRegion = region;
+            java.util.Arrays.fill(paletteBiomeIds, null);
+            java.util.Arrays.fill(paletteBlockIds, null);
+        }
+
+        private String surfaceBiome(long key) {
+            int slot = (int) (key ^ (key >>> 32)) & (SURFACE_CACHE_SIZE - 1);
+            String value = biomeValues[slot];
+            return value != null && biomeKeys[slot] == key ? value : null;
+        }
+
+        private void putSurfaceBiome(long key, String value) {
+            int slot = (int) (key ^ (key >>> 32)) & (SURFACE_CACHE_SIZE - 1);
+            biomeKeys[slot] = key;
+            biomeValues[slot] = value;
+        }
+
+        private long surfacePaletteIndices(MapManager.Region region,
+                String biomeId, String blockId) {
+            if (paletteRegion != region) {
+                paletteRegion = region;
+                java.util.Arrays.fill(paletteBiomeIds, null);
+                java.util.Arrays.fill(paletteBlockIds, null);
+            }
+            int hash = 31 * biomeId.hashCode() + blockId.hashCode();
+            int slot = hash & (SURFACE_CACHE_SIZE - 1);
+            if (biomeId.equals(paletteBiomeIds[slot])
+                    && blockId.equals(paletteBlockIds[slot])) {
+                return paletteValues[slot];
+            }
+            long value = region.getOrAddSurfacePaletteIndices(biomeId, blockId);
+            paletteBiomeIds[slot] = biomeId;
+            paletteBlockIds[slot] = blockId;
+            paletteValues[slot] = value;
+            return value;
+        }
+    }
+
+    private static final class SurfaceTopSample {
+        private int surfaceY;
+        private BlockState actualState;
+        private BlockState visibleState;
+        private MapVisualClassifier.VisualInfo visual;
+        private boolean visible;
+
+        private void reset() {
+            surfaceY = 0;
+            actualState = null;
+            visibleState = null;
+            visual = null;
+            visible = false;
+        }
+    }
+
+    private static final class SurfaceColumnSample {
+        private long packed = SURFACE_DATA_UNAVAILABLE;
+        private int tint = SurfaceTintData.UNKNOWN;
+        private byte light;
+
+        private void reset() {
+            packed = SURFACE_DATA_UNAVAILABLE;
+            tint = SurfaceTintData.UNKNOWN;
+            light = 0;
         }
     }
 }

@@ -36,6 +36,16 @@ public final class SurfaceRegionSource {
             return owner.chunkReadiness(localChunkX, localChunkZ);
         }
 
+        void copyReadinessUnsafe(long[] presentDestination,
+                long[] dirtyDestination, int wordOffset,
+                long[] revisionDestination, int revisionOffset) {
+            synchronized (this) {
+                if (closed) return;
+            }
+            owner.copyReadiness(presentDestination, dirtyDestination,
+                    wordOffset, revisionDestination, revisionOffset);
+        }
+
         View acquireView() {
             synchronized (this) {
                 if (closed) return null;
@@ -132,6 +142,8 @@ public final class SurfaceRegionSource {
     private final ChunkSnapshot[] chunks = new ChunkSnapshot[CHUNK_COUNT];
     private final MapMemoryLeaseManager.Lease[] chunkLeases =
             new MapMemoryLeaseManager.Lease[CHUNK_COUNT];
+    /** Persistent presence bits let capture probes inspect 1,024 chunks in one lock. */
+    private final long[] presentChunkMask = new long[DIRTY_WORDS];
     private final long[] dirtyChunkMask = new long[DIRTY_WORDS];
     private String[] biomePalette = new String[0];
     private String[] blockPalette = new String[0];
@@ -225,6 +237,7 @@ public final class SurfaceRegionSource {
         chunkLeases[index] = memoryLease;
         if (previousLease != null) previousLease.close();
         sourceRevision = Math.max(sourceRevision, snapshot.sourceRevision());
+        presentChunkMask[index >>> 6] |= 1L << (index & 63);
         dirtyChunkMask[index >>> 6] &= ~(1L << (index & 63));
 
         int leafX = chunkX >>> 2;
@@ -303,6 +316,32 @@ public final class SurfaceRegionSource {
                 ? 1 : 2;
     }
 
+    /**
+     * Copies the complete readiness bitmap while holding the region lock once.
+     * The previous probe path reacquired this monitor for every inspected chunk,
+     * which became expensive when several rejected 4x4 batches were retried in
+     * the same frame.
+     */
+    private synchronized void copyReadiness(long[] presentDestination,
+            long[] dirtyDestination, int wordOffset,
+            long[] revisionDestination, int revisionOffset) {
+        if (released || presentDestination == null || dirtyDestination == null
+                || revisionDestination == null
+                || wordOffset < 0
+                || wordOffset + DIRTY_WORDS > presentDestination.length
+                || wordOffset + DIRTY_WORDS > dirtyDestination.length
+                || revisionOffset < 0
+                || revisionOffset + 1 >= revisionDestination.length) {
+            return;
+        }
+        System.arraycopy(presentChunkMask, 0, presentDestination, wordOffset,
+                DIRTY_WORDS);
+        System.arraycopy(dirtyChunkMask, 0, dirtyDestination, wordOffset,
+                DIRTY_WORDS);
+        revisionDestination[revisionOffset] = sourceRevision;
+        revisionDestination[revisionOffset + 1] = paletteRevision;
+    }
+
     private synchronized void releaseView() {
         if (activeViews > 0) activeViews--;
         if (activeViews == 0 && closeRequested) releaseStorage();
@@ -317,6 +356,7 @@ public final class SurfaceRegionSource {
             chunkLeases[index] = null;
             if (lease != null) lease.close();
         }
+        Arrays.fill(presentChunkMask, 0L);
         Arrays.fill(dirtyChunkMask, -1L);
         dirtyLeafMask = -1L;
     }

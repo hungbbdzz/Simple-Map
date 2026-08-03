@@ -28,6 +28,21 @@ SIMPLE_MAP_MASTER_ROADMAP*.md
 V18_*.md
 V17_*.md
 
+# Local performance investigation and reference sources
+.simplemap-sandbox-gradle-home/
+xaeromap/
+javac.*.args
+
+# Local PASS/runtime reports and captures
+PASS*.md
+PASS*.txt
+PASS*.csv
+PASS*.json
+PASS*.bat
+BOTTLENECK_FIX_REPORT_*.md
+RUNTIME_VALIDATION_*.md
+STATIC_VALIDATION_*.txt
+
 # Patch files (internal hotfixes)
 *.patch
 

@@ -40,6 +40,7 @@ public final class RegionDataStore {
     private static final int LEGACY_BYTES_PER_PIXEL = 6;
     private static final int VERSION_2_BYTES_PER_PIXEL = 8;
     private static final int VERSION_3_BYTES_PER_PIXEL = 12;
+    public static final int COMPLETE_CHUNK_WORDS = SurfaceChunkCoverage.WORDS;
     private static final int MAX_PALETTE_ENTRIES = 65_535;
     private static final int MAX_COMPRESSED_FILE_BYTES = 8 * 1024 * 1024;
 
@@ -68,7 +69,8 @@ public final class RegionDataStore {
     private RegionDataStore() {
     }
 
-    public record StoredRegion(long[] pixels, int[] tints, String[] biomePalette, String[] blockPalette) {
+    public record StoredRegion(long[] pixels, int[] tints, String[] biomePalette,
+            String[] blockPalette, long[] completeChunks) {
         public StoredRegion {
             if (pixels == null || pixels.length != PIXEL_COUNT) {
                 throw new IllegalArgumentException("A SimpleMap region must contain exactly " + PIXEL_COUNT + " pixels");
@@ -78,19 +80,36 @@ public final class RegionDataStore {
             }
             biomePalette = biomePalette == null ? new String[0] : biomePalette;
             blockPalette = blockPalette == null ? new String[0] : blockPalette;
+            completeChunks = completeChunks == null
+                    ? inferCompleteChunks(pixels) : completeChunks;
+            if (completeChunks.length != COMPLETE_CHUNK_WORDS) {
+                throw new IllegalArgumentException("A SimpleMap region must contain exactly "
+                        + COMPLETE_CHUNK_WORDS + " chunk coverage words");
+            }
+        }
+
+        public StoredRegion(long[] pixels, int[] tints, String[] biomePalette,
+                String[] blockPalette) {
+            this(pixels, tints, biomePalette, blockPalette, null);
         }
 
         /** Backwards-compatible constructor for callers without tint metadata. */
         public StoredRegion(long[] pixels, String[] biomePalette, String[] blockPalette) {
-            this(pixels, unknownTints(), biomePalette, blockPalette);
+            this(pixels, unknownTints(), biomePalette, blockPalette, null);
         }
 
         public StoredRegion deepCopy() {
             return new StoredRegion(Arrays.copyOf(pixels, pixels.length),
                     Arrays.copyOf(tints, tints.length),
                     Arrays.copyOf(biomePalette, biomePalette.length),
-                    Arrays.copyOf(blockPalette, blockPalette.length));
+                    Arrays.copyOf(blockPalette, blockPalette.length),
+                    Arrays.copyOf(completeChunks, completeChunks.length));
         }
+    }
+
+    private static long[] inferCompleteChunks(long[] pixels) {
+        return SurfaceChunkCoverage.inferLegacy(pixels, REGION_SIZE,
+                MapBlockData.EMPTY_PACKED);
     }
 
     private static int[] unknownTints() {
@@ -105,21 +124,28 @@ public final class RegionDataStore {
         // Normal client-tick persistence should call trySaveAsync() first so it
         // cannot retain snapshots for every loaded region at once.
         enqueueSave(directory, rx, rz, packedPixels, tints,
-                biomePalette, blockPalette, true, null);
+                biomePalette, blockPalette, null, true, null);
+    }
+
+    public static void saveAsync(File directory, int rx, int rz, long[] packedPixels,
+            int[] tints, String[] biomePalette, String[] blockPalette,
+            long[] completeChunks, Consumer<SaveResult> completion) {
+        enqueueSave(directory, rx, rz, packedPixels, tints,
+                biomePalette, blockPalette, completeChunks, true, completion);
     }
 
     public static boolean trySaveAsync(File directory, int rx, int rz,
             long[] packedPixels, int[] tints, String[] biomePalette,
             String[] blockPalette) {
         return enqueueSave(directory, rx, rz, packedPixels, tints,
-                biomePalette, blockPalette, false, null);
+                biomePalette, blockPalette, null, false, null);
     }
 
     public static void saveAsync(File directory, int rx, int rz,
             long[] packedPixels, int[] tints, String[] biomePalette,
             String[] blockPalette, Consumer<SaveResult> completion) {
         enqueueSave(directory, rx, rz, packedPixels, tints,
-                biomePalette, blockPalette, true, completion);
+                biomePalette, blockPalette, null, true, completion);
     }
 
 
@@ -133,7 +159,28 @@ public final class RegionDataStore {
             long[] packedPixels, int[] tints, String[] biomePalette,
             String[] blockPalette, Consumer<SaveResult> completion) {
         return enqueueSave(directory, rx, rz, packedPixels, tints,
-                biomePalette, blockPalette, false, completion);
+                biomePalette, blockPalette, null, false, completion);
+    }
+
+    public static boolean trySaveAsync(File directory, int rx, int rz,
+            long[] packedPixels, int[] tints, String[] biomePalette,
+            String[] blockPalette, long[] completeChunks,
+            Consumer<SaveResult> completion) {
+        return enqueueSave(directory, rx, rz, packedPixels, tints,
+                biomePalette, blockPalette, completeChunks, false, completion);
+    }
+
+    /**
+     * Accepts arrays freshly created by Region.snapshot() and transfers their
+     * ownership to the IO request without cloning another multi-MiB region.
+     */
+    public static boolean trySaveOwnedAsync(File directory, int rx, int rz,
+            long[] packedPixels, int[] tints, String[] biomePalette,
+            String[] blockPalette, long[] completeChunks,
+            Consumer<SaveResult> completion) {
+        return enqueueSave(directory, rx, rz, packedPixels, tints,
+                biomePalette, blockPalette, completeChunks, false, completion,
+                false);
     }
 
     public static boolean canAcceptSave(File directory, int rx, int rz) {
@@ -146,10 +193,20 @@ public final class RegionDataStore {
 
     private static boolean enqueueSave(File directory, int rx, int rz,
             long[] packedPixels, int[] tints, String[] biomePalette,
-            String[] blockPalette, boolean force,
+            String[] blockPalette, long[] completeChunks, boolean force,
             Consumer<SaveResult> completion) {
+        return enqueueSave(directory, rx, rz, packedPixels, tints, biomePalette,
+                blockPalette, completeChunks, force, completion, true);
+    }
+
+    private static boolean enqueueSave(File directory, int rx, int rz,
+            long[] packedPixels, int[] tints, String[] biomePalette,
+            String[] blockPalette, long[] completeChunks, boolean force,
+            Consumer<SaveResult> completion, boolean defensiveCopy) {
         if (directory == null || packedPixels == null || packedPixels.length != PIXEL_COUNT
-                || tints == null || tints.length != PIXEL_COUNT) {
+                || tints == null || tints.length != PIXEL_COUNT
+                || (completeChunks != null
+                        && completeChunks.length != COMPLETE_CHUNK_WORDS)) {
             notifyCompletion(completion, new SaveResult(SaveStatus.REJECTED,
                     directory, rx, rz, null));
             return false;
@@ -162,11 +219,21 @@ public final class RegionDataStore {
                     directory, rx, rz, null));
             return false;
         }
+        long[] ownedPixels = defensiveCopy
+                ? Arrays.copyOf(packedPixels, packedPixels.length) : packedPixels;
+        int[] ownedTints = defensiveCopy
+                ? Arrays.copyOf(tints, tints.length) : tints;
+        String[] ownedBiomes = defensiveCopy
+                ? Arrays.copyOf(biomePalette, biomePalette.length) : biomePalette;
+        String[] ownedBlocks = defensiveCopy
+                ? Arrays.copyOf(blockPalette, blockPalette.length) : blockPalette;
+        long[] ownedCoverage = completeChunks == null
+                ? inferCompleteChunks(ownedPixels)
+                : (defensiveCopy ? Arrays.copyOf(completeChunks, completeChunks.length)
+                        : completeChunks);
         SaveRequest request = new SaveRequest(directory, rx, rz,
-                Arrays.copyOf(packedPixels, packedPixels.length),
-                Arrays.copyOf(tints, tints.length),
-                Arrays.copyOf(biomePalette, biomePalette.length),
-                Arrays.copyOf(blockPalette, blockPalette.length), completion);
+                ownedPixels, ownedTints, ownedBiomes, ownedBlocks, ownedCoverage,
+                completion);
         SaveRequest previous = PENDING_SAVES.put(key, request);
         if (previous != null && previous != request) {
             previous.notifyResult(SaveStatus.SUPERSEDED, null);
@@ -230,8 +297,16 @@ public final class RegionDataStore {
 
     public static boolean load(File directory, int rx, int rz, long[] outPixels, int[] outTints,
             List<String> outBiomePalette, List<String> outBlockPalette) {
+        return load(directory, rx, rz, outPixels, outTints, null,
+                outBiomePalette, outBlockPalette);
+    }
+
+    public static boolean load(File directory, int rx, int rz, long[] outPixels,
+            int[] outTints, long[] outCompleteChunks,
+            List<String> outBiomePalette, List<String> outBlockPalette) {
         Arrays.fill(outPixels, MapBlockData.EMPTY_PACKED);
         Arrays.fill(outTints, SurfaceTintData.UNKNOWN);
+        if (outCompleteChunks != null) Arrays.fill(outCompleteChunks, 0L);
         File file = new File(directory, fileName(rx, rz));
         StoredRegion pending = latestPending(directory, rx, rz);
         if (pending == null && !file.isFile()) return false;
@@ -239,6 +314,13 @@ public final class RegionDataStore {
             StoredRegion stored = pending != null ? pending : read(file);
             System.arraycopy(stored.pixels(), 0, outPixels, 0, outPixels.length);
             System.arraycopy(stored.tints(), 0, outTints, 0, outTints.length);
+            if (outCompleteChunks != null) {
+                if (outCompleteChunks.length != COMPLETE_CHUNK_WORDS) {
+                    throw new IllegalArgumentException("Invalid chunk coverage output");
+                }
+                System.arraycopy(stored.completeChunks(), 0, outCompleteChunks, 0,
+                        COMPLETE_CHUNK_WORDS);
+            }
             outBiomePalette.clear();
             outBiomePalette.addAll(Arrays.asList(stored.biomePalette()));
             outBlockPalette.clear();
@@ -248,6 +330,7 @@ public final class RegionDataStore {
             LOGGER.error("Failed to load region {},{}", rx, rz, exception);
             Arrays.fill(outPixels, MapBlockData.EMPTY_PACKED);
             Arrays.fill(outTints, SurfaceTintData.UNKNOWN);
+            if (outCompleteChunks != null) Arrays.fill(outCompleteChunks, 0L);
             outBiomePalette.clear();
             outBlockPalette.clear();
             return false;
@@ -305,8 +388,11 @@ public final class RegionDataStore {
             String[] blockPalette = readPalette(input);
             int bytesPerPixel = version >= 3 ? VERSION_3_BYTES_PER_PIXEL
                     : (version >= 2 ? VERSION_2_BYTES_PER_PIXEL : LEGACY_BYTES_PER_PIXEL);
-            byte[] raw = readCompressedPayload(input, PIXEL_COUNT * bytesPerPixel);
-            if (raw.length != PIXEL_COUNT * bytesPerPixel) {
+            int coverageBytes = version >= 4
+                    ? COMPLETE_CHUNK_WORDS * Long.BYTES : 0;
+            int expectedBytes = PIXEL_COUNT * bytesPerPixel + coverageBytes;
+            byte[] raw = readCompressedPayload(input, expectedBytes);
+            if (raw.length != expectedBytes) {
                 throw new EOFException("Unexpected pixel payload length " + raw.length);
             }
 
@@ -329,8 +415,20 @@ public final class RegionDataStore {
                             | (raw[pointer++] & 0xFF);
                 }
             }
+            long[] completeChunks = version >= 4
+                    ? new long[COMPLETE_CHUNK_WORDS] : inferCompleteChunks(pixels);
+            if (version >= 4) {
+                for (int word = 0; word < COMPLETE_CHUNK_WORDS; word++) {
+                    long value = 0L;
+                    for (int octet = 0; octet < Long.BYTES; octet++) {
+                        value = (value << 8) | (raw[pointer++] & 0xFFL);
+                    }
+                    completeChunks[word] = value;
+                }
+            }
             validatePaletteReferences(pixels, biomePalette.length, blockPalette.length);
-            return new StoredRegion(pixels, tints, biomePalette, blockPalette);
+            return new StoredRegion(pixels, tints, biomePalette, blockPalette,
+                    completeChunks);
         }
     }
 
@@ -368,7 +466,8 @@ public final class RegionDataStore {
         writePalette(output, region.biomePalette());
         writePalette(output, region.blockPalette());
 
-        byte[] raw = new byte[PIXEL_COUNT * VERSION_3_BYTES_PER_PIXEL];
+        byte[] raw = new byte[PIXEL_COUNT * VERSION_3_BYTES_PER_PIXEL
+                + COMPLETE_CHUNK_WORDS * Long.BYTES];
         int pointer = 0;
         for (int i = 0; i < region.pixels().length; i++) {
             long packed = region.pixels()[i];
@@ -388,6 +487,11 @@ public final class RegionDataStore {
             raw[pointer++] = (byte) (tint >>> 16);
             raw[pointer++] = (byte) (tint >>> 8);
             raw[pointer++] = (byte) tint;
+        }
+        for (long word : region.completeChunks()) {
+            for (int shift = 56; shift >= 0; shift -= 8) {
+                raw[pointer++] = (byte) (word >>> shift);
+            }
         }
         try (GZIPOutputStream gzip = new GZIPOutputStream(output, 64 * 1024)) {
             gzip.write(raw);
@@ -412,6 +516,11 @@ public final class RegionDataStore {
 
         long[] merged = Arrays.copyOf(base.pixels(), PIXEL_COUNT);
         int[] mergedTints = Arrays.copyOf(base.tints(), PIXEL_COUNT);
+        long[] mergedCompleteChunks = Arrays.copyOf(base.completeChunks(),
+                COMPLETE_CHUNK_WORDS);
+        for (int word = 0; word < COMPLETE_CHUNK_WORDS; word++) {
+            mergedCompleteChunks[word] |= overlay.completeChunks()[word];
+        }
         for (int i = 0; i < PIXEL_COUNT; i++) {
             long incoming = overlay.pixels()[i];
             if (MapBlockData.isEmpty(incoming)) continue;
@@ -440,7 +549,8 @@ public final class RegionDataStore {
             mergedTints[i] = overlay.tints()[i];
         }
         return new StoredRegion(merged, mergedTints,
-                outputBiomes.toArray(String[]::new), outputBlocks.toArray(String[]::new));
+                outputBiomes.toArray(String[]::new), outputBlocks.toArray(String[]::new),
+                mergedCompleteChunks);
     }
 
     /** Merges a validated incoming packet into a local file atomically. */
@@ -587,11 +697,12 @@ public final class RegionDataStore {
         private final int[] tints;
         private final String[] biomePalette;
         private final String[] blockPalette;
+        private final long[] completeChunks;
         private final Consumer<SaveResult> completion;
 
         private SaveRequest(File directory, int rx, int rz, long[] packedPixels,
                 int[] tints, String[] biomePalette, String[] blockPalette,
-                Consumer<SaveResult> completion) {
+                long[] completeChunks, Consumer<SaveResult> completion) {
             this.directory = directory;
             this.rx = rx;
             this.rz = rz;
@@ -599,6 +710,7 @@ public final class RegionDataStore {
             this.tints = tints;
             this.biomePalette = biomePalette;
             this.blockPalette = blockPalette;
+            this.completeChunks = completeChunks;
             this.completion = completion;
         }
 
@@ -612,7 +724,8 @@ public final class RegionDataStore {
 
         /** Immutable owned arrays for the IO worker; no second 3 MiB clone. */
         private StoredRegion storedRegionView() {
-            return new StoredRegion(packedPixels, tints, biomePalette, blockPalette);
+            return new StoredRegion(packedPixels, tints, biomePalette, blockPalette,
+                    completeChunks);
         }
 
         /** Defensive copy for readers racing an in-flight save. */

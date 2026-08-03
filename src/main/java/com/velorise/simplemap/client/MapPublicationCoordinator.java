@@ -6,7 +6,9 @@ package com.velorise.simplemap.client;
  * <p>Viewport/tick code publishes intent and performs no GPU work. Render events
  * drain the same intent against one shared frame ledger. This mirrors Xaero's
  * central render-process pattern: completed CPU work can advance every rendered
- * frame, while a slow frame automatically receives a smaller upload slice.</p>
+ * frame, while a slow frame automatically receives a smaller upload slice. The
+ * visible projection always runs first; a cadence-bounded secondary Surface
+ * maintenance slice may then use otherwise-unused shared-ledger capacity.</p>
  */
 public final class MapPublicationCoordinator {
     private static final MapPublicationCoordinator INSTANCE =
@@ -77,12 +79,15 @@ public final class MapPublicationCoordinator {
     }
 
     /**
-     * Drains at most one projection family for one actual rendered frame. The
+     * Drains one primary projection family for one actual rendered frame. A
+     * cadence-bounded Surface maintenance slice may use leftover ledger capacity
+     * after Cave publication. The
      * viewport intent deliberately remains live until the next client tick, so a
      * 120/144 Hz client can consume completed work in small slices instead of one
      * 20 TPS burst.
      */
     public void drainFrame(long frameId) {
+        if (MapActivityGate.getInstance().blocksForegroundStreaming()) return;
         if (!publicationAllowed) return;
         if (frameId == lastFrameId) return;
         if (!surfaceRequested && !layeredCaveRequested && !fullCaveRequested) return;
@@ -90,12 +95,22 @@ public final class MapPublicationCoordinator {
 
         boolean focused = fullCaveRequested ? fullCaveFocus
                 : layeredCaveRequested ? layeredCaveFocus : surfaceFocus;
+        // Source capture and GPU upload must share the same physical-frame
+        // boundary. A time-window budget can otherwise refill repeatedly inside
+        // one already-slow frame and deepen the movement hitch.
+        SurfaceRegionSourceDatabase.getInstance().beginPublicationFrame(frameId);
         MapGpuBudgetController.getInstance().beginFrame(focused);
         long started = System.nanoTime();
+        boolean cavePrimary = false;
         if (fullCaveRequested) {
             FullCaveTextureManager.getInstance().uploadDirtyTextures(fullCaveFocus);
+            cavePrimary = true;
         } else if (layeredCaveRequested) {
-            CaveTextureManager.getInstance().uploadDirtyTextures(false);
+            // Focus is now deadline-safe inside UnifiedCaveTextureManager. Preserve
+            // the viewport's close-zoom intent so Layered Cave is not artificially
+            // throttled while Full Cave receives the same focus signal correctly.
+            CaveTextureManager.getInstance().uploadDirtyTextures(layeredCaveFocus);
+            cavePrimary = true;
         } else if (surfaceRequested) {
             /*
              * Publish prepared coarse branches before exact leaves consume the
@@ -108,6 +123,28 @@ public final class MapPublicationCoordinator {
             MapOverviewTextureManager.getInstance().publishBranches(surfaceFocus);
             MapTextureManager.getInstance().uploadExactTextures(
                     surfaceLane, surfaceFocus);
+        }
+        /*
+         * Cave owns the visible projection, but a completed Surface payload is
+         * immutable and needs only a bounded atlas upload. Let one such payload use
+         * leftover shared GPU-ledger capacity on non-pressured frames. This does not
+         * capture source or submit CPU work, and tryReserve() still protects the
+         * primary Cave upload and minimap reserve.
+         */
+        if (cavePrimary
+                && !MapPerformanceGovernor.getInstance().underPressure()) {
+            if (surfaceRequested) {
+                // A maintenance request exists only on the bounded Cave-background
+                // cadence. Let it submit/drain one BACKGROUND Surface slice using
+                // the existing 1.5 ms deadline and shared GPU ledger.
+                MapOverviewTextureManager.getInstance().publishBranches(false);
+                MapTextureManager.getInstance().uploadExactTextures(
+                        surfaceLane == null ? MapRequestLane.BACKGROUND : surfaceLane,
+                        false);
+            } else if (MapTextureManager.getInstance().hasCompletedExactTextures()) {
+                MapTextureManager.getInstance().publishCompletedExactTextures(
+                        1, 650_000L);
+            }
         }
         drainCount++;
         MapObservationTelemetry.getInstance().record(

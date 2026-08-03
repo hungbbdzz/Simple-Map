@@ -10,6 +10,42 @@ import java.util.concurrent.atomic.AtomicInteger;
 /** Runtime bridge between logical page-table entries and Minecraft textures. */
 public final class MapGpuPageTableService {
     public record Resolved(PageTableEntry entry, ResourceLocation texture) { }
+
+    /**
+     * Allocation-free front-table view for one render interval. The contained map
+     * is immutable until the next frame-boundary swap because all publication
+     * writes target the page table's back buffer.
+     */
+    public static final class RenderView {
+        private final Map<TileKey, PageTableEntry> entries;
+        private final Map<Integer, Storage> storages;
+        private final long generation;
+
+        private RenderView(Map<TileKey, PageTableEntry> entries,
+                Map<Integer, Storage> storages, long generation) {
+            this.entries = entries;
+            this.storages = storages;
+            this.generation = generation;
+        }
+
+        public long generation() {
+            return generation;
+        }
+
+        public PageTableEntry entry(TileKey key) {
+            PageTableEntry entry = key == null ? null : entries.get(key);
+            return entry != null && entry.resident() ? entry : null;
+        }
+
+        public ResourceLocation texture(PageTableEntry entry) {
+            if (entry == null) return null;
+            Storage storage = storages.get(entry.storageId());
+            return storage != null
+                    && storage.generation == entry.storageGeneration()
+                            ? storage.texture : null;
+        }
+    }
+
     public record Summary(long generation, int entries, int storages,
             long staged, long swaps, long generationMismatches) { }
 
@@ -23,6 +59,8 @@ public final class MapGpuPageTableService {
     private long staged;
     private long swaps;
     private long generationMismatches;
+    private volatile RenderView renderView = new RenderView(
+            Map.of(), Map.of(), 0L);
 
     private MapGpuPageTableService() { }
 
@@ -75,10 +113,25 @@ public final class MapGpuPageTableService {
         return new Resolved(entry, storage.texture);
     }
 
+    /** One volatile read per draw plan replaces one synchronized lookup and one
+     * short-lived Resolved allocation per visible tile. */
+    public RenderView renderView() {
+        return renderView;
+    }
+
     public synchronized List<GpuPageTable.RetiredSlot> swapAtFrameBoundary() {
         long before = table.frontGeneration();
         List<GpuPageTable.RetiredSlot> retired = table.swapAtFrameBoundary();
-        if (table.frontGeneration() != before) swaps++;
+        long generation = table.frontGeneration();
+        if (generation != before) {
+            swaps++;
+            // The front map will not be mutated before the next swap. Storage
+            // entries are tiny and change only when an atlas is recreated; copying
+            // that map keeps the render view stable without cloning thousands of
+            // page-table entries.
+            renderView = new RenderView(table.frontView(),
+                    Map.copyOf(storages), generation);
+        }
         return retired;
     }
 
@@ -92,6 +145,8 @@ public final class MapGpuPageTableService {
         storageIds.clear();
         storages.clear();
         nextStorageId.set(1);
+        renderView = new RenderView(Map.of(), Map.of(),
+                table.frontGeneration());
     }
 
     private record Storage(ResourceLocation texture, long generation) { }

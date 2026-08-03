@@ -13,8 +13,15 @@ import com.velorise.simplemap.client.MapRequestLane;
  */
 public final class CaveScreenSpacePolicy {
     public static final int EXACT_PAGE_WORLD_SIZE = 64;
-    private static final float BRANCH_FIRST_PAGE_PIXELS = 8.0f;
-    private static final float SPARSE_EXACT_PAGE_PIXELS = 16.0f;
+    /*
+     * Below twenty screen pixels an exact 64x64 cave page is already smaller than
+     * one third of its native edge and wide fullscreen views exceed the exact atlas
+     * working set. Keeping exact traversal active at 0.25-0.30x admitted 390-500
+     * pages and produced 80-90 ms render-plan/client-thread spikes. Branch textures
+     * are density-correct here and exact work remains available as bounded seeds.
+     */
+    private static final float BRANCH_FIRST_PAGE_PIXELS = 20.0f;
+    private static final float SPARSE_EXACT_PAGE_PIXELS = 24.0f;
 
     private CaveScreenSpacePolicy() {
     }
@@ -30,8 +37,8 @@ public final class CaveScreenSpacePolicy {
     }
 
     /**
-     * At this density one 64x64 exact page contributes fewer than 8 screen pixels
-     * per edge. Rendering remains branch-only, but one slow coherent leaf seed is
+     * At this density one 64x64 exact page contributes no more than 20 screen pixels
+     * per edge. Rendering remains branch-only, but a bounded coherent leaf seed is
      * still admitted so cold areas can eventually create their branch hierarchy.
      */
     public static boolean branchOnly(float scale, MapRequestLane lane) {
@@ -45,37 +52,32 @@ public final class CaveScreenSpacePolicy {
 
     public static int exactAdmissionBudget(float scale, MapRequestLane lane,
             boolean pressured) {
-        if (lane == MapRequestLane.MINIMAP) return pressured ? 1 : 2;
-        if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) return 1;
-        // A cold far-zoom viewport has no branch/root texture until exact leaves
-        // have supplied it with pixels. One leaf every long polling interval was
-        // too conservative: a large FULL viewport could remain black for minutes.
-        // Keep pressure contraction, but allow a small coherent seed pair while
-        // the worker and GPU governors independently bound build/publication cost.
-        if (branchOnly(scale, lane)) return pressured ? 1 : 2;
-        // Close-zoom fullscreen can keep several region leaves in flight while the
-        // worker/IO and GPU governors enforce their own independent limits. Under
-        // frame pressure it immediately contracts to one.
-        if (pressured) return 1;
-        if (scale >= 0.55f) return 3;
-        if (scale >= 0.35f) return 2;
-        return 1;
+        int normal;
+        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 1 : 4;
+        else if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) normal = 1;
+        else if (branchOnly(scale, lane)) normal = pressured ? 1 : 3;
+        else if (pressured) normal = 1;
+        else if (scale >= 0.55f) normal = 8;
+        else if (scale >= 0.35f) normal = 6;
+        else if (scale >= 0.20f) normal = 4;
+        else normal = 2;
+        return CaveModeTransitionPolicy.exactAdmissionBudget(normal);
     }
 
     /** Delay expensive exact refinement while branch/root coverage is foreground. */
     public static long exactEnumerationRetryMs(float scale, MapRequestLane lane) {
-        if (lane == MapRequestLane.MINIMAP) return 50L;
-        if (branchFirst(scale, lane)) return 120L;
-        if (sparseExact(scale, lane)) return 160L;
-        if (scale < 0.35f) return 140L;
-        if (scale < 0.55f) return 90L;
-        return 70L;
+        if (lane == MapRequestLane.MINIMAP) return 25L;
+        if (branchFirst(scale, lane)) return 55L;
+        if (sparseExact(scale, lane)) return 70L;
+        if (scale < 0.35f) return 60L;
+        if (scale < 0.55f) return 40L;
+        return 25L;
     }
 
     public static long completedPlanPauseMs(float scale, MapRequestLane lane) {
-        if (branchFirst(scale, lane)) return 600L;
-        if (sparseExact(scale, lane)) return 750L;
-        return 750L;
+        if (branchFirst(scale, lane)) return 180L;
+        if (sparseExact(scale, lane)) return 160L;
+        return 120L;
     }
 
     /**
@@ -86,30 +88,31 @@ public final class CaveScreenSpacePolicy {
      */
     public static int sourceAdmissionBudget(float scale, MapRequestLane lane,
             boolean pressured) {
-        if (lane == MapRequestLane.MINIMAP) return pressured ? 1 : 3;
-        if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) {
-            return 1;
-        }
-        if (branchOnly(scale, lane)) return pressured ? 2 : 4;
-        if (pressured) return 2;
-        if (scale >= 0.55f) return 4;
-        if (scale >= 0.35f) return 3;
-        return 2;
+        int normal;
+        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 1 : 4;
+        else if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) normal = 1;
+        else if (branchOnly(scale, lane)) normal = pressured ? 2 : 6;
+        else if (pressured) normal = 2;
+        else if (scale >= 0.55f) normal = 12;
+        else if (scale >= 0.35f) normal = 10;
+        else if (scale >= 0.18f) normal = 8;
+        else normal = 6;
+        return CaveModeTransitionPolicy.sourceAdmissionBudget(normal);
     }
 
     public static long sourceEnumerationRetryMs(float scale, MapRequestLane lane,
             boolean pressured) {
-        if (lane == MapRequestLane.MINIMAP) return pressured ? 90L : 50L;
-        if (branchFirst(scale, lane)) return pressured ? 180L : 100L;
-        if (sparseExact(scale, lane)) return pressured ? 180L : 120L;
-        return pressured ? 120L : 60L;
+        if (lane == MapRequestLane.MINIMAP) return pressured ? 70L : 25L;
+        if (branchFirst(scale, lane)) return pressured ? 140L : 50L;
+        if (sparseExact(scale, lane)) return pressured ? 140L : 60L;
+        return pressured ? 100L : 30L;
     }
 
     public static long completedSourcePlanPauseMs(float scale,
             MapRequestLane lane, boolean pressured) {
-        if (branchFirst(scale, lane)) return pressured ? 600L : 300L;
-        if (sparseExact(scale, lane)) return pressured ? 650L : 400L;
-        return pressured ? 750L : 500L;
+        if (branchFirst(scale, lane)) return pressured ? 500L : 140L;
+        if (sparseExact(scale, lane)) return pressured ? 550L : 160L;
+        return pressured ? 650L : 120L;
     }
 
     /**

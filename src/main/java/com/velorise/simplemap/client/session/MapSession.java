@@ -26,6 +26,8 @@ public final class MapSession {
     private final long sourceGeneration;
     private volatile long styleGeneration;
     private volatile long projectionGeneration;
+    /** Immutable revision metadata reused until a generation changes. */
+    private volatile RevisionStamp cachedStamp;
     private final MapCancellationToken rootToken;
     private volatile State state;
 
@@ -39,6 +41,8 @@ public final class MapSession {
         this.sourceGeneration = sourceGeneration;
         this.styleGeneration = styleGeneration;
         this.projectionGeneration = projectionGeneration;
+        this.cachedStamp = new RevisionStamp(sessionId, sourceGeneration,
+                styleGeneration, projectionGeneration);
         this.state = State.CREATED;
         this.rootToken = new MapCancellationToken(() ->
                 state == State.ACTIVE && current.getAsBoolean());
@@ -62,12 +66,22 @@ public final class MapSession {
     }
 
     void updateStyleGeneration(long generation) {
-        if (state != State.CLOSED) styleGeneration = Math.max(styleGeneration, generation);
+        if (state == State.CLOSED) return;
+        long updated = Math.max(styleGeneration, generation);
+        if (updated != styleGeneration) {
+            styleGeneration = updated;
+            cachedStamp = new RevisionStamp(sessionId, sourceGeneration,
+                    styleGeneration, projectionGeneration);
+        }
     }
 
     void updateProjectionGeneration(long generation) {
-        if (state != State.CLOSED) {
-            projectionGeneration = Math.max(projectionGeneration, generation);
+        if (state == State.CLOSED) return;
+        long updated = Math.max(projectionGeneration, generation);
+        if (updated != projectionGeneration) {
+            projectionGeneration = updated;
+            cachedStamp = new RevisionStamp(sessionId, sourceGeneration,
+                    styleGeneration, projectionGeneration);
         }
     }
 
@@ -81,8 +95,7 @@ public final class MapSession {
     public MapCancellationToken rootToken() { return rootToken; }
 
     public RevisionStamp stamp() {
-        return new RevisionStamp(sessionId, sourceGeneration,
-                styleGeneration, projectionGeneration);
+        return cachedStamp;
     }
 
     public boolean matches(RevisionStamp stamp) {

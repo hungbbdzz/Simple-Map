@@ -2,6 +2,7 @@ package com.velorise.simplemap.client;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.resources.ResourceLocation;
 import com.velorise.simplemap.client.cave.CaveAtlasRegion;
 import com.velorise.simplemap.client.cave.CaveScreenSpacePolicy;
@@ -13,22 +14,78 @@ import com.velorise.simplemap.client.session.MapSessionManager;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.math.Axis;
 import com.mojang.blaze3d.systems.RenderSystem;
+import org.joml.Matrix4f;
 import org.lwjgl.opengl.GL11;
 
-import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
 
 public class MapRenderer {
     private static final MapRenderer INSTANCE = new MapRenderer();
+    private static final ResourceLocation RED_X_TEXTURE =
+            ResourceLocation.fromNamespaceAndPath(
+                    "minecraft", "textures/map/decorations/red_x.png");
     private static final float NIGHT_MIN_BRIGHTNESS = 0.22f;
+    /** Far Cave plans must stay bounded even when most selected-level branches are
+     * absent and fallback traversal would otherwise expand thousands of nodes. */
+    private static final int CAVE_BRANCH_PLAN_MAX_QUADS = 1_024;
+    private static final int CAVE_BRANCH_PLAN_MAX_VISITS = 4_096;
+    /** Coalesce many exact/branch publications into one immutable plan rebuild.
+     * The existing plan remains a valid world-space snapshot while the newest
+     * atlas state waits for the next refresh window. */
+    private static final long FULLSCREEN_PLAN_REFRESH_NANOS = 125_000_000L;
+    private static final long FULLSCREEN_BRANCH_PLAN_REFRESH_NANOS = 300_000_000L;
+    /**
+     * Surface/cave content revisions can advance many times in one visual frame as
+     * worker completions are published. Rebuilding an immutable minimap plan for
+     * every revision boxed/sorted tile instances and recreated vertex arrays much
+     * faster than the player could perceive. Coalesce those publications while an
+     * unchanged plan remains a valid visual snapshot.
+     */
+    private static final long MINIMAP_PLAN_REFRESH_NANOS = 75_000_000L;
+    private static final long MINIMAP_EMPTY_PLAN_REFRESH_NANOS = 33_000_000L;
+    private static final long FULLSCREEN_FALLBACK_MAX_NANOS = 1_500_000_000L;
+    private static final long FULLSCREEN_EMPTY_FALLBACK_MAX_NANOS = 3_000_000_000L;
 
     private int lastSurfaceHierarchyLevel = -1;
     private int lastCaveHierarchyLevel = -1;
     private CachedPlan fullscreenPlan;
     private CachedPlan fullscreenFallbackPlan;
+    private long fullscreenFallbackExpiresNanos;
+    /**
+     * Last non-empty authority plan per mode/layer. Xaero keeps root textures alive
+     * while a new leaf set warms; this small LRU supplies the same atomic visual
+     * handoff across Surface, Layered Cave and Full Cave transitions.
+     */
+    private final RenderStats sharedRenderStats = new RenderStats();
+    private final net.minecraft.world.item.ItemStack fallbackWaypointStack =
+            new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.COMPASS);
+    private final Map<String, net.minecraft.world.item.ItemStack> waypointItemStacks =
+            new LinkedHashMap<>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(
+                        Map.Entry<String, net.minecraft.world.item.ItemStack> eldest) {
+                    return size() > 64;
+                }
+            };
+    private final Map<StablePlanKey, CachedPlan> stableFullscreenPlans =
+            new LinkedHashMap<>(8, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(
+                        Map.Entry<StablePlanKey, CachedPlan> eldest) {
+                    return size() > 8;
+                }
+            };
     private CachedPlan minimapPlan;
     private CachedPlan minimapStagingPlan;
+    private int regionFallbackVisitsRemaining;
     private long minimapStagingSinceNanos;
+    private long lastMinimapPlanBuildNanos;
+    /** Render-thread scratch for at most 24 deduplicated loading cells. */
+    private final long[] loadingCellScratch = new long[24];
+    private static final int[] SPINNER_X = { 0, 1, 1, 1, 0, -1, -1, -1 };
+    private static final int[] SPINNER_Y = { -1, -1, 0, 1, 1, 1, 0, -1 };
 
 
     public static MapRenderer getInstance() {
@@ -70,19 +127,21 @@ public class MapRenderer {
             boolean cachedOnly) {
         drawMapInternal(guiGraphics, viewportX, viewportY, width, height, centerX, centerZ, scale,
                 drawPlayer, rotateWithPlayer, isMinimap, mouseWorldX, mouseWorldZ, partialTick,
-                cachedOnly, true, 1.0f, scale);
+                cachedOnly, true, 1.0f, scale, true, true);
     }
 
     /**
      * Off-screen minimap path. The framebuffer already clips to its own extent, so
-     * GuiGraphics' window-relative scissor must stay disabled here.
+     * GuiGraphics' window-relative scissor must stay disabled here. Live pin
+     * navigation is intentionally excluded and drawn after composition, preventing
+     * exact player motion from invalidating the retained atlas target.
      */
     MapDrawResult drawMapOffscreen(GuiGraphics guiGraphics, int width, int height,
             double centerX, double centerZ, float scale, boolean drawPlayer,
             boolean rotateWithPlayer, float partialTick, float fixedOverlayScale) {
         return drawMapInternal(guiGraphics, 0, 0, width, height, centerX, centerZ, scale,
                 drawPlayer, rotateWithPlayer, true, 0.0, 0.0, partialTick, false, false,
-                fixedOverlayScale, scale);
+                fixedOverlayScale, scale, true, false);
     }
 
     /**
@@ -92,11 +151,51 @@ public class MapRenderer {
      */
     MapDrawResult drawFullscreenMapOffscreen(GuiGraphics guiGraphics, int width, int height,
             double centerX, double centerZ, float renderPixelsPerBlock,
-            float policyPixelsPerBlock, boolean drawPlayer,
-            double mouseWorldX, double mouseWorldZ, float partialTick) {
+            float policyPixelsPerBlock, float partialTick) {
         return drawMapInternal(guiGraphics, 0, 0, width, height, centerX, centerZ,
-                renderPixelsPerBlock, drawPlayer, false, false, mouseWorldX, mouseWorldZ,
-                partialTick, false, false, 1.0f, policyPixelsPerBlock);
+                renderPixelsPerBlock, false, false, false, 0.0, 0.0,
+                partialTick, false, false, 1.0f, policyPixelsPerBlock, false, false);
+    }
+
+    /**
+     * Draws dynamic fullscreen markers after the retained terrain quad.
+     *
+     * <p>Waypoints, hover state, pin navigation and the live player marker are
+     * intentionally excluded from the expensive terrain framebuffer. Mouse and
+     * player motion therefore remain a small GUI overlay rather than invalidating
+     * and replaying all atlas batches.</p>
+     */
+    void drawFullscreenOverlays(GuiGraphics guiGraphics, int viewportX, int viewportY,
+            int width, int height, double centerX, double centerZ, float scale,
+            boolean drawPlayer, double mouseWorldX, double mouseWorldZ,
+            float partialTick) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null || width <= 0 || height <= 0
+                || scale <= 0.0f || !Float.isFinite(scale)) return;
+
+        RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+        PoseStack poseStack = guiGraphics.pose();
+        poseStack.pushPose();
+        guiGraphics.enableScissor(viewportX, viewportY,
+                viewportX + width, viewportY + height);
+        try {
+            poseStack.translate(viewportX + width / 2.0,
+                    viewportY + height / 2.0, 0.0);
+            poseStack.scale(scale, scale, 1.0f);
+            poseStack.translate(-centerX, -centerZ, 0.0);
+
+            double halfW = (width / 2.0) / scale;
+            double halfH = (height / 2.0) / scale;
+            drawMapOverlays(guiGraphics, mc, poseStack,
+                    centerX - halfW, centerX + halfW,
+                    centerZ - halfH, centerZ + halfH,
+                    scale, false, mouseWorldX, mouseWorldZ,
+                    partialTick, 1.0f, true, drawPlayer);
+        } finally {
+            guiGraphics.disableScissor();
+            poseStack.popPose();
+            RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+        }
     }
 
     private MapDrawResult drawMapInternal(GuiGraphics guiGraphics, int viewportX, int viewportY,
@@ -104,13 +203,14 @@ public class MapRenderer {
             boolean drawPlayer, boolean rotateWithPlayer, boolean isMinimap,
             double mouseWorldX, double mouseWorldZ, float partialTick,
             boolean cachedOnly, boolean manageScissor, float fixedOverlayScale,
-            float policyScale) {
+            float policyScale, boolean drawOverlayContent, boolean drawPinContent) {
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null)
             return MapDrawResult.EMPTY;
 
-        RenderStats renderStats = new RenderStats();
+        RenderStats renderStats = sharedRenderStats;
+        renderStats.reset();
         MapResidencyManager.beginRender(isMinimap
                 ? MapRequestLane.MINIMAP : MapRequestLane.FULLSCREEN);
         try {
@@ -193,10 +293,22 @@ public class MapRenderer {
              * Work volume is controlled by sliced demand/admission, not by silently
              * lowering the visible texture density.
              */
+            boolean surfaceCoarseRequired = !caveMode
+                    && MapRegionLodPolicy.directProjectionEnabled(
+                            policyScale, minVisiblePageX, maxVisiblePageX,
+                            minVisiblePageZ, maxVisiblePageZ);
             int candidateLevel = caveMode
                     ? MapLodPolicy.branchLevel(policyScale, width, height,
                             searchFactor, visibleNodeTarget)
                     : LodSelector.surfaceLevel(policyScale);
+            if (surfaceCoarseRequired) {
+                // Density alone selects exact L0 at 0.50x and above, but a wide
+                // fullscreen viewport can contain far more exact leaves than the
+                // finite atlas can retain. Force one hierarchy layer so the M4
+                // 512x512 region projection becomes a stable underlay while exact
+                // pages refine above it instead of leaving black holes.
+                candidateLevel = Math.max(1, candidateLevel);
+            }
             if (caveMode) {
                 hierarchyLevel = MapLodPolicy.stabilizeBranchLevel(
                         candidateLevel, lastCaveHierarchyLevel, policyScale);
@@ -204,6 +316,11 @@ public class MapRenderer {
             } else {
                 hierarchyLevel = MapLodPolicy.stabilizeBranchLevel(
                         candidateLevel, lastSurfaceHierarchyLevel, policyScale);
+                // The generic density hysteresis may intentionally keep L0 around
+                // the 0.50x boundary. It must not suppress the only stable underlay
+                // when the viewport exceeds atlas capacity (or scale is already in
+                // the coarse range), otherwise 0.48x can remain exact-only forever.
+                if (surfaceCoarseRequired) hierarchyLevel = Math.max(1, hierarchyLevel);
                 lastSurfaceHierarchyLevel = hierarchyLevel;
             }
         }
@@ -221,19 +338,22 @@ public class MapRenderer {
         int attentionPageZ = Math.floorDiv((int) Math.floor(attentionZ),
                 MapPageLayout.PAGE_SIZE);
 
-        // Publish viewport to coordinator (tick-side scan/upload, not render-side).
-        if (isMinimap) {
-            MapViewportCoordinator.getInstance().submitMinimap(minX, maxX, minZ, maxZ, policyScale);
-        } else if (!caveMode) {
-            // Submit the complete logical viewport. SurfaceDemandController owns
-            // far-zoom trimming so render and demand policy cannot trim twice.
-            MapViewportCoordinator.getInstance().submitFullscreen(
-                    minX, maxX, minZ, maxZ,
-                    policyScale, centerX, centerZ, false);
-        } else {
-            MapViewportCoordinator.getInstance().submitFullscreen(
-                    minX, maxX, minZ, maxZ, policyScale,
-                    centerX, centerZ, false);
+        // Publish viewport to the tick-side coordinator only for direct window
+        // rendering. Retained FBO owners refresh the complete guarded demand before
+        // invoking this off-screen atlas replay. Publishing here as well alternated
+        // guarded and unguarded page rectangles on every redraw, producing two
+        // planning generations and two batch submissions per retained frame.
+        if (ViewportDemandPublicationPolicy.rendererOwnsDemand(manageScissor)) {
+            if (isMinimap) {
+                MapViewportCoordinator.getInstance().submitMinimap(
+                        minX, maxX, minZ, maxZ, policyScale);
+            } else {
+                // Surface and cave fullscreen share the same viewport mailbox.
+                // SurfaceDemandController owns far-zoom trimming downstream.
+                MapViewportCoordinator.getInstance().submitFullscreen(
+                        minX, maxX, minZ, maxZ, policyScale,
+                        centerX, centerZ, false);
+            }
         }
 
         // Visible data requests are handled by MapViewportCoordinator. Keeping
@@ -267,19 +387,41 @@ public class MapRenderer {
             long contentRevision = caveMode
                     ? (fullCaveView ? fullCaveTextures.contentRevision()
                             : caveTextures.contentRevision())
-                    : residency.contentRevision();
+                    : residency.surfaceContentRevision();
             int renderScaleClass = renderScaleClass(caveMode, policyScale);
-            // Rendering and loading are both anchored to the viewport.
-            int renderAttentionPageX = isMinimap ? attentionPageX
-                    : Math.floorDiv((int) Math.floor(centerX), MapPageLayout.PAGE_SIZE);
-            int renderAttentionPageZ = isMinimap ? attentionPageZ
-                    : Math.floorDiv((int) Math.floor(centerZ), MapPageLayout.PAGE_SIZE);
+            /*
+             * A branch-only fullscreen plan draws complete top-level branch cells;
+             * sub-cell camera movement changes only clipping, not plan contents.
+             * Key those plans by the actual covered branch-cell bounds rather than
+             * the centre page, which previously forced a rebuild every 64 blocks.
+             * Exact-leaf plans, including the minimap, retain visible-page bounds
+             * because their logical key set genuinely changes when an edge page
+             * enters or leaves the viewport.
+             */
+            int planMinCellX = minVisiblePageX;
+            int planMaxCellX = maxVisiblePageX;
+            int planMinCellZ = minVisiblePageZ;
+            int planMaxCellZ = maxVisiblePageZ;
+            if (!isMinimap && caveBranchOnly && hierarchyLevel > 0) {
+                int pageSpan = MapLodPolicy.pageSpanForBranch(hierarchyLevel);
+                planMinCellX = Math.floorDiv(minVisiblePageX, pageSpan);
+                planMaxCellX = Math.floorDiv(maxVisiblePageX, pageSpan);
+                planMinCellZ = Math.floorDiv(minVisiblePageZ, pageSpan);
+                planMaxCellZ = Math.floorDiv(maxVisiblePageZ, pageSpan);
+            }
+            int keyAttentionPageX = isMinimap ? attentionPageX : 0;
+            int keyAttentionPageZ = isMinimap ? attentionPageZ : 0;
+            int keyCaveLayerY = caveMode && !fullCaveView
+                    ? caveLayerY : Integer.MIN_VALUE;
+            RevisionStamp activeStamp = MapSessionManager.getInstance().activeStamp();
+            long planSessionId = activeStamp != null ? activeStamp.sessionId() : 0L;
             PlanKey planKey = new PlanKey(
-                    MapManager.getInstance().getDimensionCacheKey(),
-                    caveMode, fullCaveView, caveLayerY,
+                    MapManager.getInstance().getDimensionCacheKey(), planSessionId,
+                    caveMode, fullCaveView, keyCaveLayerY,
                     minRegionX, maxRegionX, minRegionZ, maxRegionZ,
+                    planMinCellX, planMaxCellX, planMinCellZ, planMaxCellZ,
                     hierarchyLevel, caveBranchOnly,
-                    renderScaleClass, renderAttentionPageX, renderAttentionPageZ,
+                    renderScaleClass, keyAttentionPageX, keyAttentionPageZ,
                     MapConfig.minimapNightMode);
             long nowNanos = System.nanoTime();
             CachedPlan cachedPlan;
@@ -291,38 +433,72 @@ public class MapRenderer {
                         minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                         minVisiblePageX, maxVisiblePageX,
                         minVisiblePageZ, maxVisiblePageZ,
-                        renderAttentionPageX, renderAttentionPageZ,
+                        attentionPageX, attentionPageZ,
                         surfaceTextures, overviewTextures,
                         fullCaveTextures, caveTextures,
                         topologyRevision, contentRevision, nowNanos);
             } else {
                 fallbackPlan = fullscreenFallbackPlan;
                 if (fallbackPlan != null
+                        && nowNanos >= fullscreenFallbackExpiresNanos) {
+                    fallbackPlan = null;
+                    fullscreenFallbackPlan = null;
+                    fullscreenFallbackExpiresNanos = 0L;
+                }
+                if (fallbackPlan != null
                         && (!compatibleFullscreenFallback(fallbackPlan.key(), planKey)
                                 || !fallbackPlan.plan().topologyValid(topologyRevision))) {
                     fallbackPlan = null;
                     fullscreenFallbackPlan = null;
+                    fullscreenFallbackExpiresNanos = 0L;
                 }
                 CachedPlan previousPlan = fullscreenPlan;
+                if (fallbackPlan == null) {
+                    fallbackPlan = stableFullscreenPlan(
+                            StablePlanKey.of(planKey), planKey, topologyRevision);
+                    if (fallbackPlan != null) {
+                        fullscreenFallbackPlan = fallbackPlan;
+                        fullscreenFallbackExpiresNanos = nowNanos
+                                + FULLSCREEN_FALLBACK_MAX_NANOS;
+                    }
+                }
                 cachedPlan = previousPlan;
                 boolean cachedHasPending = cachedPlan != null
                         && cachedPlan.plan().pendingRegions().length > 0;
-                if (cachedPlan == null || !cachedPlan.key().equals(planKey)
-                        || cachedPlan.contentRevision() != contentRevision
-                        || !cachedPlan.plan().valid(topologyRevision, nowNanos,
-                                cachedHasPending)) {
+                boolean keyChanged = cachedPlan == null
+                        || !cachedPlan.key().equals(planKey);
+                boolean topologyChanged = cachedPlan != null
+                        && !cachedPlan.plan().valid(topologyRevision, nowNanos,
+                                cachedHasPending);
+                boolean contentChanged = cachedPlan != null
+                        && cachedPlan.contentRevision() != contentRevision;
+                long contentRefreshNanos = fullscreenPlanRefreshNanos(
+                        caveMode, caveBranchOnly);
+                boolean contentRefreshDue = contentChanged
+                        && (cachedPlan.plan().quadCount() == 0
+                                || nowNanos - cachedPlan.plan().builtAtNanos()
+                                        >= contentRefreshNanos);
+                if (cachedPlan == null || keyChanged || topologyChanged
+                        || contentRefreshDue) {
+                    long planBuildStartedNanos = System.nanoTime();
                     MapRenderPlan plan = buildRenderPlan(caveMode, fullCaveView,
                             caveLayerY, hierarchyLevel, caveBranchOnly, policyScale,
-                            true, false,
+                            true, caveBranchOnly, false,
                             minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                             minVisiblePageX, maxVisiblePageX,
                             minVisiblePageZ, maxVisiblePageZ,
-                            renderAttentionPageX, renderAttentionPageZ,
+                            attentionPageX, attentionPageZ,
                             surfaceTextures, overviewTextures,
-                            fullCaveTextures, caveTextures);
+                            fullCaveTextures, caveTextures,
+                            topologyRevision);
+                    long planBuildNanos = System.nanoTime() - planBuildStartedNanos;
                     MapPipelineTelemetry.getInstance().recordRenderPlanBuild(
                             plan.quadCount(), plan.batchCount());
-                    if (previousPlan != null
+                    recordSlowRenderPlan(planBuildNanos, caveMode, caveBranchOnly,
+                            policyScale, hierarchyLevel, plan,
+                            minVisiblePageX, maxVisiblePageX,
+                            minVisiblePageZ, maxVisiblePageZ);
+                    if (fallbackPlan == null && previousPlan != null
                             && compatibleFullscreenFallback(previousPlan.key(), planKey)
                             && previousPlan.plan().topologyValid(topologyRevision)
                             && previousPlan.plan().quadCount() > 0
@@ -334,64 +510,89 @@ public class MapRenderer {
                         // instead of flashing to black.
                         fallbackPlan = previousPlan;
                         fullscreenFallbackPlan = previousPlan;
+                        fullscreenFallbackExpiresNanos = nowNanos
+                                + (plan.quadCount() == 0
+                                        ? FULLSCREEN_EMPTY_FALLBACK_MAX_NANOS
+                                        : FULLSCREEN_FALLBACK_MAX_NANOS);
                     }
                     cachedPlan = new CachedPlan(planKey, plan, contentRevision);
                     fullscreenPlan = cachedPlan;
+                    if (plan.quadCount() > 0) {
+                        rememberStableFullscreenPlan(cachedPlan);
+                    }
                     if (fullscreenFallbackPlan != null
                             && cachedPlan.plan().quadCount() > 0
                             && cachedPlan.plan().pendingRegions().length == 0) {
                         fallbackPlan = null;
                         fullscreenFallbackPlan = null;
+                        fullscreenFallbackExpiresNanos = 0L;
                     }
                 } else {
                     MapPipelineTelemetry.getInstance().recordRenderPlanReuse();
                 }
             }
 
+            /*
+             * Replay base and glow under one render-state scope. Previously each
+             * immutable plan call flushed GuiGraphics and queried/restored depth,
+             * while the glow pass repeated the blend query. Those synchronous GL
+             * reads serialized the render thread despite low GPU utilisation.
+             */
             boolean blendWasEnabledForMap = GL11.glIsEnabled(GL11.GL_BLEND);
-            boolean mapBlendRequired = caveMode || hierarchyLevel > 0;
-            if (mapBlendRequired) {
-                RenderSystem.enableBlend();
-                RenderSystem.defaultBlendFunc();
-            }
-            if (caveMode) {
-                RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
-                guiGraphics.fill(minRegionX * 512, minRegionZ * 512,
-                        (maxRegionX + 1) * 512, (maxRegionZ + 1) * 512,
-                        0xFF080A0C);
-                RenderSystem.setShaderColor(caveBrightness, caveBrightness,
-                        caveBrightness, 1.0F);
-            } else {
-                RenderSystem.setShaderColor(mapBrightness, mapBrightness,
-                        mapBrightness, 1.0F);
-            }
-            if (fallbackPlan != null) fallbackPlan.plan().drawBase(guiGraphics);
-            cachedPlan.plan().drawBase(guiGraphics);
-            RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
-            if (mapBlendRequired && !blendWasEnabledForMap) {
-                RenderSystem.disableBlend();
-            }
+            boolean depthWasEnabledForMap = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+            RenderSystem.enableBlend();
+            RenderSystem.defaultBlendFunc();
+            RenderSystem.disableDepthTest();
+            try {
+                if (caveMode) {
+                    RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+                    guiGraphics.fill(minRegionX * 512, minRegionZ * 512,
+                            (maxRegionX + 1) * 512, (maxRegionZ + 1) * 512,
+                            0xFF080A0C);
+                }
+                // Flush the buffered cave backdrop/earlier GUI exactly once before
+                // direct BufferUploader replay starts.
+                guiGraphics.flush();
+                RenderSystem.setShader(GameRenderer::getPositionTexShader);
+                Matrix4f planMatrix = guiGraphics.pose().last().pose();
+                float baseBrightness = caveMode ? caveBrightness : mapBrightness;
+                RenderSystem.setShaderColor(baseBrightness, baseBrightness,
+                        baseBrightness, 1.0F);
+                if (fallbackPlan != null) {
+                    fallbackPlan.plan().drawBasePrepared(planMatrix);
+                }
+                cachedPlan.plan().drawBasePrepared(planMatrix);
 
-            if (!caveMode && MapConfig.minimapNightMode != 0
-                    && hierarchyLevel == 0) {
-                boolean blendWasEnabled = GL11.glIsEnabled(GL11.GL_BLEND);
-                RenderSystem.enableBlend();
-                RenderSystem.defaultBlendFunc();
-                float glowStrength = MapConfig.minimapNightMode == 2
-                        ? 1.0f
-                        : Math.max(0.0f, Math.min(1.0f,
-                                (1.0f - mapBrightness)
-                                        / (1.0f - NIGHT_MIN_BRIGHTNESS)));
-                RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, glowStrength);
-                if (fallbackPlan != null) fallbackPlan.plan().drawGlow(guiGraphics);
-                cachedPlan.plan().drawGlow(guiGraphics);
+                if (!caveMode && MapConfig.minimapNightMode != 0
+                        && hierarchyLevel == 0) {
+                    float glowStrength = MapConfig.minimapNightMode == 2
+                            ? 1.0f
+                            : Math.max(0.0f, Math.min(1.0f,
+                                    (1.0f - mapBrightness)
+                                            / (1.0f - NIGHT_MIN_BRIGHTNESS)));
+                    RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F,
+                            glowStrength);
+                    if (fallbackPlan != null) {
+                        fallbackPlan.plan().drawGlowPrepared(planMatrix);
+                    }
+                    cachedPlan.plan().drawGlowPrepared(planMatrix);
+                }
+            } finally {
                 RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
-                if (!blendWasEnabled) RenderSystem.disableBlend();
+                if (depthWasEnabledForMap) RenderSystem.enableDepthTest();
+                else RenderSystem.disableDepthTest();
+                if (blendWasEnabledForMap) {
+                    RenderSystem.enableBlend();
+                    RenderSystem.defaultBlendFunc();
+                } else {
+                    RenderSystem.disableBlend();
+                }
             }
             if (!isMinimap) {
                 drawLoadingIndicators(guiGraphics,
                         cachedPlan.plan().pendingRegions(), policyScale);
             }
+            if (fallbackPlan != null) renderStats.accept(fallbackPlan.plan().result());
             renderStats.accept(cachedPlan.plan().result());
         } finally {
             guiGraphics.flush();
@@ -401,88 +602,11 @@ public class MapRenderer {
             surfaceTextures.endRenderBatch();
         }
 
-        // 6.5. Draw waypoints for the current dimension if enabled
-        if (MapConfig.waypointsVisible) {
-            java.util.List<WaypointManager.Waypoint> waypoints = WaypointManager.getInstance()
-                    .getWaypointsForDimension(MapManager.getInstance().getCurrentDimensionId());
-            for (WaypointManager.Waypoint wp : waypoints) {
-                boolean isHovered = false;
-                if (!isMinimap) {
-                    // Waypoint width in world coordinates is ~1.28 * waypointScale. So hover radius
-                    // is ~0.64 * waypointScale (increased slightly to 0.8 for easier hovering)
-                    double hoverRadius = 0.8 * MapConfig.waypointScale;
-                    isHovered = Math.abs(mouseWorldX - wp.x) <= hoverRadius
-                            && Math.abs(mouseWorldZ - wp.z) <= hoverRadius;
-                }
-                drawWaypointMarker(guiGraphics, wp, scale, isMinimap, isHovered);
-            }
-        }
-
-        // 6.6. Render pin navigation dotted line in world coordinates
-        if (MapConfig.pinActive) {
-            double playerX = net.minecraft.util.Mth.lerp(partialTick, mc.player.xo, mc.player.getX());
-            double playerZ = net.minecraft.util.Mth.lerp(partialTick, mc.player.zo, mc.player.getZ());
-
-            double dx = MapConfig.pinWorldX - playerX;
-            double dz = MapConfig.pinWorldZ - playerZ;
-            double len = Math.sqrt(dx * dx + dz * dz);
-            if (len > 0) {
-                double nx = dx / len;
-                double nz = dz / len;
-
-                int pointerColor = getActualPointerColor(MapConfig.playerPointerColor);
-                int lineColor = isMinimap ? ((pointerColor & 0x00FFFFFF) | 0xCC000000) : pointerColor;
-
-                double approxStep = Math.max(8.0, 6.0 / scale);
-                double start = 4.0;
-                double end = len - 4.0;
-
-                if (end > start) {
-                    int numSteps = (int) Math.round((end - start) / approxStep);
-                    double step = numSteps > 0 ? (end - start) / numSteps : 0.0;
-
-                    for (int k = 0; k <= numSteps; k++) {
-                        double traveled = start + k * step;
-                        double wx = playerX + nx * traveled;
-                        double wz = playerZ + nz * traveled;
-
-                        int bx = (int) Math.floor(wx);
-                        int bz = (int) Math.floor(wz);
-
-                        guiGraphics.fill(bx, bz, bx + 1, bz + 1, lineColor);
-                    }
-                }
-            }
-        }
-
-        // 6.5. Render pin marker if active and within visible bounds
-        if (MapConfig.pinActive) {
-            if (MapConfig.pinWorldX >= minX && MapConfig.pinWorldX <= maxX &&
-                    MapConfig.pinWorldZ >= minZ && MapConfig.pinWorldZ <= maxZ) {
-
-                poseStack.pushPose();
-                poseStack.translate(MapConfig.pinWorldX, MapConfig.pinWorldZ, 5);
-
-                float baseFactor = isMinimap ? 1.0f : 2.0f;
-                float pinScaleFactor = (baseFactor / scale) * MapConfig.pinScale * fixedOverlayScale;
-                poseStack.scale(pinScaleFactor, pinScaleFactor, 1.0f);
-
-                net.minecraft.resources.ResourceLocation redX = net.minecraft.resources.ResourceLocation
-                        .fromNamespaceAndPath("minecraft", "textures/map/decorations/red_x.png");
-                guiGraphics.blit(redX, -4, -4, 8, 8, 0.0f, 0.0f, 8, 8, 8, 8);
-
-                poseStack.popPose();
-            }
-        }
-
-        // 7. Render player marker if enabled
-        if (drawPlayer) {
-            double playerX = net.minecraft.util.Mth.lerp(partialTick, mc.player.xo, mc.player.getX());
-            double playerZ = net.minecraft.util.Mth.lerp(partialTick, mc.player.zo, mc.player.getZ());
-            float playerYaw = net.minecraft.util.Mth.rotLerp(partialTick, mc.player.yRotO, mc.player.getYRot())
-                    + 180.0f;
-
-            drawPlayerMarker(guiGraphics, playerX, playerZ, playerYaw, scale, fixedOverlayScale);
+        if (drawOverlayContent) {
+            drawMapOverlays(guiGraphics, mc, poseStack,
+                    minX, maxX, minZ, maxZ, scale, isMinimap,
+                    mouseWorldX, mouseWorldZ, partialTick,
+                    fixedOverlayScale, drawPinContent, drawPlayer);
         }
 
         // 8. Disable scissor and pop pose
@@ -503,6 +627,157 @@ public class MapRenderer {
         }
     }
 
+    private void drawMapOverlays(GuiGraphics guiGraphics, Minecraft mc,
+            PoseStack poseStack, double minX, double maxX,
+            double minZ, double maxZ, float scale, boolean isMinimap,
+            double mouseWorldX, double mouseWorldZ, float partialTick,
+            float fixedOverlayScale, boolean drawPinContent,
+            boolean drawPlayer) {
+        // 6.5. Draw waypoints for the current dimension if enabled
+        if (MapConfig.waypointsVisible) {
+            java.util.List<WaypointManager.Waypoint> waypoints = WaypointManager.getInstance()
+                    .getWaypointsForDimension(
+                            MapManager.getInstance().getCurrentDimensionResourceId());
+            for (WaypointManager.Waypoint wp : waypoints) {
+                boolean isHovered = false;
+                if (!isMinimap) {
+                    double hoverRadius = waypointHitRadiusWorld(wp, scale);
+                    isHovered = Math.abs(mouseWorldX - wp.x) <= hoverRadius
+                            && Math.abs(mouseWorldZ - wp.z) <= hoverRadius;
+                }
+                drawWaypointMarker(guiGraphics, wp, scale, isMinimap, isHovered);
+            }
+        }
+
+        // 6.6. Render only the visible part of the pin route. The previous loop
+        // walked the entire player-to-pin distance even when nearly all dots were
+        // offscreen, so a distant pin could issue thousands of fill calls/frame.
+        if (drawPinContent && MapConfig.pinActive) {
+            double playerX = net.minecraft.util.Mth.lerp(partialTick,
+                    mc.player.xo, mc.player.getX());
+            double playerZ = net.minecraft.util.Mth.lerp(partialTick,
+                    mc.player.zo, mc.player.getZ());
+            double dx = MapConfig.pinWorldX - playerX;
+            double dz = MapConfig.pinWorldZ - playerZ;
+            double lenSquared = dx * dx + dz * dz;
+            if (lenSquared > 0.000001) {
+                double t0 = 0.0;
+                double t1 = 1.0;
+                boolean visible = true;
+                if (Math.abs(dx) < 0.000001) {
+                    visible = playerX >= minX && playerX <= maxX;
+                } else {
+                    double tx0 = (minX - playerX) / dx;
+                    double tx1 = (maxX - playerX) / dx;
+                    if (tx0 > tx1) {
+                        double swap = tx0;
+                        tx0 = tx1;
+                        tx1 = swap;
+                    }
+                    t0 = Math.max(t0, tx0);
+                    t1 = Math.min(t1, tx1);
+                    visible = t1 >= t0;
+                }
+                if (visible) {
+                    if (Math.abs(dz) < 0.000001) {
+                        visible = playerZ >= minZ && playerZ <= maxZ;
+                    } else {
+                        double tz0 = (minZ - playerZ) / dz;
+                        double tz1 = (maxZ - playerZ) / dz;
+                        if (tz0 > tz1) {
+                            double swap = tz0;
+                            tz0 = tz1;
+                            tz1 = swap;
+                        }
+                        t0 = Math.max(t0, tz0);
+                        t1 = Math.min(t1, tz1);
+                        visible = t1 >= t0;
+                    }
+                }
+                if (visible) {
+                    double len = Math.sqrt(lenSquared);
+                    double start = Math.max(4.0, Math.max(0.0, t0) * len);
+                    double end = Math.min(len - 4.0, Math.min(1.0, t1) * len);
+                    if (end > start) {
+                        int pointerColor = getActualPointerColor(
+                                MapConfig.playerPointerColor);
+                        int lineColor = isMinimap
+                                ? ((pointerColor & 0x00FFFFFF) | 0xCC000000)
+                                : pointerColor;
+                        double requestedStep = Math.max(8.0, 6.0 / scale);
+                        int numSteps = Math.max(1, (int) Math.ceil(
+                                (end - start) / requestedStep));
+                        numSteps = Math.min(256, numSteps);
+                        double step = (end - start) / numSteps;
+                        double nx = dx / len;
+                        double nz = dz / len;
+                        for (int k = 0; k <= numSteps; k++) {
+                            double traveled = start + k * step;
+                            int bx = (int) Math.floor(playerX + nx * traveled);
+                            int bz = (int) Math.floor(playerZ + nz * traveled);
+                            guiGraphics.fill(bx, bz, bx + 1, bz + 1, lineColor);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6.5. Render pin marker if active and within visible bounds
+        if (drawPinContent && MapConfig.pinActive) {
+            if (MapConfig.pinWorldX >= minX && MapConfig.pinWorldX <= maxX &&
+                    MapConfig.pinWorldZ >= minZ && MapConfig.pinWorldZ <= maxZ) {
+
+                poseStack.pushPose();
+                poseStack.translate(MapConfig.pinWorldX, MapConfig.pinWorldZ, 5);
+
+                float baseFactor = isMinimap ? 1.0f : 2.0f;
+                float pinScaleFactor = (baseFactor / scale) * MapConfig.pinScale * fixedOverlayScale;
+                poseStack.scale(pinScaleFactor, pinScaleFactor, 1.0f);
+
+                guiGraphics.blit(RED_X_TEXTURE, -4, -4, 8, 8,
+                        0.0f, 0.0f, 8, 8, 8, 8);
+
+                /*
+                 * Keep the distance label inside the exact same world-to-screen
+                 * transform as the pin icon. Rendering it later from MapScreen used a
+                 * second projection that drifted during pixel-aligned framebuffer
+                 * composition, opening animation and zoom interpolation.
+                 */
+                if (!isMinimap) {
+                    double playerX = net.minecraft.util.Mth.lerp(partialTick,
+                            mc.player.xo, mc.player.getX());
+                    double playerZ = net.minecraft.util.Mth.lerp(partialTick,
+                            mc.player.zo, mc.player.getZ());
+                    double distanceX = MapConfig.pinWorldX - playerX;
+                    double distanceZ = MapConfig.pinWorldZ - playerZ;
+                    int distanceBlocks = (int) Math.floor(Math.sqrt(
+                            distanceX * distanceX + distanceZ * distanceZ));
+                    String distanceText = distanceBlocks + " blocks";
+                    int textWidth = mc.font.width(distanceText);
+                    int labelY = 6;
+                    poseStack.translate(0.0F, 0.0F, 1.0F);
+                    guiGraphics.fill(-textWidth / 2 - 2, labelY - 1,
+                            textWidth / 2 + 2, labelY + 9, 0xAA000000);
+                    guiGraphics.drawString(mc.font, distanceText,
+                            -textWidth / 2, labelY, 0xFFFFFFFF, false);
+                }
+
+                poseStack.popPose();
+            }
+        }
+
+        // 7. Render player marker if enabled
+        if (drawPlayer) {
+            double playerX = net.minecraft.util.Mth.lerp(partialTick, mc.player.xo, mc.player.getX());
+            double playerZ = net.minecraft.util.Mth.lerp(partialTick, mc.player.zo, mc.player.getZ());
+            float playerYaw = net.minecraft.util.Mth.rotLerp(partialTick, mc.player.yRotO, mc.player.getYRot())
+                    + 180.0f;
+
+            drawPlayerMarker(guiGraphics, playerX, playerZ, playerYaw, scale, fixedOverlayScale);
+        }
+
+    }
+
     private CachedPlan selectMinimapPlan(PlanKey planKey,
             boolean caveMode, boolean fullCaveView, int caveLayerY,
             int hierarchyLevel, boolean caveBranchOnly, float scale,
@@ -517,38 +792,94 @@ public class MapRenderer {
             CaveTextureManager caveTextures,
             long topologyRevision, long contentRevision, long nowNanos) {
         CachedPlan current = minimapPlan;
-        boolean currentSafe = current != null
-                && current.plan().topologyValid(topologyRevision)
-                && sameMinimapAuthority(current.key(), planKey);
-        boolean sameStagingWindow = minimapStagingPlan != null
-                && minimapStagingPlan.key().equals(planKey)
-                && minimapStagingPlan.plan().topologyValid(topologyRevision);
-        boolean stagingMatches = sameStagingWindow
-                && minimapStagingPlan.contentRevision() == contentRevision;
-        if (!stagingMatches) {
-            MapRenderPlan candidate = buildRenderPlan(caveMode, fullCaveView,
-                    caveLayerY, hierarchyLevel, caveBranchOnly, scale,
-                    false, true,
-                    minRegionX, maxRegionX, minRegionZ, maxRegionZ,
-                    minVisiblePageX, maxVisiblePageX,
-                    minVisiblePageZ, maxVisiblePageZ,
-                    attentionPageX, attentionPageZ,
-                    surfaceTextures, overviewTextures,
-                    fullCaveTextures, caveTextures);
-            minimapStagingPlan = new CachedPlan(planKey, candidate, contentRevision);
-            if (!sameStagingWindow) minimapStagingSinceNanos = nowNanos;
-            MapPipelineTelemetry.getInstance().recordRenderPlanBuild(
-                    candidate.quadCount(), candidate.batchCount());
+        /*
+         * A logical-coverage minimap plan contains one world-space instance for
+         * every visible exact page, including pages that were absent at build time.
+         * Residency is resolved from the front page table during replay, so atlas
+         * publication/eviction does not alter geometry and must not rebuild/sort the
+         * plan. PlanKey includes the map session, authority, viewport and style.
+         */
+        if (current != null && current.key().equals(planKey)
+                && current.plan().logicalExactCoverage()) {
+            minimapStagingPlan = null;
+            minimapStagingSinceNanos = 0L;
+            MapPipelineTelemetry.getInstance().recordRenderPlanReuse();
+            return current;
         }
-
-        CachedPlan staging = minimapStagingPlan;
         int expectedPages = visiblePageCount(minX, maxX, minZ, maxZ);
         int requiredPages = Math.max(1,
                 Math.min(expectedPages, (int) Math.ceil(expectedPages * 0.70)));
+        boolean currentSafe = current != null
+                && current.plan().topologyValid(topologyRevision)
+                && sameMinimapAuthority(current.key(), planKey);
+        boolean currentWindowComplete = currentSafe
+                && current.key().equals(planKey)
+                && current.contentRevision() == contentRevision
+                && current.plan().result().exactPagesDrawn() >= expectedPages;
+        if (currentWindowComplete && minimapStagingPlan == null) {
+            // Pixel uploads inside an existing slot do not advance the coverage
+            // revision, so the UV plan remains valid. New residents and evictions do
+            // advance it and must rebuild the plan; otherwise an evicted exact tile
+            // could remain a permanent skipped hole after the page-table entry is
+            // removed.
+            MapPipelineTelemetry.getInstance().recordRenderPlanReuse();
+            return current;
+        }
+        boolean sameStagingWindow = minimapStagingPlan != null
+                && minimapStagingPlan.key().equals(planKey)
+                && (minimapStagingPlan.plan().logicalExactCoverage()
+                        || minimapStagingPlan.plan().topologyValid(topologyRevision));
+        boolean stagingMatches = sameStagingWindow
+                && (minimapStagingPlan.plan().logicalExactCoverage()
+                        || minimapStagingPlan.contentRevision() == contentRevision);
+        if (!stagingMatches) {
+            boolean currentWindowMatches = current != null
+                    && current.key().equals(planKey)
+                    && current.plan().topologyValid(topologyRevision);
+            boolean newWindowNeedsCandidate = !currentWindowMatches
+                    && !sameStagingWindow;
+            long refreshInterval = current == null
+                    || current.plan().quadCount() == 0
+                            ? MINIMAP_EMPTY_PLAN_REFRESH_NANOS
+                            : MapPerformanceGovernor.getInstance().underPressure()
+                                    ? 125_000_000L
+                                    : MINIMAP_PLAN_REFRESH_NANOS;
+            boolean refreshDue = nowNanos - lastMinimapPlanBuildNanos
+                    >= refreshInterval;
+            boolean buildCandidate = newWindowNeedsCandidate || refreshDue
+                    || (!currentSafe && !sameStagingWindow);
+            if (!buildCandidate) {
+                if (minimapStagingPlan == null) {
+                    MapPipelineTelemetry.getInstance().recordRenderPlanReuse();
+                    return current;
+                }
+                // Keep evaluating the existing staging plan below; do not rebuild
+                // it merely because another page published during this window.
+            } else {
+                MapRenderPlan candidate = buildRenderPlan(caveMode, fullCaveView,
+                        caveLayerY, hierarchyLevel, caveBranchOnly, scale,
+                        false, true, true,
+                        minRegionX, maxRegionX, minRegionZ, maxRegionZ,
+                        minVisiblePageX, maxVisiblePageX,
+                        minVisiblePageZ, maxVisiblePageZ,
+                        attentionPageX, attentionPageZ,
+                        surfaceTextures, overviewTextures,
+                        fullCaveTextures, caveTextures,
+                        topologyRevision);
+                minimapStagingPlan = new CachedPlan(planKey, candidate, contentRevision);
+                lastMinimapPlanBuildNanos = nowNanos;
+                if (!sameStagingWindow) minimapStagingSinceNanos = nowNanos;
+                MapPipelineTelemetry.getInstance().recordRenderPlanBuild(
+                        candidate.quadCount(), candidate.batchCount());
+            }
+        }
+
+        CachedPlan staging = minimapStagingPlan;
         int stagedExact = staging.plan().result().exactPagesDrawn();
         boolean authorityChanged = current == null
                 || !sameMinimapAuthority(current.key(), planKey);
-        boolean ready = stagedExact >= requiredPages
+        boolean ready = staging.plan().logicalExactCoverage()
+                || stagedExact >= requiredPages
                 || (!currentSafe && stagedExact > 0)
                 || (stagedExact > 0
                         && nowNanos - minimapStagingSinceNanos >= 350_000_000L);
@@ -565,6 +896,7 @@ public class MapRenderer {
     private static boolean sameMinimapAuthority(PlanKey left, PlanKey right) {
         if (left == null || right == null) return false;
         return left.dimension().equals(right.dimension())
+                && left.sessionId() == right.sessionId()
                 && left.caveMode() == right.caveMode()
                 && left.fullCaveView() == right.fullCaveView()
                 && (!left.caveMode() || left.fullCaveView()
@@ -587,16 +919,64 @@ public class MapRenderer {
     }
 
     private static int renderScaleClass(boolean caveMode, float scale) {
-        if (!caveMode) return 0;
+        if (!caveMode) return MapRegionLodPolicy.targetLevel(scale);
         int mip = MapLodPolicy.leafMipLevel(scale, 3);
         int partialExactClass = CaveScreenSpacePolicy.exactPagePixels(scale) >= 16.0f
                 ? 1 : 0;
         return (mip << 1) | partialExactClass;
     }
 
+    private static long fullscreenPlanRefreshNanos(boolean caveMode,
+            boolean caveBranchOnly) {
+        if (caveBranchOnly) {
+            return MapPerformanceGovernor.getInstance().underPressure()
+                    ? 500_000_000L : FULLSCREEN_BRANCH_PLAN_REFRESH_NANOS;
+        }
+        if (caveMode) return 200_000_000L;
+        if (MapPerformanceGovernor.getInstance().underPressure()) {
+            return Math.max(FULLSCREEN_PLAN_REFRESH_NANOS, 200_000_000L);
+        }
+        return FULLSCREEN_PLAN_REFRESH_NANOS;
+    }
+
+    /**
+     * Missing far-zoom branches used to recurse through the full 4,096-node cap
+     * every time the camera crossed one page. At four screen pixels per exact page,
+     * those deep sparse descendants cannot contribute enough visible information to
+     * justify a multi-millisecond traversal. Keep a larger budget as density rises.
+     */
+    private static int caveBranchVisitBudget(float scale) {
+        float exactPagePixels = CaveScreenSpacePolicy.exactPagePixels(scale);
+        if (exactPagePixels <= 4.5f) return 512;
+        if (exactPagePixels <= 8.0f) return 1_024;
+        if (exactPagePixels < 16.0f) return 2_048;
+        return CAVE_BRANCH_PLAN_MAX_VISITS;
+    }
+
+    private static void recordSlowRenderPlan(long buildNanos,
+            boolean caveMode, boolean caveBranchOnly, float scale,
+            int hierarchyLevel, MapRenderPlan plan,
+            int minPageX, int maxPageX, int minPageZ, int maxPageZ) {
+        if (buildNanos < 4_000_000L) return;
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (!recorder.shouldEmitEvent("RENDER_PLAN_SLOW", 250L)) return;
+        long pageCount = (long) (maxPageX - minPageX + 1)
+                * (maxPageZ - minPageZ + 1);
+        recorder.event("RENDER_PLAN_SLOW",
+                "build_us=" + (buildNanos / 1_000L)
+                        + " cave=" + caveMode
+                        + " branch_only=" + caveBranchOnly
+                        + " scale=" + scale
+                        + " hierarchy=" + hierarchyLevel
+                        + " visible_pages=" + pageCount
+                        + " quads=" + plan.quadCount()
+                        + " batches=" + plan.batchCount());
+    }
+
     private MapRenderPlan buildRenderPlan(boolean caveMode, boolean fullCaveView,
             int caveLayerY, int hierarchyLevel, boolean caveBranchOnly, float scale,
             boolean collectPending, boolean centerOutTraversal,
+            boolean logicalExactCoverage,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
             int minVisiblePageX, int maxVisiblePageX,
             int minVisiblePageZ, int maxVisiblePageZ,
@@ -604,10 +984,15 @@ public class MapRenderer {
             MapTextureManager surfaceTextures,
             MapOverviewTextureManager overviewTextures,
             FullCaveTextureManager fullCaveTextures,
-            CaveTextureManager caveTextures) {
+            CaveTextureManager caveTextures,
+            long topologyRevision) {
         MapRenderPlan.Builder builder = new MapRenderPlan.Builder();
+        boolean pageTableCoverage = logicalExactCoverage
+                && hierarchyLevel == 0
+                && MapSessionManager.getInstance().activeStamp() != null;
+        if (pageTableCoverage) builder.logicalExactCoverage();
         if (caveMode) {
-            Set<Long> drawnRegions = new LinkedHashSet<>();
+            LongKeySet drawnRegions = new LongKeySet();
             CaveHierarchySource source;
             if (fullCaveView) {
                 source = new CaveHierarchySource() {
@@ -636,6 +1021,13 @@ public class MapRenderer {
                     @Override
                     public CaveAtlasRegion page(int rx, int rz, int px, int pz, float drawScale) {
                         return fullCaveTextures.peekPageRegion(rx, rz, px, pz, drawScale);
+                    }
+
+                    @Override
+                    public TileKey pageKey(int globalPageX, int globalPageZ,
+                            float drawScale) {
+                        return fullCaveTextures.pageTileKey(
+                                globalPageX, globalPageZ, drawScale);
                     }
                 };
             } else {
@@ -666,6 +1058,13 @@ public class MapRenderer {
                     public CaveAtlasRegion page(int rx, int rz, int px, int pz, float drawScale) {
                         return caveTextures.peekPageRegion(caveLayerY, rx, rz, px, pz, drawScale);
                     }
+
+                    @Override
+                    public TileKey pageKey(int globalPageX, int globalPageZ,
+                            float drawScale) {
+                        return caveTextures.pageTileKey(caveLayerY,
+                                globalPageX, globalPageZ, drawScale);
+                    }
                 };
             }
             collectCaveHierarchy(builder, source,
@@ -674,7 +1073,7 @@ public class MapRenderer {
                     minVisiblePageZ, maxVisiblePageZ,
                     hierarchyLevel, scale, caveBranchOnly,
                     attentionPageX, attentionPageZ, centerOutTraversal,
-                    drawnRegions);
+                    pageTableCoverage, drawnRegions);
             if (collectPending && fullCaveView) {
                 FullCaveMapManager manager = FullCaveMapManager.getInstance();
                 for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
@@ -702,19 +1101,32 @@ public class MapRenderer {
             }
         } else {
             MapManager manager = MapManager.getInstance();
-            if (hierarchyLevel > 0) {
-                // M4 region-centric coverage is an underlay authority. It is
-                // intentionally collected before the old factor-2 refinement tree
-                // so a 512x512 coarse region can appear without 64 exact leaves.
+            boolean regionOnly = MapRegionLodPolicy.regionAuthorityOnly(scale);
+            /*
+             * Xaero never lets a finer texture level become the sole visual
+             * authority: a loaded root texture remains underneath and is cropped
+             * to the missing child. Do the same for every fullscreen Surface LOD,
+             * including hierarchy level 0. This closes the exact-only black window
+             * seen after a fast zoom when coarse M4 coverage is already resident
+             * but the new 64x64 leaf working set has not warmed yet.
+             *
+             * The minimap remains exact-only. Its compact player-centred halo is
+             * independently staged and does not need a 512x512 region underlay.
+             */
+            if (!centerOutTraversal) {
                 collectRegionSurfaceCoverage(builder, overviewTextures,
                         minRegionX, maxRegionX, minRegionZ, maxRegionZ,
-                        scale, attentionPageX, attentionPageZ);
-                collectSurfaceHierarchy(builder, overviewTextures, surfaceTextures,
-                        minRegionX, maxRegionX, minRegionZ, maxRegionZ,
-                        minVisiblePageX, maxVisiblePageX,
-                        minVisiblePageZ, maxVisiblePageZ,
-                        hierarchyLevel, scale, attentionPageX, attentionPageZ,
-                        manager, collectPending, centerOutTraversal);
+                        scale, attentionPageX, attentionPageZ, regionOnly);
+            }
+            if (hierarchyLevel > 0) {
+                if (!regionOnly) {
+                    collectSurfaceHierarchy(builder, overviewTextures, surfaceTextures,
+                            minRegionX, maxRegionX, minRegionZ, maxRegionZ,
+                            minVisiblePageX, maxVisiblePageX,
+                            minVisiblePageZ, maxVisiblePageZ,
+                            hierarchyLevel, scale, attentionPageX, attentionPageZ,
+                            manager, collectPending, centerOutTraversal);
+                }
             } else {
                 if (centerOutTraversal) {
                     int centerPageX = clamp(attentionPageX,
@@ -725,18 +1137,39 @@ public class MapRenderer {
                             minVisiblePageZ, maxVisiblePageZ,
                             centerPageX, centerPageZ);
                     for (int radius = 0; radius <= maximumRadius; radius++) {
-                        for (int pageZ = centerPageZ - radius;
-                                pageZ <= centerPageZ + radius; pageZ++) {
-                            for (int pageX = centerPageX - radius;
-                                    pageX <= centerPageX + radius; pageX++) {
-                                if (!onRing(pageX, pageZ, centerPageX, centerPageZ,
-                                        radius)
-                                        || pageX < minVisiblePageX
-                                        || pageX > maxVisiblePageX
-                                        || pageZ < minVisiblePageZ
-                                        || pageZ > maxVisiblePageZ) continue;
+                        int left = centerPageX - radius;
+                        int right = centerPageX + radius;
+                        int top = centerPageZ - radius;
+                        int bottom = centerPageZ + radius;
+                        if (top >= minVisiblePageZ && top <= maxVisiblePageZ) {
+                            for (int pageX = Math.max(minVisiblePageX, left);
+                                    pageX <= Math.min(maxVisiblePageX, right); pageX++) {
                                 collectSurfaceLeaf(builder, surfaceTextures,
-                                        pageX, pageZ, manager, collectPending);
+                                        pageX, top, manager, collectPending,
+                                        MapRenderPlan.PHASE_EXACT, pageTableCoverage);
+                            }
+                        }
+                        if (radius == 0) continue;
+                        for (int pageZ = Math.max(minVisiblePageZ, top + 1);
+                                pageZ <= Math.min(maxVisiblePageZ, bottom - 1); pageZ++) {
+                            if (left >= minVisiblePageX && left <= maxVisiblePageX) {
+                                collectSurfaceLeaf(builder, surfaceTextures,
+                                        left, pageZ, manager, collectPending,
+                                        MapRenderPlan.PHASE_EXACT, pageTableCoverage);
+                            }
+                            if (right != left && right >= minVisiblePageX
+                                    && right <= maxVisiblePageX) {
+                                collectSurfaceLeaf(builder, surfaceTextures,
+                                        right, pageZ, manager, collectPending,
+                                        MapRenderPlan.PHASE_EXACT, pageTableCoverage);
+                            }
+                        }
+                        if (bottom >= minVisiblePageZ && bottom <= maxVisiblePageZ) {
+                            for (int pageX = Math.max(minVisiblePageX, left);
+                                    pageX <= Math.min(maxVisiblePageX, right); pageX++) {
+                                collectSurfaceLeaf(builder, surfaceTextures,
+                                        pageX, bottom, manager, collectPending,
+                                        MapRenderPlan.PHASE_EXACT, pageTableCoverage);
                             }
                         }
                     }
@@ -746,7 +1179,8 @@ public class MapRenderer {
                         for (int pageZ = minVisiblePageZ;
                                 pageZ <= maxVisiblePageZ; pageZ++) {
                             collectSurfaceLeaf(builder, surfaceTextures,
-                                    pageX, pageZ, manager, collectPending);
+                                    pageX, pageZ, manager, collectPending,
+                                    MapRenderPlan.PHASE_EXACT, pageTableCoverage);
                         }
                     }
                 }
@@ -756,13 +1190,13 @@ public class MapRenderer {
                         for (int pageZ = minVisiblePageZ;
                                 pageZ <= maxVisiblePageZ; pageZ++) {
                             collectSurfaceGlowLeaf(builder, surfaceTextures,
-                                    pageX, pageZ);
+                                    pageX, pageZ, pageTableCoverage);
                         }
                     }
                 }
             }
         }
-        return builder.build(MapResidencyManager.getInstance().topologyRevision());
+        return builder.build(topologyRevision);
     }
 
     private void collectCaveHierarchy(MapRenderPlan.Builder builder,
@@ -772,18 +1206,47 @@ public class MapRenderer {
             int minVisiblePageZ, int maxVisiblePageZ,
             int level, float scale, boolean branchOnly,
             int focusPageX, int focusPageZ, boolean centerOutTraversal,
-            Set<Long> drawnRegions) {
+            boolean logicalExactCoverage, LongKeySet drawnRegions) {
         int minPageX = minVisiblePageX;
         int maxPageX = maxVisiblePageX;
         int minPageZ = minVisiblePageZ;
         int maxPageZ = maxVisiblePageZ;
+        if (branchOnly && level > 0) {
+            /*
+             * Build complete selected-level cells. The GUI scissor clips their
+             * offscreen portions, while the immutable plan remains valid until an
+             * actual selected-cell edge enters/leaves the viewport. Without this
+             * alignment, reusing a quantized plan could omit a lower-level fallback
+             * that became visible inside the same selected cell during a small pan.
+             */
+            int pageSpan = MapLodPolicy.pageSpanForBranch(level);
+            minPageX = Math.floorDiv(minPageX, pageSpan) * pageSpan;
+            maxPageX = (Math.floorDiv(maxPageX, pageSpan) + 1) * pageSpan - 1;
+            minPageZ = Math.floorDiv(minPageZ, pageSpan) * pageSpan;
+            maxPageZ = (Math.floorDiv(maxPageZ, pageSpan) + 1) * pageSpan - 1;
+        }
+        CaveTraversalBudget traversalBudget = branchOnly
+                ? new CaveTraversalBudget(caveBranchVisitBudget(scale),
+                        CAVE_BRANCH_PLAN_MAX_QUADS)
+                : CaveTraversalBudget.unbounded();
         if (level <= 0) {
             if (branchOnly) return;
             if (!centerOutTraversal) {
+                /*
+                 * Xaero retains a coarser root texture while the selected fine
+                 * texture is absent. Layered/Full Cave previously became exact-only
+                 * at L0, so a zoom transition could show a completely black viewport
+                 * even though an L1 or older ancestor was already resident. Draw a
+                 * branch-only underlay first; exact leaves refine it below.
+                 */
+                collectCaveLevelZeroUnderlay(builder, source,
+                        minPageX, maxPageX, minPageZ, maxPageZ,
+                        scale, focusPageX, focusPageZ, drawnRegions);
                 for (int pageX = minPageX; pageX <= maxPageX; pageX++) {
                     for (int pageZ = minPageZ; pageZ <= maxPageZ; pageZ++) {
                         collectCaveLeaf(builder, source, pageX, pageZ, scale,
-                                drawnRegions);
+                                drawnRegions, MapRenderPlan.PHASE_EXACT,
+                                logicalExactCoverage);
                     }
                 }
                 return;
@@ -793,13 +1256,38 @@ public class MapRenderer {
             int maximumRadius = gridRadius(minPageX, maxPageX, minPageZ, maxPageZ,
                     centerX, centerZ);
             for (int radius = 0; radius <= maximumRadius; radius++) {
-                for (int pageZ = centerZ - radius; pageZ <= centerZ + radius; pageZ++) {
-                    for (int pageX = centerX - radius; pageX <= centerX + radius; pageX++) {
-                        if (!onRing(pageX, pageZ, centerX, centerZ, radius)
-                                || pageX < minPageX || pageX > maxPageX
-                                || pageZ < minPageZ || pageZ > maxPageZ) continue;
-                        collectCaveLeaf(builder, source, pageX, pageZ, scale,
-                                drawnRegions);
+                int left = centerX - radius;
+                int right = centerX + radius;
+                int top = centerZ - radius;
+                int bottom = centerZ + radius;
+                if (top >= minPageZ && top <= maxPageZ) {
+                    for (int pageX = Math.max(minPageX, left);
+                            pageX <= Math.min(maxPageX, right); pageX++) {
+                        collectCaveLeaf(builder, source, pageX, top, scale,
+                                drawnRegions, MapRenderPlan.PHASE_EXACT,
+                                logicalExactCoverage);
+                    }
+                }
+                if (radius == 0) continue;
+                for (int pageZ = Math.max(minPageZ, top + 1);
+                        pageZ <= Math.min(maxPageZ, bottom - 1); pageZ++) {
+                    if (left >= minPageX && left <= maxPageX) {
+                        collectCaveLeaf(builder, source, left, pageZ, scale,
+                                drawnRegions, MapRenderPlan.PHASE_EXACT,
+                                logicalExactCoverage);
+                    }
+                    if (right != left && right >= minPageX && right <= maxPageX) {
+                        collectCaveLeaf(builder, source, right, pageZ, scale,
+                                drawnRegions, MapRenderPlan.PHASE_EXACT,
+                                logicalExactCoverage);
+                    }
+                }
+                if (bottom >= minPageZ && bottom <= maxPageZ) {
+                    for (int pageX = Math.max(minPageX, left);
+                            pageX <= Math.min(maxPageX, right); pageX++) {
+                        collectCaveLeaf(builder, source, pageX, bottom, scale,
+                                drawnRegions, MapRenderPlan.PHASE_EXACT,
+                                logicalExactCoverage);
                     }
                 }
             }
@@ -813,9 +1301,10 @@ public class MapRenderer {
         if (!centerOutTraversal) {
             for (int nodeX = minNodeX; nodeX <= maxNodeX; nodeX++) {
                 for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
+                    if (traversalBudget.exhausted()) return;
                     collectCaveNode(builder, source, level, nodeX, nodeZ, scale,
                             branchOnly, minPageX, maxPageX, minPageZ, maxPageZ,
-                            drawnRegions);
+                            drawnRegions, traversalBudget);
                 }
             }
             return;
@@ -825,14 +1314,108 @@ public class MapRenderer {
         int maximumRadius = gridRadius(minNodeX, maxNodeX, minNodeZ, maxNodeZ,
                 centerX, centerZ);
         for (int radius = 0; radius <= maximumRadius; radius++) {
-            for (int nodeZ = centerZ - radius; nodeZ <= centerZ + radius; nodeZ++) {
-                for (int nodeX = centerX - radius; nodeX <= centerX + radius; nodeX++) {
-                    if (!onRing(nodeX, nodeZ, centerX, centerZ, radius)
-                            || nodeX < minNodeX || nodeX > maxNodeX
-                            || nodeZ < minNodeZ || nodeZ > maxNodeZ) continue;
-                    collectCaveNode(builder, source, level, nodeX, nodeZ, scale,
+            int left = centerX - radius;
+            int right = centerX + radius;
+            int top = centerZ - radius;
+            int bottom = centerZ + radius;
+            if (top >= minNodeZ && top <= maxNodeZ) {
+                for (int nodeX = Math.max(minNodeX, left);
+                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
+                    if (traversalBudget.exhausted()) return;
+                    collectCaveNode(builder, source, level, nodeX, top, scale,
                             branchOnly, minPageX, maxPageX, minPageZ, maxPageZ,
-                            drawnRegions);
+                            drawnRegions, traversalBudget);
+                }
+            }
+            if (radius == 0) continue;
+            for (int nodeZ = Math.max(minNodeZ, top + 1);
+                    nodeZ <= Math.min(maxNodeZ, bottom - 1); nodeZ++) {
+                if (left >= minNodeX && left <= maxNodeX) {
+                    if (traversalBudget.exhausted()) return;
+                    collectCaveNode(builder, source, level, left, nodeZ, scale,
+                            branchOnly, minPageX, maxPageX, minPageZ, maxPageZ,
+                            drawnRegions, traversalBudget);
+                }
+                if (right != left && right >= minNodeX && right <= maxNodeX) {
+                    if (traversalBudget.exhausted()) return;
+                    collectCaveNode(builder, source, level, right, nodeZ, scale,
+                            branchOnly, minPageX, maxPageX, minPageZ, maxPageZ,
+                            drawnRegions, traversalBudget);
+                }
+            }
+            if (bottom >= minNodeZ && bottom <= maxNodeZ) {
+                for (int nodeX = Math.max(minNodeX, left);
+                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
+                    if (traversalBudget.exhausted()) return;
+                    collectCaveNode(builder, source, level, nodeX, bottom, scale,
+                            branchOnly, minPageX, maxPageX, minPageZ, maxPageZ,
+                            drawnRegions, traversalBudget);
+                }
+            }
+        }
+    }
+
+    private void collectCaveLevelZeroUnderlay(MapRenderPlan.Builder builder,
+            CaveHierarchySource source,
+            int minPageX, int maxPageX, int minPageZ, int maxPageZ,
+            float scale, int focusPageX, int focusPageZ,
+            LongKeySet drawnRegions) {
+        int underlayLevel = 1;
+        int pageSpan = MapLodPolicy.pageSpanForBranch(underlayLevel);
+        int minNodeX = Math.floorDiv(minPageX, pageSpan);
+        int maxNodeX = Math.floorDiv(maxPageX, pageSpan);
+        int minNodeZ = Math.floorDiv(minPageZ, pageSpan);
+        int maxNodeZ = Math.floorDiv(maxPageZ, pageSpan);
+        int centerX = clamp(Math.floorDiv(focusPageX, pageSpan),
+                minNodeX, maxNodeX);
+        int centerZ = clamp(Math.floorDiv(focusPageZ, pageSpan),
+                minNodeZ, maxNodeZ);
+        int maximumRadius = gridRadius(minNodeX, maxNodeX,
+                minNodeZ, maxNodeZ, centerX, centerZ);
+        CaveTraversalBudget budget = new CaveTraversalBudget(
+                Math.min(1_024, caveBranchVisitBudget(scale)),
+                CAVE_BRANCH_PLAN_MAX_QUADS);
+        for (int radius = 0; radius <= maximumRadius; radius++) {
+            int left = centerX - radius;
+            int right = centerX + radius;
+            int top = centerZ - radius;
+            int bottom = centerZ + radius;
+            if (top >= minNodeZ && top <= maxNodeZ) {
+                for (int nodeX = Math.max(minNodeX, left);
+                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
+                    if (budget.exhausted()) return;
+                    collectCaveNode(builder, source, underlayLevel,
+                            nodeX, top, scale, true,
+                            minPageX, maxPageX, minPageZ, maxPageZ,
+                            drawnRegions, budget);
+                }
+            }
+            if (radius == 0) continue;
+            for (int nodeZ = Math.max(minNodeZ, top + 1);
+                    nodeZ <= Math.min(maxNodeZ, bottom - 1); nodeZ++) {
+                if (left >= minNodeX && left <= maxNodeX) {
+                    if (budget.exhausted()) return;
+                    collectCaveNode(builder, source, underlayLevel,
+                            left, nodeZ, scale, true,
+                            minPageX, maxPageX, minPageZ, maxPageZ,
+                            drawnRegions, budget);
+                }
+                if (right != left && right >= minNodeX && right <= maxNodeX) {
+                    if (budget.exhausted()) return;
+                    collectCaveNode(builder, source, underlayLevel,
+                            right, nodeZ, scale, true,
+                            minPageX, maxPageX, minPageZ, maxPageZ,
+                            drawnRegions, budget);
+                }
+            }
+            if (bottom >= minNodeZ && bottom <= maxNodeZ) {
+                for (int nodeX = Math.max(minNodeX, left);
+                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
+                    if (budget.exhausted()) return;
+                    collectCaveNode(builder, source, underlayLevel,
+                            nodeX, bottom, scale, true,
+                            minPageX, maxPageX, minPageZ, maxPageZ,
+                            drawnRegions, budget);
                 }
             }
         }
@@ -842,7 +1425,8 @@ public class MapRenderer {
             CaveHierarchySource source, int level, int nodeX, int nodeZ,
             float scale, boolean branchOnly,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
-            Set<Long> drawnRegions) {
+            LongKeySet drawnRegions, CaveTraversalBudget traversalBudget) {
+        if (!traversalBudget.visit()) return;
         int pageSpan = MapLodPolicy.pageSpanForBranch(level);
         int firstPageX = nodeX * pageSpan;
         int firstPageZ = nodeZ * pageSpan;
@@ -855,7 +1439,7 @@ public class MapRenderer {
         CaveAtlasRegion ancestor = null;
         if (branch == null) {
             ancestor = findCaveAncestor(source, level, nodeX, nodeZ);
-            if (ancestor != null) {
+            if (ancestor != null && traversalBudget.emitQuad()) {
                 addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
                 markDrawnPageRange(drawnRegions,
                         Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
@@ -863,26 +1447,80 @@ public class MapRenderer {
             }
         }
         if (branchOnly) {
-            if (branch != null) {
-                addNodeQuad(builder, branch, nodeX, nodeZ, level);
-                markDrawnPageRange(drawnRegions,
-                        Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
-                        Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
+            /*
+             * Branch-only controls preferred density, not visibility. At L1 a
+             * resident exact page is a temporary underlay while its coherent 2x2
+             * branch is deriving/loading. This also applies to a partial branch:
+             * transparent/unknown child quadrants must not erase exact data that is
+             * already GPU-ready. Phase 27 sorts exact below the L1 branch (phase 28).
+             */
+            if (level == 1) {
+                for (int childX = 0; childX < 2
+                        && !traversalBudget.exhausted(); childX++) {
+                    for (int childZ = 0; childZ < 2
+                            && !traversalBudget.exhausted(); childZ++) {
+                        int childIndex = childZ * 2 + childX;
+                        if (branch != null && branch.childComplete(childIndex)) {
+                            continue;
+                        }
+                        int pageX = firstPageX + childX;
+                        int pageZ = firstPageZ + childZ;
+                        if (pageX < minPageX || pageX > maxPageX
+                                || pageZ < minPageZ || pageZ > maxPageZ) continue;
+                        if (!traversalBudget.emitQuad()) return;
+                        if (!collectCaveLeaf(builder, source, pageX, pageZ, scale,
+                                drawnRegions,
+                                MapRenderPlan.PHASE_L1_EXACT_UNDERLAY)) {
+                            traversalBudget.refundQuad();
+                        }
+                    }
+                }
+                if (branch != null && traversalBudget.emitQuad()) {
+                    addNodeQuad(builder, branch, nodeX, nodeZ, level);
+                    markDrawnPageRange(drawnRegions,
+                            Math.max(firstPageX, minPageX),
+                            Math.min(lastPageX, maxPageX),
+                            Math.max(firstPageZ, minPageZ),
+                            Math.min(lastPageZ, maxPageZ));
+                }
+                // An ancestor was already added above at the correct phase. Exact
+                // underlay fills only its transparent gaps; no recursive probe is
+                // needed after either coherent representation exists.
                 return;
             }
-            if (source.hasBranchData(level, nodeX, nodeZ) || level <= 1) return;
-            for (int childX = 0; childX < 2; childX++) {
-                for (int childZ = 0; childZ < 2; childZ++) {
+            // A coarser ancestor already covers this higher-level node. Descending
+            // after drawing it causes overlap and exponential traversal.
+            if (ancestor != null) return;
+            if (branch != null) {
+                if (traversalBudget.emitQuad()) {
+                    addNodeQuad(builder, branch, nodeX, nodeZ, level);
+                    markDrawnPageRange(drawnRegions,
+                            Math.max(firstPageX, minPageX),
+                            Math.min(lastPageX, maxPageX),
+                            Math.max(firstPageZ, minPageZ),
+                            Math.min(lastPageZ, maxPageZ));
+                }
+                return;
+            }
+            // At higher levels descend only when an exact/child branch subtree is
+            // resident. Disk metadata alone is not a reason to hide useful leaves.
+            if (!source.hasResidentPageInNode(level, nodeX, nodeZ)) return;
+            for (int childX = 0; childX < 2 && !traversalBudget.exhausted(); childX++) {
+                for (int childZ = 0; childZ < 2
+                        && !traversalBudget.exhausted(); childZ++) {
                     collectCaveNode(builder, source, level - 1,
                             nodeX * 2 + childX, nodeZ * 2 + childZ, scale, true,
-                            minPageX, maxPageX, minPageZ, maxPageZ, drawnRegions);
+                            minPageX, maxPageX, minPageZ, maxPageZ, drawnRegions,
+                            traversalBudget);
                 }
             }
             return;
         }
         if (branch == null && ancestor == null
                 && !source.hasResidentPageInNode(level, nodeX, nodeZ)) return;
-        if (branch != null) addNodeQuad(builder, branch, nodeX, nodeZ, level);
+        if (branch != null && traversalBudget.emitQuad()) {
+            addNodeQuad(builder, branch, nodeX, nodeZ, level);
+        }
         if (level == 1) {
             for (int childX = 0; childX < 2; childX++) {
                 for (int childZ = 0; childZ < 2; childZ++) {
@@ -910,69 +1548,117 @@ public class MapRenderer {
                                 childNodeX, childNodeZ)) continue;
                 collectCaveNode(builder, source, level - 1,
                         childNodeX, childNodeZ, scale, false,
-                        minPageX, maxPageX, minPageZ, maxPageZ, drawnRegions);
+                        minPageX, maxPageX, minPageZ, maxPageZ, drawnRegions,
+                        traversalBudget);
             }
         }
     }
 
     private boolean collectCaveLeaf(MapRenderPlan.Builder builder,
             CaveHierarchySource source, int globalPageX, int globalPageZ,
-            float scale, Set<Long> drawnRegions) {
+            float scale, LongKeySet drawnRegions) {
+        return collectCaveLeaf(builder, source, globalPageX, globalPageZ,
+                scale, drawnRegions, MapRenderPlan.PHASE_EXACT, false);
+    }
+
+    private boolean collectCaveLeaf(MapRenderPlan.Builder builder,
+            CaveHierarchySource source, int globalPageX, int globalPageZ,
+            float scale, LongKeySet drawnRegions, int phase) {
+        return collectCaveLeaf(builder, source, globalPageX, globalPageZ,
+                scale, drawnRegions, phase, false);
+    }
+
+    private boolean collectCaveLeaf(MapRenderPlan.Builder builder,
+            CaveHierarchySource source, int globalPageX, int globalPageZ,
+            float scale, LongKeySet drawnRegions, int phase,
+            boolean logicalExactCoverage) {
         if (!source.allowExact(globalPageX, globalPageZ)) return false;
         int rx = Math.floorDiv(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int rz = Math.floorDiv(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         int px = Math.floorMod(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int pz = Math.floorMod(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         CaveAtlasRegion page = source.page(rx, rz, px, pz, scale);
-        if (page == null) return false;
-        addCavePageQuad(builder, page, rx, rz, px, pz);
+        TileKey pageKey = source.pageKey(globalPageX, globalPageZ, scale);
+        if (page == null) {
+            if (logicalExactCoverage && pageKey != null) {
+                addLogicalCavePageQuad(builder, pageKey, globalPageX,
+                        globalPageZ, phase);
+            }
+            return false;
+        }
+        addCavePageQuad(builder, pageKey, page, rx, rz, px, pz, phase);
         drawnRegions.add(packRegion(rx, rz));
         return true;
     }
 
+    private static final int REGION_ONLY_PLAN_QUAD_CAP = 1_024;
+    private static final int REGION_ONLY_FALLBACK_VISIT_CAP = 4_096;
+
     private void collectRegionSurfaceCoverage(MapRenderPlan.Builder builder,
             MapOverviewTextureManager overviewTextures,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
-            float scale, int focusPageX, int focusPageZ) {
+            float scale, int focusPageX, int focusPageZ, boolean regionOnly) {
         int level = MapRegionLodPolicy.targetLevel(scale);
         int span = MapRegionLodPolicy.regionSpan(level);
         int minNodeX = Math.floorDiv(minRegionX, span);
         int maxNodeX = Math.floorDiv(maxRegionX, span);
         int minNodeZ = Math.floorDiv(minRegionZ, span);
         int maxNodeZ = Math.floorDiv(maxRegionZ, span);
-        int focusRegionX = Math.floorDiv(focusPageX,
-                MapPageLayout.PAGES_PER_REGION);
-        int focusRegionZ = Math.floorDiv(focusPageZ,
-                MapPageLayout.PAGES_PER_REGION);
-        int focusNodeX = clamp(Math.floorDiv(focusRegionX, span),
-                minNodeX, maxNodeX);
-        int focusNodeZ = clamp(Math.floorDiv(focusRegionZ, span),
-                minNodeZ, maxNodeZ);
-        int radiusMax = gridRadius(minNodeX, maxNodeX, minNodeZ, maxNodeZ,
-                focusNodeX, focusNodeZ);
-        for (int radius = 0; radius <= radiusMax; radius++) {
-            for (int nodeZ = focusNodeZ - radius;
-                    nodeZ <= focusNodeZ + radius; nodeZ++) {
-                for (int nodeX = focusNodeX - radius;
-                        nodeX <= focusNodeX + radius; nodeX++) {
-                    if (!onRing(nodeX, nodeZ, focusNodeX, focusNodeZ, radius)
-                            || nodeX < minNodeX || nodeX > maxNodeX
-                            || nodeZ < minNodeZ || nodeZ > maxNodeZ) continue;
-                    CaveAtlasRegion branch = overviewTextures
-                            .peekRegionSurfaceBranch(level, nodeX, nodeZ);
-                    if (branch != null) {
-                        addRegionLodQuad(builder, branch, nodeX, nodeZ);
-                        continue;
-                    }
-                    CaveAtlasRegion ancestor = findRegionSurfaceAncestor(
-                            overviewTextures, level, nodeX, nodeZ);
-                    if (ancestor != null) {
-                        addRegionLodAncestorQuad(builder, ancestor,
-                                level, nodeX, nodeZ);
-                    }
-                }
+        // Match source/publication order. At extreme far zoom, missing target nodes
+        // may use already-resident M4 descendants, but never exact leaves or the
+        // duplicate factor-2 tree. Bound both emitted quads and failed hierarchy
+        // lookups: an empty level-2 node otherwise expands into 4,096 level-0 probes.
+        regionFallbackVisitsRemaining = regionOnly
+                ? REGION_ONLY_FALLBACK_VISIT_CAP : Integer.MAX_VALUE;
+        for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
+            for (int nodeX = minNodeX; nodeX <= maxNodeX; nodeX++) {
+                if (regionOnly && builder.entryCount() >= REGION_ONLY_PLAN_QUAD_CAP)
+                    return;
+                if (collectRegionSurfaceNode(builder, overviewTextures, level,
+                        nodeX, nodeZ, minRegionX, maxRegionX,
+                        minRegionZ, maxRegionZ, regionOnly)) continue;
             }
         }
+    }
+
+    private boolean collectRegionSurfaceNode(MapRenderPlan.Builder builder,
+            MapOverviewTextureManager overviewTextures, int level,
+            int nodeX, int nodeZ, int minRegionX, int maxRegionX,
+            int minRegionZ, int maxRegionZ, boolean allowDescendants) {
+        if (regionFallbackVisitsRemaining-- <= 0) return false;
+        int span = MapRegionLodPolicy.regionSpan(level);
+        int firstRegionX = nodeX * span;
+        int firstRegionZ = nodeZ * span;
+        int lastRegionX = firstRegionX + span - 1;
+        int lastRegionZ = firstRegionZ + span - 1;
+        if (lastRegionX < minRegionX || firstRegionX > maxRegionX
+                || lastRegionZ < minRegionZ || firstRegionZ > maxRegionZ) {
+            return false;
+        }
+        CaveAtlasRegion branch = overviewTextures
+                .peekRegionSurfaceBranch(level, nodeX, nodeZ);
+        if (branch != null) {
+            addRegionLodQuad(builder, branch, nodeX, nodeZ);
+            return true;
+        }
+        CaveAtlasRegion ancestor = findRegionSurfaceAncestor(
+                overviewTextures, level, nodeX, nodeZ);
+        if (ancestor != null) {
+            addRegionLodAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
+            return true;
+        }
+        if (!allowDescendants || level <= 0) return false;
+        boolean drew = false;
+        int childLevel = level - 1;
+        for (int childZ = 0; childZ < 2; childZ++) {
+            for (int childX = 0; childX < 2; childX++) {
+                if (builder.entryCount() >= REGION_ONLY_PLAN_QUAD_CAP) return drew;
+                drew |= collectRegionSurfaceNode(builder, overviewTextures,
+                        childLevel, nodeX * 2 + childX, nodeZ * 2 + childZ,
+                        minRegionX, maxRegionX, minRegionZ, maxRegionZ, true);
+            }
+        }
+        return drew;
     }
 
     private CaveAtlasRegion findRegionSurfaceAncestor(
@@ -980,7 +1666,7 @@ public class MapRenderer {
             int targetNodeX, int targetNodeZ) {
         int divisor = 1;
         for (int level = targetLevel + 1; level <= 3; level++) {
-            divisor *= 8;
+            divisor *= 2;
             CaveAtlasRegion ancestor = overviewTextures.peekRegionSurfaceBranch(
                     level, Math.floorDiv(targetNodeX, divisor),
                     Math.floorDiv(targetNodeZ, divisor));
@@ -1022,13 +1708,37 @@ public class MapRenderer {
         int maximumRadius = gridRadius(minNodeX, maxNodeX, minNodeZ, maxNodeZ,
                 centerX, centerZ);
         for (int radius = 0; radius <= maximumRadius; radius++) {
-            for (int nodeZ = centerZ - radius; nodeZ <= centerZ + radius; nodeZ++) {
-                for (int nodeX = centerX - radius; nodeX <= centerX + radius; nodeX++) {
-                    if (!onRing(nodeX, nodeZ, centerX, centerZ, radius)
-                            || nodeX < minNodeX || nodeX > maxNodeX
-                            || nodeZ < minNodeZ || nodeZ > maxNodeZ) continue;
+            int left = centerX - radius;
+            int right = centerX + radius;
+            int top = centerZ - radius;
+            int bottom = centerZ + radius;
+            if (top >= minNodeZ && top <= maxNodeZ) {
+                for (int nodeX = Math.max(minNodeX, left);
+                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
-                            level, nodeX, nodeZ, minPageX, maxPageX,
+                            level, nodeX, top, minPageX, maxPageX,
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                }
+            }
+            if (radius == 0) continue;
+            for (int nodeZ = Math.max(minNodeZ, top + 1);
+                    nodeZ <= Math.min(maxNodeZ, bottom - 1); nodeZ++) {
+                if (left >= minNodeX && left <= maxNodeX) {
+                    collectSurfaceNode(builder, overviewTextures, surfaceTextures,
+                            level, left, nodeZ, minPageX, maxPageX,
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                }
+                if (right != left && right >= minNodeX && right <= maxNodeX) {
+                    collectSurfaceNode(builder, overviewTextures, surfaceTextures,
+                            level, right, nodeZ, minPageX, maxPageX,
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                }
+            }
+            if (bottom >= minNodeZ && bottom <= maxNodeZ) {
+                for (int nodeX = Math.max(minNodeX, left);
+                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
+                    collectSurfaceNode(builder, overviewTextures, surfaceTextures,
+                            level, nodeX, bottom, minPageX, maxPageX,
                             minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
             }
@@ -1050,6 +1760,12 @@ public class MapRenderer {
         if (lastPageX < minPageX || firstPageX > maxPageX
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
 
+        boolean exactResident = surfaceTextures.hasResidentPageInNode(
+                level, nodeX, nodeZ);
+        boolean sourceAvailable = surfaceNodeHasSource(manager,
+                Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
+                Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
+        if (!exactResident && !sourceAvailable) return;
         CaveAtlasRegion branch = overviewTextures.peekSurfaceBranch(level, nodeX, nodeZ);
         boolean nodeCovered = inheritedCoverage;
         if (branch != null) {
@@ -1065,6 +1781,17 @@ public class MapRenderer {
                 addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
                 nodeCovered = true;
             }
+        }
+
+        // Source exists but neither an exact descendant nor a branch is resident
+        // yet. Record pending once per overlapping region.
+        // Descending to every leaf only repeats cache/file lookups and turned a
+        // sparse 2,405-page far view into a 20 ms render-thread plan build.
+        if (branch == null && !exactResident) {
+            if (collectPending) recordPendingSurfaceRegions(builder, manager,
+                    Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
+                    Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
+            return;
         }
 
         if (level == 1) {
@@ -1099,7 +1826,7 @@ public class MapRenderer {
                             ? MapRenderPlan.PHASE_L1_EXACT_UNDERLAY
                             : MapRenderPlan.PHASE_EXACT;
                     collectSurfaceLeaf(builder, surfaceTextures, pageX, pageZ,
-                            manager, collectPending, phase);
+                            manager, collectPending, phase, false);
                 }
             }
             return;
@@ -1120,16 +1847,59 @@ public class MapRenderer {
         }
     }
 
-    private boolean collectSurfaceLeaf(MapRenderPlan.Builder builder,
-            MapTextureManager surfaceTextures, int globalPageX, int globalPageZ,
-            MapManager manager, boolean collectPending) {
-        return collectSurfaceLeaf(builder, surfaceTextures, globalPageX, globalPageZ,
-                manager, collectPending, MapRenderPlan.PHASE_EXACT);
+    private boolean surfaceNodeHasSource(MapManager manager,
+            int firstPageX, int lastPageX, int firstPageZ, int lastPageZ) {
+        int firstRegionX = Math.floorDiv(firstPageX,
+                MapPageLayout.PAGES_PER_REGION);
+        int lastRegionX = Math.floorDiv(lastPageX,
+                MapPageLayout.PAGES_PER_REGION);
+        int firstRegionZ = Math.floorDiv(firstPageZ,
+                MapPageLayout.PAGES_PER_REGION);
+        int lastRegionZ = Math.floorDiv(lastPageZ,
+                MapPageLayout.PAGES_PER_REGION);
+        boolean available = false;
+        for (int regionZ = firstRegionZ; regionZ <= lastRegionZ; regionZ++) {
+            for (int regionX = firstRegionX; regionX <= lastRegionX; regionX++) {
+                if (!manager.hasRegionFile(regionX, regionZ)
+                        && !manager.isRegionLoadedInCache(regionX, regionZ)) continue;
+                available = true;
+            }
+        }
+        return available;
+    }
+
+    private void recordPendingSurfaceRegions(MapRenderPlan.Builder builder,
+            MapManager manager, int firstPageX, int lastPageX,
+            int firstPageZ, int lastPageZ) {
+        int firstRegionX = Math.floorDiv(firstPageX,
+                MapPageLayout.PAGES_PER_REGION);
+        int lastRegionX = Math.floorDiv(lastPageX,
+                MapPageLayout.PAGES_PER_REGION);
+        int firstRegionZ = Math.floorDiv(firstPageZ,
+                MapPageLayout.PAGES_PER_REGION);
+        int lastRegionZ = Math.floorDiv(lastPageZ,
+                MapPageLayout.PAGES_PER_REGION);
+        for (int regionZ = firstRegionZ; regionZ <= lastRegionZ; regionZ++) {
+            for (int regionX = firstRegionX; regionX <= lastRegionX; regionX++) {
+                if (manager.hasRegionFile(regionX, regionZ)
+                        || manager.isRegionLoadedInCache(regionX, regionZ)) {
+                    builder.pending(regionX, regionZ);
+                }
+            }
+        }
     }
 
     private boolean collectSurfaceLeaf(MapRenderPlan.Builder builder,
             MapTextureManager surfaceTextures, int globalPageX, int globalPageZ,
-            MapManager manager, boolean collectPending, int phase) {
+            MapManager manager, boolean collectPending) {
+        return collectSurfaceLeaf(builder, surfaceTextures, globalPageX, globalPageZ,
+                manager, collectPending, MapRenderPlan.PHASE_EXACT, false);
+    }
+
+    private boolean collectSurfaceLeaf(MapRenderPlan.Builder builder,
+            MapTextureManager surfaceTextures, int globalPageX, int globalPageZ,
+            MapManager manager, boolean collectPending, int phase,
+            boolean logicalExactCoverage) {
         int rx = Math.floorDiv(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int rz = Math.floorDiv(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         int px = Math.floorMod(globalPageX, MapPageLayout.PAGES_PER_REGION);
@@ -1138,6 +1908,9 @@ public class MapRenderer {
         if (page != null) {
             addPageQuad(builder, page, rx, rz, px, pz, phase);
             return true;
+        }
+        if (logicalExactCoverage) {
+            addLogicalSurfacePageQuad(builder, globalPageX, globalPageZ, phase);
         }
         if (collectPending && (manager.hasRegionFile(rx, rz)
                 || manager.isRegionLoadedInCache(rx, rz))) {
@@ -1163,13 +1936,23 @@ public class MapRenderer {
 
     private void collectSurfaceGlowLeaf(MapRenderPlan.Builder builder,
             MapTextureManager surfaceTextures, int globalPageX, int globalPageZ) {
+        collectSurfaceGlowLeaf(builder, surfaceTextures, globalPageX, globalPageZ, false);
+    }
+
+    private void collectSurfaceGlowLeaf(MapRenderPlan.Builder builder,
+            MapTextureManager surfaceTextures, int globalPageX, int globalPageZ,
+            boolean logicalExactCoverage) {
         int rx = Math.floorDiv(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int rz = Math.floorDiv(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         int px = Math.floorMod(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int pz = Math.floorMod(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         CaveAtlasRegion page = surfaceTextures.peekGlowPageRegion(rx, rz, px, pz);
-        if (page != null) addPageQuad(builder, page, rx, rz, px, pz,
-                MapRenderPlan.PHASE_GLOW);
+        if (page != null) {
+            addPageQuad(builder, page, rx, rz, px, pz, MapRenderPlan.PHASE_GLOW);
+        } else if (logicalExactCoverage) {
+            addLogicalSurfacePageQuad(builder, globalPageX, globalPageZ,
+                    MapRenderPlan.PHASE_GLOW);
+        }
     }
 
     private void collectSurfaceGlowPages(MapRenderPlan.Builder builder,
@@ -1183,20 +1966,49 @@ public class MapRenderer {
         }
     }
 
-    /** Cave pages are not published into the M5 Surface page table yet.
-     * Replaying them as Surface TileKeys can resolve an unrelated Surface atlas
-     * entry at the same page coordinates, producing the mixed green/cave mosaic. */
-    private void addCavePageQuad(MapRenderPlan.Builder builder,
+    private void addLogicalCavePageQuad(MapRenderPlan.Builder builder, TileKey key,
+            int globalPageX, int globalPageZ, int phase) {
+        if (key == null) return;
+        builder.addTile(key, phase,
+                globalPageX * MapPageLayout.PAGE_SIZE,
+                globalPageZ * MapPageLayout.PAGE_SIZE,
+                MapPageLayout.PAGE_SIZE, MapPageLayout.PAGE_SIZE);
+    }
+
+    private void addLogicalSurfacePageQuad(MapRenderPlan.Builder builder,
+            int globalPageX, int globalPageZ, int phase) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null) return;
+        int variant = phase >= MapRenderPlan.PHASE_GLOW
+                ? TileKey.VARIANT_SURFACE_GLOW
+                : TileKey.VARIANT_SURFACE_EXACT;
+        builder.addTile(new TileKey(stamp.sessionId(), 0, 0,
+                        globalPageX, globalPageZ, variant),
+                phase, globalPageX * MapPageLayout.PAGE_SIZE,
+                globalPageZ * MapPageLayout.PAGE_SIZE,
+                MapPageLayout.PAGE_SIZE, MapPageLayout.PAGE_SIZE);
+    }
+
+    /** Cave exact leaves use the same logical page-table indirection as Surface.
+     * Atlas slot reuse and storage recreation therefore no longer invalidate cached
+     * world geometry or risk sampling another cave page's slot. */
+    private void addCavePageQuad(MapRenderPlan.Builder builder, TileKey key,
             CaveAtlasRegion region, int regionX, int regionZ,
-            int pageX, int pageZ) {
-        if (builder.add(region.texture(), MapRenderPlan.PHASE_EXACT,
-                regionX * 512 + pageX * 64,
-                regionZ * 512 + pageZ * 64,
-                64, 64, region.sourceX(), region.sourceY(),
-                region.sourceSize(), region.sourceSize(),
-                region.atlasSize(), region.atlasSize())) {
-            builder.exact();
+            int pageX, int pageZ, int phase) {
+        boolean added;
+        if (key != null) {
+            added = builder.addTile(key, phase,
+                    regionX * 512 + pageX * 64,
+                    regionZ * 512 + pageZ * 64, 64, 64);
+        } else {
+            added = builder.add(region.texture(), phase,
+                    regionX * 512 + pageX * 64,
+                    regionZ * 512 + pageZ * 64,
+                    64, 64, region.sourceX(), region.sourceY(),
+                    region.sourceSize(), region.sourceSize(),
+                    region.atlasSize(), region.atlasSize());
         }
+        if (added) builder.exact();
     }
 
     private void addPageQuad(MapRenderPlan.Builder builder, CaveAtlasRegion region,
@@ -1211,12 +2023,8 @@ public class MapRenderer {
         if (stamp != null) {
             added = builder.addTile(new TileKey(stamp.sessionId(), 0, 0,
                             globalPageX, globalPageZ, variant),
-                    region.texture(), phase,
-                    regionX * 512 + pageX * 64,
-                    regionZ * 512 + pageZ * 64,
-                    64, 64, region.sourceX(), region.sourceY(),
-                    region.sourceSize(), region.sourceSize(),
-                    region.atlasSize(), region.atlasSize());
+                    phase, regionX * 512 + pageX * 64,
+                    regionZ * 512 + pageZ * 64, 64, 64);
         } else {
             added = builder.add(region.texture(), phase,
                     regionX * 512 + pageX * 64,
@@ -1251,11 +2059,9 @@ public class MapRenderer {
                             RegionSurfaceLodService.PROJECTION_SURFACE,
                             region.level(), nodeX, nodeZ,
                             TileKey.VARIANT_SURFACE_BRANCH),
-                    region.texture(), MapRenderPlan.PHASE_REGION_COARSE,
+                    MapRenderPlan.PHASE_REGION_COARSE,
                     nodeX * worldSize, nodeZ * worldSize,
-                    worldSize, worldSize, region.sourceX(), region.sourceY(),
-                    region.sourceSize(), region.sourceSize(),
-                    region.atlasSize(), region.atlasSize());
+                    worldSize, worldSize);
         } else {
             added = builder.add(region.texture(),
                     MapRenderPlan.PHASE_REGION_COARSE,
@@ -1275,8 +2081,7 @@ public class MapRenderer {
             addRegionLodQuad(builder, ancestor, nodeX, nodeZ);
             return;
         }
-        int subdivision = 1;
-        for (int index = 0; index < difference; index++) subdivision *= 8;
+        int subdivision = 1 << difference;
         int sourceSize = Math.max(1, ancestor.sourceSize() / subdivision);
         int localX = Math.floorMod(nodeX, subdivision);
         int localZ = Math.floorMod(nodeZ, subdivision);
@@ -1356,7 +2161,7 @@ public class MapRenderer {
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
             int level, float scale, boolean branchOnly,
             int focusPageX, int focusPageZ,
-            Set<Long> drawnRegions, RenderStats stats) {
+            LongKeySet drawnRegions, RenderStats stats) {
         int minPageX = minRegionX * MapPageLayout.PAGES_PER_REGION;
         int maxPageX = (maxRegionX + 1) * MapPageLayout.PAGES_PER_REGION - 1;
         int minPageZ = minRegionZ * MapPageLayout.PAGES_PER_REGION;
@@ -1411,7 +2216,7 @@ public class MapRenderer {
     private void drawCaveNode(GuiGraphics guiGraphics, CaveHierarchySource source,
             int level, int nodeX, int nodeZ, float scale, boolean branchOnly,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
-            Set<Long> drawnRegions, RenderStats stats) {
+            LongKeySet drawnRegions, RenderStats stats) {
         int pageSpan = MapLodPolicy.pageSpanForBranch(level);
         int firstPageX = nodeX * pageSpan;
         int firstPageZ = nodeZ * pageSpan;
@@ -1421,19 +2226,46 @@ public class MapRenderer {
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
 
         CaveAtlasRegion branch = source.branch(level, nodeX, nodeZ);
-        CaveAtlasRegion ancestorFallback = null;
-        if (branch == null) {
-            ancestorFallback = findCaveAncestor(source, level, nodeX, nodeZ);
-            if (ancestorFallback != null) {
-                drawCaveAncestorSubRect(guiGraphics, ancestorFallback,
-                        level, nodeX, nodeZ);
-                stats.branchNodes++;
-                markDrawnPageRange(drawnRegions,
-                        Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
-                        Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
-            }
-        }
+        CaveAtlasRegion ancestorFallback = branch == null
+                ? findCaveAncestor(source, level, nodeX, nodeZ) : null;
         if (branchOnly) {
+            if (level == 1) {
+                // Legacy/direct replay follows the same ordering as the immutable
+                // plan: exact incomplete children first, then branch/ancestor on top.
+                for (int childX = 0; childX < 2; childX++) {
+                    for (int childZ = 0; childZ < 2; childZ++) {
+                        int childIndex = childZ * 2 + childX;
+                        if (branch != null && branch.childComplete(childIndex)) {
+                            continue;
+                        }
+                        int pageX = firstPageX + childX;
+                        int pageZ = firstPageZ + childZ;
+                        if (pageX < minPageX || pageX > maxPageX
+                                || pageZ < minPageZ || pageZ > maxPageZ) continue;
+                        drawCaveLeafPage(guiGraphics, source, pageX, pageZ, scale,
+                                drawnRegions, stats);
+                    }
+                }
+                if (branch != null) {
+                    drawAtlasNode(guiGraphics, branch, nodeX, nodeZ);
+                    stats.branchNodes++;
+                    markDrawnPageRange(drawnRegions,
+                            Math.max(firstPageX, minPageX),
+                            Math.min(lastPageX, maxPageX),
+                            Math.max(firstPageZ, minPageZ),
+                            Math.min(lastPageZ, maxPageZ));
+                } else if (ancestorFallback != null) {
+                    drawCaveAncestorSubRect(guiGraphics, ancestorFallback,
+                            level, nodeX, nodeZ);
+                    stats.branchNodes++;
+                    markDrawnPageRange(drawnRegions,
+                            Math.max(firstPageX, minPageX),
+                            Math.min(lastPageX, maxPageX),
+                            Math.max(firstPageZ, minPageZ),
+                            Math.min(lastPageZ, maxPageZ));
+                }
+                return;
+            }
             if (branch != null) {
                 drawAtlasNode(guiGraphics, branch, nodeX, nodeZ);
                 stats.branchNodes++;
@@ -1442,15 +2274,16 @@ public class MapRenderer {
                         Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
                 return;
             }
-            // If metadata says this branch exists on disk, wait for that coherent
-            // representation instead of recursively probing many lower levels in
-            // the same frame. Descend only when the current level is genuinely
-            // absent and a smaller cached branch may provide coverage.
-            if (source.hasBranchData(level, nodeX, nodeZ)) return;
-            // Xaero keeps a coarse root/ancestor sub-rectangle visible while lower
-            // branch levels load. Continue downward only to refine that stable base;
-            // never fall through to exact leaves at branch-only zoom.
-            if (level <= 1) return;
+            if (ancestorFallback != null) {
+                drawCaveAncestorSubRect(guiGraphics, ancestorFallback,
+                        level, nodeX, nodeZ);
+                stats.branchNodes++;
+                markDrawnPageRange(drawnRegions,
+                        Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
+                        Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
+                return;
+            }
+            if (!source.hasResidentPageInNode(level, nodeX, nodeZ)) return;
             int childPageSpan = MapLodPolicy.pageSpanForBranch(level - 1);
             for (int childX = 0; childX < 2; childX++) {
                 for (int childZ = 0; childZ < 2; childZ++) {
@@ -1469,6 +2302,15 @@ public class MapRenderer {
                 }
             }
             return;
+        }
+
+        if (ancestorFallback != null) {
+            drawCaveAncestorSubRect(guiGraphics, ancestorFallback,
+                    level, nodeX, nodeZ);
+            stats.branchNodes++;
+            markDrawnPageRange(drawnRegions,
+                    Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
+                    Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
         }
 
         // A missing branch is not allowed to hide resident exact pages at close and
@@ -1529,7 +2371,7 @@ public class MapRenderer {
     }
 
     private boolean drawCaveLeafPage(GuiGraphics guiGraphics, CaveHierarchySource source,
-            int globalPageX, int globalPageZ, float scale, Set<Long> drawnRegions,
+            int globalPageX, int globalPageZ, float scale, LongKeySet drawnRegions,
             RenderStats stats) {
         int rx = Math.floorDiv(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int rz = Math.floorDiv(globalPageZ, MapPageLayout.PAGES_PER_REGION);
@@ -1556,6 +2398,40 @@ public class MapRenderer {
             if (ancestor != null) return ancestor;
         }
         return null;
+    }
+
+    private static final class CaveTraversalBudget {
+        private int remainingVisits;
+        private int remainingQuads;
+
+        private CaveTraversalBudget(int remainingVisits, int remainingQuads) {
+            this.remainingVisits = remainingVisits;
+            this.remainingQuads = remainingQuads;
+        }
+
+        private static CaveTraversalBudget unbounded() {
+            return new CaveTraversalBudget(Integer.MAX_VALUE, Integer.MAX_VALUE);
+        }
+
+        private boolean visit() {
+            if (remainingVisits <= 0) return false;
+            remainingVisits--;
+            return true;
+        }
+
+        private boolean emitQuad() {
+            if (remainingQuads <= 0) return false;
+            remainingQuads--;
+            return true;
+        }
+
+        private void refundQuad() {
+            if (remainingQuads < Integer.MAX_VALUE) remainingQuads++;
+        }
+
+        private boolean exhausted() {
+            return remainingVisits <= 0 || remainingQuads <= 0;
+        }
     }
 
     private CaveAtlasRegion findCaveAncestor(CaveHierarchySource source,
@@ -1602,13 +2478,13 @@ public class MapRenderer {
                 region.atlasSize(), region.atlasSize());
     }
 
-    private static void markPageDrawn(Set<Long> output, int pageX, int pageZ) {
+    private static void markPageDrawn(LongKeySet output, int pageX, int pageZ) {
         output.add(packRegion(
                 Math.floorDiv(pageX, MapPageLayout.PAGES_PER_REGION),
                 Math.floorDiv(pageZ, MapPageLayout.PAGES_PER_REGION)));
     }
 
-    private static void markDrawnPageRange(Set<Long> output,
+    private static void markDrawnPageRange(LongKeySet output,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ) {
         if (maxPageX < minPageX || maxPageZ < minPageZ) return;
         int minRegionX = Math.floorDiv(minPageX, MapPageLayout.PAGES_PER_REGION);
@@ -1633,6 +2509,8 @@ public class MapRenderer {
 
         CaveAtlasRegion page(int regionX, int regionZ,
                 int pageX, int pageZ, float scale);
+
+        TileKey pageKey(int globalPageX, int globalPageZ, float scale);
     }
 
     private void drawSurfaceHierarchy(GuiGraphics guiGraphics,
@@ -1802,49 +2680,55 @@ public class MapRenderer {
      */
     private void drawLoadingIndicators(GuiGraphics guiGraphics,
             long[] pendingRegions, float mapScale) {
-        if (pendingRegions == null || pendingRegions.length == 0) return;
-        Set<Long> pending = new LinkedHashSet<>();
-        for (long packed : pendingRegions) {
-            if (pending.size() >= 256) break;
-            pending.add(packed);
-        }
-        drawLoadingIndicators(guiGraphics, pending, mapScale);
-    }
-
-    private void drawLoadingIndicators(GuiGraphics guiGraphics,
-            Set<Long> pendingRegions, float mapScale) {
-        if (pendingRegions == null || pendingRegions.isEmpty() || mapScale <= 0.0f) return;
+        if (pendingRegions == null || pendingRegions.length == 0
+                || mapScale <= 0.0f) return;
         int cellBlocks = loadingCellBlocks(mapScale);
-        Set<Long> cells = new LinkedHashSet<>();
-        for (long packed : pendingRegions) {
-            int rx = (int) (packed >> 32);
-            int rz = (int) packed;
-            int regionX = rx * 512;
-            int regionZ = rz * 512;
+        int cellCount = 0;
+        for (int pendingIndex = 0; pendingIndex < pendingRegions.length
+                && pendingIndex < 256 && cellCount < loadingCellScratch.length;
+                pendingIndex++) {
+            long packed = pendingRegions[pendingIndex];
+            int regionX = (int) (packed >> 32) * 512;
+            int regionZ = (int) packed * 512;
             if (cellBlocks < 512) {
-                for (int z = regionZ; z < regionZ + 512 && cells.size() < 24; z += cellBlocks) {
-                    for (int x = regionX; x < regionX + 512 && cells.size() < 24; x += cellBlocks) {
-                        cells.add(packCell(x, z));
+                for (int z = regionZ; z < regionZ + 512
+                        && cellCount < loadingCellScratch.length; z += cellBlocks) {
+                    for (int x = regionX; x < regionX + 512
+                            && cellCount < loadingCellScratch.length; x += cellBlocks) {
+                        cellCount = appendUniqueLoadingCell(
+                                packCell(x, z), cellCount);
                     }
                 }
             } else {
                 int cellX = Math.floorDiv(regionX, cellBlocks) * cellBlocks;
                 int cellZ = Math.floorDiv(regionZ, cellBlocks) * cellBlocks;
-                cells.add(packCell(cellX, cellZ));
+                cellCount = appendUniqueLoadingCell(
+                        packCell(cellX, cellZ), cellCount);
             }
-            if (cells.size() >= 24) break;
         }
 
         float screenCell = Math.max(1.0f, cellBlocks * mapScale);
         int radius = Math.max(4, Math.min(9, Math.round(screenCell * 0.08f)));
-        for (long packed : cells) {
+        int spinnerPhase = (int) ((System.currentTimeMillis() / 90L) & 7L);
+        for (int index = 0; index < cellCount; index++) {
+            long packed = loadingCellScratch[index];
             int cellX = (int) (packed >> 32);
             int cellZ = (int) packed;
             drawLoadingSpinner(guiGraphics,
                     cellX + cellBlocks * 0.5,
                     cellZ + cellBlocks * 0.5,
-                    mapScale, radius);
+                    mapScale, radius, spinnerPhase);
         }
+    }
+
+    private int appendUniqueLoadingCell(long packed, int count) {
+        for (int index = 0; index < count; index++) {
+            if (loadingCellScratch[index] == packed) return count;
+        }
+        if (count < loadingCellScratch.length) {
+            loadingCellScratch[count++] = packed;
+        }
+        return count;
     }
 
     private static int loadingCellBlocks(float scale) {
@@ -1860,25 +2744,21 @@ public class MapRenderer {
     }
 
     private void drawLoadingSpinner(GuiGraphics guiGraphics,
-            double worldX, double worldZ, float mapScale, int radius) {
+            double worldX, double worldZ, float mapScale, int radius,
+            int phase) {
         PoseStack pose = guiGraphics.pose();
         pose.pushPose();
         pose.translate(worldX, worldZ, 20.0);
         float inverseScale = 1.0f / mapScale;
         pose.scale(inverseScale, inverseScale, 1.0f);
         int diagonal = Math.max(3, Math.round(radius * 0.70f));
-        int[][] points = {
-                { 0, -radius }, { diagonal, -diagonal }, { radius, 0 },
-                { diagonal, diagonal }, { 0, radius }, { -diagonal, diagonal },
-                { -radius, 0 }, { -diagonal, -diagonal }
-        };
-        int phase = (int) ((System.currentTimeMillis() / 90L) & 7L);
-        for (int i = 0; i < points.length; i++) {
+        for (int i = 0; i < 8; i++) {
             int distance = (i - phase + 8) & 7;
             int alpha = distance == 0 ? 0xFF : distance <= 2 ? 0xA0 : 0x48;
             int color = (alpha << 24) | 0x00D8D8D8;
-            int x = points[i][0];
-            int y = points[i][1];
+            int distanceFromCenter = (i & 1) == 0 ? radius : diagonal;
+            int x = SPINNER_X[i] * distanceFromCenter;
+            int y = SPINNER_Y[i] * distanceFromCenter;
             guiGraphics.fill(x - 1, y - 1, x + 1, y + 1, color);
         }
         pose.popPose();
@@ -1894,6 +2774,20 @@ public class MapRenderer {
         }
     }
 
+
+    /**
+     * Quantized visual brightness used by retained minimap composition. The atlas
+     * geometry can remain unchanged while day/night brightness changes, so the FBO
+     * cache needs a low-frequency visual generation that does not force a redraw
+     * for every interpolation tick.
+     */
+    int minimapBrightnessBucket(Minecraft mc, float partialTick,
+            boolean caveMode) {
+        float brightness = caveMode
+                ? getCaveBrightness(mc, partialTick)
+                : getMapBrightness(mc, partialTick);
+        return Math.max(0, Math.min(64, Math.round(brightness * 64.0f)));
+    }
 
     private float getMapBrightness(Minecraft mc, float partialTick) {
         if (MapConfig.minimapNightMode == 0) return 1.0f;
@@ -1932,44 +2826,35 @@ public class MapRenderer {
         // Translate to the waypoint's position in world space
         poseStack.translate(wp.x, wp.z, 5);
 
-        // Do not compensate map scale so waypoints scale with map zoom.
-        // Base scale is 0.08f (fits perfectly in ~1.28 blocks in world space).
-        float markerScale = 0.08f * MapConfig.waypointScale * wp.scale;
+        // Item icons are screen overlays anchored in world space. Compensating the
+        // camera zoom keeps a 0.48x fullscreen icon visible instead of shrinking it
+        // to less than one pixel; wp.scale remains an immediately visible choice.
+        float safeMapScale = Math.max(0.0001f, Math.abs(mapScale));
+        // The global setting is historically 1..10 with 5 as its visual 1.0x.
+        float markerScale = (0.20f * MapConfig.waypointScale * wp.scale)
+                / safeMapScale;
         poseStack.scale(markerScale, markerScale, 1.0f);
 
-        // Determine item ID (map old preset iconTypes to item textures for backward
-        // compatibility)
-        String itemID = wp.iconItem;
-        if (wp.iconType >= 0) {
-            if (wp.iconType == 0)
-                itemID = "minecraft:red_dye";
-            else if (wp.iconType == 1)
-                itemID = "minecraft:red_bed";
-            else if (wp.iconType == 2)
-                itemID = "minecraft:target";
-            else
-                itemID = "minecraft:nether_star";
-        }
+        // Resolve old preset icons and new item icons through one shared path so
+        // the map and Waypoint Manager always display the same symbol.
+        String itemID = WaypointManager.resolveIconItemId(wp);
 
-        // Draw the item texture
-        if (itemID.isEmpty()) {
-            itemID = "minecraft:compass";
-        }
-
-        try {
-            net.minecraft.world.item.Item item = net.minecraft.core.registries.BuiltInRegistries.ITEM.get(
-                    ResourceLocation.parse(itemID));
-            if (item != null && item != net.minecraft.world.item.Items.AIR) {
-                // Draw item centered (ItemStack is 16x16px, so we offset by -8)
-                guiGraphics.renderFakeItem(new net.minecraft.world.item.ItemStack(item), -8, -8);
-            } else {
-                guiGraphics.renderFakeItem(
-                        new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.COMPASS), -8, -8);
+        net.minecraft.world.item.ItemStack iconStack = waypointItemStacks.get(itemID);
+        if (iconStack == null) {
+            try {
+                net.minecraft.world.item.Item item =
+                        net.minecraft.core.registries.BuiltInRegistries.ITEM.get(
+                                ResourceLocation.parse(itemID));
+                iconStack = item != null && item != net.minecraft.world.item.Items.AIR
+                        ? new net.minecraft.world.item.ItemStack(item)
+                        : fallbackWaypointStack;
+            } catch (RuntimeException invalidIdentifier) {
+                iconStack = fallbackWaypointStack;
             }
-        } catch (Exception e) {
-            guiGraphics.renderFakeItem(new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.COMPASS),
-                    -8, -8);
+            waypointItemStacks.put(itemID, iconStack);
         }
+        // Draw item centered (ItemStack is 16x16px, so we offset by -8).
+        guiGraphics.renderFakeItem(iconStack, -8, -8);
 
         // Draw name text above the icon ONLY if it is not the minimap and it is hovered
         if (!isMinimap && isHovered) {
@@ -1983,6 +2868,14 @@ public class MapRenderer {
         }
 
         poseStack.popPose();
+    }
+
+    static double waypointHitRadiusWorld(WaypointManager.Waypoint waypoint,
+            float mapScale) {
+        float iconScale = waypoint == null ? 1.0f : waypoint.scale;
+        double radiusPixels = Math.max(6.0,
+                8.0 * 0.20 * MapConfig.waypointScale * iconScale + 2.0);
+        return radiusPixels / Math.max(0.0001, Math.abs(mapScale));
     }
 
     /**
@@ -2188,6 +3081,12 @@ public class MapRenderer {
         private int branchNodes;
         private int legacyFallbacks;
 
+        private void reset() {
+            exactPages = 0;
+            branchNodes = 0;
+            legacyFallbacks = 0;
+        }
+
         private void accept(MapDrawResult result) {
             if (result == null) return;
             exactPages += result.exactPagesDrawn();
@@ -2200,24 +3099,117 @@ public class MapRenderer {
         }
     }
 
+    private CachedPlan stableFullscreenPlan(StablePlanKey stableKey,
+            PlanKey target, long topologyRevision) {
+        CachedPlan candidate = stableFullscreenPlans.get(stableKey);
+        if (candidate == null) return null;
+        if (!candidate.plan().topologyValid(topologyRevision)) {
+            stableFullscreenPlans.remove(stableKey);
+            return null;
+        }
+        return compatibleFullscreenFallback(candidate.key(), target)
+                && candidate.plan().quadCount() > 0 ? candidate : null;
+    }
+
+    private void rememberStableFullscreenPlan(CachedPlan plan) {
+        if (plan == null || plan.plan().quadCount() <= 0) return;
+        stableFullscreenPlans.put(StablePlanKey.of(plan.key()), plan);
+    }
+
     private static boolean compatibleFullscreenFallback(
             PlanKey previous, PlanKey target) {
         if (previous == null || target == null
                 || !previous.dimension().equals(target.dimension())
+                || previous.sessionId() != target.sessionId()
                 || previous.caveMode() != target.caveMode()
                 || previous.fullCaveView() != target.fullCaveView()
                 || previous.caveLayerY() != target.caveLayerY()) return false;
-        return previous.maxRegionX() >= target.minRegionX()
-                && previous.minRegionX() <= target.maxRegionX()
-                && previous.maxRegionZ() >= target.minRegionZ()
-                && previous.minRegionZ() <= target.maxRegionZ();
+        int overlapMinX = Math.max(previous.minRegionX(), target.minRegionX());
+        int overlapMaxX = Math.min(previous.maxRegionX(), target.maxRegionX());
+        int overlapMinZ = Math.max(previous.minRegionZ(), target.minRegionZ());
+        int overlapMaxZ = Math.min(previous.maxRegionZ(), target.maxRegionZ());
+        if (overlapMaxX < overlapMinX || overlapMaxZ < overlapMinZ) return false;
+        int targetCenterX = Math.floorDiv(target.minRegionX() + target.maxRegionX(), 2);
+        int targetCenterZ = Math.floorDiv(target.minRegionZ() + target.maxRegionZ(), 2);
+        boolean coversTargetCenter = targetCenterX >= previous.minRegionX()
+                && targetCenterX <= previous.maxRegionX()
+                && targetCenterZ >= previous.minRegionZ()
+                && targetCenterZ <= previous.maxRegionZ();
+        long overlapArea = (long) (overlapMaxX - overlapMinX + 1)
+                * (overlapMaxZ - overlapMinZ + 1);
+        long targetArea = (long) (target.maxRegionX() - target.minRegionX() + 1)
+                * (target.maxRegionZ() - target.minRegionZ() + 1);
+        return coversTargetCenter || overlapArea * 4L >= targetArea;
     }
 
-    private record PlanKey(String dimension, boolean caveMode,
+    private record PlanKey(String dimension, long sessionId, boolean caveMode,
             boolean fullCaveView, int caveLayerY,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
+            int minPlanCellX, int maxPlanCellX,
+            int minPlanCellZ, int maxPlanCellZ,
             int hierarchyLevel, boolean caveBranchOnly, int renderScaleClass,
             int attentionPageX, int attentionPageZ, int nightMode) {
+    }
+
+    private record StablePlanKey(String dimension, long sessionId, boolean caveMode,
+            boolean fullCaveView, int caveLayerY) {
+        private static StablePlanKey of(PlanKey key) {
+            int layer = key.caveMode() && !key.fullCaveView()
+                    ? key.caveLayerY() : Integer.MIN_VALUE;
+            return new StablePlanKey(key.dimension(), key.sessionId(), key.caveMode(),
+                    key.fullCaveView(), layer);
+        }
+    }
+
+    /** Allocation-free region membership set used only while building one plan. */
+    private static final class LongKeySet {
+        private long[] keys = new long[32];
+        private byte[] states = new byte[32];
+        private int size;
+
+        private boolean add(long key) {
+            if ((size + 1) * 10 >= keys.length * 7) resize(keys.length << 1);
+            int mask = keys.length - 1;
+            int index = mix(key) & mask;
+            while (states[index] != 0) {
+                if (keys[index] == key) return false;
+                index = (index + 1) & mask;
+            }
+            states[index] = 1;
+            keys[index] = key;
+            size++;
+            return true;
+        }
+
+        private boolean contains(long key) {
+            int mask = keys.length - 1;
+            int index = mix(key) & mask;
+            while (states[index] != 0) {
+                if (keys[index] == key) return true;
+                index = (index + 1) & mask;
+            }
+            return false;
+        }
+
+        private void resize(int capacity) {
+            long[] oldKeys = keys;
+            byte[] oldStates = states;
+            keys = new long[capacity];
+            states = new byte[capacity];
+            size = 0;
+            for (int i = 0; i < oldKeys.length; i++) {
+                if (oldStates[i] != 0) add(oldKeys[i]);
+            }
+        }
+
+        private static int mix(long value) {
+            value ^= value >>> 33;
+            value *= 0xff51afd7ed558ccdL;
+            value ^= value >>> 33;
+            value *= 0xc4ceb9fe1a85ec53L;
+            value ^= value >>> 33;
+            return (int) value;
+        }
     }
 
     private record CachedPlan(PlanKey key, MapRenderPlan plan,

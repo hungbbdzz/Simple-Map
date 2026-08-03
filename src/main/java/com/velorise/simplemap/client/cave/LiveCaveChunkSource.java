@@ -13,6 +13,8 @@ import net.minecraft.world.level.levelgen.Heightmap;
 final class LiveCaveChunkSource implements CaveDisplayProjector.ChunkSource {
     private final Level level;
     private final LevelChunk chunk;
+    private final CaveTileScanContext scanContext;
+    private final CaveStateClassifier geometry = CaveStateClassifier.getInstance();
     private final int chunkX;
     private final int chunkZ;
     private final CaveColorResolver colors = CaveColorResolver.getInstance();
@@ -26,6 +28,7 @@ final class LiveCaveChunkSource implements CaveDisplayProjector.ChunkSource {
         this.chunkX = snapshot.chunkX();
         this.chunkZ = snapshot.chunkZ();
         this.chunk = snapshot.centerChunk();
+        this.scanContext = CaveTileScanContext.create(this.chunk);
     }
 
     @Override
@@ -61,8 +64,27 @@ final class LiveCaveChunkSource implements CaveDisplayProjector.ChunkSource {
     }
 
     @Override
+    public byte sectionKind(int y) {
+        return scanContext == null ? CaveTileScanContext.MIXED
+                : scanContext.sectionKind(level, y, geometry);
+    }
+
+    @Override
+    public int sectionBottom(int y) {
+        return scanContext == null ? Math.floorDiv(y, 16) * 16
+                : scanContext.sectionBottom(level, y);
+    }
+
+    @Override
     public BlockState visualStateAt(int localX, int y, int localZ) {
         BlockState actual = stateAt(localX, y, localZ);
+        return visualStateAt(localX, y, localZ, actual);
+    }
+
+    @Override
+    public BlockState visualStateAt(int localX, int y, int localZ,
+            BlockState actual) {
+        if (!actual.hasBlockEntity()) return actual;
         globalProbe.set((chunkX << 4) + localX, y, (chunkZ << 4) + localZ);
         return blockEntityVisuals.resolveLive(level, globalProbe, actual);
     }

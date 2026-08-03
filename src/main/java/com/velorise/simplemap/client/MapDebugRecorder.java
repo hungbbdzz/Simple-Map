@@ -41,8 +41,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>events.jsonl: sparse lifecycle/anomaly events with flexible payload text.</li>
  * </ul>
  *
- * <p>All disk I/O is performed on one daemon writer thread. The client thread only
- * captures immutable snapshots and offers preformatted lines to a bounded queue.</p>
+ * <p>All disk I/O and expensive map-state scans are performed on one low-priority
+ * daemon writer thread. The client thread captures only the current viewport and
+ * allocation-light counters, preventing the 1 Hz recorder from becoming a visible
+ * frame-time pulse.</p>
  */
 public final class MapDebugRecorder {
     private static final Logger LOGGER = LogManager.getLogger();
@@ -73,6 +75,8 @@ public final class MapDebugRecorder {
     private volatile long activeSessionId = Long.MIN_VALUE;
     private volatile Path activeDirectory;
     private volatile DebugSnapshot lastSnapshot = DebugSnapshot.empty();
+    /** Heavy diagnostic scans are refreshed by the low-priority writer thread. */
+    private volatile DeepSnapshots deepSnapshots;
 
     private BufferedWriter metricsWriter;
     private BufferedWriter eventsWriter;
@@ -265,6 +269,7 @@ public final class MapDebugRecorder {
                             metricsWriter.write(item.line());
                             metricsWriter.newLine();
                         }
+                        refreshDeepSnapshots();
                     }
                     case EVENTS -> {
                         if (eventsWriter != null) {
@@ -346,42 +351,28 @@ public final class MapDebugRecorder {
         MapObservationTelemetry.Snapshot observation =
                 MapObservationTelemetry.getInstance().snapshot();
         MapWorkScheduler.Snapshot scheduler = MapWorkScheduler.snapshot();
-        MapWorkGraph.Snapshot graph = MapWorkGraph.getInstance().snapshot();
         MapGpuBudgetController.Snapshot gpu =
                 MapGpuBudgetController.getInstance().snapshot();
-        MapResidencyManager.Snapshot residency =
-                MapResidencyManager.getInstance().snapshot();
-        MapAtlasMemoryTracker.Snapshot atlas =
-                MapAtlasMemoryTracker.getInstance().snapshot();
-        MapTextureManager.DebugSnapshot texture =
-                MapTextureManager.getInstance().debugSnapshot();
-        SurfaceRegionSourceDatabase.DebugSnapshot sourceDb =
-                SurfaceRegionSourceDatabase.getInstance().debugSnapshot();
-        UnifiedCaveTextureManager.DebugSnapshot cave =
-                UnifiedCaveTextureManager.getInstance().debugSnapshot();
-        ExactPageStateTracker.Snapshot exactStates =
-                ExactPageStateTracker.getInstance().snapshot();
-        RegionLodGraph.Summary lodGraph =
-                MapOverviewTextureManager.getInstance().lodGraphSummary();
-        MapArchitectureCoordinator.Summary architecture =
-                MapArchitectureCoordinator.getInstance().summary();
+        DeepSnapshots deep = deepSnapshots;
+        if (deep == null) {
+            // One synchronous bootstrap sample is acceptable at world start; all
+            // recurring 1 Hz scans are refreshed by the writer thread afterward.
+            refreshDeepSnapshots();
+            deep = deepSnapshots;
+        }
         MapSession session = MapSessionManager.getInstance().active();
         RevisionStamp stamp = session == null ? null : session.stamp();
         MapManager mapManager = MapManager.getInstance();
         MapScreen mapScreen = minecraft.screen instanceof MapScreen screen ? screen : null;
 
-        long heapUsed = runtime.totalMemory() - runtime.freeMemory();
-        long heapCommitted = runtime.totalMemory();
-        long heapMax = runtime.maxMemory();
-        double allocationMiBPerSecond = allocationRate(nowNanos);
-        long[] gcTotals = gcTotals();
-        long gcCountDelta = Math.max(0L, gcTotals[0] - lastGcCount);
-        long gcTimeDelta = Math.max(0L, gcTotals[1] - lastGcTimeMs);
-        lastGcCount = gcTotals[0];
-        lastGcTimeMs = gcTotals[1];
-
-        double processCpu = osBean == null ? -1.0 : percent(osBean.getProcessCpuLoad());
-        double systemCpu = osBean == null ? -1.0 : percent(osBean.getCpuLoad());
+        long heapUsed = deep.heapUsedBytes();
+        long heapCommitted = deep.heapCommittedBytes();
+        long heapMax = deep.heapMaxBytes();
+        double allocationMiBPerSecond = deep.allocationMiBPerSecond();
+        long gcCountDelta = deep.gcCountDelta();
+        long gcTimeDelta = deep.gcTimeMsDelta();
+        double processCpu = deep.processCpuPercent();
+        double systemCpu = deep.systemCpuPercent();
         double serverMspt = serverMspt(minecraft);
         double serverTps = serverMspt > 0.0
                 ? Math.min(20.0, 1000.0 / serverMspt) : -1.0;
@@ -424,14 +415,50 @@ public final class MapDebugRecorder {
                 MapConfig.minimapEnabled,
                 mapScreen != null,
                 mapManager.isViewingLiveDimension(),
-                p, render, stages, scheduler, observation, graph, gpu, residency, atlas,
-                texture, sourceDb, cave, exactStates, lodGraph, architecture,
+                p, render, stages, scheduler, observation, deep.workGraph(), gpu,
+                deep.residency(), deep.atlas(), deep.texture(), deep.sourceDb(),
+                deep.cave(), deep.exactStates(), deep.lodGraph(), deep.architecture(),
                 mapManager.dirtyRegionCount(),
                 RegionDataStore.pendingSaveCount(),
                 RegionDataStore.inFlightSaveCount(),
                 MapLightManager.getInstance().dirtyRegionCount(),
                 MapLightManager.getInstance().pendingSaveCount(),
                 MapLightManager.getInstance().inFlightSaveCount());
+    }
+
+    private void refreshDeepSnapshots() {
+        try {
+            long nowNanos = System.nanoTime();
+            long heapUsed = runtime.totalMemory() - runtime.freeMemory();
+            long heapCommitted = runtime.totalMemory();
+            long heapMax = runtime.maxMemory();
+            double allocationMiBPerSecond = allocationRate(nowNanos);
+            long[] totals = gcTotals();
+            long gcCountDelta = Math.max(0L, totals[0] - lastGcCount);
+            long gcTimeDelta = Math.max(0L, totals[1] - lastGcTimeMs);
+            lastGcCount = totals[0];
+            lastGcTimeMs = totals[1];
+            double processCpu = osBean == null ? -1.0
+                    : percent(osBean.getProcessCpuLoad());
+            double systemCpu = osBean == null ? -1.0
+                    : percent(osBean.getCpuLoad());
+
+            deepSnapshots = new DeepSnapshots(
+                    heapUsed, heapCommitted, heapMax,
+                    allocationMiBPerSecond, gcCountDelta, gcTimeDelta,
+                    processCpu, systemCpu,
+                    MapWorkGraph.getInstance().snapshot(),
+                    MapResidencyManager.getInstance().snapshot(),
+                    MapAtlasMemoryTracker.getInstance().snapshot(),
+                    MapTextureManager.getInstance().debugSnapshot(),
+                    SurfaceRegionSourceDatabase.getInstance().debugSnapshot(),
+                    UnifiedCaveTextureManager.getInstance().debugSnapshot(),
+                    ExactPageStateTracker.getInstance().snapshot(),
+                    MapOverviewTextureManager.getInstance().lodGraphSummary(),
+                    MapArchitectureCoordinator.getInstance().summary());
+        } catch (RuntimeException exception) {
+            LOGGER.debug("SimpleMap background diagnostic snapshot failed", exception);
+        }
     }
 
     private double allocationRate(long nowNanos) {
@@ -595,6 +622,33 @@ public final class MapDebugRecorder {
         return fraction < 0.0 ? -1.0 : fraction * 100.0;
     }
 
+    private record DeepSnapshots(
+            long heapUsedBytes, long heapCommittedBytes, long heapMaxBytes,
+            double allocationMiBPerSecond, long gcCountDelta, long gcTimeMsDelta,
+            double processCpuPercent, double systemCpuPercent,
+            MapWorkGraph.Snapshot workGraph,
+            MapResidencyManager.Snapshot residency,
+            MapAtlasMemoryTracker.Snapshot atlas,
+            MapTextureManager.DebugSnapshot texture,
+            SurfaceRegionSourceDatabase.DebugSnapshot sourceDb,
+            UnifiedCaveTextureManager.DebugSnapshot cave,
+            ExactPageStateTracker.Snapshot exactStates,
+            RegionLodGraph.Summary lodGraph,
+            MapArchitectureCoordinator.Summary architecture) {
+
+        private static DeepSnapshots from(DebugSnapshot snapshot) {
+            return new DeepSnapshots(
+                    snapshot.heapUsedBytes(), snapshot.heapCommittedBytes(),
+                    snapshot.heapMaxBytes(), snapshot.allocationMiBPerSecond(),
+                    snapshot.gcCountDelta(), snapshot.gcTimeMsDelta(),
+                    snapshot.processCpuPercent(), snapshot.systemCpuPercent(),
+                    snapshot.workGraph(), snapshot.residency(), snapshot.atlas(),
+                    snapshot.texture(), snapshot.sourceDb(), snapshot.cave(),
+                    snapshot.exactStates(), snapshot.lodGraph(),
+                    snapshot.architecture());
+        }
+    }
+
     private enum Stream { OPEN, ROTATE, FLUSH, METRICS_HEADER, METRICS, EVENTS }
 
     private record WriteItem(Stream stream, String line) { }
@@ -735,10 +789,16 @@ public final class MapDebugRecorder {
                     "gpu_legacy_reservation_denied",
                     "gpu_oversize_foreground_admissions",
                     "gpu_branch_bootstrap_admissions",
-                    "fullscreen_fbo_frames", "fullscreen_fbo_fallbacks",
-                    "fullscreen_fbo_reallocations", "fullscreen_fbo_width",
+                    "fullscreen_fbo_frames", "fullscreen_fbo_redraws",
+                    "fullscreen_fbo_reuses", "fullscreen_fbo_coalesced",
+                    "fullscreen_fbo_fallbacks", "fullscreen_fbo_reallocations",
+                    "fullscreen_fbo_width",
                     "fullscreen_fbo_height", "fullscreen_fbo_disabled",
-                    "surface_demand_trimmed", "surface_demand_area_ratio",
+                    "minimap_fbo_redraws", "minimap_fbo_reuses",
+                    "minimap_fbo_coalesced", "minimap_fbo_fallbacks",
+                    "minimap_fbo_reallocations",
+                    "minimap_fbo_width", "minimap_fbo_height",
+                    "minimap_fbo_disabled", "surface_demand_trimmed", "surface_demand_area_ratio",
                     "surface_demand_left_pct", "surface_demand_right_pct",
                     "surface_demand_vertical_pct", "surface_exact_active_window",
                     "texture_regions", "texture_pages", "texture_pages_initialized",
@@ -799,6 +859,8 @@ public final class MapDebugRecorder {
             List<String> values = new ArrayList<>(192);
             FullscreenMapFramebufferRenderer.Snapshot fullscreenFbo =
                     FullscreenMapFramebufferRenderer.getInstance().snapshot();
+            MinimapFramebufferRenderer.Snapshot minimapFbo =
+                    MinimapFramebufferRenderer.getInstance().snapshot();
             MapSurfaceDemandPolicy.Snapshot surfaceDemand =
                     MapSurfaceDemandPolicy.snapshot();
             MapArchitectureCoordinator.Summary architectureSnapshot =
@@ -898,9 +960,15 @@ public final class MapDebugRecorder {
                     gpu.caveExactDeniedReservations(),
                     gpu.branchDeniedReservations(), gpu.legacyDeniedReservations(),
                     gpu.oversizedForegroundAdmissions(), gpu.branchBootstrapAdmissions(),
-                    fullscreenFbo.renderedFrames(), fullscreenFbo.fallbackFrames(),
-                    fullscreenFbo.reallocations(), fullscreenFbo.width(),
+                    fullscreenFbo.renderedFrames(), fullscreenFbo.redrawFrames(),
+                    fullscreenFbo.reuseFrames(), fullscreenFbo.coalescedFrames(),
+                    fullscreenFbo.fallbackFrames(), fullscreenFbo.reallocations(),
+                    fullscreenFbo.width(),
                     fullscreenFbo.height(), fullscreenFbo.disabled(),
+                    minimapFbo.redrawFrames(), minimapFbo.reuseFrames(),
+                    minimapFbo.coalescedFrames(), minimapFbo.fallbackFrames(),
+                    minimapFbo.reallocations(),
+                    minimapFbo.width(), minimapFbo.height(), minimapFbo.disabled(),
                     surfaceDemand.trimmed(), format(surfaceDemand.areaRatio()),
                     format(surfaceDemand.leftFraction() * 100.0),
                     format(surfaceDemand.rightFraction() * 100.0),

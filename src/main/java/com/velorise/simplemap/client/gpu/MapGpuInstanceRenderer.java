@@ -32,6 +32,14 @@ public final class MapGpuInstanceRenderer {
         drawFiltered(graphics, plan, targetPhase >= PHASE_GLOW, targetPhase);
     }
 
+    /** Draws one phase inside a state scope owned by MapRenderPlan. */
+    public static void drawPhasePrepared(MapGpuInstancePlan plan,
+            int targetPhase, Matrix4f matrix) {
+        if (plan == null || plan.size() == 0 || matrix == null
+                || !plan.hasPhase(targetPhase)) return;
+        drawPrepared(plan, targetPhase >= PHASE_GLOW, targetPhase, matrix);
+    }
+
     private static void drawFiltered(GuiGraphics graphics,
             MapGpuInstancePlan plan, boolean glow, Integer targetPhase) {
         if (graphics == null || plan == null || plan.size() == 0) return;
@@ -41,64 +49,73 @@ public final class MapGpuInstanceRenderer {
         try {
             RenderSystem.setShader(GameRenderer::getPositionTexShader);
             Matrix4f matrix = graphics.pose().last().pose();
-            ResourceLocation activeTexture = null;
-            BufferBuilder buffer = null;
-            int submissions = 0;
-            for (int index = 0; index < plan.size(); index++) {
-                int phase = plan.phase(index);
-                boolean instanceGlow = phase >= PHASE_GLOW;
-                if (instanceGlow != glow
-                        || (targetPhase != null && phase != targetPhase)) continue;
-                MapGpuPageTableService.Resolved resolved =
-                        MapGpuPageTableService.getInstance().resolve(plan.key(index));
-                ResourceLocation texture;
-                float u0;
-                float v0;
-                float u1;
-                float v1;
-                if (resolved != null) {
-                    PageTableEntry entry = resolved.entry();
-                    texture = resolved.texture();
-                    float inverse = 1.0f / entry.atlasSize();
-                    u0 = entry.sourceX() * inverse;
-                    v0 = entry.sourceY() * inverse;
-                    u1 = (entry.sourceX() + entry.sourceSize()) * inverse;
-                    v1 = (entry.sourceY() + entry.sourceSize()) * inverse;
-                } else {
-                    texture = plan.fallbackTexture(index);
-                    u0 = plan.fallbackU0(index);
-                    v0 = plan.fallbackV0(index);
-                    u1 = plan.fallbackU1(index);
-                    v1 = plan.fallbackV1(index);
-                }
-                if (!texture.equals(activeTexture)) {
-                    if (buffer != null) {
-                        BufferUploader.drawWithShader(buffer.buildOrThrow());
-                        submissions++;
-                    }
-                    activeTexture = texture;
-                    RenderSystem.setShaderTexture(0, texture);
-                    buffer = Tesselator.getInstance().begin(
-                            VertexFormat.Mode.QUADS,
-                            DefaultVertexFormat.POSITION_TEX);
-                }
-                float x0 = plan.x(index);
-                float y0 = plan.y(index);
-                float x1 = x0 + plan.width(index);
-                float y1 = y0 + plan.height(index);
-                buffer.addVertex(matrix, x0, y0, 0.0f).setUv(u0, v0);
-                buffer.addVertex(matrix, x0, y1, 0.0f).setUv(u0, v1);
-                buffer.addVertex(matrix, x1, y1, 0.0f).setUv(u1, v1);
-                buffer.addVertex(matrix, x1, y0, 0.0f).setUv(u1, v0);
-            }
-            if (buffer != null) {
-                BufferUploader.drawWithShader(buffer.buildOrThrow());
-                submissions++;
-            }
-            MapPipelineTelemetry.getInstance().recordRawBatchSubmissions(submissions);
+            drawPrepared(plan, glow, targetPhase == null ? -1 : targetPhase,
+                    matrix);
         } finally {
             if (depthWasEnabled) RenderSystem.enableDepthTest();
             else RenderSystem.disableDepthTest();
         }
     }
+
+    private static void drawPrepared(MapGpuInstancePlan plan, boolean glow,
+            int targetPhase, Matrix4f matrix) {
+        int start;
+        int end;
+        if (targetPhase >= 0) {
+            start = plan.firstIndexAtOrAfter(targetPhase);
+            end = plan.firstIndexAfter(targetPhase);
+        } else if (glow) {
+            start = plan.firstIndexAtOrAfter(PHASE_GLOW);
+            end = plan.size();
+        } else {
+            start = 0;
+            end = plan.firstIndexAtOrAfter(PHASE_GLOW);
+        }
+        if (start >= end) return;
+
+        ResourceLocation activeTexture = null;
+        BufferBuilder buffer = null;
+        int submissions = 0;
+        MapGpuPageTableService.RenderView pageTable =
+                MapGpuPageTableService.getInstance().renderView();
+        for (int index = start; index < end; index++) {
+            PageTableEntry entry = pageTable.entry(plan.key(index));
+            ResourceLocation texture = pageTable.texture(entry);
+            // A keyed instance is authoritative only while its page-table entry is
+            // resident. Replaying cached fallback UVs after eviction can sample a
+            // slot that has already been reused by another page. Skip it and let
+            // the coverage revision rebuild the plan instead.
+            if (entry == null || texture == null || entry.atlasSize() <= 0) continue;
+            float inverse = 1.0f / entry.atlasSize();
+            float u0 = entry.sourceX() * inverse;
+            float v0 = entry.sourceY() * inverse;
+            float u1 = (entry.sourceX() + entry.sourceSize()) * inverse;
+            float v1 = (entry.sourceY() + entry.sourceSize()) * inverse;
+            if (!texture.equals(activeTexture)) {
+                if (buffer != null) {
+                    BufferUploader.drawWithShader(buffer.buildOrThrow());
+                    submissions++;
+                }
+                activeTexture = texture;
+                RenderSystem.setShaderTexture(0, texture);
+                buffer = Tesselator.getInstance().begin(
+                        VertexFormat.Mode.QUADS,
+                        DefaultVertexFormat.POSITION_TEX);
+            }
+            float x0 = plan.x(index);
+            float y0 = plan.y(index);
+            float x1 = x0 + plan.width(index);
+            float y1 = y0 + plan.height(index);
+            buffer.addVertex(matrix, x0, y0, 0.0f).setUv(u0, v0);
+            buffer.addVertex(matrix, x0, y1, 0.0f).setUv(u0, v1);
+            buffer.addVertex(matrix, x1, y1, 0.0f).setUv(u1, v1);
+            buffer.addVertex(matrix, x1, y0, 0.0f).setUv(u1, v0);
+        }
+        if (buffer != null) {
+            BufferUploader.drawWithShader(buffer.buildOrThrow());
+            submissions++;
+        }
+        MapPipelineTelemetry.getInstance().recordRawBatchSubmissions(submissions);
+    }
+
 }

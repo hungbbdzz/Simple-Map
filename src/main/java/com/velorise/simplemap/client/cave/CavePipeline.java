@@ -66,6 +66,11 @@ public final class CavePipeline {
         return repository;
     }
 
+    /** Packet path: retain only a primitive travel-frontier key. */
+    public void enqueueLoadedChunk(int chunkX, int chunkZ) {
+        displayScheduler.enqueueLoadedChunk(chunkX, chunkZ);
+    }
+
     public CaveTelemetry.Snapshot telemetry() {
         return telemetry.snapshot();
     }
@@ -112,6 +117,12 @@ public final class CavePipeline {
             readiness.reset();
             return;
         }
+        if (!MapManager.getInstance().acceptsLiveLevel(minecraft.level)) {
+            // Remote cave reconstruction is owned by the viewed dimension/session.
+            // Movement or teleport packets from the live ClientLevel must not
+            // cancel its display transactions or re-anchor its AUTO layer.
+            return;
+        }
         if (!readiness.observePlayer(minecraft)) return;
         scheduler.reset();
         displayScheduler.cancelInFlight();
@@ -144,12 +155,84 @@ public final class CavePipeline {
         int chunkRadius = Math.min(liveRadius, requestedRadius);
         CaveView view = CaveMode.isFullView(minecraft) ? CaveView.FULL : CaveView.LAYERED;
         int layerY = CaveMode.getLayerY(minecraft);
-        displayScheduler.enqueueAround(minecraft.level, view, layerY,
-                centerChunkX, centerChunkZ, chunkRadius, 1_000_000);
+        /*
+         * Gameplay is a moving viewport, not permanent background demand. The old
+         * enqueueAround path walked the complete render-distance disc every client
+         * tick and made every admitted tile persistent, so stale travel work kept
+         * competing after the player moved. Reuse the cadence-bounded MINIMAP
+         * viewport lane: unchanged shapes refresh at most every 150 ms and handoff
+         * cancels only unpublished tiles outside the new live window.
+         */
+        // Newly received chunks are completed coherently before the broader
+        // rolling viewport. This is the travel writer; it records the path while
+        // keeping packet handlers allocation-free and deadline bounded.
+        displayScheduler.admitLoadedChunk(minecraft.level, view, layerY,
+                centerChunkX, centerChunkZ, 1_000_000);
+        displayScheduler.enqueueViewport(minecraft.level, view, layerY,
+                centerChunkX - chunkRadius, centerChunkX + chunkRadius,
+                centerChunkZ - chunkRadius, centerChunkZ + chunkRadius,
+                centerChunkX, centerChunkZ, 1_000_000,
+                MapRequestLane.MINIMAP);
 
         long budget = MapPerformanceGovernor.getInstance().gameplayScanBudgetNanos(true);
         if (budget > 0L) {
             displayScheduler.process(minecraft.level, System.nanoTime() + budget);
+        }
+        updateTelemetry();
+    }
+
+    /**
+     * Render-frame continuation for already-admitted live Cave transactions.
+     * Packet ingress and the 20 Hz viewport pass remain responsible for discovery;
+     * this method only resumes the bounded hot frontier and active tile builders.
+     */
+    public void scanForegroundFrame(Minecraft minecraft, long budgetNanos) {
+        if (budgetNanos <= 0L || !usable(minecraft)
+                || !CaveMode.isActive(minecraft)) return;
+        int centerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
+        int centerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
+        CaveView view = CaveMode.isFullView(minecraft)
+                ? CaveView.FULL : CaveView.LAYERED;
+        int layerY = CaveMode.getLayerY(minecraft);
+        displayScheduler.admitLoadedChunk(minecraft.level, view, layerY,
+                centerChunkX, centerChunkZ, 1_150_000);
+        int hotRadius = CaveModeTransitionPolicy.liveRadius(3);
+        displayScheduler.enqueueViewport(minecraft.level, view, layerY,
+                centerChunkX - hotRadius, centerChunkX + hotRadius,
+                centerChunkZ - hotRadius, centerChunkZ + hotRadius,
+                centerChunkX, centerChunkZ, 1_050_000,
+                MapRequestLane.MINIMAP);
+        displayScheduler.process(minecraft.level,
+                System.nanoTime() + CaveModeTransitionPolicy.foregroundBudget(budgetNanos));
+        updateTelemetry();
+    }
+
+    /**
+     * Starts a mode transition from the centre outward without invalidating warm
+     * Surface/Cave caches and without a synchronous 20 ms scan/upload burst.
+     */
+    public void primeCurrentView(Minecraft minecraft) {
+        if (!usable(minecraft) || !CaveMode.isActive(minecraft)) return;
+        CaveView view = CaveMode.isFullView(minecraft)
+                ? CaveView.FULL : CaveView.LAYERED;
+        int layerY = CaveMode.getLayerY(minecraft);
+        int centerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
+        int centerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
+        for (int ring = 0; ring <= 1; ring++) {
+            for (int dz = -ring; dz <= ring; dz++) {
+                for (int dx = -ring; dx <= ring; dx++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
+                    int chunkX = centerChunkX + dx;
+                    int chunkZ = centerChunkZ + dz;
+                    if (!minecraft.level.hasChunk(chunkX, chunkZ)
+                            || repository.hasFreshDisplayTileSource(view, layerY,
+                                    chunkX, chunkZ, DenseCaveTile.Source.LIVE)) {
+                        continue;
+                    }
+                    displayScheduler.enqueue(chunkX, chunkZ, view, layerY,
+                            1_900_000 - ring * 20_000);
+                }
+            }
         }
         updateTelemetry();
     }
@@ -239,13 +322,19 @@ public final class CavePipeline {
 
         int playerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
         int playerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
-        // The player hot set is independent of a panned fullscreen frontier. Keep
-        // the current chunk and its immediate neighbours at the strongest live
-        // priority so the HUD/full map cannot show a hole around the marker while
-        // distant saved regions are being reconstructed.
-        displayScheduler.enqueueAround(minecraft.level, view, layerY,
-                playerChunkX, playerChunkZ, 1,
-                effectiveLane.priorityBase() + 500_000);
+        // The player hot set is independent of a panned fullscreen frontier. Model
+        // it as the short-lived MINIMAP lane instead of persistent demand: a player
+        // who travels must not leave unavailable/deferred cave tasks permanently in
+        // the queue. The actual minimap call already owns this lane, so only add the
+        // independent hot set while a fullscreen viewport is active.
+        if (effectiveLane == MapRequestLane.FULLSCREEN) {
+            displayScheduler.enqueueViewport(minecraft.level, view, layerY,
+                    playerChunkX - 1, playerChunkX + 1,
+                    playerChunkZ - 1, playerChunkZ + 1,
+                    playerChunkX, playerChunkZ,
+                    MapRequestLane.MINIMAP.priorityBase() + 500_000,
+                    MapRequestLane.MINIMAP);
+        }
         int liveRadius = Math.max(2, minecraft.options.renderDistance().get() + 3);
         int minChunkX = Math.max(viewportMinChunkX - 1, playerChunkX - liveRadius);
         int maxChunkX = Math.min(viewportMaxChunkX + 1, playerChunkX + liveRadius);
@@ -270,10 +359,10 @@ public final class CavePipeline {
                     (minChunkX + maxChunkX) * 0.5, (minChunkZ + maxChunkZ) * 0.5,
                     effectiveLane.priorityBase(), effectiveLane);
         }
-        // enqueueAround() above is independent of the panned/zoomed viewport. Drain
-        // it even when the live viewport intersection is empty, otherwise the player
-        // marker can remain surrounded by old/blank cave leaves until the camera is
-        // moved back over the live chunk window.
+        // The player-hot MINIMAP lane above is independent of the panned/zoomed
+        // fullscreen frontier. Drain it even when the live viewport intersection is
+        // empty, otherwise the marker can remain surrounded by old/blank cave leaves
+        // until the camera is moved back over the live chunk window.
         MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
         long budget = effectiveLane == MapRequestLane.MINIMAP
                 ? governor.gameplayScanBudgetNanos(true)
@@ -585,6 +674,22 @@ public final class CavePipeline {
         MapVisualClassifier.getInstance().clear();
         resetRevalidation();
         UnifiedCaveTextureManager.getInstance().clear();
+    }
+
+    /** Flushes the active dimension's mutable repository/runtime state without
+     * destroying dimension-keyed cave atlas pages and recursive LOD branches. */
+    public void flushForDimensionSwitch() {
+        scheduler.reset();
+        displayScheduler.reset();
+        readiness.reset();
+        worldSaveReader.reset();
+        worldSaveReader.clearSourceCache();
+        layerWarmup = null;
+        repository.flushAndClear();
+        CaveStateClassifier.getInstance().clear();
+        MapVisualClassifier.getInstance().clear();
+        resetRevalidation();
+        UnifiedCaveTextureManager.getInstance().suspendForDimensionSwitch();
     }
 
     public void flushAndClear() {
