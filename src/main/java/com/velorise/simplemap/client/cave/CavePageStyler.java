@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
 import com.velorise.simplemap.client.FullCaveMapManager;
+import com.velorise.simplemap.client.MapAccurateColorFilter;
 import com.velorise.simplemap.client.MapColorProfile;
 import com.velorise.simplemap.client.MapConfig;
 
@@ -23,7 +24,7 @@ public final class CavePageStyler {
             short[] topHeights, byte[] flags, byte[] lights,
             CaveView view, int layerY) {
         int[] output = new int[source.length];
-        boolean[] emissivePixels = new boolean[Math.min(source.length, SIZE * SIZE)];
+        byte[] emissionStrength = null;
         int slopes = MapConfig.terrainSlopes;
         int profile = MapConfig.mapColorProfile;
         int limit = Math.min(source.length, SIZE * SIZE);
@@ -43,14 +44,30 @@ public final class CavePageStyler {
             float relief = slopes <= 0 ? 1.0f : shade(heights, x, z, slopes);
             boolean emissive = (pixelFlags & DenseCaveTile.FLAG_EMISSIVE) != 0;
             boolean legacy = (pixelFlags & DenseCaveTile.FLAG_PRELIT_LEGACY) != 0;
-            int light = lights == null || index >= lights.length
-                    ? 15 : Byte.toUnsignedInt(lights[index]);
-            int styled = styleMaterial(color, visualY, light, emissive,
+            boolean hasLightSample = lights != null && index < lights.length;
+            int light = hasLightSample ? Byte.toUnsignedInt(lights[index]) : 15;
+            boolean luminous = emissive || (hasLightSample && light >= 13);
+            int styled = styleMaterial(color, visualY, light, luminous,
                     legacy, relief, view, layerY);
+            boolean water = (pixelFlags & DenseCaveTile.FLAG_WATER) != 0;
+            boolean fluid = (pixelFlags & (DenseCaveTile.FLAG_WATER
+                    | DenseCaveTile.FLAG_FLUID)) != 0;
+            if (MapConfig.blockColourMode == 0) {
+                styled = MapAccurateColorFilter.applyAbgr(styled, false, fluid);
+            }
+            styled = gradeCaveColor(styled, water, fluid, view, luminous);
             output[index] = MapColorProfile.apply(styled, profile);
-            emissivePixels[index] = emissive;
+            int emission = emissive ? 15
+                    : hasLightSample ? Math.max(0, light - 9) : 0;
+            if (emission > 0) {
+                if (emissionStrength == null) {
+                    emissionStrength = new byte[Math.min(source.length,
+                            SIZE * SIZE)];
+                }
+                emissionStrength[index] = (byte) emission;
+            }
         }
-        applyEmissionHalo(output, emissivePixels);
+        applyEmissionHalo(output, emissionStrength);
         return output;
     }
 
@@ -71,7 +88,7 @@ public final class CavePageStyler {
         }
 
         int[] output = new int[baseColors.length];
-        boolean[] emissivePixels = new boolean[Math.min(baseColors.length, SIZE * SIZE)];
+        byte[] emissionStrength = null;
         int slopes = MapConfig.terrainSlopes;
         int profile = MapConfig.mapColorProfile;
         int limit = Math.min(baseColors.length, SIZE * SIZE);
@@ -82,14 +99,27 @@ public final class CavePageStyler {
             int z = index >> 6;
             byte pixelFlags = flags == null || index >= flags.length ? 0 : flags[index];
             int floorY = height(heights, x, z, FullCaveMapManager.NO_SURFACE);
-            int baseLight = baseLights == null || index >= baseLights.length
-                    ? 15 : Byte.toUnsignedInt(baseLights[index]);
+            boolean hasBaseLight = baseLights != null && index < baseLights.length;
+            int baseLight = hasBaseLight
+                    ? Byte.toUnsignedInt(baseLights[index]) : 15;
             float relief = slopes <= 0 ? 1.0f : shade(heights, x, z, slopes);
             boolean baseEmissive = (pixelFlags & DenseCaveTile.FLAG_EMISSIVE) != 0;
+            boolean baseLuminous = baseEmissive
+                    || (hasBaseLight && baseLight >= 13);
             boolean legacy = (pixelFlags & DenseCaveTile.FLAG_PRELIT_LEGACY) != 0;
-            int composed = styleMaterial(base, floorY, baseLight, baseEmissive,
+            int composed = styleMaterial(base, floorY, baseLight, baseLuminous,
                     legacy, relief, view, layerY);
-            boolean anyEmissive = baseEmissive;
+            boolean baseWater = (pixelFlags & DenseCaveTile.FLAG_WATER) != 0;
+            boolean baseFluid = (pixelFlags & (DenseCaveTile.FLAG_WATER
+                    | DenseCaveTile.FLAG_FLUID)) != 0;
+            if (MapConfig.blockColourMode == 0) {
+                composed = MapAccurateColorFilter.applyAbgr(
+                        composed, false, baseFluid);
+            }
+            composed = gradeCaveColor(composed, baseWater, baseFluid,
+                    view, baseLuminous);
+            int strongestEmission = baseEmissive ? 15
+                    : hasBaseLight ? Math.max(0, baseLight - 9) : 0;
 
             int count = Math.min(DenseCaveTile.MAX_OVERLAYS,
                     Byte.toUnsignedInt(overlayCounts[index]));
@@ -104,17 +134,34 @@ public final class CavePageStyler {
                 if (overlay == 0 || alpha <= 0) continue;
                 boolean overlayEmissive = (overlayFlags[entry]
                         & DenseCaveTile.OVERLAY_EMISSIVE) != 0;
+                int overlayLight = Byte.toUnsignedInt(overlayLights[entry]);
+                boolean overlayLuminous = overlayEmissive || overlayLight >= 13;
                 int styledOverlay = styleMaterial(overlay, overlayY[entry],
-                        Byte.toUnsignedInt(overlayLights[entry]), overlayEmissive,
+                        overlayLight, overlayLuminous,
                         false, relief, view, layerY);
+                boolean overlayFluid = (overlayFlags[entry]
+                        & DenseCaveTile.OVERLAY_FLUID) != 0;
+                if (MapConfig.blockColourMode == 0) {
+                    styledOverlay = MapAccurateColorFilter.applyAbgr(
+                            styledOverlay, false, overlayFluid);
+                }
+                styledOverlay = gradeCaveColor(styledOverlay, false,
+                        overlayFluid, view, overlayLuminous);
                 composed = blendAbgr(composed, styledOverlay, alpha);
-                anyEmissive |= overlayEmissive;
+                strongestEmission = Math.max(strongestEmission,
+                        overlayEmissive ? 15 : Math.max(0, overlayLight - 9));
             }
 
             output[index] = MapColorProfile.apply(composed, profile);
-            emissivePixels[index] = anyEmissive;
+            if (strongestEmission > 0) {
+                if (emissionStrength == null) {
+                    emissionStrength = new byte[Math.min(baseColors.length,
+                            SIZE * SIZE)];
+                }
+                emissionStrength[index] = (byte) strongestEmission;
+            }
         }
-        applyEmissionHalo(output, emissivePixels);
+        applyEmissionHalo(output, emissionStrength);
         return output;
     }
 
@@ -133,10 +180,12 @@ public final class CavePageStyler {
             color = ensureGlowBrightness(color);
         }
         float combined = clamp(depth * lightShade * relief, 0.48f, 1.20f);
-        int red = readableChannel(color & 0xFF, combined, emissive);
-        int green = readableChannel((color >>> 8) & 0xFF, combined, emissive);
-        int blue = readableChannel((color >>> 16) & 0xFF, combined, emissive);
-        return (color & 0xFF000000) | (blue << 16) | (green << 8) | red;
+        int red = clamp(Math.round((color & 0xFF) * combined));
+        int green = clamp(Math.round(((color >>> 8) & 0xFF) * combined));
+        int blue = clamp(Math.round(((color >>> 16) & 0xFF) * combined));
+        int shaded = (color & 0xFF000000) | (blue << 16) | (green << 8) | red;
+        return applyLumaFloor(shaded, emissive ? 78.0f
+                : view == CaveView.FULL ? 27.0f : 32.0f);
     }
 
     /** Xaero full-cave uses a folded 64-block height band. */
@@ -201,23 +250,38 @@ public final class CavePageStyler {
         return (abgr & 0xFF000000) | (blue << 16) | (green << 8) | red;
     }
 
-    private static void applyEmissionHalo(int[] pixels, boolean[] emissive) {
-        int[] base = pixels.clone();
-        int limit = Math.min(emissive.length, SIZE * SIZE);
+    private static void applyEmissionHalo(int[] pixels, byte[] emissionStrength) {
+        if (emissionStrength == null || emissionStrength.length == 0) return;
+        int limit = Math.min(emissionStrength.length, SIZE * SIZE);
+        boolean hasEmission = false;
         for (int index = 0; index < limit; index++) {
-            if (!emissive[index] || base[index] == 0) continue;
+            if (emissionStrength[index] != 0) {
+                hasEmission = true;
+                break;
+            }
+        }
+        if (!hasEmission) return;
+        int[] base = pixels.clone();
+        for (int index = 0; index < limit; index++) {
+            int strength = Byte.toUnsignedInt(emissionStrength[index]);
+            if (strength <= 0 || base[index] == 0) continue;
             int x = index & 63;
             int z = index >> 6;
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int dx = -1; dx <= 1; dx++) {
+            int radius = strength >= 12 ? 2 : 1;
+            for (int dz = -radius; dz <= radius; dz++) {
+                for (int dx = -radius; dx <= radius; dx++) {
                     if (dx == 0 && dz == 0) continue;
                     int nx = x + dx;
                     int nz = z + dz;
                     if (nx < 0 || nx >= SIZE || nz < 0 || nz >= SIZE) continue;
                     int neighbour = nz * SIZE + nx;
-                    if (base[neighbour] == 0 || emissive[neighbour]) continue;
+                    if (base[neighbour] == 0) continue;
+                    int distance = Math.max(Math.abs(dx), Math.abs(dz));
+                    int alpha = distance == 1
+                            ? 12 + strength * 2
+                            : 4 + strength;
                     pixels[neighbour] = blendAbgr(pixels[neighbour], base[index],
-                            dx == 0 || dz == 0 ? 18 : 10);
+                            Math.min(52, alpha));
                 }
             }
         }
@@ -235,10 +299,50 @@ public final class CavePageStyler {
         return (base & 0xFF000000) | (blue << 16) | (green << 8) | red;
     }
 
-    private static int readableChannel(int value, float shade, boolean emissive) {
-        float lift = emissive ? 1.03f : 1.06f;
-        float bias = emissive ? 4.0f : 5.0f;
-        return clamp(Math.round((value * lift + bias) * shade));
+    /**
+     * Cave grading preserves the material hue instead of adding an equal RGB bias,
+     * which made stone, deepslate and fluids converge toward flat grey in PASS76.
+     * The saturation increase is deliberately modest; Xaero's legibility comes from
+     * stable block colour plus depth/light, not a neon post-process.
+     */
+    static int gradeCaveColor(int abgr, boolean water, boolean fluid,
+            CaveView view, boolean emissive) {
+        if (abgr == 0) return 0;
+        float red = abgr & 0xFF;
+        float green = (abgr >>> 8) & 0xFF;
+        float blue = (abgr >>> 16) & 0xFF;
+        float luma = red * 0.2126f + green * 0.7152f + blue * 0.0722f;
+        float saturation = emissive ? 1.04f
+                : view == CaveView.FULL ? 1.16f : 1.10f;
+        red = luma + (red - luma) * saturation;
+        green = luma + (green - luma) * saturation;
+        blue = luma + (blue - luma) * saturation;
+        if (water) {
+            red *= 0.94f;
+            green *= 1.035f;
+            blue *= 1.10f;
+        } else if (fluid) {
+            red *= 1.12f;
+            green *= 1.025f;
+            blue *= 0.92f;
+        }
+        return (abgr & 0xFF000000)
+                | (clamp(Math.round(blue)) << 16)
+                | (clamp(Math.round(green)) << 8)
+                | clamp(Math.round(red));
+    }
+
+    private static int applyLumaFloor(int abgr, float minimumLuma) {
+        int red = abgr & 0xFF;
+        int green = (abgr >>> 8) & 0xFF;
+        int blue = (abgr >>> 16) & 0xFF;
+        float luma = red * 0.2126f + green * 0.7152f + blue * 0.0722f;
+        if (luma <= 0.0f || luma >= minimumLuma) return abgr;
+        float scale = Math.min(1.42f, minimumLuma / luma);
+        red = clamp(Math.round(red * scale));
+        green = clamp(Math.round(green * scale));
+        blue = clamp(Math.round(blue * scale));
+        return (abgr & 0xFF000000) | (blue << 16) | (green << 8) | red;
     }
 
 

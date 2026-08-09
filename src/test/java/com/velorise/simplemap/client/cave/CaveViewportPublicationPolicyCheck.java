@@ -17,7 +17,7 @@ public final class CaveViewportPublicationPolicyCheck {
         if (!CaveViewportPublicationPolicy.windowOpen(true, false, 1_000L, now)) {
             throw new AssertionError("Due window must open");
         }
-        if (CaveViewportPublicationPolicy.nextWindow(now) - now != 50L) {
+        if (CaveViewportPublicationPolicy.nextWindow(now) - now != 16L) {
             throw new AssertionError("Unexpected viewport cadence");
         }
         System.out.println("CAVE_VIEWPORT_PUBLICATION_POLICY_PASS");

@@ -1,5 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.MapConfig;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
@@ -36,14 +38,18 @@ import java.util.zip.GZIPOutputStream;
  */
 final class CaveRegionStore {
     private static final int REGION_MAGIC = 0x43565231; // CVR1
-    private static final int REGION_VERSION = 1;
+    /*
+     * v5 invalidates raw archives whose live Full-Cave entry scan still required
+     * a multi-solid roof instead of Xaero-style first real terrain entry.
+     */
+    private static final int REGION_VERSION = 5;
     private static final int RECORD_MAGIC = 0x54494C45; // TILE
     private static final int REGION_HEADER_BYTES = Integer.BYTES * 2;
     private static final int RECORD_HEADER_BYTES = Integer.BYTES * 5;
     private static final int MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
     private static final int SNAPSHOT_MAGIC = 0x43565434; // CVT4
-    private static final int SNAPSHOT_VERSION = 3;
+    private static final int SNAPSHOT_VERSION = 8;
 
     /** Compaction is deliberately conservative because it is maintenance IO. */
     private static final long COMPACT_MIN_FILE_BYTES = Math.max(1L << 20,
@@ -64,8 +70,11 @@ final class CaveRegionStore {
     static Map<Long, RecordPointer> rebuildIndex(File directory) {
         Map<Long, RecordPointer> result = new HashMap<>();
         if (directory == null || !directory.isDirectory()) return result;
+        String prefix = colourNamespacePrefix();
         File[] files = directory.listFiles((dir, name) -> name != null
-                && name.matches("r\\.-?\\d+\\.-?\\d+\\.cvr"));
+                && name.startsWith(prefix)
+                && name.substring(prefix.length())
+                        .matches("r\\.-?\\d+\\.-?\\d+\\.cvr"));
         if (files == null) return result;
         for (File file : files) scanRegionFile(file, result);
         return result;
@@ -365,8 +374,13 @@ final class CaveRegionStore {
     }
 
     private static int[] parseRegionCoordinates(File file) {
-        String[] parts = file.getName().split("\\.");
-        if (parts.length != 4) return null;
+        if (file == null) return null;
+        String name = file.getName();
+        String prefix = colourNamespacePrefix();
+        if (!name.startsWith(prefix)) return null;
+        String[] parts = name.substring(prefix.length()).split("\\.");
+        if (parts.length != 4 || !"r".equals(parts[0])
+                || !"cvr".equals(parts[3])) return null;
         try {
             return new int[] { Integer.parseInt(parts[1]), Integer.parseInt(parts[2]) };
         } catch (NumberFormatException ignored) {
@@ -494,7 +508,17 @@ final class CaveRegionStore {
     }
 
     private static File regionFile(File directory, int regionX, int regionZ) {
-        return new File(directory, "r." + regionX + "." + regionZ + ".cvr");
+        return new File(directory, colourNamespacePrefix()
+                + "r." + regionX + "." + regionZ + ".cvr");
+    }
+
+    /**
+     * CVR stores resolved material colours, so it is not safe to share between
+     * Accurate and Vanilla colour modes. c5 also invalidates archives written
+     * before Surface-equivalent Accurate input and raw archive shading.
+     */
+    private static String colourNamespacePrefix() {
+        return "c5-m" + Math.max(0, MapConfig.blockColourMode) + "-";
     }
 
     private static Object regionLock(File file) {

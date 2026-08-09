@@ -42,6 +42,9 @@ public final class CaveChunkTile {
     private final BitSet liveOwned = new BitSet(COLUMN_COUNT);
 
     private long revision = 1L;
+    /** Changes only when CompactCaveTile-visible content changes. */
+    private long archiveRevision = 1L;
+    private long publishedArchiveRevision;
     private long savedRevision;
     private int cursor;
 
@@ -61,6 +64,16 @@ public final class CaveChunkTile {
 
     public synchronized long revision() {
         return revision;
+    }
+
+    public synchronized long archiveRevision() { return archiveRevision; }
+
+    public synchronized boolean archivePublicationCurrent(long value) {
+        return value > 0L && publishedArchiveRevision == value;
+    }
+
+    public synchronized void markArchivePublished(long value) {
+        if (value > publishedArchiveRevision) publishedArchiveRevision = value;
     }
 
     public synchronized long savedRevision() {
@@ -183,7 +196,10 @@ public final class CaveChunkTile {
     public synchronized boolean commitColumn(int index, CaveColumnData value) {
         CaveColumnData safe = value == null ? CaveColumnData.empty() : value;
         CaveColumnData previous = columns[index];
-        boolean changed = previous == null || !previous.contentEquals(safe) || !scanned.get(index);
+        boolean wasScanned = scanned.get(index);
+        boolean changed = previous == null || !previous.contentEquals(safe) || !wasScanned;
+        boolean archiveChanged = previous == null
+                || !previous.archiveContentEquals(safe) || !wasScanned;
         columns[index] = safe;
         scanned.set(index);
         pending.clear(index);
@@ -192,6 +208,7 @@ public final class CaveChunkTile {
         else fullHeight.clear(index);
         liveOwned.set(index);
         if (changed) revision++;
+        if (archiveChanged) archiveRevision++;
         return changed;
     }
 
@@ -220,6 +237,7 @@ public final class CaveChunkTile {
         recheck.clear();
         liveOwned.set(0, COLUMN_COUNT);
         revision++;
+        archiveRevision++;
     }
 
     public synchronized boolean invalidateColumn(int localX, int localZ) {
@@ -230,7 +248,10 @@ public final class CaveChunkTile {
         pending.set(index);
         recheck.clear(index);
         liveOwned.set(index);
-        if (changed) revision++;
+        if (changed) {
+            revision++;
+            archiveRevision++;
+        }
         return changed;
     }
 
@@ -251,7 +272,10 @@ public final class CaveChunkTile {
             recheck.clear(i);
             changed = true;
         }
-        if (changed) revision++;
+        if (changed) {
+            revision++;
+            archiveRevision++;
+        }
         return changed;
     }
 
@@ -270,6 +294,7 @@ public final class CaveChunkTile {
         revision = Math.max(revision, snapshot.revision());
         savedRevision = Math.max(savedRevision, snapshot.revision());
         if (hadLiveChanges) revision = Math.max(revision, savedRevision + 1L);
+        if (changed) archiveRevision++;
         return changed;
     }
 
@@ -289,6 +314,7 @@ public final class CaveChunkTile {
             tile.pending.set(0, COLUMN_COUNT);
             tile.pending.andNot(tile.scanned);
             tile.revision = Math.max(1L, snapshot.revision());
+            tile.archiveRevision = tile.revision;
             tile.savedRevision = tile.revision;
         }
         return tile;

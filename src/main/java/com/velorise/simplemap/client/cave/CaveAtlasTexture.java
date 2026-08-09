@@ -42,8 +42,11 @@ final class CaveAtlasTexture extends AbstractTexture {
     void allocateStorage() {
         RenderSystem.assertOnRenderThreadOrInit();
         GlStateManager._bindTexture(getId());
-        // Exact atlases remain nearest-filtered. Branch atlases opt into linear
-        // minification only after allocating replicated one-pixel gutters per slot.
+        // Cave hierarchy levels are already prefiltered/downsampled, so their
+        // callers keep nearest minification. Surface exact leaves deliberately opt
+        // into linear minification (matching Xaero World Map RegionTexture) because
+        // fractional ~1.0x zoom otherwise aliases block/chunk cadence into water
+        // stripes. Magnification remains pixel-exact NEAREST for every atlas.
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER,
                 linearMinification ? GL11.GL_LINEAR : GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER,

@@ -6,6 +6,8 @@ Simple Map focuses on readable terrain, fast client-side exploration, practical 
 
 > **Architecture checkpoint:** V17.8 / M4 Region LOD authority. Surface far-zoom coverage can now be projected directly from region source data, published through a durable 8×8 hierarchy, and rendered as a coarse underlay before exact pages finish. The older factor-2 LOD tree remains temporarily as a quality/refinement adapter until the M5 page-table renderer replaces both paths.
 
+> **PASS99 loaded/loading checkpoint:** minimap Surface/Cave now keep retained root coverage behind refinement and gate front/back FBO handoff like Xaero's loaded/loading grids. Cave branch work uses foreground/background dirty lanes rather than viewport queue sorting, and projection/page styling removes several high-rate transient allocations.
+
 ---
 
 ## Highlights

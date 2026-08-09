@@ -46,11 +46,18 @@ public final class SurfaceRegionSource {
                     wordOffset, revisionDestination, revisionOffset);
         }
 
-        View acquireView() {
+        ProbeMetadata snapshotMetadataUnsafe() {
             synchronized (this) {
                 if (closed) return null;
             }
-            return owner.acquireView();
+            return owner.snapshotProbeMetadata();
+        }
+
+        View acquireView(long expectedPaletteRevision) {
+            synchronized (this) {
+                if (closed) return null;
+            }
+            return owner.acquireView(expectedPaletteRevision);
         }
 
         @Override
@@ -62,6 +69,9 @@ public final class SurfaceRegionSource {
             owner.releaseView();
         }
     }
+
+    static record ProbeMetadata(long sourceRevision, long paletteRevision,
+            String[] biomePalette, String[] blockPalette) { }
 
     public static final class View implements AutoCloseable {
         private final SurfaceRegionSource owner;
@@ -212,6 +222,36 @@ public final class SurfaceRegionSource {
         return true;
     }
 
+    /**
+     * Returns the 4x4 exact-subtile mask currently backed by clean retained
+     * chunk snapshots for one 64x64 page. Missing or dirty writer slots are not
+     * advertised to the renderer. This lets the live minimap consume the writer
+     * database without re-entering MapManager/Region.
+     */
+    public synchronized int leafPresentSubtileMask(int localPageX,
+            int localPageZ) {
+        if (released || closeRequested || localPageX < 0
+                || localPageX >= MapPageLayout.PAGES_PER_REGION
+                || localPageZ < 0
+                || localPageZ >= MapPageLayout.PAGES_PER_REGION) return 0;
+        int startChunkX = localPageX * 4;
+        int startChunkZ = localPageZ * 4;
+        int mask = 0;
+        for (int z = 0; z < 4; z++) {
+            for (int x = 0; x < 4; x++) {
+                int chunkX = startChunkX + x;
+                int chunkZ = startChunkZ + z;
+                int index = chunkZ * CHUNKS_PER_AXIS + chunkX;
+                long bit = 1L << (index & 63);
+                if (chunks[index] != null
+                        && (dirtyChunkMask[index >>> 6] & bit) == 0L) {
+                    mask |= 1 << (z * 4 + x);
+                }
+            }
+        }
+        return mask;
+    }
+
     public synchronized boolean commit(ChunkSnapshot snapshot,
             MapMemoryLeaseManager.Lease memoryLease) {
         if (memoryLease == null) return false;
@@ -272,7 +312,11 @@ public final class SurfaceRegionSource {
 
     synchronized int debugDirtyChunkCount() {
         int count = 0;
-        for (long word : dirtyChunkMask) count += Long.bitCount(word);
+        for (int i = 0; i < dirtyChunkMask.length; i++) {
+            // Absent slots start dirty by design; telemetry must count retained
+            // chunks that need refresh, not all never-observed chunks in a region.
+            count += Long.bitCount(dirtyChunkMask[i] & presentChunkMask[i]);
+        }
         return count;
     }
 
@@ -291,6 +335,22 @@ public final class SurfaceRegionSource {
     public synchronized void close() {
         closeRequested = true;
         if (activeViews == 0) releaseStorage();
+    }
+
+    private synchronized ProbeMetadata snapshotProbeMetadata() {
+        if (released) return null;
+        // Palette arrays are immutable publication snapshots; updatePalette swaps
+        // the whole reference, so returning these references is safe while the
+        // revision pair is validated before a worker acquires a View.
+        return new ProbeMetadata(sourceRevision, paletteRevision,
+                biomePalette, blockPalette);
+    }
+
+    private synchronized View acquireView(long expectedPaletteRevision) {
+        if (released || paletteRevision != expectedPaletteRevision) return null;
+        activeViews++;
+        return new View(this, stamp, regionX, regionZ, sourceRevision, chunks,
+                biomePalette, blockPalette, dirtyChunkMask, dirtyLeafMask);
     }
 
     public synchronized View acquireView() {

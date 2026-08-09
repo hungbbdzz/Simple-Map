@@ -90,6 +90,13 @@ public final class RegionSurfaceLodService {
         return graph;
     }
 
+    /** Flushes region-LOD atlas slot quarantine after the page-table swap. */
+    public void onPageTableFrameBoundary() {
+        for (int level = 0; level <= MAX_LEVEL; level++) {
+            atlases[level].onPageTableFrameBoundary();
+        }
+    }
+
     /**
      * Returns a bounded compatibility-LOD publication budget for the current
      * Surface viewport. The legacy factor-2 tree remains a bootstrap fallback,
@@ -135,7 +142,7 @@ public final class RegionSurfaceLodService {
     /** Updates only priority metadata; no durable dirty state is discarded. */
     public void setVisibleView(RevisionStamp stamp, float logicalScale,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
-            int focusPageX, int focusPageZ) {
+            int focusPageX, int focusPageZ, MapRequestLane lane) {
         if (stamp == null || !stamp.isCurrent()) {
             visibleView = VisibleView.none();
             visibleLoadSignature = Long.MIN_VALUE;
@@ -156,12 +163,21 @@ public final class RegionSurfaceLodService {
                 MapPageLayout.PAGES_PER_REGION);
         int focusRegionZ = Math.floorDiv(focusPageZ,
                 MapPageLayout.PAGES_PER_REGION);
-        boolean coarseRequired = MapRegionLodPolicy.directProjectionEnabled(
-                logicalScale, minPageX, maxPageX, minPageZ, maxPageZ);
+        /*
+         * Both visible Surface owners feed this service. Keep one
+         * cheap M4 level-0/root authority for every visible region at every zoom.
+         * Xaero never allows a finer child to become the sole representation:
+         * when a child is cold, the retained root sub-rectangle remains visible.
+         * The old density gate disabled exactly that invariant at close zoom and
+         * left teleport/atlas-eviction holes with no renderable underlay.
+         */
+        boolean coarseRequired = true;
+        MapRequestLane visibleLane = lane == null
+                ? MapRequestLane.FULLSCREEN : lane;
         VisibleView next = new VisibleView(stamp, logicalScale,
                 minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                 focusRegionX, focusRegionZ, focusPageX, focusPageZ,
-                coarseRequired);
+                coarseRequired, visibleLane);
         long signature = visibleLoadSignature(next);
         if (signature != visibleLoadSignature) {
             visibleLoadSignature = signature;
@@ -267,6 +283,7 @@ public final class RegionSurfaceLodService {
             NodeRecord record = records.get(key);
             if (record == null || !record.initialized
                     || (record.uploadedKnownMask & (1L << child)) == 0L
+                    || (record.uploadedCompleteMask & (1L << child)) == 0L
                     || record.uploadedChildVersions == null) return false;
             return record.uploadedChildVersions[child]
                     >= Math.max(1L, sourceRevision);
@@ -401,7 +418,9 @@ public final class RegionSurfaceLodService {
                 || System.nanoTime() >= deadlineNanos) return;
         int total = visibleRegionPlan.length;
         if (total == 0) return;
-        int budget = focused
+        boolean visibleForeground = view.lane == MapRequestLane.MINIMAP
+                || view.lane == MapRequestLane.FULLSCREEN;
+        int budget = visibleForeground
                 ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
                         ? VISIBLE_REGION_LOAD_FAR_FOCUSED
                         : VISIBLE_REGION_LOAD_FOCUSED)
@@ -429,7 +448,7 @@ public final class RegionSurfaceLodService {
             MapManager.Region resident = manager.getRegion(regionX, regionZ, false);
             if (resident != null && resident.isLoaded()) continue;
             if (!manager.hasRegionFile(regionX, regionZ)) continue;
-            int priority = MapRequestLane.FULLSCREEN.priorityBase() + 220_000
+            int priority = view.lane.priorityBase() + 220_000
                     - Math.min(200_000, ordinal * 128);
             MapProcessor.getInstance().enqueueSurfaceLoad(
                     regionX, regionZ, priority);
@@ -439,13 +458,15 @@ public final class RegionSurfaceLodService {
 
     private void scheduleDirectLevel0(boolean focused, long deadlineNanos) {
         VisibleView view = visibleView;
-        // Direct region projection is the far-zoom coarse-first path. At close
-        // zoom the exact pipeline and the legacy refinement adapter already own
-        // visible quality, so capturing whole 512x512 regions here would only
-        // recreate the M3 foreground spike that M4 is intended to remove.
+        // Direct level-0 is the retained fullscreen root at every zoom. It is a
+        // 64x64 coarse representation of one 512x512 region, not a 512x512 GPU
+        // upload. Exact/factor-2 textures refine it without ever making already
+        // known coverage disappear.
         if (!view.current() || !view.coarseRequired
                 || System.nanoTime() >= deadlineNanos) return;
-        int budget = focused
+        boolean visibleForeground = view.lane == MapRequestLane.MINIMAP
+                || view.lane == MapRequestLane.FULLSCREEN;
+        int budget = visibleForeground
                 ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
                         ? DIRECT_SCHEDULE_FAR_FOCUSED
                         : DIRECT_SCHEDULE_FOCUSED)
@@ -471,8 +492,7 @@ public final class RegionSurfaceLodService {
                     candidateX, candidateZ, false);
             if (region == null || !region.isLoaded()) continue;
             noteDirectProbe(key);
-            MapRequestLane lane = focused
-                    ? MapRequestLane.FULLSCREEN : MapRequestLane.BACKGROUND;
+            MapRequestLane lane = view.lane;
             MapManager.RegionLodSnapshot source = region.snapshotLodLevel0();
             if (source == null || source.knownCells() == 0) {
                 noteDirectProbeMiss(key);
@@ -506,7 +526,9 @@ public final class RegionSurfaceLodService {
         VisibleView view = visibleView;
         if (!view.current() || !view.coarseRequired
                 || System.nanoTime() >= deadlineNanos) return;
-        int budget = focused
+        boolean visibleForeground = view.lane == MapRequestLane.MINIMAP
+                || view.lane == MapRequestLane.FULLSCREEN;
+        int budget = visibleForeground
                 ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
                         ? EXACT_LEVEL0_SCHEDULE_FAR_FOCUSED
                         : EXACT_LEVEL0_SCHEDULE_FOCUSED)
@@ -526,8 +548,7 @@ public final class RegionSurfaceLodService {
                 graph.defer(lease);
                 continue;
             }
-            MapRequestLane lane = focused
-                    ? MapRequestLane.FULLSCREEN : MapRequestLane.BACKGROUND;
+            MapRequestLane lane = view.lane;
             long epoch = lifecycleEpoch;
             CompletableFuture<PreparedBranch> future =
                     MapTextureBuildWorker.tryDeriveRegionLodLevel0(
@@ -750,7 +771,7 @@ public final class RegionSurfaceLodService {
             }
             long bytes = 66L * 66L * Integer.BYTES;
             MapRequestLane lane = isVisible(record.key, view)
-                    ? MapRequestLane.FULLSCREEN : MapRequestLane.BACKGROUND;
+                    ? view.lane : MapRequestLane.BACKGROUND;
             if (!MapGpuBudgetController.getInstance().tryReserve(
                     MapGpuBudgetController.UploadKind.BRANCH,
                     lane, focused, bytes)) break;
@@ -758,12 +779,15 @@ public final class RegionSurfaceLodService {
             long previousKnownMask = record.uploadedKnownMask;
             long previousCompleteMask = record.uploadedCompleteMask;
             if (record.slot < 0) {
-                record.slot = atlases[record.key.level()].acquireSlot();
+                SurfaceRegionLodAtlas atlas = atlases[record.key.level()];
+                record.slot = atlas.acquireSlot();
                 if (record.slot < 0) {
+                    if (atlas.hasQuarantinedSlots()) break;
                     evictOne(record.key.level());
-                    record.slot = atlases[record.key.level()].acquireSlot();
+                    // Fenced reuse intentionally waits until the next frame; do
+                    // not evict another prepared region in the same publish pass.
+                    break;
                 }
-                if (record.slot < 0) break;
             }
             int[] pixels = prepared.pixels();
             long uploadStart = System.nanoTime();
@@ -794,7 +818,7 @@ public final class RegionSurfaceLodService {
                     record.slot, record.uploadedKnownMask,
                     record.uploadedCompleteMask);
             if (publishedRegion != null) {
-                int flags = PageTableEntry.FLAG_LINEAR;
+                int flags = 0;
                 if (prepared.completeMask()
                         == RegionLodGraph.completeMaskForLevel(
                                 prepared.key().level())) {
@@ -900,6 +924,9 @@ public final class RegionSurfaceLodService {
             // Removing the residency entry keeps O(1) byte accounting and the
             // surface coverage revision coherent in both cases.
             MapResidencyManager.getInstance().remove(residencyKey(key));
+            // Ancestor fallback quads can carry raw atlas UVs. Invalidate the
+            // immutable render-plan topology before this slot is ever recycled.
+            MapResidencyManager.getInstance().markTopologyChanged();
             return true;
         }
     }
@@ -918,12 +945,14 @@ public final class RegionSurfaceLodService {
     }
 
     private void releaseRecord(NodeRecord record) {
-        if (record.slot >= 0) {
+        boolean retiredGpuSlot = record.slot >= 0;
+        if (retiredGpuSlot) {
             atlases[record.key.level()].releaseSlot(record.slot);
             SurfacePublicationService.getInstance().remove(tileKey(record.key));
             record.slot = -1;
         }
         MapResidencyManager.getInstance().remove(residencyKey(record.key));
+        if (retiredGpuSlot) MapResidencyManager.getInstance().markTopologyChanged();
     }
 
     private void trimCpuRecords() {
@@ -1154,10 +1183,11 @@ public final class RegionSurfaceLodService {
     private record VisibleView(RevisionStamp stamp, float scale,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
             int focusRegionX, int focusRegionZ,
-            int focusPageX, int focusPageZ, boolean coarseRequired) {
+            int focusPageX, int focusPageZ, boolean coarseRequired,
+            MapRequestLane lane) {
         private static VisibleView none() {
             return new VisibleView(null, 1.0f, 0, -1, 0, -1,
-                    0, 0, 0, 0, false);
+                    0, 0, 0, 0, false, MapRequestLane.BACKGROUND);
         }
 
         private boolean current() {

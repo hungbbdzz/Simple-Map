@@ -72,7 +72,10 @@ public final class MapForegroundWriter {
 
         // A fixed duty ratio makes throughput independent of FPS. At 120 FPS this
         // accrues many small slices; at 20 FPS it accrues a larger but capped slice.
-        double duty = pressured ? 0.040D : (moving ? 0.075D : 0.055D);
+        // Healthy sessions in the PASS53 trace held 119-128 FPS while the live
+        // Surface frontier still fell behind. Spend a little more of that measured
+        // headroom on coherent near-player chunks; pressure retains the old cap.
+        double duty = pressured ? 0.040D : (moving ? 0.090D : 0.065D);
         long gained = Math.max(40_000L, (long) (elapsed * duty));
         creditNanos = Math.min(MAX_CREDIT_NANOS, creditNanos + gained);
         long frameCap = pressured ? PRESSURED_FRAME_CAP_NANOS
@@ -84,7 +87,7 @@ public final class MapForegroundWriter {
         if (CaveMode.isActive(minecraft)) {
             // Cave projection is the selected visual, but Surface history must keep
             // following the route for an instant OFF switch and the world map.
-            long caveBudget = budget * 3L / 5L;
+            long caveBudget = Math.min(650_000L, budget * 2L / 5L);
             CavePipeline.getInstance().scanForegroundFrame(minecraft, caveBudget);
             long remainingDeadline = started + budget;
             long remaining = Math.max(0L, remainingDeadline - System.nanoTime());

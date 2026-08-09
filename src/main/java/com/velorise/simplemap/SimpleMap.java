@@ -26,6 +26,7 @@ import com.velorise.simplemap.client.MapPublicationCoordinator;
 import com.velorise.simplemap.client.MapScreen;
 import com.velorise.simplemap.client.MapViewportCoordinator;
 import com.velorise.simplemap.client.MinimapRenderer;
+import com.velorise.simplemap.client.PinNavigation;
 import com.velorise.simplemap.client.MapTextureManager;
 import com.velorise.simplemap.client.RegionDataStore;
 import com.velorise.simplemap.client.WaypointManager;
@@ -444,7 +445,7 @@ public class SimpleMap {
                 double dz = mc.player.getZ() - MapConfig.pinWorldZ;
                 double distSq = dx * dx + dz * dz;
                 if (distSq <= 25.0) { // 5 blocks squared (5 * 5 = 25)
-                    MapConfig.pinActive = false;
+                    PinNavigation.clear();
                     MapManager.getInstance().savePin();
                     // Play a satisfying experience orb pickup sound locally to notify player
                     mc.player.playSound(net.minecraft.sounds.SoundEvents.EXPERIENCE_ORB_PICKUP, 0.6f, 1.0f);

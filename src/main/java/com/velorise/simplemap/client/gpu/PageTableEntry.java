@@ -8,6 +8,9 @@ public record PageTableEntry(int storageId, int slot, long storageGeneration,
     public static final int FLAG_COMPLETE = 1 << 1;
     public static final int FLAG_PROTECTED = 1 << 2;
     public static final int FLAG_LINEAR = 1 << 3;
+    /** Surface exact pages encode their 4x4 complete-subtile coverage here. */
+    public static final int COVERAGE_SHIFT = 8;
+    public static final int COVERAGE_BITS = 0xFFFF << COVERAGE_SHIFT;
 
     public PageTableEntry {
         if (storageId < 0) throw new IllegalArgumentException("storageId");
@@ -19,5 +22,14 @@ public record PageTableEntry(int storageId, int slot, long storageGeneration,
 
     public boolean resident() {
         return (flags & FLAG_RESIDENT) != 0;
+    }
+
+    public int coverageMask() {
+        return (flags >>> COVERAGE_SHIFT) & 0xFFFF;
+    }
+
+    public static int withCoverageMask(int flags, int coverageMask) {
+        return (flags & ~COVERAGE_BITS)
+                | ((coverageMask & 0xFFFF) << COVERAGE_SHIFT);
     }
 }

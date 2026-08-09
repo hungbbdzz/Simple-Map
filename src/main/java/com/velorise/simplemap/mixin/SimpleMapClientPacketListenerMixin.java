@@ -48,10 +48,11 @@ public abstract class SimpleMapClientPacketListenerMixin {
                 section.getX(), section.getZ());
     }
 
-    // handleLevelChunkWithLight always delegates to updateLevelChunk. Hook only
-    // this common point so one network packet cannot reset/requeue the same 16x16
-    // Surface transaction twice before the next client tick.
-    @Inject(method = "updateLevelChunk", at = @At("HEAD"))
+    // handleLevelChunkWithLight always delegates to updateLevelChunk. The map must
+    // observe the chunk only after vanilla has applied the packet. At HEAD the
+    // client chunk can still be its empty placeholder; recording that placeholder
+    // produced permanently-complete black 16x16 tiles.
+    @Inject(method = "updateLevelChunk", at = @At("TAIL"))
     private void simplemap$onChunkData(int chunkX, int chunkZ,
             ClientboundLevelChunkPacketData packet, CallbackInfo callback) {
         MapMutationBus.getInstance().onChunkData(chunkX, chunkZ);

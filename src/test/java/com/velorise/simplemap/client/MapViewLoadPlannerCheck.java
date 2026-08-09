@@ -38,9 +38,11 @@ public final class MapViewLoadPlannerCheck {
     }
 
     private static void minimapHaloStartsAtFocus() {
-        long[] pages = new long[49];
+        int radius = MapViewLoadPlanner.minimapWorkingRadiusPages(12);
+        int side = radius * 2 + 1;
+        long[] pages = new long[side * side];
         int count = MapViewLoadPlanner.fillMinimapHalo(
-                0, 10, 0, 10, 5, 5, pages);
+                -100, 100, -100, 100, 5, 5, radius, pages);
         require(count == pages.length, "minimap halo size changed");
         require(MapViewLoadPlanner.packedX(pages[0]) == 5
                         && MapViewLoadPlanner.packedZ(pages[0]) == 5,
@@ -48,9 +50,15 @@ public final class MapViewLoadPlannerCheck {
         for (int ordinal = 0; ordinal < count; ordinal++) {
             int x = MapViewLoadPlanner.packedX(pages[ordinal]);
             int z = MapViewLoadPlanner.packedZ(pages[ordinal]);
-            int radius = Math.max(Math.abs(x - 5), Math.abs(z - 5));
-            require(radius <= 3, "minimap halo escaped its exact-page cap");
+            int pageRadius = Math.max(Math.abs(x - 5), Math.abs(z - 5));
+            require(pageRadius <= MapViewLoadPlanner.minimapWorkingRadiusPages(12),
+                    "minimap halo escaped its exact-page cap");
         }
+        require(MapViewLoadPlanner.minimapWorkingRadiusPages(2) >= 2,
+                "small render distance lost its repair halo");
+        require(MapViewLoadPlanner.minimapWorkingRadiusPages(32)
+                        == MapViewLoadPlanner.MINIMAP_MAX_RADIUS_PAGES,
+                "maximum render distance is not covered by the minimap working set");
     }
 
     private static void require(boolean condition, String message) {

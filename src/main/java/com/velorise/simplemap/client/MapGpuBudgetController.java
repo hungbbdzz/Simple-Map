@@ -22,6 +22,9 @@ public final class MapGpuBudgetController {
     private static final long PRESSURE_BYTE_BUDGET = 768L << 10;
     private static final long FOCUSED_BYTE_BUDGET = 4L << 20;
     private static final long MINIMAP_RESERVE_BYTES = 384L << 10;
+    /** Extra bounded ledger used only by a CPU-complete fullscreen cave row. */
+    private static final long FULLSCREEN_CAVE_WAVEFRONT_EXTRA_NANOS = 3_000_000L;
+    private static final long FULLSCREEN_CAVE_WAVEFRONT_EXTRA_BYTES = 2L << 20;
     /**
      * One exact upload is an atomic operation: it cannot be split merely because
      * the adaptive frame slice became a few microseconds smaller than the current
@@ -79,6 +82,9 @@ public final class MapGpuBudgetController {
     private long lastOversizedForegroundAdmissionNanos;
     private long branchBootstrapAdmissions;
     private long lastBranchBootstrapAdmissionNanos;
+    private long fullscreenCaveWavefrontExtraNanos;
+    private long fullscreenCaveWavefrontExtraBytes;
+    private long fullscreenCaveWavefrontAdmissions;
     /** One primary-branch escape hatch is available in every explicit render frame. */
     private boolean branchBootstrapUsedThisFrame;
 
@@ -106,6 +112,8 @@ public final class MapGpuBudgetController {
         reservedBytes = 0L;
         minimapReservedBytes = 0L;
         branchBootstrapUsedThisFrame = false;
+        fullscreenCaveWavefrontExtraNanos = 0L;
+        fullscreenCaveWavefrontExtraBytes = 0L;
         boolean pressure = MapPerformanceGovernor.getInstance().underPressure();
         long configured = MapPerformanceGovernor.getInstance()
                 .textureUploadBudgetNanos(focused);
@@ -164,15 +172,29 @@ public final class MapGpuBudgetController {
                 MINIMAP_RESERVE_NANOS - minimapReservedNanos);
         long protectedBytes = Math.max(0L,
                 MINIMAP_RESERVE_BYTES - minimapReservedBytes);
-        boolean weak = effectiveKind == UploadKind.BRANCH
-                || effectiveKind == UploadKind.LEGACY
+        /*
+         * A FULLSCREEN branch is the primary representation at far zoom, not weak
+         * maintenance work. Reserving the minimap slice against it forced one tiny
+         * bootstrap admission and produced tens of thousands of denials while the
+         * actual branch upload cost stayed around a few hundred microseconds. Xaero
+         * advances the visible region texture before leaf refinements; give visible
+         * branches the normal foreground ledger and keep only background/prefetch
+         * branches weak.
+         */
+        boolean weak = effectiveKind == UploadKind.LEGACY
                 || effectiveLane == MapRequestLane.BACKGROUND
-                || effectiveLane == MapRequestLane.PREFETCH;
+                || effectiveLane == MapRequestLane.PREFETCH
+                || (effectiveKind == UploadKind.BRANCH
+                        && effectiveLane != MapRequestLane.FULLSCREEN
+                        && effectiveLane != MapRequestLane.MINIMAP);
         long usableNanos = weak ? Math.max(0L, budget - protectedNanos) : budget;
         long usableBytes = weak ? Math.max(0L, byteBudget - protectedBytes) : byteBudget;
         if (reservedNanos + prediction > usableNanos
                 || reservedBytes + predictedBytes > usableBytes) {
             long now = System.nanoTime();
+            if (tryAdmitFullscreenCaveWavefront(effectiveKind, effectiveLane,
+                    prediction, predictedBytes, usableNanos, usableBytes,
+                    pressure)) return true;
             if (tryAdmitBranchBootstrap(effectiveKind, effectiveLane,
                     prediction, predictedBytes, now, pressure)) return true;
             if (tryAdmitAtomicForeground(effectiveKind, effectiveLane,
@@ -195,6 +217,44 @@ public final class MapGpuBudgetController {
         }
     }
 
+
+    /**
+     * Fullscreen cave rows are already CPU-complete and ordered before they reach
+     * this ledger. Give that wavefront a small extra render-frame allowance instead
+     * of denying the same immutable page for hundreds of frames. The allowance is
+     * disabled under pressure and remains below one normal 60 Hz frame half-slice.
+     */
+    private boolean tryAdmitFullscreenCaveWavefront(UploadKind kind,
+            MapRequestLane lane, long prediction, long bytes,
+            long budget, long byteBudget, boolean pressure) {
+        if (pressure || kind != UploadKind.CAVE_EXACT
+                || lane != MapRequestLane.FULLSCREEN || !explicitFrame) {
+            return false;
+        }
+        long projectedNanos = reservedNanos + prediction;
+        long projectedBytes = reservedBytes + bytes;
+        long extraNanos = Math.max(0L, projectedNanos - Math.max(0L, budget));
+        long extraBytes = Math.max(0L, projectedBytes - Math.max(0L, byteBudget));
+        if (extraNanos > FULLSCREEN_CAVE_WAVEFRONT_EXTRA_NANOS
+                || extraBytes > FULLSCREEN_CAVE_WAVEFRONT_EXTRA_BYTES) {
+            return false;
+        }
+        long newlyConsumedNanos = Math.max(0L,
+                extraNanos - fullscreenCaveWavefrontExtraNanos);
+        long newlyConsumedBytes = Math.max(0L,
+                extraBytes - fullscreenCaveWavefrontExtraBytes);
+        if (fullscreenCaveWavefrontExtraNanos + newlyConsumedNanos
+                        > FULLSCREEN_CAVE_WAVEFRONT_EXTRA_NANOS
+                || fullscreenCaveWavefrontExtraBytes + newlyConsumedBytes
+                        > FULLSCREEN_CAVE_WAVEFRONT_EXTRA_BYTES) {
+            return false;
+        }
+        reserve(prediction, bytes, false);
+        fullscreenCaveWavefrontExtraNanos = extraNanos;
+        fullscreenCaveWavefrontExtraBytes = extraBytes;
+        fullscreenCaveWavefrontAdmissions++;
+        return true;
+    }
 
     private boolean tryAdmitBranchBootstrap(UploadKind kind,
             MapRequestLane lane, long prediction, long bytes,
@@ -320,6 +380,8 @@ public final class MapGpuBudgetController {
             reservedBytes = 0L;
             minimapReservedBytes = 0L;
             branchBootstrapUsedThisFrame = false;
+            fullscreenCaveWavefrontExtraNanos = 0L;
+            fullscreenCaveWavefrontExtraBytes = 0L;
         }
     }
 

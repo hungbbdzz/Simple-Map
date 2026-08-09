@@ -7,7 +7,11 @@ package com.velorise.simplemap.client;
  * Java object per pixel. Version 2 added a second height used by fluids: topY is
  * the visible fluid surface, while floorY is the solid terrain below it. Version
  * 3 stores the exact per-pixel BlockColors tint alongside this packed value in
- * the region file. For non-fluid pixels floorY equals topY.
+ * the region file. Version 5 introduced connected-water-surface/basin-floor
+ * semantics. Version 6 keeps the binary layout and performs a targeted water-only
+ * authority migration after restoring the proven beta water compositor and single
+ * live Surface writer. For non-fluid pixels floorY equals
+ * topY.
  *
  * Packed layout (low to high bits):
  *   0..15   topY
@@ -23,7 +27,10 @@ public final class MapBlockData {
     public static final short NO_BLOCK = -1;
 
     public static final int FILE_MAGIC   = 0x534D4150; // "SMAP"
-    public static final int FILE_VERSION = 4;
+    // v6 invalidates completion only for water-bearing chunks. Pixels remain
+    // available as last-good while the canonical live/disk authority rebuilds them,
+    // so land does not pay another cache migration.
+    public static final int FILE_VERSION = 6;
 
     public static final long EMPTY_PACKED = packRaw(
             EMPTY_Y, NO_BLOCK, NO_BIOME, (byte) 0, EMPTY_Y);

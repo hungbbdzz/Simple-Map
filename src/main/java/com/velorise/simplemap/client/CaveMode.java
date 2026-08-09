@@ -3,6 +3,7 @@ package com.velorise.simplemap.client;
 import com.velorise.simplemap.client.cave.CaveContextCache;
 import com.velorise.simplemap.client.cave.CaveLayerBand;
 import com.velorise.simplemap.client.cave.CaveModeTransitionPolicy;
+import com.velorise.simplemap.client.cave.CavePipeline;
 import com.velorise.simplemap.client.cave.CaveView;
 import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
 import com.velorise.simplemap.client.cave.CaveStateClassifier;
@@ -17,6 +18,7 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.material.PushReaction;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -32,28 +34,33 @@ public final class CaveMode {
     private static final CaveStateClassifier CAVE_STATE_CLASSIFIER = CaveStateClassifier.getInstance();
 
     /*
-     * Layered cave textures use immutable 16-block bands. AUTO may follow the
-     * local floor/roof context, but the final projection is snapped to the one
-     * deterministic Top-Y owned by that band. This prevents a revisited Nether
-     * layer from accumulating incompatible 16x16 tile projections.
+     * Layered cave textures use a retained 16-block identity while preserving the
+     * exact selected Top-Y, matching Xaero's caveStart/layer split. Old members of
+     * a band remain fallback-only until the exact projection has been rebuilt.
      */
-    private static final int AUTO_LAYER_STABLE_TICKS = 8;
+    /* Xaero keeps the candidate cave start separate from the displayed cave map.
+     * A one-second stable layer window prevents stair/elytra/player-Y jitter from
+     * rebasing thousands of retained Layered projection products. */
+    private static final int AUTO_LAYER_STABLE_TICKS = 20;
     /** Prevent stair steps and small jumps from oscillating around a band edge. */
     private static final int AUTO_LAYER_BOUNDARY_HYSTERESIS = 3;
     private static final int AUTO_LAYER_FAST_SWITCH_DISTANCE = 32;
     private static final int LAYER_DEPTH = 32;
 
-    /** Enter quickly after a coherent roof/floor context is observed. */
-    private static final int AUTO_ENTER_TICKS = 2;
+    /**
+     * Xaero's default cave-mode toggle timer is 1000 ms. Keep the same 20-tick
+     * display latch while exposing the covered candidate to the Cave prewarmer
+     * immediately. The renderer therefore stays on its stable Surface image while
+     * Cave source tiles are prepared instead of flipping after only ~100 ms.
+     */
+    private static final int AUTO_ENTER_TICKS = 20;
+    /** Never leave AUTO stuck on Surface if background GPU warmup is unavailable. */
+    private static final int AUTO_ENTER_FORCE_TICKS = 40;
     /** Xaero-style toggle hysteresis: brief openings must not drop the cave layer. */
     private static final int AUTO_EXIT_TICKS = 20;
     private static final int AUTO_CONTEXT_PROBE_INTERVAL = 4;
-    private static final int AUTO_ROOF_NEARBY_RADIUS = 2;
-    private static final int AUTO_ROOF_NEARBY_REQUIRED = 2;
-    private static final int AUTO_FLOOR_HEADROOM = 4;
-    /** Hard bounds for synchronous AUTO probes on the client/render thread. */
-    private static final int AUTO_ROOF_PROBE_DEPTH = 48;
-    private static final int AUTO_FLOOR_PROBE_DEPTH = 48;
+    /** Xaero's automatic cave check requires a coherent 3x3 roof neighbourhood. */
+    private static final int AUTO_ROOF_RADIUS = 1;
 
     private static int activeLayerY = Integer.MIN_VALUE;
     private static int pendingLayerY = Integer.MIN_VALUE;
@@ -97,12 +104,38 @@ public final class CaveMode {
         // decision; the type only decides whether that active cave is layered or full.
         if (MapConfig.getEffectiveCaveMapMode() == 0
                 || getCaveType(mc) == CaveType.OFF) return false;
+        MapManager manager = MapManager.getInstance();
+        boolean acceptsLive = manager.acceptsLiveLevel(mc.level);
+        // Portal handoff can expose the new ClientLevel one render frame before
+        // MapManager changes its source namespace. Do not let a manual cave setting
+        // render the previous dimension under the new live session. An intentional
+        // remote map view is different: its explicit override may use manual Cave.
+        if (manager.isViewingLiveDimension() && !acceptsLive) return false;
         if (hasManualTopY(mc)) return true;
-        // Xaero treats a remotely selected dimension as a custom dimension: it
-        // retains the dimension's cave index/type, but AUTO has no player-local
-        // roof context and therefore resolves to Surface.
-        if (!MapManager.getInstance().acceptsLiveLevel(mc.level)) return false;
+        // Remote AUTO has no player-local roof context and remains Surface.
+        if (!acceptsLive) return false;
         return updateAutomaticDetection(mc);
+    }
+
+    /**
+     * True while automatic roof detection is a stable Cave candidate even if the
+     * one-second display latch has not elapsed yet. Source writers may use this to
+     * prewarm a compact near-player Cave set; renderers must continue using
+     * {@link #isActive(Minecraft)} so preparation never creates a visible half-Cave
+     * transition.
+     */
+    public static synchronized boolean shouldPrepare(Minecraft mc) {
+        if (mc == null || mc.level == null || mc.player == null) return false;
+        if (MapConfig.getEffectiveCaveMapMode() == 0
+                || getCaveType(mc) == CaveType.OFF) return false;
+        MapManager manager = MapManager.getInstance();
+        boolean acceptsLive = manager.acceptsLiveLevel(mc.level);
+        if (manager.isViewingLiveDimension() && !acceptsLive) return false;
+        if (hasManualTopY(mc)) return true;
+        if (!acceptsLive) return false;
+        updateAutomaticDetection(mc);
+        AutoDetectionState state = AUTO_DETECTION.get(dimensionKey(mc));
+        return state != null && (state.active || state.lastCovered);
     }
 
     /** Y used by the scanner. Supports manual Top Y across cave views. */
@@ -275,6 +308,19 @@ public final class CaveMode {
         return clampY(level, topY);
     }
 
+    /** Build limits of the map dimension currently being viewed, not necessarily live. */
+    public static int getViewedScanMinimum(Minecraft mc, int topY) {
+        DimensionMapProfile profile = MapManager.getInstance().getCurrentDimensionProfile();
+        int maximum = profile == null ? clampY(mc.level, topY) : profile.clampY(topY);
+        int minimumBound = profile == null ? mc.level.getMinBuildHeight() : profile.minY();
+        return Math.max(minimumBound, maximum - LAYER_DEPTH + 1);
+    }
+
+    public static int getViewedScanMaximum(Minecraft mc, int topY) {
+        DimensionMapProfile profile = MapManager.getInstance().getCurrentDimensionProfile();
+        return profile == null ? clampY(mc.level, topY) : profile.clampY(topY);
+    }
+
     public static synchronized void clearManualLayer() {
         MANUAL_TOP_Y.clear();
         CAVE_TYPES.clear();
@@ -311,8 +357,10 @@ public final class CaveMode {
 
     private static int clampViewedY(Minecraft mc, int y) {
         String dimension = dimensionKey(mc);
-        if ("minecraft:the_nether".equals(dimension)) {
-            return Math.max(0, Math.min(255, y));
+        DimensionMapProfile profile = MapManager.getInstance()
+                .getCurrentDimensionProfile();
+        if (profile != null && dimension.equals(profile.resourceId())) {
+            return profile.clampY(y);
         }
         return clampY(mc.level, y);
     }
@@ -367,13 +415,41 @@ public final class CaveMode {
         if (state.lastCovered) {
             state.openTicks = 0;
             state.coveredTicks++;
-            if (state.coveredTicks >= AUTO_ENTER_TICKS) state.active = true;
+            if (!state.active && state.coveredTicks >= AUTO_ENTER_TICKS) {
+                /*
+                 * Time hysteresis alone is not a loading barrier. Keep Surface as
+                 * loadedCaving until the centre Cave source set is actually warm;
+                 * otherwise the exact/branch/GPU pipeline starts from cold on the
+                 * same frame the AUTO detector flips presentation.
+                 */
+                boolean warm = CavePipeline.getInstance().autoWarmupReady(mc);
+                if (warm || state.coveredTicks >= AUTO_ENTER_FORCE_TICKS) {
+                    state.active = true;
+                } else {
+                    MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                    String eventKey = "CAVE_AUTO_WAITING_WARM_SOURCE:" + dimension;
+                    if (recorder.shouldEmitEvent(eventKey, 250L)) {
+                        recorder.event("CAVE_AUTO_WAITING_WARM_SOURCE",
+                                "covered_ticks=" + state.coveredTicks
+                                        + " suggested_top_y=" + state.suggestedTopY);
+                    }
+                }
+            }
         } else {
             state.coveredTicks = 0;
             state.openTicks++;
             if (state.openTicks >= AUTO_EXIT_TICKS) state.active = false;
         }
-        if (wasActive != state.active) modeRevision++;
+        if (wasActive != state.active) {
+            modeRevision++;
+            CaveModeTransitionPolicy.begin();
+            MapDebugRecorder.getInstance().event("CAVE_AUTO_DISPLAY_LATCH",
+                    "active=" + state.active
+                            + " covered_ticks=" + state.coveredTicks
+                            + " open_ticks=" + state.openTicks
+                            + " confidence=" + state.lastConfidence
+                            + " suggested_top_y=" + state.suggestedTopY);
+        }
         return state.active;
     }
 
@@ -387,65 +463,43 @@ public final class CaveMode {
         Level level = mc.level;
         int x = (int) Math.floor(mc.player.getX());
         int z = (int) Math.floor(mc.player.getZ());
-        int eyeY = clampY(level, (int) Math.floor(mc.player.getEyeY()));
-        int firstRoofY = Math.min(level.getMaxBuildHeight() - 1, eyeY + 1);
+        int scanY = clampY(level, (int) Math.floor(mc.player.getY()) + 1);
         boolean hardCeiling = level.dimensionType().hasCeiling();
 
-        BlockPos eye = new BlockPos(x, eyeY, z);
+        BlockPos eye = new BlockPos(x, scanY, z);
         if (!hardCeiling && level.dimensionType().hasSkyLight()
                 && level.getBrightness(LightLayer.SKY, eye) >= 15
                 && level.canSeeSky(eye)) {
-            return new CaveContext(false, eyeY + 1, 0);
+            return new CaveContext(false, scanY + 3, 0);
         }
 
-        int[][] offsets = {
-                { AUTO_ROOF_NEARBY_RADIUS, 0 },
-                { -AUTO_ROOF_NEARBY_RADIUS, 0 },
-                { 0, AUTO_ROOF_NEARBY_RADIUS },
-                { 0, -AUTO_ROOF_NEARBY_RADIUS }
-        };
-        int directRoof;
-        int nearbyRoofCount = 0;
-        directRoof = findBlockingRoofY(level, x, z, firstRoofY);
-        for (int[] offset : offsets) {
-            if (findBlockingRoofY(level, x + offset[0], z + offset[1], firstRoofY)
-                    != Integer.MIN_VALUE) {
-                nearbyRoofCount++;
+        int centerRoof = Integer.MIN_VALUE;
+        int coveredColumns = 0;
+        int diameter = AUTO_ROOF_RADIUS * 2 + 1;
+        for (int dz = -AUTO_ROOF_RADIUS; dz <= AUTO_ROOF_RADIUS; dz++) {
+            for (int dx = -AUTO_ROOF_RADIUS; dx <= AUTO_ROOF_RADIUS; dx++) {
+                int roof = findBlockingRoofY(level, x + dx, z + dz, scanY);
+                if (roof == Integer.MIN_VALUE) {
+                    return new CaveContext(false, scanY + 3,
+                            Math.min(3, coveredColumns));
+                }
+                coveredColumns++;
+                if (dx == 0 && dz == 0) centerRoof = roof;
             }
         }
 
-        // A dimension ceiling is only a scan hint, never proof that the player is
-        // currently underground. This is the key Xaero cave-start distinction:
-        // Nether, End and custom dimensions all use the same real roof test.
-        boolean covered = directRoof != Integer.MIN_VALUE
-                || nearbyRoofCount >= AUTO_ROOF_NEARBY_REQUIRED;
-        int confidence = Math.min(3,
-                (directRoof != Integer.MIN_VALUE ? 1 : 0) + nearbyRoofCount);
-
-        /*
-         * A player hovering high above the local cave floor should not select an empty
-         * 32-block band. Anchor the band to the nearest substantial floor in the same
-         * small neighbourhood while retaining several blocks of headroom.
-         */
-        int nearestFloor = findNearestFloorY(level, x, z, eyeY - 1);
-        for (int[] offset : offsets) {
-            nearestFloor = Math.max(nearestFloor,
-                    findNearestFloorY(level, x + offset[0], z + offset[1], eyeY - 1));
-        }
-        int suggestedTop = eyeY + 1;
-        if (nearestFloor != Integer.MIN_VALUE
-                && suggestedTop - nearestFloor >= LAYER_DEPTH) {
-            suggestedTop = nearestFloor + LAYER_DEPTH - AUTO_FLOOR_HEADROOM;
-        }
-        return new CaveContext(covered, clampY(level, suggestedTop), confidence);
+        // Xaero caps caveStart at playerY + 4 even when the physical roof is higher.
+        // The exact roof is used only when it lies closer to the player.
+        int suggestedTop = Math.min(centerRoof, scanY + 3);
+        return new CaveContext(coveredColumns == diameter * diameter,
+                clampY(level, suggestedTop), 3);
     }
 
     private static int findBlockingRoofY(Level level, int x, int z, int firstY) {
         LevelChunk chunk = fullChunk(level, x >> 4, z >> 4);
         if (chunk == null) return Integer.MIN_VALUE;
 
-            int upperBound = Math.min(level.getMaxBuildHeight() - 1,
-                    firstY + AUTO_ROOF_PROBE_DEPTH - 1);
+        int upperBound = level.getMaxBuildHeight() - 1;
         if (level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling()) {
             try {
                 upperBound = Math.min(upperBound,
@@ -476,38 +530,15 @@ public final class CaveMode {
         return Integer.MIN_VALUE;
     }
 
-    private static int findNearestFloorY(Level level, int x, int z, int startY) {
-        if (startY < level.getMinBuildHeight()) return Integer.MIN_VALUE;
-        LevelChunk chunk = fullChunk(level, x >> 4, z >> 4);
-        if (chunk == null) return Integer.MIN_VALUE;
-
-        int lowerBound = Math.max(level.getMinBuildHeight(),
-                startY - AUTO_FLOOR_PROBE_DEPTH + 1);
-        int top = Math.min(startY, level.getMaxBuildHeight() - 1);
-        LevelChunkSection[] sections = chunk.getSections();
-        int firstSection = Math.min(sections.length - 1, level.getSectionIndex(top));
-        int lastSection = Math.max(0, level.getSectionIndex(lowerBound));
-        int minimumSectionY = Math.floorDiv(level.getMinBuildHeight(), 16);
-        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos(x, top, z);
-        for (int sectionIndex = firstSection; sectionIndex >= lastSection; sectionIndex--) {
-            LevelChunkSection section = sections[sectionIndex];
-            if (section == null || section.hasOnlyAir()) continue;
-            int sectionBottom = (minimumSectionY + sectionIndex) << 4;
-            int fromY = Math.min(top, sectionBottom + 15);
-            int toY = Math.max(lowerBound, sectionBottom);
-            for (int y = fromY; y >= toY; y--) {
-                cursor.setY(y);
-                BlockState state = level.getBlockState(cursor);
-                if (isSubstantialBarrier(level, cursor, state)) return y;
-            }
-        }
-        return Integer.MIN_VALUE;
-    }
-
     private static boolean isSubstantialBarrier(Level level,
             BlockPos.MutableBlockPos pos, BlockState state) {
         if (state == null || state.isAir() || state.is(BlockTags.LEAVES)
-                || !state.getFluidState().isEmpty()) return false;
+                || !state.getFluidState().isEmpty() || state.canBeReplaced()
+                || state.getPistonPushReaction() == PushReaction.DESTROY) return false;
+        MapVisualClassifier.VisualInfo visual =
+                MapVisualClassifier.getInstance().info(state);
+        if (visual.leaves() || visual.flower()
+                || visual.role() != MapVisualClassifier.Role.OPAQUE_BASE) return false;
         if (state.blocksMotion()) return true;
         return !CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state);
     }

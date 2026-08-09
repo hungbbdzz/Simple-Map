@@ -1,18 +1,23 @@
 package com.velorise.simplemap.client.persistence.v2;
 
+import com.velorise.simplemap.client.MapConfig;
 import com.velorise.simplemap.client.RegionDataStore;
 import com.velorise.simplemap.client.cave.archive.CompactCaveTile;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * Non-destructive M10 sidecar writer. Legacy caches remain readable during
@@ -26,6 +31,11 @@ public final class MapPersistenceV2Service {
             new MapPersistenceV2Service();
     private final ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "SimpleMap-PersistenceV2");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final ExecutorService loader = Executors.newFixedThreadPool(2, r -> {
+        Thread thread = new Thread(r, "SimpleMap-PersistenceV2-Read");
         thread.setDaemon(true);
         return thread;
     });
@@ -71,11 +81,127 @@ public final class MapPersistenceV2Service {
         int regionX = tile.chunkX() >> 5;
         int regionZ = tile.chunkZ() >> 5;
         int localKey = ((tile.chunkZ() & 31) << 5) | (tile.chunkX() & 31);
+        // Keep Accurate and Vanilla archives independent inside the same SMR2
+        // region. The style field is a persistent schema signature, not the
+        // session-local style generation supplied by older callers.
+        localKey |= Math.max(0, MapConfig.blockColourMode) << 10;
         return append(dimensionDirectory, worldIdentity, regionX, regionZ,
                 new RegionContainerV2.Record(
                         new RegionContainerV2.RecordKey(
                                 RegionContainerV2.RecordType.CAVE_ARCHIVE, localKey),
-                        tile.revision(), styleRevision, payload), false);
+                        tile.revision(), caveArchiveStyleSignature(), payload), false);
+    }
+
+    /**
+     * Replays colour-schema-isolated cave archives at world open. PASS56 wrote
+     * SMR2 records but never read them, so every client restart repeated the complete
+     * Anvil/DataFixer scan before a Layered Top-Y could use the archive.
+     */
+    public CompletableFuture<Integer> loadCaveArchives(File dimensionDirectory,
+            long worldIdentity, Consumer<CompactCaveTile> consumer) {
+        if (dimensionDirectory == null || consumer == null) {
+            return CompletableFuture.completedFuture(0);
+        }
+        Path containerDirectory = dimensionDirectory.toPath().resolve("containers-v2");
+        if (!Files.isDirectory(containerDirectory)) {
+            return CompletableFuture.completedFuture(0);
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            int loaded = 0;
+            try (var paths = Files.list(containerDirectory)) {
+                for (Path path : (Iterable<Path>) paths
+                        .filter(candidate -> candidate.getFileName().toString()
+                                .endsWith(".smr2"))::iterator) {
+                    try {
+                        RegionContainerV2.ReadResult result = RegionContainerV2.read(path);
+                        if (result.header() == null
+                                || result.header().worldIdentity() != worldIdentity) continue;
+                        for (RegionContainerV2.Record record : result.latest().values()) {
+                            if (record.key().type()
+                                    != RegionContainerV2.RecordType.CAVE_ARCHIVE
+                                    || record.styleRevision()
+                                            != caveArchiveStyleSignature()) continue;
+                            CompactCaveTile tile = decodeCave(record.payload());
+                            if (tile == null) continue;
+                            consumer.accept(tile);
+                            loaded++;
+                        }
+                    } catch (IOException | RuntimeException ignored) {
+                        // One corrupt region sidecar must not block the remaining map.
+                    }
+                }
+            } catch (IOException ignored) {
+                return loaded;
+            }
+            return loaded;
+        }, loader);
+    }
+
+    /**
+     * Loads only the compact cave records belonging to one 64x64 exact page.
+     * A page is four-by-four chunks and a Minecraft region is 32x32 chunks, so
+     * page boundaries never cross an SMR2 region boundary. This is the random-
+     * access resident refill used after the archive LRU evicts an indexed tile.
+     */
+    public CompletableFuture<Integer> loadCaveArchivePage(
+            File dimensionDirectory, long worldIdentity, int globalPageX,
+            int globalPageZ, Consumer<CompactCaveTile> consumer) {
+        if (dimensionDirectory == null || consumer == null) {
+            return CompletableFuture.completedFuture(0);
+        }
+        int firstChunkX = globalPageX << 2;
+        int firstChunkZ = globalPageZ << 2;
+        int regionX = Math.floorDiv(firstChunkX, 32);
+        int regionZ = Math.floorDiv(firstChunkZ, 32);
+        Path path = containerPath(dimensionDirectory, regionX, regionZ);
+        if (!Files.isRegularFile(path)) {
+            return CompletableFuture.completedFuture(0);
+        }
+        int localStartX = Math.floorMod(firstChunkX, 32);
+        int localStartZ = Math.floorMod(firstChunkZ, 32);
+        long expectedStyle = caveArchiveStyleSignature();
+        return CompletableFuture.supplyAsync(() -> {
+            int loaded = 0;
+            try {
+                RegionContainerV2.ReadResult result = RegionContainerV2.read(path);
+                if (result.header() == null
+                        || result.header().worldIdentity() != worldIdentity
+                        || result.header().regionX() != regionX
+                        || result.header().regionZ() != regionZ) return 0;
+                for (RegionContainerV2.Record record : result.latest().values()) {
+                    if (record.key().type()
+                            != RegionContainerV2.RecordType.CAVE_ARCHIVE
+                            || record.styleRevision() != expectedStyle) continue;
+                    int localChunk = record.key().localKey() & 0x3FF;
+                    int localX = localChunk & 31;
+                    int localZ = (localChunk >>> 5) & 31;
+                    if (localX < localStartX || localX >= localStartX + 4
+                            || localZ < localStartZ || localZ >= localStartZ + 4) {
+                        continue;
+                    }
+                    CompactCaveTile tile = decodeCave(record.payload());
+                    if (tile == null
+                            || Math.floorDiv(tile.chunkX(), 4) != globalPageX
+                            || Math.floorDiv(tile.chunkZ(), 4) != globalPageZ) {
+                        continue;
+                    }
+                    consumer.accept(tile);
+                    loaded++;
+                }
+            } catch (IOException | RuntimeException ignored) {
+                return loaded;
+            }
+            return loaded;
+        }, loader);
+    }
+
+    /**
+     * Persistent archive colour schema. CVR/SMR2 store resolved raw material
+     * colours, so replay is valid only for the same colour mode and schema.
+     */
+    private static long caveArchiveStyleSignature() {
+        return 0x4341563600000000L
+                | (Math.max(0, MapConfig.blockColourMode) & 0xFFFFL);
     }
 
     public synchronized Summary summary() {
@@ -157,6 +283,54 @@ public final class MapPersistenceV2Service {
             }
         }
         return bytes.toByteArray();
+    }
+
+    private static CompactCaveTile decodeCave(byte[] payload) throws IOException {
+        if (payload == null) return null;
+        try (DataInputStream input = new DataInputStream(
+                new ByteArrayInputStream(payload))) {
+            int chunkX = input.readInt();
+            int chunkZ = input.readInt();
+            long revision = input.readLong();
+            int declaredRuns = input.readInt();
+            if (declaredRuns < 0 || declaredRuns > 1_000_000) {
+                throw new IOException("invalid cave run count");
+            }
+            int[] offsets = new int[CompactCaveTile.COLUMNS + 1];
+            short[] top = new short[declaredRuns];
+            short[] floor = new short[declaredRuns];
+            int[] material = new int[declaredRuns];
+            short[] biome = new short[declaredRuns];
+            byte[] block = new byte[declaredRuns];
+            byte[] sky = new byte[declaredRuns];
+            byte[] fluid = new byte[declaredRuns];
+            byte[] flags = new byte[declaredRuns];
+            byte[] statuses = new byte[CompactCaveTile.COLUMNS];
+            int cursor = 0;
+            for (int column = 0; column < CompactCaveTile.COLUMNS; column++) {
+                offsets[column] = cursor;
+                statuses[column] = input.readByte();
+                int count = input.readUnsignedShort();
+                if (cursor + count > declaredRuns) {
+                    throw new IOException("cave run overflow");
+                }
+                for (int run = 0; run < count; run++) {
+                    top[cursor] = input.readShort();
+                    floor[cursor] = input.readShort();
+                    material[cursor] = input.readInt();
+                    biome[cursor] = input.readShort();
+                    block[cursor] = input.readByte();
+                    sky[cursor] = input.readByte();
+                    fluid[cursor] = input.readByte();
+                    flags[cursor] = input.readByte();
+                    cursor++;
+                }
+            }
+            offsets[CompactCaveTile.COLUMNS] = cursor;
+            if (cursor != declaredRuns) throw new IOException("cave run mismatch");
+            return new CompactCaveTile(chunkX, chunkZ, revision, offsets,
+                    top, floor, material, biome, block, sky, fluid, flags, statuses);
+        }
     }
 
     private static void writeStrings(DataOutputStream output, String[] values)

@@ -26,6 +26,8 @@ public final class SurfaceRegionLodAtlas {
     private final int slotCount;
     private final boolean[] allocated;
     private final ArrayDeque<Integer> free;
+    /** Slots retired this frame; direct/ancestor plans may still sample their UVs. */
+    private final ArrayDeque<Integer> quarantined = new ArrayDeque<>();
     private final CavePboUploader uploader = new CavePboUploader();
     private final int[] gutteredUpload = new int[PITCH * PITCH];
 
@@ -60,6 +62,10 @@ public final class SurfaceRegionLodAtlas {
         return storageGeneration;
     }
 
+    public boolean hasQuarantinedSlots() {
+        return !quarantined.isEmpty();
+    }
+
     public int acquireSlot() {
         RenderSystem.assertOnRenderThreadOrInit();
         initialize();
@@ -71,13 +77,27 @@ public final class SurfaceRegionLodAtlas {
 
     public void releaseSlot(int slot) {
         if (slot < 0 || slot >= slotCount || !allocated[slot]) return;
-        allocated[slot] = false;
-        free.addLast(slot);
+        if (!quarantined.contains(slot)) quarantined.addLast(slot);
+    }
+
+    /**
+     * Makes retired slots reusable only after the old front page table/render
+     * plan generation has crossed a frame boundary.
+     */
+    public void onPageTableFrameBoundary() {
+        RenderSystem.assertOnRenderThreadOrInit();
+        while (!quarantined.isEmpty()) {
+            int slot = quarantined.removeFirst();
+            if (slot < 0 || slot >= slotCount || !allocated[slot]) continue;
+            allocated[slot] = false;
+            free.addLast(slot);
+        }
     }
 
     public void resetSlots() {
         RenderSystem.assertOnRenderThreadOrInit();
         java.util.Arrays.fill(allocated, false);
+        quarantined.clear();
         refill();
     }
 

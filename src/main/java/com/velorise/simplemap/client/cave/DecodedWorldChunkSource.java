@@ -1,5 +1,6 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.cave.archive.CaveArchiveV2Service;
 import com.velorise.simplemap.client.MapBlockEntityVisualResolver;
 import com.velorise.simplemap.client.MapCancellationToken;
 import com.velorise.simplemap.client.MapVisualClassifier;
@@ -19,6 +20,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.biome.Biome;
 
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -40,6 +42,19 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, ResourceLocation> RESOURCE_ID_CACHE =
             new ConcurrentHashMap<>();
+    /*
+     * Offline Surface reconstruction used to call ResourceLocation.toString() for
+     * block and biome ids in every one of 256 columns per decoded chunk. A large
+     * fullscreen reconstruction therefore produced millions of short-lived Strings.
+     * Registry objects are stable for a world session and the number of distinct
+     * ids is tiny relative to the number of columns, so retain canonical id Strings.
+     */
+    private static final ConcurrentHashMap<Block, String> SURFACE_BLOCK_ID_CACHE =
+            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Biome, String> SURFACE_BIOME_ID_CACHE =
+            new ConcurrentHashMap<>();
+    private static final String SURFACE_AIR_ID = "minecraft:air";
+    private static final String SURFACE_PLAINS_ID = "minecraft:plains";
 
     private final int chunkX;
     private final int chunkZ;
@@ -61,20 +76,35 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
     private final MapVisualClassifier visuals = MapVisualClassifier.getInstance();
     private final MapBlockEntityVisualResolver blockEntityVisuals =
             MapBlockEntityVisualResolver.getInstance();
-    private volatile SurfaceProjection[] surfaceWithFlowers;
-    private volatile SurfaceProjection[] surfaceWithoutFlowers;
     /**
      * Small projection memo for Full Cave and adjacent Layered Cave Y values.
      * Decoded sections are immutable, so repeated viewport requests can reuse the
      * same dense tile instead of rescanning the full vertical column range.
      */
-    private static final int MAX_CAVE_PROJECTION_CACHE = 3;
+    private static final int MAX_CAVE_PROJECTION_CACHE = 6;
     private final LinkedHashMap<Long, DenseCaveTile> caveProjectionCache =
             new LinkedHashMap<>(4, 0.75f, true);
+    /**
+     * Style-independent vertical cavity runs. Built once from the decoded Anvil
+     * payload before any visible cave projection, then reused for Full and every
+     * exact Layered Top-Y.
+     */
+    private volatile CaveChunkTile.Snapshot verticalArchive;
+    /** Stable content identity derived from the decoded Anvil payload. */
+    private final long sourceRevision;
+    /**
+     * Surface must never treat a proto-generation Anvil snapshot as final terrain.
+     * Newly generated chunks can be visible to the client before the server has
+     * flushed the final FULL chunk to the region file. Those earlier statuses can
+     * contain the base surface while FEATURES (trees/vegetation) are still absent.
+     */
+    private final boolean authoritativeSurfaceSource;
+    private final CaveStateClassifier caveGeometry = CaveStateClassifier.getInstance();
 
     private DecodedWorldChunkSource(int chunkX, int chunkZ, int minimumY, int maximumY,
             int minimumSectionY, Section[] sections, int[] surfaceHeights,
-            Registry<Biome> biomeRegistry, Map<Integer, CompoundTag> blockEntities) {
+            Registry<Biome> biomeRegistry, Map<Integer, CompoundTag> blockEntities,
+            long sourceRevision, boolean authoritativeSurfaceSource) {
         this.chunkX = chunkX;
         this.chunkZ = chunkZ;
         this.minimumY = minimumY;
@@ -84,6 +114,8 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         this.surfaceHeights = surfaceHeights;
         this.biomeRegistry = biomeRegistry;
         this.blockEntities = blockEntities == null ? Map.of() : Map.copyOf(blockEntities);
+        this.sourceRevision = sourceRevision == 0L ? 1L : sourceRevision;
+        this.authoritativeSurfaceSource = authoritativeSurfaceSource;
     }
 
     static DecodedWorldChunkSource decode(CompoundTag source, int chunkX, int chunkZ,
@@ -123,12 +155,73 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         effectiveToken.checkpoint("chunk-block-entities-start");
         Map<Integer, CompoundTag> blockEntities = decodeBlockEntities(
                 root, chunkX, chunkZ, minimumY, effectiveToken);
+        long sourceRevision = stableSourceRevision(source, root, sectionTags,
+                chunkX, chunkZ, minimumY, maximumY);
+        String chunkStatus = root.getString("Status");
+        boolean authoritativeSurfaceSource = "full".equals(chunkStatus)
+                || "minecraft:full".equals(chunkStatus);
         DecodedWorldChunkSource decoded = new DecodedWorldChunkSource(chunkX, chunkZ,
                 minimumY, maximumY, minimumSectionY, sections, heights,
-                biomeRegistry, blockEntities);
+                biomeRegistry, blockEntities, sourceRevision,
+                authoritativeSurfaceSource);
         if (needsSurfaceScan) decoded.fillSurfaceHeightsByScan(effectiveToken);
         effectiveToken.checkpoint("chunk-source-ready");
         return decoded;
+    }
+
+    private static long stableSourceRevision(CompoundTag source, CompoundTag root,
+            ListTag sectionTags, int chunkX, int chunkZ,
+            int minimumY, int maximumY) {
+        long hash = 0xcbf29ce484222325L;
+        hash = mix(hash, chunkX);
+        hash = mix(hash, chunkZ);
+        hash = mix(hash, minimumY);
+        hash = mix(hash, maximumY);
+        int dataVersion = source.contains("DataVersion", Tag.TAG_ANY_NUMERIC)
+                ? source.getInt("DataVersion")
+                : root.contains("DataVersion", Tag.TAG_ANY_NUMERIC)
+                        ? root.getInt("DataVersion") : -1;
+        hash = mix(hash, dataVersion);
+        hash = mix(hash, root.getLong("LastUpdate"));
+        hash = mix(hash, root.getLong("InhabitedTime"));
+        hash = mix(hash, root.getString("Status").hashCode());
+        hash = mix(hash, sectionTags.size());
+        for (int index = 0; index < sectionTags.size(); index++) {
+            CompoundTag section = sectionTags.getCompound(index);
+            hash = mix(hash, section.getByte("Y"));
+            CompoundTag blocks = section.getCompound("block_states");
+            ListTag palette = blocks.getList("palette", Tag.TAG_COMPOUND);
+            hash = mix(hash, palette.size());
+            for (int entry = 0; entry < palette.size(); entry++) {
+                hash = mix(hash, palette.getCompound(entry).hashCode());
+            }
+            long[] blockData = blocks.getLongArray("data");
+            hash = mix(hash, blockData.length);
+            for (long value : blockData) hash = mix(hash, value);
+            CompoundTag biomes = section.getCompound("biomes");
+            ListTag biomePalette = biomes.getList("palette", Tag.TAG_STRING);
+            hash = mix(hash, biomePalette.hashCode());
+            long[] biomeData = biomes.getLongArray("data");
+            for (long value : biomeData) hash = mix(hash, value);
+            hash = mix(hash, java.util.Arrays.hashCode(
+                    section.getByteArray("BlockLight")));
+            hash = mix(hash, java.util.Arrays.hashCode(
+                    section.getByteArray("SkyLight")));
+        }
+        hash = mix(hash, root.getCompound("Heightmaps").hashCode());
+        hash = mix(hash, root.getList("block_entities", Tag.TAG_COMPOUND).hashCode());
+        hash = mix(hash, root.getList("TileEntities", Tag.TAG_COMPOUND).hashCode());
+        hash ^= hash >>> 33;
+        hash *= 0xff51afd7ed558ccdL;
+        hash ^= hash >>> 33;
+        hash *= 0xc4ceb9fe1a85ec53L;
+        hash ^= hash >>> 33;
+        return hash == 0L ? 1L : hash;
+    }
+
+    private static long mix(long hash, long value) {
+        hash ^= value;
+        return hash * 0x100000001b3L;
     }
 
     @Override
@@ -162,6 +255,33 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         if (sectionIndex < 0 || sectionIndex >= sections.length) return AIR;
         Section section = sections[sectionIndex];
         return section == null ? AIR : section.stateAt(localX, y & 15, localZ);
+    }
+
+    @Override
+    public byte sectionKind(int y) {
+        int sectionIndex = Math.floorDiv(y, 16) - minimumSectionY;
+        if (sectionIndex < 0 || sectionIndex >= sections.length) {
+            return CaveTileScanContext.ALL_AIR;
+        }
+        Section section = sections[sectionIndex];
+        return section == null ? CaveTileScanContext.ALL_AIR
+                : section.sectionKind();
+    }
+
+    @Override
+    public byte sectionKind(int localX, int y, int localZ) {
+        int sectionIndex = Math.floorDiv(y, 16) - minimumSectionY;
+        if (sectionIndex < 0 || sectionIndex >= sections.length) {
+            return CaveTileScanContext.ALL_AIR;
+        }
+        Section section = sections[sectionIndex];
+        return section == null ? CaveTileScanContext.ALL_AIR
+                : section.columnKind(localX, localZ);
+    }
+
+    @Override
+    public int sectionBottom(int y) {
+        return Math.max(minimumY, Math.floorDiv(y, 16) * 16);
     }
 
     @Override
@@ -239,8 +359,21 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
                 ^ (projectionY & 0xFFFFFFFFL);
         DenseCaveTile cached = caveProjectionCache.get(key);
         if (cached != null) return cached;
-        DenseCaveTile projected = projector.project(this, effectiveView, layerY,
-                System.nanoTime(), tileSource, token);
+
+        /*
+         * One decoded Anvil chunk now has one source transaction. PASS74 first
+         * produced a direct display tile, then built the vertical archive later and
+         * invalidated that first image. Build the reusable archive before any public
+         * projection so Full, Layered and CIMG consume identical source authority.
+         */
+        CaveChunkTile.Snapshot archive = ensureVerticalArchive(token);
+        DenseCaveTile projected = archive == null ? null
+                : CaveArchiveProjector.project(archive, effectiveView,
+                        layerY, tileSource);
+        if (projected == null) {
+            projected = projector.project(this, effectiveView, layerY,
+                    sourceRevision, tileSource, token);
+        }
         caveProjectionCache.put(key, projected);
         while (caveProjectionCache.size() > MAX_CAVE_PROJECTION_CACHE) {
             var iterator = caveProjectionCache.entrySet().iterator();
@@ -251,23 +384,304 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         return projected;
     }
 
-    SurfaceProjection[] projectSurface(boolean showFlowers) {
-        SurfaceProjection[] cached = showFlowers ? surfaceWithFlowers : surfaceWithoutFlowers;
-        if (cached != null) return cached;
-        synchronized (this) {
-            cached = showFlowers ? surfaceWithFlowers : surfaceWithoutFlowers;
-            if (cached != null) return cached;
-            SurfaceProjection[] built = new SurfaceProjection[DenseCaveTile.COLUMN_COUNT];
-            for (int localZ = 0; localZ < 16; localZ++) {
-                for (int localX = 0; localX < 16; localX++) {
-                    built[DenseCaveTile.index(localX, localZ)] =
-                            projectSurfaceColumn(localX, localZ, showFlowers);
-                }
+    /**
+     * Materializes the reusable source products for one decoded Anvil chunk.
+     *
+     * <p>This is deliberately a source-stage operation, not a presentation-stage
+     * reader. The NBT payload and palettes have already been decoded once. Surface
+     * receives its 256 immutable columns while Layered and Full receive the same
+     * vertical archive. Later view changes only project these retained products; no
+     * second RegionFileStorage read or palette decode is started.</p>
+     */
+    synchronized ProjectionBundle prepareProjectionBundle(boolean surfaceRequested,
+            boolean caveRequested, boolean showFlowers,
+            MapCancellationToken token) {
+        SurfaceProjection[] surface = surfaceRequested
+                && authoritativeSurfaceSource
+                ? projectSurface(showFlowers) : null;
+        CaveChunkTile.Snapshot archive = caveRequested
+                ? ensureVerticalArchive(token) : null;
+        return new ProjectionBundle(sourceRevision, surface, archive);
+    }
+
+    synchronized CaveChunkTile.Snapshot ensureVerticalArchive(
+            MapCancellationToken token) {
+        CaveChunkTile.Snapshot archive = verticalArchive;
+        if (archive != null) {
+            /*
+             * DecodedWorldRegionCache can outlive the compact-archive resident LRU.
+             * Re-ingestion is content-idempotent: an already-resident tile is
+             * ignored, while an evicted tile is restored without a second disk
+             * append. Full projection must never see indexed-complete source with
+             * no resident CompactCaveTile.
+             */
+            CaveTileRepository repository = CaveTileRepository.getInstance();
+            long expectedGeneration = repository.generation();
+            if (!repository.isGenerationCurrent(expectedGeneration)) return null;
+            // PASS96 / Xaero-style retained source ownership: a decoded chunk cache
+            // hit must not rebuild + fingerprint the same compact archive again.
+            // Only restore the compact source when its resident LRU entry is absent.
+            if (!CaveArchiveV2Service.getInstance().isResident(
+                    archive.chunkX(), archive.chunkZ())) {
+                repository.ingestDecodedArchive(archive, expectedGeneration);
             }
-            if (showFlowers) surfaceWithFlowers = built;
-            else surfaceWithoutFlowers = built;
-            return built;
+            return archive;
         }
+        MapCancellationToken effectiveToken = token == null
+                ? new MapCancellationToken(null) : token;
+        archive = buildVerticalArchive(effectiveToken);
+        effectiveToken.checkpoint("vertical-archive-built");
+        CaveTileRepository repository = CaveTileRepository.getInstance();
+        long expectedGeneration = repository.generation();
+        if (!repository.isGenerationCurrent(expectedGeneration)) return null;
+        verticalArchive = archive;
+        repository.mergeWorldSaveTile(archive, expectedGeneration);
+        repository.ingestDecodedArchive(archive, expectedGeneration);
+        return archive;
+    }
+
+    private CaveChunkTile.Snapshot buildVerticalArchive(MapCancellationToken token) {
+        CaveColumnData[] columns = new CaveColumnData[CaveChunkTile.COLUMN_COUNT];
+        BitSet scanned = new BitSet(CaveChunkTile.COLUMN_COUNT);
+        BitSet fullHeight = new BitSet(CaveChunkTile.COLUMN_COUNT);
+        CaveColumnData.Builder builder = new CaveColumnData.Builder();
+        for (int localZ = 0; localZ < 16; localZ++) {
+            token.checkpoint("vertical-cave-archive-row-" + localZ);
+            for (int localX = 0; localX < 16; localX++) {
+                int index = CaveChunkTile.index(localX, localZ);
+                CaveColumnData column = scanArchiveColumn(localX, localZ, builder, token);
+                columns[index] = column;
+                scanned.set(index);
+                if (column.fullHeightComplete()) fullHeight.set(index);
+            }
+        }
+        return new CaveChunkTile.Snapshot(chunkX, chunkZ, sourceRevision,
+                scanned, fullHeight, columns);
+    }
+
+    private CaveColumnData scanArchiveColumn(int localX, int localZ,
+            CaveColumnData.Builder builder, MapCancellationToken token) {
+        int startY = findArchiveUndergroundStart(localX, localZ);
+        if (startY <= minimumY) {
+            return CaveColumnData.emptyScanned(minimumY, startY, true);
+        }
+        builder.reset();
+        boolean inOpenRun = false;
+        int runTopY = startY;
+        int waterDepth = 0;
+        boolean runHadWater = false;
+        boolean runHadOtherFluid = false;
+        boolean runHadEmissive = false;
+        int runEmissiveColor = 0;
+        int runFluidColor = 0;
+        int steps = 0;
+        for (int y = startY; y >= minimumY; y--) {
+            if ((steps++ & 63) == 0) token.checkpoint("vertical-cave-column");
+            byte sectionKind = sectionKind(localX, y, localZ);
+            int sectionBottom = sectionBottom(y);
+            if (sectionKind == CaveTileScanContext.ALL_AIR) {
+                if (!inOpenRun) {
+                    inOpenRun = true;
+                    runTopY = y;
+                    waterDepth = 0;
+                    runHadWater = false;
+                    runHadOtherFluid = false;
+                    runHadEmissive = false;
+                    runEmissiveColor = 0;
+                    runFluidColor = 0;
+                }
+                y = sectionBottom;
+                continue;
+            }
+            if (sectionKind == CaveTileScanContext.ALL_SOLID_FAST) {
+                if (inOpenRun) {
+                    BlockState floor = visualStateAt(localX, y, localZ);
+                    int color = resolveArchiveFloorColor(floor, localX, y, localZ,
+                            runHadWater ? waterDepth : 0);
+                    byte flags = runHadWater ? CaveColumnData.FLAG_WATER : 0;
+                    if (runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
+                    boolean floorEmissive = floor.getLightEmission() > 0
+                            || visuals.info(floor).emissive();
+                    if (floorEmissive || runHadEmissive) {
+                        flags |= CaveColumnData.FLAG_EMISSIVE;
+                    }
+                    if (runFluidColor != 0) {
+                        color = CaveProjectionSemantics.blendOverlay(
+                                color, runFluidColor, 112);
+                    }
+                    if (runEmissiveColor != 0) {
+                        color = blendArchiveEmissive(color, runEmissiveColor);
+                    }
+                    builder.add(runTopY, y, color, flags);
+                    inOpenRun = false;
+                    waterDepth = 0;
+                    runHadWater = false;
+                    runHadOtherFluid = false;
+                    runHadEmissive = false;
+                    runEmissiveColor = 0;
+                    runFluidColor = 0;
+                }
+                y = sectionBottom;
+                continue;
+            }
+
+            BlockState actual = stateAt(localX, y, localZ);
+            BlockState visual = visualStateAt(localX, y, localZ, actual);
+            byte kind = caveGeometry.classify(actual);
+            if (kind == CaveStateClassifier.WATER) {
+                if (!inOpenRun) {
+                    inOpenRun = true;
+                    runTopY = y;
+                    waterDepth = 0;
+                    runHadWater = false;
+                    runHadOtherFluid = false;
+                    runHadEmissive = false;
+                    runEmissiveColor = 0;
+                    runFluidColor = 0;
+                }
+                runHadWater = true;
+                waterDepth++;
+                continue;
+            }
+            if (kind == CaveStateClassifier.OTHER_FLUID) {
+                // Fluid below the terrain roof is an overlay/open cavity. Continue
+                // to the solid floor instead of archiving the fluid block as the
+                // floor itself; this mirrors Xaero's loadPixel underair flow.
+                if (!inOpenRun) {
+                    inOpenRun = true;
+                    runTopY = y;
+                    waterDepth = 0;
+                    runHadWater = false;
+                    runHadOtherFluid = false;
+                    runHadEmissive = false;
+                    runEmissiveColor = 0;
+                    runFluidColor = 0;
+                }
+                runHadOtherFluid = true;
+                int fluidColor = resolveFluidColor(visual, localX, y, localZ);
+                if (fluidColor != 0) runFluidColor = fluidColor;
+                if (visual.getLightEmission() > 0 || visuals.info(visual).emissive()) {
+                    runHadEmissive = true;
+                    if (fluidColor != 0) runEmissiveColor = fluidColor;
+                }
+                continue;
+            }
+            if (actual.isAir()) {
+                if (!inOpenRun) {
+                    inOpenRun = true;
+                    runTopY = y;
+                    waterDepth = 0;
+                    runHadWater = false;
+                    runHadOtherFluid = false;
+                    runHadEmissive = false;
+                    runEmissiveColor = 0;
+                    runFluidColor = 0;
+                }
+                continue;
+            }
+
+            CaveStateClassifier.StateInfo info = caveGeometry.info(actual);
+            MapVisualClassifier.VisualInfo openVisual = visuals.info(visual);
+            if (inOpenRun && CaveProjectionSemantics.isOpenDecoration(
+                    actual, openVisual, info.collisionEmpty())) {
+                if (visual.getLightEmission() > 0 || openVisual.emissive()) {
+                    runHadEmissive = true;
+                    int emissiveColor = resolveBlockColor(
+                            visual, localX, y, localZ);
+                    if (emissiveColor != 0) runEmissiveColor = emissiveColor;
+                }
+                continue;
+            }
+            if (inOpenRun) {
+                int color = resolveArchiveFloorColor(visual, localX, y, localZ,
+                        runHadWater ? waterDepth : 0);
+                byte flags = runHadWater ? CaveColumnData.FLAG_WATER : 0;
+                if (runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
+                boolean floorEmissive = visual.getLightEmission() > 0
+                        || openVisual.emissive();
+                if (floorEmissive || runHadEmissive) {
+                    flags |= CaveColumnData.FLAG_EMISSIVE;
+                }
+                if (runFluidColor != 0) {
+                    color = CaveProjectionSemantics.blendOverlay(
+                            color, runFluidColor, 112);
+                }
+                if (runEmissiveColor != 0) {
+                    color = blendArchiveEmissive(color, runEmissiveColor);
+                }
+                builder.add(runTopY, y, color, flags);
+                inOpenRun = false;
+                waterDepth = 0;
+                runHadWater = false;
+                runHadOtherFluid = false;
+                runHadEmissive = false;
+                runEmissiveColor = 0;
+                runFluidColor = 0;
+            }
+        }
+        return builder.build(minimumY, startY, true);
+    }
+
+    private int resolveArchiveFloorColor(BlockState state, int localX, int y,
+            int localZ, int waterDepth) {
+        return colors.resolveDenseOffline(state, biomeAt(localX, y, localZ),
+                Math.max(0, waterDepth));
+    }
+
+    private static int blendArchiveEmissive(int base, int glow) {
+        if (base == 0) return glow;
+        if (glow == 0) return base;
+        int alpha = 112;
+        int inverse = 256 - alpha;
+        int red = ((base & 0xFF) * inverse + (glow & 0xFF) * alpha) >> 8;
+        int green = (((base >>> 8) & 0xFF) * inverse
+                + ((glow >>> 8) & 0xFF) * alpha) >> 8;
+        int blue = (((base >>> 16) & 0xFF) * inverse
+                + ((glow >>> 16) & 0xFF) * alpha) >> 8;
+        return (base & 0xFF000000) | (blue << 16) | (green << 8) | red;
+    }
+
+    private int findArchiveUndergroundStart(int localX, int localZ) {
+        int top = Math.max(minimumY,
+                Math.min(maximumY - 1, surfaceY(localX, localZ) + 1));
+        for (int y = top; y >= minimumY; y--) {
+            byte sectionKind = sectionKind(localX, y, localZ);
+            if (sectionKind == CaveTileScanContext.ALL_AIR) {
+                y = sectionBottom(y);
+                continue;
+            }
+            if (sectionKind == CaveTileScanContext.ALL_SOLID_FAST) return y - 1;
+            BlockState actual = stateAt(localX, y, localZ);
+            BlockState visualState = visualStateAt(localX, y, localZ, actual);
+            CaveStateClassifier.StateInfo info = caveGeometry.info(actual);
+            MapVisualClassifier.VisualInfo visual = visuals.info(visualState);
+            if (CaveProjectionSemantics.isTerrainEntry(
+                    actual, visual, info.collisionEmpty())) return y - 1;
+        }
+        return minimumY;
+    }
+
+    boolean hasAuthoritativeSurfaceSource() {
+        return authoritativeSurfaceSource;
+    }
+
+    SurfaceProjection[] projectSurface(boolean showFlowers) {
+        /*
+         * The projection is handed directly to SurfaceWorldSaveReconstructor, which
+         * owns it until the client-thread commit. Retaining a second reference on
+         * every DecodedWorldChunkSource kept 256 projection objects alive per cached
+         * Anvil chunk after publication. Rebuild-on-repeat is cheaper than pinning
+         * that payload, and the importer marks a source cell projected after one
+         * successful handoff so normal operation does not repeat this work.
+         */
+        SurfaceProjection[] built = new SurfaceProjection[DenseCaveTile.COLUMN_COUNT];
+        for (int localZ = 0; localZ < 16; localZ++) {
+            for (int localX = 0; localX < 16; localX++) {
+                built[DenseCaveTile.index(localX, localZ)] =
+                        projectSurfaceColumn(localX, localZ, showFlowers);
+            }
+        }
+        return built;
     }
 
     SurfaceProjection projectSurfaceColumn(int localX, int localZ, boolean showFlowers) {
@@ -290,6 +704,19 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         boolean fluid = !actual.getFluidState().isEmpty();
         boolean water = actual.getFluidState().is(net.minecraft.tags.FluidTags.WATER);
         boolean lava = actual.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
+        if (water) {
+            /*
+             * WORLD_SURFACE normally starts above the liquid surface, but modded or
+             * partially regenerated chunks can point at a waterlogged plant lower in
+             * the column. Using that Y as the fluid top makes kelp/seagrass columns
+             * look artificially shallow and exposes them as long warm-ocean dashes.
+             * Recover the top of the connected water column before measuring depth.
+             */
+            visibleY = findConnectedWaterSurfaceY(localX, localZ, visibleY);
+            actual = stateAt(localX, visibleY, localZ);
+            visual = visualStateAt(localX, visibleY, localZ, actual);
+            pos = position(localX, visibleY, localZ);
+        }
         int floorY = visibleY;
         BlockState paletteState = visual;
         if (water) {
@@ -316,17 +743,36 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         }
 
         MapVisualClassifier.VisualInfo visualInfo = visuals.info(visual);
-        String blockId = BuiltInRegistries.BLOCK.getKey(paletteState.getBlock()).toString();
+        Block surfaceBlock = paletteState.getBlock();
+        String blockId = SURFACE_BLOCK_ID_CACHE.computeIfAbsent(surfaceBlock, block -> {
+            ResourceLocation id = BuiltInRegistries.BLOCK.getKey(block);
+            return id == null ? SURFACE_AIR_ID : id.toString();
+        });
         Biome biome = biomeAt(localX, visibleY, localZ);
-        ResourceLocation biomeId = biome == null || biomeRegistry == null
-                ? ResourceLocation.parse("minecraft:plains") : biomeRegistry.getKey(biome);
+        String biomeId = biome == null || biomeRegistry == null
+                ? SURFACE_PLAINS_ID
+                : SURFACE_BIOME_ID_CACHE.computeIfAbsent(biome, value -> {
+                    ResourceLocation id = biomeRegistry.getKey(value);
+                    return id == null ? SURFACE_PLAINS_ID : id.toString();
+                });
         int light = Math.max(lightAt(localX, visibleY, localZ),
                 lightAt(localX, Math.min(maximumY - 1, visibleY + 1), localZ));
         return new SurfaceProjection(false, visibleY, floorY, blockId,
-                biomeId == null ? "minecraft:plains" : biomeId.toString(),
+                biomeId,
                 light, lava || (!water && visualInfo.emissive()), fluid,
                 !fluid && visualInfo.flower(), !fluid && visualInfo.leaves(),
                 SurfaceTintData.UNKNOWN);
+    }
+
+    /** Returns the highest block in the connected water column. */
+    private int findConnectedWaterSurfaceY(int localX, int localZ, int startY) {
+        int surface = Math.max(minimumY, Math.min(maximumY - 1, startY));
+        for (int y = surface + 1; y < maximumY; y++) {
+            BlockState state = stateAt(localX, y, localZ);
+            if (!state.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) break;
+            surface = y;
+        }
+        return surface;
     }
 
     long estimatedBytes() {
@@ -361,17 +807,21 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         return ((y - minimumY) << 8) | ((localZ & 15) << 4) | (localX & 15);
     }
 
+    record ProjectionBundle(long sourceRevision,
+            SurfaceProjection[] surfaceColumns,
+            CaveChunkTile.Snapshot verticalArchive) {
+    }
+
     record SurfaceProjection(boolean empty, int topY, int floorY, String blockId,
             String biomeId, int blockLight, boolean glowing, boolean fluid,
             boolean flower, boolean leaves, int tint) {
-        static SurfaceProjection emptyProjection() {
-            return new SurfaceProjection(true, minimumEmptyY(), minimumEmptyY(),
-                    "minecraft:air", "minecraft:plains", 0, false, false,
-                    false, false, SurfaceTintData.UNKNOWN);
-        }
+        private static final SurfaceProjection EMPTY = new SurfaceProjection(
+                true, Short.MIN_VALUE, Short.MIN_VALUE, SURFACE_AIR_ID,
+                SURFACE_PLAINS_ID, 0, false, false, false, false,
+                SurfaceTintData.UNKNOWN);
 
-        private static int minimumEmptyY() {
-            return Short.MIN_VALUE;
+        static SurfaceProjection emptyProjection() {
+            return EMPTY;
         }
     }
 
@@ -434,6 +884,9 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
         private final int biomeBits;
         private final int biomeValuesPerLong;
         private final long biomeMask;
+        /** One conservative cave classification for each X/Z column in this section. */
+        private final byte[] caveColumnKinds;
+        private final byte caveSectionKind;
 
         private Section(BlockState[] palette, long[] data, int bits,
                 byte[] blockLight, byte[] skyLight,
@@ -450,6 +903,16 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
             this.biomeBits = biomeBits;
             this.biomeValuesPerLong = biomeBits == 0 ? 0 : 64 / biomeBits;
             this.biomeMask = biomeBits == 0 ? 0L : (1L << biomeBits) - 1L;
+            this.caveColumnKinds = classifyCaveColumns();
+            byte summary = caveColumnKinds.length == 0
+                    ? CaveTileScanContext.MIXED : caveColumnKinds[0];
+            for (int i = 1; i < caveColumnKinds.length; i++) {
+                if (caveColumnKinds[i] != summary) {
+                    summary = CaveTileScanContext.MIXED;
+                    break;
+                }
+            }
+            this.caveSectionKind = summary;
         }
 
         static Section decode(CompoundTag sectionTag, Registry<Biome> biomeRegistry) {
@@ -516,13 +979,61 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
                     biomePalette, biomeData, biomeBits);
         }
 
-        long estimatedBytes() {
+        byte sectionKind() {
+            return caveSectionKind;
+        }
+
+        byte columnKind(int localX, int localZ) {
+            return caveColumnKinds[(localZ & 15) * 16 + (localX & 15)];
+        }
+
+        private byte[] classifyCaveColumns() {
+            byte[] result = new byte[256];
+            if (palette.length == 0) {
+                java.util.Arrays.fill(result, CaveTileScanContext.ALL_AIR);
+                return result;
+            }
+            if (bits == 0 || data.length == 0) {
+                BlockState state = palette[0];
+                byte uniform = state.isAir() ? CaveTileScanContext.ALL_AIR
+                        : CaveStateClassifier.getInstance().classify(state)
+                                == CaveStateClassifier.SOLID_FAST
+                                ? CaveTileScanContext.ALL_SOLID_FAST
+                                : CaveTileScanContext.MIXED;
+                java.util.Arrays.fill(result, uniform);
+                return result;
+            }
+            CaveStateClassifier classifier = CaveStateClassifier.getInstance();
+            for (int localZ = 0; localZ < 16; localZ++) {
+                for (int localX = 0; localX < 16; localX++) {
+                    boolean allAir = true;
+                    boolean allSolidFast = true;
+                    for (int localY = 0; localY < 16; localY++) {
+                        BlockState state = stateAt(localX, localY, localZ);
+                        if (!state.isAir()) allAir = false;
+                        if (classifier.classify(state)
+                                != CaveStateClassifier.SOLID_FAST) {
+                            allSolidFast = false;
+                        }
+                        if (!allAir && !allSolidFast) break;
+                    }
+                    result[localZ * 16 + localX] = allAir
+                            ? CaveTileScanContext.ALL_AIR
+                            : allSolidFast ? CaveTileScanContext.ALL_SOLID_FAST
+                                    : CaveTileScanContext.MIXED;
+                }
+            }
+            return result;
+        }
+
+    long estimatedBytes() {
             return 96L + (long) palette.length * 16L
                     + (long) data.length * Long.BYTES
                     + (blockLight == null ? 0L : blockLight.length)
                     + (skyLight == null ? 0L : skyLight.length)
                     + (long) biomePalette.length * 8L
-                    + (long) biomeData.length * Long.BYTES;
+                    + (long) biomeData.length * Long.BYTES
+                    + caveColumnKinds.length;
         }
 
         BlockState stateAt(int localX, int localY, int localZ) {

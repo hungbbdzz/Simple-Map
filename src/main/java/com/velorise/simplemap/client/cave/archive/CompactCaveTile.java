@@ -21,6 +21,7 @@ public final class CompactCaveTile {
     public static final byte FLAG_WATER = 1;
     public static final byte FLAG_FLUID = 1 << 1;
     public static final byte FLAG_EMISSIVE = 1 << 2;
+    /** Material field contains an inline raw ABGR colour, not a registry id. */
     public static final byte FLAG_LEGACY_COLOR = 1 << 6;
     public static final int COLUMNS = 256;
 
@@ -37,6 +38,15 @@ public final class CompactCaveTile {
     private final byte[] fluidDepth;
     private final byte[] flags;
     private final byte[] statuses;
+    private final boolean completeCoverage;
+    /**
+     * Full Cave only needs a final discovered run set for each column. Legacy/live
+     * scans marked COMPLETE_TRUNCATED already contain that set even though they are
+     * not safe for an arbitrary future Layered Top-Y query.
+     */
+    private final boolean fullProjectionCoverage;
+    /** Stable geometry/material identity independent from scanner revision counters. */
+    private final long contentFingerprint;
 
     public CompactCaveTile(int chunkX, int chunkZ, long revision,
             int[] columnOffsets, short[] runTopY, short[] runFloorY,
@@ -71,11 +81,26 @@ public final class CompactCaveTile {
         this.fluidDepth = Arrays.copyOf(fluidDepth, runs);
         this.flags = Arrays.copyOf(flags, runs);
         this.statuses = Arrays.copyOf(statuses, COLUMNS);
+        boolean complete = true;
+        boolean fullProjectionComplete = true;
+        int completeOrdinal = ColumnStatus.COMPLETE.ordinal();
+        int truncatedOrdinal = ColumnStatus.COMPLETE_TRUNCATED.ordinal();
+        for (byte status : this.statuses) {
+            int value = status & 0xFF;
+            if (value != completeOrdinal) complete = false;
+            if (value != completeOrdinal && value != truncatedOrdinal) {
+                fullProjectionComplete = false;
+            }
+        }
+        this.completeCoverage = complete;
+        this.fullProjectionCoverage = fullProjectionComplete;
+        this.contentFingerprint = computeContentFingerprint();
     }
 
     public int chunkX() { return chunkX; }
     public int chunkZ() { return chunkZ; }
     public long revision() { return revision; }
+    public long contentFingerprint() { return contentFingerprint; }
     public int runCount() { return runTopY.length; }
     public int runStart(int column) { return columnOffsets[column]; }
     public int runEnd(int column) { return columnOffsets[column + 1]; }
@@ -87,6 +112,141 @@ public final class CompactCaveTile {
     public byte skyLight(int run) { return skyLight[run]; }
     public byte fluidDepth(int run) { return fluidDepth[run]; }
     public byte flags(int run) { return flags[run]; }
+
+    /**
+     * Selects one connected-looking Full Cave representative for a column.
+     *
+     * <p>The archive stores every discovered vertical cavity. Selecting runStart()
+     * unconditionally collapses a full projection into unrelated ceiling cracks.
+     * This score prefers usable rooms/tunnels and then strongly follows the floor
+     * selected by an adjacent column. {@code preferredY} is the dominant floor band
+     * of the whole 16x16 tile and prevents the first column from choosing an extreme
+     * outlier.</p>
+     */
+    public int selectFullRun(int column, int preferredY, int neighbourY) {
+        int first = runStart(column);
+        int end = runEnd(column);
+        int selected = -1;
+        int bestScore = Integer.MIN_VALUE;
+        for (int run = first; run < end; run++) {
+            int top = topY(run);
+            int floor = floorY(run);
+            int height = Math.max(1, top - floor);
+            int center = (top + floor) >> 1;
+            int score = Math.min(96, height) * 24;
+            if (height >= 2) score += 120;
+            if (height >= 4) score += 180;
+            if (height >= 8) score += 220;
+            int runFlags = flags(run) & 0xFF;
+            if ((runFlags & FLAG_EMISSIVE) != 0) score += 80;
+            if ((runFlags & FLAG_WATER) != 0) score += 28;
+            if ((runFlags & FLAG_FLUID) != 0) score += 42;
+            if (preferredY != Integer.MIN_VALUE) {
+                score -= Math.min(480, Math.abs(center - preferredY) * 3);
+            }
+            if (neighbourY != Integer.MIN_VALUE) {
+                score -= Math.min(1600, Math.abs(floor - neighbourY) * 24);
+                if (Math.abs(floor - neighbourY) <= 3) score += 260;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                selected = run;
+            }
+        }
+        return selected;
+    }
+
+    /** Selects a cavity intersecting the exact Layered Top-Y window. */
+    public int selectLayeredRun(int column, int maximumY, int minimumY,
+            int neighbourY) {
+        int first = runStart(column);
+        int end = runEnd(column);
+        int selected = -1;
+        int bestScore = Integer.MIN_VALUE;
+        for (int run = first; run < end; run++) {
+            int top = topY(run);
+            int floor = floorY(run);
+            if (top < minimumY || floor > maximumY) continue;
+            int overlapTop = Math.min(top, maximumY);
+            int overlapBottom = Math.max(floor, minimumY);
+            int overlap = Math.max(1, overlapTop - overlapBottom + 1);
+            int height = Math.max(1, top - floor);
+            int score = overlap * 32 + Math.min(64, height) * 8;
+            if (floor >= minimumY && floor <= maximumY) score += 320;
+            score -= Math.abs(maximumY - top) * 2;
+            int runFlags = flags(run) & 0xFF;
+            if ((runFlags & FLAG_EMISSIVE) != 0) score += 24;
+            if ((runFlags & FLAG_WATER) != 0) score += 12;
+            if ((runFlags & FLAG_FLUID) != 0) score += 16;
+            if (neighbourY != Integer.MIN_VALUE) {
+                score -= Math.min(900, Math.abs(floor - neighbourY) * 20);
+                if (Math.abs(floor - neighbourY) <= 2) score += 180;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                selected = run;
+            }
+        }
+        return selected;
+    }
+
+    /**
+     * Dominant vertical floor band used to seed a deterministic Full Cave raster.
+     * Eight-block buckets are broad enough to join sloped tunnels while rejecting
+     * isolated near-surface cracks and deep one-column pockets.
+     */
+    public int dominantFullFloorY() {
+        int minimumBand = Integer.MAX_VALUE;
+        int maximumBand = Integer.MIN_VALUE;
+        for (int run = 0; run < runCount(); run++) {
+            int band = Math.floorDiv(floorY(run), 8);
+            minimumBand = Math.min(minimumBand, band);
+            maximumBand = Math.max(maximumBand, band);
+        }
+        if (minimumBand == Integer.MAX_VALUE) return Integer.MIN_VALUE;
+        int[] weights = new int[maximumBand - minimumBand + 1];
+        for (int run = 0; run < runCount(); run++) {
+            int height = Math.max(1, topY(run) - floorY(run));
+            int weight = 1 + Math.min(64, height) * 3;
+            if (height >= 3) weight += 24;
+            if (height >= 7) weight += 32;
+            weights[Math.floorDiv(floorY(run), 8) - minimumBand] += weight;
+        }
+        int best = 0;
+        for (int index = 1; index < weights.length; index++) {
+            if (weights[index] > weights[best]) best = index;
+        }
+        return (minimumBand + best) * 8 + 4;
+    }
+
+    /**
+     * Canonical Full-Cave projection: runs are stored highest-first, therefore
+     * the first archived cavity is the same top-down cavity reached by the live
+     * Xaero-style column scan. Selection is deliberately column-local; no tile-wide
+     * preferred Y or neighbour continuity may change the vertical authority.
+     */
+    public int firstVisibleFullRun(int column) {
+        int first = runStart(column);
+        return first < runEnd(column) ? first : -1;
+    }
+
+    /**
+     * Canonical Layered projection: descending from Top-Y, select the first cavity
+     * whose floor lies inside the requested band. This mirrors the live column scan
+     * and avoids chunk-local continuity scores selecting a different vertical run.
+     */
+    public int firstVisibleLayeredRun(int column, int maximumY, int minimumY) {
+        for (int run = runStart(column), end = runEnd(column); run < end; run++) {
+            int floor = floorY(run);
+            if (floor > maximumY) continue;
+            if (floor < minimumY) break;
+            if (topY(run) >= minimumY) return run;
+        }
+        return -1;
+    }
+
+    public boolean completeCoverage() { return completeCoverage; }
+    public boolean fullProjectionCoverage() { return fullProjectionCoverage; }
     public ColumnStatus status(int column) {
         int ordinal = statuses[column] & 0xFF;
         return ordinal >= ColumnStatus.values().length
@@ -97,6 +257,36 @@ public final class CompactCaveTile {
         return (long) columnOffsets.length * Integer.BYTES
                 + (long) runTopY.length * (Short.BYTES * 3L + Integer.BYTES + 5L)
                 + statuses.length;
+    }
+
+    private long computeContentFingerprint() {
+        long hash = 0xCBF29CE484222325L;
+        hash = mix(hash, chunkX);
+        hash = mix(hash, chunkZ);
+        for (int value : columnOffsets) hash = mix(hash, value);
+        for (short value : runTopY) hash = mix(hash, value);
+        for (short value : runFloorY) hash = mix(hash, value);
+        for (int value : materialIds) hash = mix(hash, value);
+        for (short value : biomeIds) hash = mix(hash, value);
+        for (byte value : blockLight) hash = mix(hash, value);
+        for (byte value : skyLight) hash = mix(hash, value);
+        for (byte value : fluidDepth) hash = mix(hash, value);
+        for (byte value : flags) hash = mix(hash, value);
+        for (byte value : statuses) hash = mix(hash, value);
+        hash ^= completeCoverage
+                ? 0x6C8E9CF570932BD5L : 0xA5A5A5A55A5A5A5AL;
+        hash ^= hash >>> 30;
+        hash *= 0xBF58476D1CE4E5B9L;
+        hash ^= hash >>> 27;
+        hash *= 0x94D049BB133111EBL;
+        hash ^= hash >>> 31;
+        return hash == 0L ? 1L : hash;
+    }
+
+    private static long mix(long hash, long value) {
+        hash ^= value;
+        hash *= 0x100000001B3L;
+        return hash;
     }
 
     public static CompactCaveTile fromLegacy(CaveChunkTile.Snapshot snapshot) {

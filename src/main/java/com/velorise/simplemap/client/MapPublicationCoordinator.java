@@ -6,9 +6,9 @@ package com.velorise.simplemap.client;
  * <p>Viewport/tick code publishes intent and performs no GPU work. Render events
  * drain the same intent against one shared frame ledger. This mirrors Xaero's
  * central render-process pattern: completed CPU work can advance every rendered
- * frame, while a slow frame automatically receives a smaller upload slice. The
- * visible projection always runs first; a cadence-bounded secondary Surface
- * maintenance slice may then use otherwise-unused shared-ledger capacity.</p>
+ * frame, while a slow frame automatically receives a smaller upload slice.
+ * The visible projection exclusively owns that frame's GPU publication slice;
+ * inactive projection payloads stay retained until they become primary.</p>
  */
 public final class MapPublicationCoordinator {
     private static final MapPublicationCoordinator INSTANCE =
@@ -79,9 +79,7 @@ public final class MapPublicationCoordinator {
     }
 
     /**
-     * Drains one primary projection family for one actual rendered frame. A
-     * cadence-bounded Surface maintenance slice may use leftover ledger capacity
-     * after Cave publication. The
+     * Drains one primary projection family for one actual rendered frame. The
      * viewport intent deliberately remains live until the next client tick, so a
      * 120/144 Hz client can consume completed work in small slices instead of one
      * 20 TPS burst.
@@ -101,16 +99,13 @@ public final class MapPublicationCoordinator {
         SurfaceRegionSourceDatabase.getInstance().beginPublicationFrame(frameId);
         MapGpuBudgetController.getInstance().beginFrame(focused);
         long started = System.nanoTime();
-        boolean cavePrimary = false;
         if (fullCaveRequested) {
             FullCaveTextureManager.getInstance().uploadDirtyTextures(fullCaveFocus);
-            cavePrimary = true;
         } else if (layeredCaveRequested) {
             // Focus is now deadline-safe inside UnifiedCaveTextureManager. Preserve
             // the viewport's close-zoom intent so Layered Cave is not artificially
             // throttled while Full Cave receives the same focus signal correctly.
             CaveTextureManager.getInstance().uploadDirtyTextures(layeredCaveFocus);
-            cavePrimary = true;
         } else if (surfaceRequested) {
             /*
              * Publish prepared coarse branches before exact leaves consume the
@@ -125,27 +120,11 @@ public final class MapPublicationCoordinator {
                     surfaceLane, surfaceFocus);
         }
         /*
-         * Cave owns the visible projection, but a completed Surface payload is
-         * immutable and needs only a bounded atlas upload. Let one such payload use
-         * leftover shared GPU-ledger capacity on non-pressured frames. This does not
-         * capture source or submit CPU work, and tryReserve() still protects the
-         * primary Cave upload and minimap reserve.
+         * Xaero gives the visible projection exclusive ownership of the current
+         * upload slice. There is intentionally no secondary Surface GPU drain while
+         * Cave/Full Cave is visible. CPU-complete Surface payloads remain retained
+         * and resume when Surface becomes primary again.
          */
-        if (cavePrimary
-                && !MapPerformanceGovernor.getInstance().underPressure()) {
-            if (surfaceRequested) {
-                // A maintenance request exists only on the bounded Cave-background
-                // cadence. Let it submit/drain one BACKGROUND Surface slice using
-                // the existing 1.5 ms deadline and shared GPU ledger.
-                MapOverviewTextureManager.getInstance().publishBranches(false);
-                MapTextureManager.getInstance().uploadExactTextures(
-                        surfaceLane == null ? MapRequestLane.BACKGROUND : surfaceLane,
-                        false);
-            } else if (MapTextureManager.getInstance().hasCompletedExactTextures()) {
-                MapTextureManager.getInstance().publishCompletedExactTextures(
-                        1, 650_000L);
-            }
-        }
         drainCount++;
         MapObservationTelemetry.getInstance().record(
                 MapObservationTelemetry.Lane.PUBLICATION,

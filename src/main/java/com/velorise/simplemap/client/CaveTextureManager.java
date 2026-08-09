@@ -5,6 +5,7 @@ import com.velorise.simplemap.client.cave.CaveView;
 import com.velorise.simplemap.client.cave.DenseCaveTile;
 import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
 import com.velorise.simplemap.client.gpu.TileKey;
+import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
 
 import java.util.concurrent.atomic.AtomicLong;
@@ -20,10 +21,30 @@ public final class CaveTextureManager {
     private volatile long layerHandoffStartedMs;
     private volatile int layerHandoffReadyPasses;
 
-    private static final int HANDOFF_RADIUS_PAGES = 1;
-    private static final int HANDOFF_MIN_READY_PAGES = 5;
+    /*
+     * Xaero-style minimap layer lifecycle. activeLayerY is the detector/requested
+     * projection, while minimapWriterLayerY is the stable layer that is allowed to
+     * consume CPU projection work. One previous writer layer is retained as a
+     * per-page visual fallback while the new writer replaces it centre-out.
+     */
+    private volatile int minimapWriterLayerY = Integer.MIN_VALUE;
+    private volatile int minimapPreviousLayerY = Integer.MIN_VALUE;
+    private volatile int minimapCandidateLayerY = Integer.MIN_VALUE;
+    private volatile long minimapCandidateSinceMs;
+    private volatile long minimapLastMovementMs;
+    private volatile long minimapWriterCommittedMs;
+    /** 0 = full viewport, 1 = centre-first, 2 = near window. */
+    private volatile int minimapTransitionPhase;
+
     private static final int HANDOFF_STABLE_PASSES = 2;
-    private static final long HANDOFF_MAX_WAIT_MS = 2_000L;
+    private static final int HANDOFF_SAMPLE_CAP = 256;
+    private static final float HANDOFF_READY_RATIO = 0.92f;
+    private static final long MINIMAP_LAYER_CANDIDATE_MS = 100L;
+    private static final long MINIMAP_LAYER_STABLE_MS = 180L;
+    private static final long MINIMAP_CENTER_PHASE_MAX_MS = 250L;
+    private static final long MINIMAP_NEAR_PHASE_MAX_MS = 700L;
+    private static final double MINIMAP_CENTER_RADIUS_BLOCKS = MapPageLayout.PAGE_SIZE;
+    private static final double MINIMAP_NEAR_RADIUS_BLOCKS = MapPageLayout.PAGE_SIZE * 2.0;
 
     private CaveTextureManager() {
     }
@@ -56,49 +77,57 @@ public final class CaveTextureManager {
     public void requestVisiblePages(int layerY, double minX, double maxX,
             double minZ, double maxZ, float scale,
             double focusX, double focusZ, MapRequestLane lane) {
-        if (!sameBand(activeLayerY, layerY)) onLayerActivated(layerY);
-        else activeLayerY = layerY;
-        unified.requestVisiblePages(CaveView.LAYERED, layerY,
-                minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
-        observeLayerHandoff(layerY, minX, maxX, minZ, maxZ,
-                focusX, focusZ, lane);
+        if (activeLayerY != layerY) onLayerActivated(layerY);
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.FULLSCREEN : lane;
+        int requestedLayerY = layerY;
+        double requestMinX = minX;
+        double requestMaxX = maxX;
+        double requestMinZ = minZ;
+        double requestMaxZ = maxZ;
+        if (effectiveLane == MapRequestLane.MINIMAP) {
+            requestedLayerY = selectMinimapWriterLayer(layerY, focusX, focusZ);
+            int phase = advanceMinimapTransition(requestedLayerY, focusX, focusZ);
+            if (phase == 1) {
+                requestMinX = Math.max(minX, focusX - MINIMAP_CENTER_RADIUS_BLOCKS);
+                requestMaxX = Math.min(maxX, focusX + MINIMAP_CENTER_RADIUS_BLOCKS);
+                requestMinZ = Math.max(minZ, focusZ - MINIMAP_CENTER_RADIUS_BLOCKS);
+                requestMaxZ = Math.min(maxZ, focusZ + MINIMAP_CENTER_RADIUS_BLOCKS);
+            } else if (phase == 2) {
+                requestMinX = Math.max(minX, focusX - MINIMAP_NEAR_RADIUS_BLOCKS);
+                requestMaxX = Math.min(maxX, focusX + MINIMAP_NEAR_RADIUS_BLOCKS);
+                requestMinZ = Math.max(minZ, focusZ - MINIMAP_NEAR_RADIUS_BLOCKS);
+                requestMaxZ = Math.min(maxZ, focusZ + MINIMAP_NEAR_RADIUS_BLOCKS);
+            }
+        }
+        unified.requestVisiblePages(CaveView.LAYERED, requestedLayerY,
+                requestMinX, requestMaxX, requestMinZ, requestMaxZ,
+                scale, focusX, focusZ, effectiveLane);
+        if (effectiveLane != MapRequestLane.MINIMAP) {
+            observeLayerHandoff(layerY, minX, maxX, minZ, maxZ,
+                    focusX, focusZ, effectiveLane);
+        }
     }
 
     public void requestVisibleRegion(int layerY, int rx, int rz) {
-        if (!sameBand(activeLayerY, layerY)) onLayerActivated(layerY);
-        else activeLayerY = layerY;
+        if (activeLayerY != layerY) onLayerActivated(layerY);
         unified.requestRegion(CaveView.LAYERED, layerY, rx, rz);
     }
 
     public synchronized void onLayerActivated(int layerY) {
-        if (sameBand(activeLayerY, layerY)) {
-            activeLayerY = layerY;
-            return;
-        }
-
-        // If B is still loading while A remains displayed and the user selects A
-        // again, cancel the transition immediately. Otherwise the actually visible
-        // layer (A), not the half-loaded B, becomes the fallback for C.
-        int visibleLayer = layerHandoffPending
-                && previousLayerY != Integer.MIN_VALUE
-                        ? previousLayerY : activeLayerY;
-        if (visibleLayer != Integer.MIN_VALUE && sameBand(visibleLayer, layerY)) {
-            activeLayerY = layerY;
-            previousLayerY = Integer.MIN_VALUE;
-            layerHandoffPending = false;
-            layerHandoffStartedMs = 0L;
-            layerHandoffReadyPasses = 0;
-            handoffRevision.incrementAndGet();
-            return;
-        }
-
-        previousLayerY = visibleLayer;
+        if (activeLayerY == layerY) return;
+        int oldLayer = activeLayerY;
+        boolean retainedBand = sameBand(oldLayer, layerY);
+        previousLayerY = retainedBand ? oldLayer : Integer.MIN_VALUE;
         activeLayerY = layerY;
         layerHandoffPending = previousLayerY != Integer.MIN_VALUE;
         layerHandoffStartedMs = layerHandoffPending
                 ? System.currentTimeMillis() : 0L;
         layerHandoffReadyPasses = 0;
-        handoffRevision.incrementAndGet();
+        // Exact Top-Y changes inside one 16-block band reuse the same retained
+        // geometry/cache universe. Unified publication revisions will refresh the
+        // pixels; do not invalidate the minimap plan merely because Y moved by one.
+        if (!retainedBand) handoffRevision.incrementAndGet();
     }
 
     public long contentRevision() {
@@ -119,16 +148,42 @@ public final class CaveTextureManager {
 
     public CaveAtlasRegion peekPageRegion(int layerY, int rx, int rz,
             int pageX, int pageZ, float scale) {
-        if (!sameBand(activeLayerY, layerY)) return null;
-        int visibleLayer = visibleLayerY(layerY);
-        return unified.peekPageRegion(CaveView.LAYERED, visibleLayer,
-                rx, rz, pageX, pageZ, scale);
+        return peekPageRegion(layerY, rx, rz, pageX, pageZ, scale,
+                MapRequestLane.FULLSCREEN);
+    }
+
+    public CaveAtlasRegion peekPageRegion(int layerY, int rx, int rz,
+            int pageX, int pageZ, float scale, MapRequestLane lane) {
+        if (activeLayerY != layerY) return null;
+        return unified.peekPageRegion(CaveView.LAYERED,
+                layerY, rx, rz, pageX, pageZ, scale);
+    }
+
+    /** One retained previous-layer page used only as a minimap visual underlay. */
+    public PageSelection peekFallbackPage(int layerY, int rx, int rz,
+            int pageX, int pageZ, float scale, MapRequestLane lane) {
+        if (lane != MapRequestLane.MINIMAP || activeLayerY != layerY) return null;
+        int globalPageX = (rx << 3) + pageX;
+        int globalPageZ = (rz << 3) + pageZ;
+        int first = minimapFallbackLayer(layerY, true);
+        PageSelection selection = fallbackPageSelection(first, layerY, rx, rz,
+                pageX, pageZ, globalPageX, globalPageZ, scale);
+        if (selection != null) return selection;
+        int second = minimapFallbackLayer(layerY, false);
+        return fallbackPageSelection(second, layerY, rx, rz, pageX, pageZ,
+                globalPageX, globalPageZ, scale);
     }
 
     public TileKey pageTileKey(int layerY, int globalPageX,
             int globalPageZ, float scale) {
-        if (!sameBand(activeLayerY, layerY)) return null;
-        return unified.pageTileKey(CaveView.LAYERED, visibleLayerY(layerY),
+        return pageTileKey(layerY, globalPageX, globalPageZ, scale,
+                MapRequestLane.FULLSCREEN);
+    }
+
+    public TileKey pageTileKey(int layerY, int globalPageX,
+            int globalPageZ, float scale, MapRequestLane lane) {
+        if (activeLayerY != layerY) return null;
+        return unified.pageTileKey(CaveView.LAYERED, layerY,
                 globalPageX, globalPageZ, scale);
     }
 
@@ -138,30 +193,78 @@ public final class CaveTextureManager {
 
     public CaveAtlasRegion peekBranchRegion(int layerY, int level,
             int nodeX, int nodeZ) {
-        if (!sameBand(activeLayerY, layerY)) return null;
-        return unified.peekBranchRegion(CaveView.LAYERED, visibleLayerY(layerY),
-                level, nodeX, nodeZ);
+        return peekBranchRegion(layerY, level, nodeX, nodeZ,
+                MapRequestLane.FULLSCREEN);
+    }
+
+    public CaveAtlasRegion peekBranchRegion(int layerY, int level,
+            int nodeX, int nodeZ, MapRequestLane lane) {
+        if (activeLayerY != layerY) return null;
+        CaveAtlasRegion current = unified.peekBranchRegion(CaveView.LAYERED,
+                layerY, level, nodeX, nodeZ);
+        if (current != null || lane != MapRequestLane.MINIMAP) return current;
+        int first = minimapFallbackLayer(layerY, true);
+        if (validFallback(first, layerY)) {
+            CaveAtlasRegion fallback = unified.peekBranchRegion(CaveView.LAYERED,
+                    first, level, nodeX, nodeZ);
+            if (fallback != null) return fallback;
+        }
+        int second = minimapFallbackLayer(layerY, false);
+        if (validFallback(second, layerY)) {
+            return unified.peekBranchRegion(CaveView.LAYERED,
+                    second, level, nodeX, nodeZ);
+        }
+        return null;
     }
 
     public boolean hasBranchData(int layerY, int level, int nodeX, int nodeZ) {
-        if (!sameBand(activeLayerY, layerY)) return false;
-        return unified.hasBranchData(CaveView.LAYERED, visibleLayerY(layerY),
-                level, nodeX, nodeZ);
+        return hasBranchData(layerY, level, nodeX, nodeZ,
+                MapRequestLane.FULLSCREEN);
+    }
+
+    public boolean hasBranchData(int layerY, int level, int nodeX, int nodeZ,
+            MapRequestLane lane) {
+        if (activeLayerY != layerY) return false;
+        if (unified.hasBranchData(CaveView.LAYERED, layerY,
+                level, nodeX, nodeZ)) return true;
+        if (lane != MapRequestLane.MINIMAP) return false;
+        int first = minimapFallbackLayer(layerY, true);
+        if (validFallback(first, layerY)
+                && unified.hasBranchData(CaveView.LAYERED, first,
+                        level, nodeX, nodeZ)) return true;
+        int second = minimapFallbackLayer(layerY, false);
+        return validFallback(second, layerY)
+                && unified.hasBranchData(CaveView.LAYERED, second,
+                        level, nodeX, nodeZ);
     }
 
     public boolean hasResidentPageInNode(int layerY, int level,
             int nodeX, int nodeZ) {
-        if (!sameBand(activeLayerY, layerY)) return false;
-        return unified.hasResidentPageInNode(CaveView.LAYERED,
-                visibleLayerY(layerY), level, nodeX, nodeZ);
+        return hasResidentPageInNode(layerY, level, nodeX, nodeZ,
+                MapRequestLane.FULLSCREEN);
+    }
+
+    public boolean hasResidentPageInNode(int layerY, int level,
+            int nodeX, int nodeZ, MapRequestLane lane) {
+        if (activeLayerY != layerY) return false;
+        if (unified.hasResidentPageInNode(CaveView.LAYERED,
+                layerY, level, nodeX, nodeZ)) return true;
+        if (lane != MapRequestLane.MINIMAP) return false;
+        int first = minimapFallbackLayer(layerY, true);
+        if (validFallback(first, layerY)
+                && unified.hasResidentPageInNode(CaveView.LAYERED, first,
+                        level, nodeX, nodeZ)) return true;
+        int second = minimapFallbackLayer(layerY, false);
+        return validFallback(second, layerY)
+                && unified.hasResidentPageInNode(CaveView.LAYERED, second,
+                        level, nodeX, nodeZ);
     }
 
     public boolean allowFullscreenExact(int layerY,
             int globalPageX, int globalPageZ) {
-        if (!sameBand(activeLayerY, layerY)) return false;
-        return unified.allowFullscreenExact(CaveView.LAYERED,
-                visibleLayerY(layerY),
-                globalPageX, globalPageZ);
+        return activeLayerY == layerY
+                && unified.allowFullscreenExact(CaveView.LAYERED, layerY,
+                        globalPageX, globalPageZ);
     }
 
     public ResourceLocation peekPageTexture(int layerY, int rx, int rz,
@@ -171,9 +274,8 @@ public final class CaveTextureManager {
     }
 
     public boolean hasAnyPageTexture(int layerY, int rx, int rz) {
-        if (!sameBand(activeLayerY, layerY)) return false;
-        return unified.hasAnyPage(CaveView.LAYERED,
-                visibleLayerY(layerY), rx, rz);
+        return activeLayerY == layerY
+                && unified.hasAnyPage(CaveView.LAYERED, layerY, rx, rz);
     }
 
     /** Region textures were removed; exact 64x64 pages are the foreground unit. */
@@ -210,18 +312,169 @@ public final class CaveTextureManager {
         resetViewState();
     }
 
-    private void resetViewState() {
+    private synchronized void resetViewState() {
         activeLayerY = Integer.MIN_VALUE;
         previousLayerY = Integer.MIN_VALUE;
         layerHandoffPending = false;
         layerHandoffStartedMs = 0L;
         layerHandoffReadyPasses = 0;
+        minimapWriterLayerY = Integer.MIN_VALUE;
+        minimapPreviousLayerY = Integer.MIN_VALUE;
+        minimapCandidateLayerY = Integer.MIN_VALUE;
+        minimapCandidateSinceMs = 0L;
+        minimapLastMovementMs = 0L;
+        minimapWriterCommittedMs = 0L;
+        minimapTransitionPhase = 0;
         handoffRevision.incrementAndGet();
     }
 
-    private int visibleLayerY(int requestedLayerY) {
-        return layerHandoffPending && previousLayerY != Integer.MIN_VALUE
-                ? previousLayerY : requestedLayerY;
+    /** Returns the projection Top-Y that is currently allowed to consume minimap writer work. */
+    public int projectionLayerForLane(int requestedLayerY, MapRequestLane lane) {
+        if (lane == MapRequestLane.MINIMAP
+                && minimapWriterLayerY != Integer.MIN_VALUE) {
+            return minimapWriterLayerY;
+        }
+        return requestedLayerY;
+    }
+
+    private synchronized int selectMinimapWriterLayer(int desiredLayerY,
+            double focusX, double focusZ) {
+        long now = System.currentTimeMillis();
+        if (minimapWriterLayerY == Integer.MIN_VALUE) {
+            commitMinimapWriterLayer(desiredLayerY, now, false);
+            return minimapWriterLayerY;
+        }
+        boolean moving = playerMoving();
+        if (moving) minimapLastMovementMs = now;
+        if (desiredLayerY == minimapWriterLayerY) {
+            minimapCandidateLayerY = Integer.MIN_VALUE;
+            minimapCandidateSinceMs = 0L;
+            return minimapWriterLayerY;
+        }
+
+        int focusPageX = Math.floorDiv((int) Math.floor(focusX),
+                MapPageLayout.PAGE_SIZE);
+        int focusPageZ = Math.floorDiv((int) Math.floor(focusZ),
+                MapPageLayout.PAGE_SIZE);
+        boolean alreadyRenderable = unified.isPageProjectionResolved(
+                CaveView.LAYERED, desiredLayerY, focusPageX, focusPageZ);
+        if (alreadyRenderable) {
+            commitMinimapWriterLayer(desiredLayerY, now, true);
+            return minimapWriterLayerY;
+        }
+
+        if (minimapCandidateLayerY != desiredLayerY) {
+            minimapCandidateLayerY = desiredLayerY;
+            minimapCandidateSinceMs = now;
+            return minimapWriterLayerY;
+        }
+        boolean candidateStable = now - minimapCandidateSinceMs
+                >= MINIMAP_LAYER_CANDIDATE_MS;
+        boolean playerStable = !moving && (minimapLastMovementMs == 0L
+                || now - minimapLastMovementMs >= MINIMAP_LAYER_STABLE_MS);
+        if (candidateStable && playerStable) {
+            commitMinimapWriterLayer(desiredLayerY, now, false);
+        }
+        return minimapWriterLayerY;
+    }
+
+    private void commitMinimapWriterLayer(int layerY, long now, boolean cached) {
+        int previous = minimapWriterLayerY;
+        if (previous == layerY) return;
+        minimapPreviousLayerY = previous;
+        minimapWriterLayerY = layerY;
+        minimapCandidateLayerY = Integer.MIN_VALUE;
+        minimapCandidateSinceMs = 0L;
+        minimapWriterCommittedMs = now;
+        minimapTransitionPhase = previous == Integer.MIN_VALUE || cached ? 0 : 1;
+        handoffRevision.incrementAndGet();
+        MapDebugRecorder.getInstance().event("CAVE_MINIMAP_WRITER_LAYER_COMMIT",
+                "previous_top_y=" + previous
+                        + " writer_top_y=" + layerY
+                        + " cached=" + cached
+                        + " phase=" + minimapTransitionPhase);
+    }
+
+    private synchronized int advanceMinimapTransition(int writerLayerY,
+            double focusX, double focusZ) {
+        if (minimapTransitionPhase == 0 || writerLayerY == Integer.MIN_VALUE) {
+            return 0;
+        }
+        long now = System.currentTimeMillis();
+        int centerPageX = Math.floorDiv((int) Math.floor(focusX),
+                MapPageLayout.PAGE_SIZE);
+        int centerPageZ = Math.floorDiv((int) Math.floor(focusZ),
+                MapPageLayout.PAGE_SIZE);
+        long elapsed = Math.max(0L, now - minimapWriterCommittedMs);
+        if (minimapTransitionPhase == 1) {
+            boolean centerReady = unified.isPageProjectionResolved(CaveView.LAYERED,
+                    writerLayerY, centerPageX, centerPageZ);
+            if (centerReady || elapsed >= MINIMAP_CENTER_PHASE_MAX_MS) {
+                minimapTransitionPhase = 2;
+                MapDebugRecorder.getInstance().event(
+                        "CAVE_MINIMAP_WRITER_WINDOW_EXPANDED",
+                        "writer_top_y=" + writerLayerY + " phase=near"
+                                + " center_ready=" + centerReady
+                                + " elapsed_ms=" + elapsed);
+            }
+        }
+        if (minimapTransitionPhase == 2) {
+            int ready = 0;
+            if (unified.isPageProjectionResolved(CaveView.LAYERED, writerLayerY,
+                    centerPageX, centerPageZ)) ready++;
+            if (unified.isPageProjectionResolved(CaveView.LAYERED, writerLayerY,
+                    centerPageX + 1, centerPageZ)) ready++;
+            if (unified.isPageProjectionResolved(CaveView.LAYERED, writerLayerY,
+                    centerPageX - 1, centerPageZ)) ready++;
+            if (unified.isPageProjectionResolved(CaveView.LAYERED, writerLayerY,
+                    centerPageX, centerPageZ + 1)) ready++;
+            if (unified.isPageProjectionResolved(CaveView.LAYERED, writerLayerY,
+                    centerPageX, centerPageZ - 1)) ready++;
+            if (ready >= 3 || elapsed >= MINIMAP_NEAR_PHASE_MAX_MS) {
+                minimapTransitionPhase = 0;
+                MapDebugRecorder.getInstance().event(
+                        "CAVE_MINIMAP_WRITER_WINDOW_EXPANDED",
+                        "writer_top_y=" + writerLayerY + " phase=full"
+                                + " ready_core=" + ready + "/5"
+                                + " elapsed_ms=" + elapsed);
+            }
+        }
+        return minimapTransitionPhase;
+    }
+
+    private int minimapFallbackLayer(int requestedLayerY, boolean first) {
+        int writer = minimapWriterLayerY;
+        int previous = minimapPreviousLayerY;
+        if (first) return writer != requestedLayerY ? writer : previous;
+        if (writer == requestedLayerY || previous == writer) return Integer.MIN_VALUE;
+        return previous;
+    }
+
+    private static boolean validFallback(int candidate, int requestedLayerY) {
+        return candidate != Integer.MIN_VALUE && candidate != requestedLayerY;
+    }
+
+    private PageSelection fallbackPageSelection(int candidate, int requestedLayerY,
+            int rx, int rz, int pageX, int pageZ,
+            int globalPageX, int globalPageZ, float scale) {
+        if (!validFallback(candidate, requestedLayerY)) return null;
+        CaveAtlasRegion region = unified.peekPageRegion(CaveView.LAYERED,
+                candidate, rx, rz, pageX, pageZ, scale);
+        if (region == null) return null;
+        TileKey key = unified.pageTileKey(CaveView.LAYERED, candidate,
+                globalPageX, globalPageZ, scale);
+        return new PageSelection(region, key);
+    }
+
+    private static boolean playerMoving() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft == null || minecraft.player == null) return false;
+        return minecraft.player.xo != minecraft.player.getX()
+                || minecraft.player.yo != minecraft.player.getY()
+                || minecraft.player.zo != minecraft.player.getZ();
+    }
+
+    public record PageSelection(CaveAtlasRegion region, TileKey tileKey) {
     }
 
     private synchronized void observeLayerHandoff(int layerY,
@@ -241,33 +494,35 @@ public final class CaveTextureManager {
         int centerPageZ = Math.max(minimumPageZ, Math.min(maximumPageZ,
                 Math.floorDiv((int) Math.floor(focusZ), MapPageLayout.PAGE_SIZE)));
 
+        int width = Math.max(1, maximumPageX - minimumPageX + 1);
+        int height = Math.max(1, maximumPageZ - minimumPageZ + 1);
+        int total = width * height;
+        int stride = lane == MapRequestLane.MINIMAP ? 1
+                : Math.max(1, (int) Math.ceil(Math.sqrt(
+                        total / (double) HANDOFF_SAMPLE_CAP)));
         int resolved = 0;
         int target = 0;
-        boolean centerResolved = false;
-        int radius = lane == MapRequestLane.MINIMAP ? 0 : HANDOFF_RADIUS_PAGES;
-        for (int dz = -radius; dz <= radius; dz++) {
-            int pageZ = centerPageZ + dz;
-            if (pageZ < minimumPageZ || pageZ > maximumPageZ) continue;
-            for (int dx = -radius; dx <= radius; dx++) {
-                int pageX = centerPageX + dx;
-                if (pageX < minimumPageX || pageX > maximumPageX) continue;
+        for (int pageZ = minimumPageZ; pageZ <= maximumPageZ; pageZ += stride) {
+            for (int pageX = minimumPageX; pageX <= maximumPageX; pageX += stride) {
                 target++;
-                boolean ready = unified.isPageProjectionResolved(
-                        CaveView.LAYERED, layerY, pageX, pageZ);
-                if (ready) resolved++;
-                if (dx == 0 && dz == 0) centerResolved = ready;
+                if (unified.isPageProjectionResolved(CaveView.LAYERED,
+                        layerY, pageX, pageZ)) resolved++;
             }
         }
-        int required = lane == MapRequestLane.MINIMAP ? 1
-                : Math.min(HANDOFF_MIN_READY_PAGES, target);
+        boolean centerResolved = unified.isPageProjectionResolved(
+                CaveView.LAYERED, layerY, centerPageX, centerPageZ);
+        int required = lane == MapRequestLane.MINIMAP ? target
+                : Math.max(1, (int) Math.ceil(target * HANDOFF_READY_RATIO));
         if (centerResolved && resolved >= required) layerHandoffReadyPasses++;
         else layerHandoffReadyPasses = 0;
 
-        long elapsed = System.currentTimeMillis() - layerHandoffStartedMs;
-        if (layerHandoffReadyPasses >= HANDOFF_STABLE_PASSES
-                || (centerResolved && elapsed >= HANDOFF_MAX_WAIT_MS)) {
+        if (layerHandoffReadyPasses >= HANDOFF_STABLE_PASSES) {
             int loadedLayer = activeLayerY;
             int unloadedLayer = previousLayerY;
+            // Xaero keeps the previous exact caveStart inside the same retained
+            // 16-block band until the replacement is ready. UnifiedCaveTextureManager
+            // performs an atomic whole-page swap, so this underlay cannot create a
+            // mixed 16x16 checkerboard and disappears naturally page by page.
             previousLayerY = Integer.MIN_VALUE;
             layerHandoffPending = false;
             layerHandoffStartedMs = 0L;
@@ -277,7 +532,9 @@ public final class CaveTextureManager {
                     "previous_top_y=" + unloadedLayer
                             + " current_top_y=" + loadedLayer
                             + " center_page=" + centerPageX + ',' + centerPageZ
-                            + " ready_pages=" + resolved + '/' + target);
+                            + " ready_samples=" + resolved + '/' + target
+                            + " ratio=" + (target == 0 ? 1.0
+                                    : (double) resolved / target));
         }
     }
 

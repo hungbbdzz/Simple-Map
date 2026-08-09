@@ -11,16 +11,32 @@ import java.util.Arrays;
  * after migration and allocated twenty unnecessary bytes per visible instance.</p>
  */
 public final class MapGpuInstancePlan {
+    /**
+     * Resolve the current 4x4 Surface completion mask at replay time. A complete
+     * page emits one quad; a partial page emits only its resident 16x16 cells.
+     */
+    public static final int DYNAMIC_SURFACE_SUBTILES = -1;
+
     private final TileKey[] keys;
     private final int[] phases;
     private final float[] rects;
+    /** Local UV rectangle inside the logical page-table entry. */
+    private final float[] localUvs;
+    /**
+     * Required complete-subtile bits. Zero means no predicate; -1 means dynamic
+     * Surface 4x4 coverage resolved by the replay renderer.
+     */
+    private final int[] requiredCoverageMasks;
     private final int size;
 
     private MapGpuInstancePlan(TileKey[] keys, int[] phases,
-            float[] rects, int size) {
+            float[] rects, float[] localUvs, int[] requiredCoverageMasks,
+            int size) {
         this.keys = keys;
         this.phases = phases;
         this.rects = rects;
+        this.localUvs = localUvs;
+        this.requiredCoverageMasks = requiredCoverageMasks;
         this.size = size;
     }
 
@@ -61,16 +77,36 @@ public final class MapGpuInstancePlan {
     public float y(int index) { return rects[index * 4 + 1]; }
     public float width(int index) { return rects[index * 4 + 2]; }
     public float height(int index) { return rects[index * 4 + 3]; }
+    public float localU0(int index) { return localUvs[index * 4]; }
+    public float localV0(int index) { return localUvs[index * 4 + 1]; }
+    public float localU1(int index) { return localUvs[index * 4 + 2]; }
+    public float localV1(int index) { return localUvs[index * 4 + 3]; }
+    public int requiredCoverageMask(int index) {
+        return requiredCoverageMasks[index];
+    }
 
     public static final class Builder {
         private TileKey[] keys = new TileKey[128];
         private int[] phases = new int[128];
         private float[] rects = new float[512];
+        private float[] localUvs = new float[512];
+        private int[] requiredCoverageMasks = new int[128];
         private int size;
 
         public boolean add(TileKey key, int phase,
                 int x, int y, int width, int height) {
-            if (key == null || width <= 0 || height <= 0) return false;
+            return add(key, phase, x, y, width, height,
+                    0.0f, 0.0f, 1.0f, 1.0f, 0);
+        }
+
+        public boolean add(TileKey key, int phase,
+                int x, int y, int width, int height,
+                float localU0, float localV0, float localU1, float localV1,
+                int requiredCoverageMask) {
+            if (key == null || width <= 0 || height <= 0
+                    || localU0 < 0.0f || localV0 < 0.0f
+                    || localU1 > 1.0f || localV1 > 1.0f
+                    || localU1 <= localU0 || localV1 <= localV0) return false;
             ensure(size + 1);
             keys[size] = key;
             phases[size] = phase;
@@ -79,6 +115,11 @@ public final class MapGpuInstancePlan {
             rects[offset + 1] = y;
             rects[offset + 2] = width;
             rects[offset + 3] = height;
+            localUvs[offset] = localU0;
+            localUvs[offset + 1] = localV0;
+            localUvs[offset + 2] = localU1;
+            localUvs[offset + 3] = localV1;
+            requiredCoverageMasks[size] = requiredCoverageMask;
             size++;
             return true;
         }
@@ -86,7 +127,7 @@ public final class MapGpuInstancePlan {
         public MapGpuInstancePlan build() {
             if (size == 0) {
                 return new MapGpuInstancePlan(new TileKey[0], new int[0],
-                        new float[0], 0);
+                        new float[0], new float[0], new int[0], 0);
             }
             // Primitive stable phase order. Actual texture grouping happens after
             // page-table resolution, so sorting by a stale fallback texture only
@@ -97,13 +138,18 @@ public final class MapGpuInstancePlan {
             TileKey[] outKeys = new TileKey[size];
             int[] outPhases = new int[size];
             float[] outRects = new float[size * 4];
+            float[] outLocalUvs = new float[size * 4];
+            int[] outRequiredCoverageMasks = new int[size];
             for (int target = 0; target < size; target++) {
                 int source = order[target];
                 outKeys[target] = keys[source];
                 outPhases[target] = phases[source];
                 System.arraycopy(rects, source * 4, outRects, target * 4, 4);
+                System.arraycopy(localUvs, source * 4, outLocalUvs, target * 4, 4);
+                outRequiredCoverageMasks[target] = requiredCoverageMasks[source];
             }
-            return new MapGpuInstancePlan(outKeys, outPhases, outRects, size);
+            return new MapGpuInstancePlan(outKeys, outPhases, outRects,
+                    outLocalUvs, outRequiredCoverageMasks, size);
         }
 
         private void sortOrder(int[] order, int low, int high) {
@@ -156,6 +202,8 @@ public final class MapGpuInstancePlan {
             keys = Arrays.copyOf(keys, next);
             phases = Arrays.copyOf(phases, next);
             rects = Arrays.copyOf(rects, next * 4);
+            localUvs = Arrays.copyOf(localUvs, next * 4);
+            requiredCoverageMasks = Arrays.copyOf(requiredCoverageMasks, next);
         }
     }
 }

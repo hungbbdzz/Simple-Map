@@ -32,6 +32,12 @@ public final class SurfaceLodTree {
     public static final int MAX_LEVEL = 7;
     private static final long FULL_ROW = -1L;
     private static final long GPU_RETRY_MAX_NANOS = 160_000_000L;
+    /** Exact pages publish immediately; only derived branches wait for a short
+     * quiet window so a burst of child revisions collapses into one reduction. */
+    private static final long FOREGROUND_LEAF_QUIET_NANOS = 40_000_000L;
+    private static final long BACKGROUND_LEAF_QUIET_NANOS = 80_000_000L;
+    private static final long FOREGROUND_LEAF_MAX_WAIT_NANOS = 160_000_000L;
+    private static final long BACKGROUND_LEAF_MAX_WAIT_NANOS = 300_000_000L;
     /** Clean leaf authority is LRU-bounded; dirty state is never discarded. */
     private static final int MAX_RETAINED_LEAF_STATES = 16_384;
 
@@ -93,6 +99,13 @@ public final class SurfaceLodTree {
                 Math.max(1, Math.min(MAX_LEVEL, preferredLevel)),
                 safeMinX, safeMaxX, safeMinZ, safeMaxZ,
                 focusPageX, focusPageZ);
+    }
+
+    /** Retires branch-atlas slots quarantined by the previous frame. */
+    public void onPageTableFrameBoundary() {
+        for (int level = 1; level <= MAX_LEVEL; level++) {
+            atlases[level].onPageTableFrameBoundary();
+        }
     }
 
     public void synchronizeStorage() {
@@ -171,20 +184,26 @@ public final class SurfaceLodTree {
         MapRequestLane effectiveLane = lane == null
                 ? MapRequestLane.BACKGROUND : lane;
         long revision = Math.max(1L, sourceRevision);
+        boolean newlyQueued;
         synchronized (leafLock) {
             LeafState state = leafStates.computeIfAbsent(key, LeafState::new);
             if (revision < state.sourceRevision) return;
+            long now = System.nanoTime();
+            boolean cleanBeforeUpdate = state.derivedRevision >= state.sourceRevision;
             state.pixels64 = pixels64;
             state.knownRows = java.util.Arrays.copyOf(knownRows, 64);
             state.complete = complete;
             state.sourceRevision = revision;
-            state.queuedNanos = state.queuedNanos == 0L
-                    ? System.nanoTime() : state.queuedNanos;
+            if (cleanBeforeUpdate || state.firstDirtyNanos == 0L) {
+                state.firstDirtyNanos = now;
+            }
+            state.lastDirtyNanos = now;
+            state.queuedNanos = state.queuedNanos == 0L ? now : state.queuedNanos;
             if (effectiveLane.strongerThan(state.lane)) state.lane = effectiveLane;
-            enqueueLeafLocked(key);
+            newlyQueued = enqueueLeafLocked(key);
             trimLeafStatesLocked();
         }
-        pipelineTelemetry.recordBranchUpdateQueued();
+        if (newlyQueued) pipelineTelemetry.recordBranchUpdateQueued();
     }
 
     /** Returns true only when a GPU-resident level-1 branch covers this revision. */
@@ -198,6 +217,7 @@ public final class SurfaceLodTree {
         int childIndex = Math.floorMod(globalPageZ, 2) * 2
                 + Math.floorMod(globalPageX, 2);
         boolean covered = (node.uploadedKnownMask & (1L << childIndex)) != 0L
+                && (node.uploadedCompleteMask & (1L << childIndex)) != 0L
                 && node.uploadedChildRevisions[childIndex] >= sourceRevision;
         if (covered) MapResidencyManager.getInstance().touch(residencyKey(node.key));
         return covered;
@@ -205,6 +225,12 @@ public final class SurfaceLodTree {
 
     private int scheduleLeafDerivations(int budget, long deadlineNanos) {
         int scheduled = 0;
+        int deferred = 0;
+        int deferBudget;
+        synchronized (leafLock) {
+            deferBudget = Math.max(1, Math.min(VISIBLE_QUEUE_SCAN_BUDGET,
+                    pendingLeafQueue.size()));
+        }
         while (scheduled < budget && System.nanoTime() < deadlineNanos) {
             LeafInput input;
             synchronized (leafLock) {
@@ -214,6 +240,12 @@ public final class SurfaceLodTree {
                 LeafState state = leafStates.get(key);
                 if (state == null || state.pixels64 == null || state.knownRows == null
                         || state.derivedRevision >= state.sourceRevision) continue;
+                long now = System.nanoTime();
+                if (!state.derivationSettled(now)) {
+                    enqueueLeafLocked(key);
+                    if (++deferred >= deferBudget) break;
+                    continue;
+                }
                 if (!inFlightLeafDerivations.add(key)) continue;
                 input = new LeafInput(key, state.pixels64, state.knownRows,
                         state.complete, state.sourceRevision,
@@ -276,10 +308,14 @@ public final class SurfaceLodTree {
                 if (state != null) {
                     state.derivedRevision = Math.max(state.derivedRevision,
                             prepared.revision());
-                    state.queuedNanos = 0L;
                     if (state.derivedRevision < state.sourceRevision) {
-                        state.queuedNanos = System.nanoTime();
+                        if (state.queuedNanos == 0L) state.queuedNanos = System.nanoTime();
                         enqueueLeafLocked(prepared.key());
+                    } else {
+                        state.queuedNanos = 0L;
+                        state.firstDirtyNanos = 0L;
+                        state.lastDirtyNanos = 0L;
+                        state.lane = MapRequestLane.BACKGROUND;
                     }
                     trimLeafStatesLocked();
                 }
@@ -418,8 +454,10 @@ public final class SurfaceLodTree {
                 && candidate.nodeZ() >= minNodeZ && candidate.nodeZ() <= maxNodeZ;
     }
 
-    private void enqueueLeafLocked(PageUpdateKey key) {
-        if (key != null && pendingLeafSet.add(key)) pendingLeafQueue.addLast(key);
+    private boolean enqueueLeafLocked(PageUpdateKey key) {
+        if (key == null || !pendingLeafSet.add(key)) return false;
+        pendingLeafQueue.addLast(key);
+        return true;
     }
 
     private void trimLeafStatesLocked() {
@@ -652,27 +690,31 @@ public final class SurfaceLodTree {
     }
 
     private static int reduceSurface(int[] pixels, long[] rows, int x, int y) {
-        long red = 0L, green = 0L, blue = 0L, weight = 0L;
-        int maximumAlpha = 0;
-        // Four scalar samples; avoids two short-lived arrays for every LOD texel.
+        int redTotal = 0;
+        int greenTotal = 0;
+        int blueTotal = 0;
+        int count = 0;
         for (int child = 0; child < 4; child++) {
             int sourceX = x + (child & 1);
             int sourceY = y + (child >>> 1);
             if ((rows[sourceY] & (1L << sourceX)) == 0L) continue;
             int value = pixels[sourceY * 64 + sourceX];
-            int alpha = (value >>> 24) & 0xFF;
-            if (value == 0 || alpha == 0) continue;
-            red += (long) (value & 0xFF) * alpha;
-            green += (long) ((value >>> 8) & 0xFF) * alpha;
-            blue += (long) ((value >>> 16) & 0xFF) * alpha;
-            weight += alpha;
-            maximumAlpha = Math.max(maximumAlpha, alpha);
+            if (value == 0 || ((value >>> 24) & 0xFF) == 0) continue;
+            redTotal += value & 0xFF;
+            greenTotal += (value >>> 8) & 0xFF;
+            blueTotal += (value >>> 16) & 0xFF;
+            count++;
         }
-        if (weight == 0L) return 0;
-        return (Math.max(1, maximumAlpha) << 24)
-                | ((int) (blue / weight) << 16)
-                | ((int) (green / weight) << 8)
-                | (int) (red / weight);
+        if (count == 0) return 0;
+        /* PASS118: this hierarchy is a minification filter, not a terrain
+         * classifier. Selecting one real child nearest the mean aliases repeated
+         * seabed/foliage detail into long 2x/4x stripes. Xaero downsamples branch
+         * textures through linear texture filtering; arithmetic averaging is the
+         * CPU equivalent for our retained hierarchy. */
+        int meanRed = redTotal / count;
+        int meanGreen = greenTotal / count;
+        int meanBlue = blueTotal / count;
+        return 0xFF000000 | (meanBlue << 16) | (meanGreen << 8) | meanRed;
     }
 
     private static void setBit(long[] rows, int x, int y, boolean value) {
@@ -758,7 +800,7 @@ public final class SurfaceLodTree {
     }
 
     private static LodBranchDiskCache.Key diskKey(NodeKey key) {
-        return new LodBranchDiskCache.Key("surface_chunk16_" + key.dimension,
+        return new LodBranchDiskCache.Key("surface_v2_chunk16_" + key.dimension,
                 key.level, key.nodeX, key.nodeZ);
     }
 
@@ -772,6 +814,9 @@ public final class SurfaceLodTree {
         MapResidencyManager.getInstance().remove(residencyKey(key));
         node.atlasSlot = -1;
         node.initialized = false;
+        // MapRenderPlan stores raw UVs for this compatibility tree. Retiring a
+        // slot changes world->atlas topology even though its CPU pixels survive.
+        MapResidencyManager.getInstance().markTopologyChanged();
         return true;
     }
 
@@ -796,10 +841,14 @@ public final class SurfaceLodTree {
 
     private boolean ensureSlot(Node node) {
         if (node.atlasSlot >= 0) return true;
-        int slot = atlases[node.key.level()].acquireSlot();
+        SurfaceBranchAtlas atlas = atlases[node.key.level()];
+        int slot = atlas.acquireSlot();
         if (slot < 0) {
+            if (atlas.hasQuarantinedSlots()) return false;
             if (!retireOldestResident(node.key.level(), node.key)) return false;
-            slot = atlases[node.key.level()].acquireSlot();
+            // The retired slot deliberately becomes reusable only at the next
+            // frame boundary; do not cascade-evict the rest of this level.
+            return false;
         }
         if (slot < 0) return false;
         node.atlasSlot = slot;
@@ -851,6 +900,7 @@ public final class SurfaceLodTree {
         MapResidencyManager.getInstance().remove(victimKey);
         retired.atlasSlot = -1;
         retired.initialized = false;
+        MapResidencyManager.getInstance().markTopologyChanged();
         return true;
     }
 
@@ -956,10 +1006,24 @@ public final class SurfaceLodTree {
         private long sourceRevision;
         private long derivedRevision;
         private long queuedNanos;
+        private long firstDirtyNanos;
+        private long lastDirtyNanos;
         private MapRequestLane lane = MapRequestLane.BACKGROUND;
 
         private LeafState(PageUpdateKey key) {
             this.key = key;
+        }
+
+        private boolean derivationSettled(long now) {
+            if (firstDirtyNanos == 0L || lastDirtyNanos == 0L) return true;
+            boolean foreground = lane == MapRequestLane.MINIMAP
+                    || lane == MapRequestLane.FULLSCREEN;
+            long quiet = foreground
+                    ? FOREGROUND_LEAF_QUIET_NANOS : BACKGROUND_LEAF_QUIET_NANOS;
+            long maxWait = foreground
+                    ? FOREGROUND_LEAF_MAX_WAIT_NANOS : BACKGROUND_LEAF_MAX_WAIT_NANOS;
+            return now - lastDirtyNanos >= quiet
+                    || now - firstDirtyNanos >= maxWait;
         }
     }
 

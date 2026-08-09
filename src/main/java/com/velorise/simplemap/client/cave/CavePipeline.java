@@ -40,6 +40,15 @@ public final class CavePipeline {
     private static final int MAX_VISIBLE_SOFT_REFRESH_TILES = 4096;
     private static final int MAX_TRANSITION_STALE_TILES = 4096;
     private static final long VIEWPORT_REFRESH_MEMORY_NANOS = 2_000_000_000L;
+    /** Xaero warms only a compact map-chunk neighbourhood when Cave is entering. */
+    private static final int AUTO_PREWARM_RADIUS_CHUNKS = 2;
+    /** Fallback writer radius; the render viewport supplies the real minimap bounds. */
+    private static final int GAMEPLAY_FALLBACK_RADIUS_CHUNKS = 4;
+    private static final int MINIMAP_VIEWPORT_HALO_CHUNKS = 1;
+    private static final long AUTO_PREWARM_BUDGET_NANOS = 350_000L;
+    private static final int[][] AUTO_WARMUP_REQUIRED_OFFSETS = {
+            { 0, 0 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }
+    };
 
     private long lastRevalidationTick = Long.MIN_VALUE;
     private int revalidationStep;
@@ -85,6 +94,7 @@ public final class CavePipeline {
 
     public void setCacheDirectory(File directory) {
         repository.setDirectory(directory);
+        CaveRegionImageCache.getInstance().setBaseDirectory(directory);
         scheduler.reset();
         displayScheduler.reset();
         readiness.reset();
@@ -145,14 +155,115 @@ public final class CavePipeline {
                 MAX_TRANSITION_STALE_TILES);
     }
 
+    /**
+     * Prepares the candidate Cave view behind the still-visible Surface map.
+     * Xaero separates loadingCaving from loadedCaving and constrains a newly
+     * entering cave write to a small centre window. This is the equivalent source
+     * stage: no renderer ownership is changed and no broad render-distance square
+     * is admitted before the display latch expires.
+     */
+    public void prewarmAroundPlayer(Minecraft minecraft) {
+        if (!usable(minecraft) || CaveMode.isActive(minecraft)
+                || !CaveMode.shouldPrepare(minecraft)) return;
+        CaveView view = CaveMode.getCaveType(minecraft) == CaveMode.CaveType.FULL
+                ? CaveView.FULL : CaveView.LAYERED;
+        int layerY = view == CaveView.FULL
+                ? Integer.MIN_VALUE : CaveMode.getLayerY(minecraft);
+        int centerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
+        int centerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
+        int liveRadius = Math.max(2,
+                minecraft.options.getEffectiveRenderDistance() + 2);
+        int radius = Math.min(liveRadius, AUTO_PREWARM_RADIUS_CHUNKS);
+        /*
+         * Xaero separates loadingCaving from loadedCaving. Preparation must not
+         * impersonate the visible minimap lane: PASS119 did that and created
+         * thousands of foreground offers which the renderer correctly rejected
+         * while Surface was still displayed. Warm only finite source transactions.
+         */
+        displayScheduler.enqueueWarmupWindow(minecraft.level, view, layerY,
+                centerChunkX, centerChunkZ, radius,
+                MapRequestLane.BACKGROUND.priorityBase() + 950_000);
+        long governed = MapPerformanceGovernor.getInstance()
+                .gameplayScanBudgetNanos(true);
+        long budget = Math.min(AUTO_PREWARM_BUDGET_NANOS, governed);
+        if (budget > 0L) {
+            displayScheduler.process(minecraft.level,
+                    System.nanoTime() + budget);
+        }
+
+        /*
+         * Xaero does not swap loadedCaving until its loading canvas has already
+         * been written. Pre-stage only the compact centre exact pages on the
+         * BACKGROUND lane while Surface is still visible. This spreads CPU/GPU
+         * publication across the one-second latch instead of making the first Cave
+         * frame pay the entire exact-page cold start.
+         */
+        if (repository.hasFreshDisplayTileSource(view, layerY,
+                centerChunkX, centerChunkZ, DenseCaveTile.Source.LIVE)) {
+            double centerX = minecraft.player.getX();
+            double centerZ = minecraft.player.getZ();
+            double warmRadiusBlocks = (radius + 1) * 16.0;
+            UnifiedCaveTextureManager textureManager =
+                    UnifiedCaveTextureManager.getInstance();
+            textureManager.requestVisiblePages(view, layerY,
+                    centerX - warmRadiusBlocks, centerX + warmRadiusBlocks,
+                    centerZ - warmRadiusBlocks, centerZ + warmRadiusBlocks,
+                    1.0f, centerX, centerZ, MapRequestLane.BACKGROUND);
+            textureManager.upload(false);
+        }
+        updateTelemetry();
+    }
+
+    /**
+     * AUTO display readiness for the small centre cross. Surface remains visible
+     * until these tiles are transactionally committed. This mirrors Xaero's
+     * loadingCaving/loadedCaving split and prevents the switch frame from also being
+     * the first frame that discovers/builds the player's Cave neighbourhood.
+     */
+    public boolean autoWarmupReady(Minecraft minecraft) {
+        if (!usable(minecraft) || !CaveMode.shouldPrepare(minecraft)) return false;
+        CaveView view = CaveMode.getCaveType(minecraft) == CaveMode.CaveType.FULL
+                ? CaveView.FULL : CaveView.LAYERED;
+        int layerY = view == CaveView.FULL
+                ? Integer.MIN_VALUE : CaveMode.getLayerY(minecraft);
+        int centerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
+        int centerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
+        // Centre + four cardinals are sufficient for a stable minimap handoff.
+        // Diagonals continue warming without blocking AUTO forever.
+        for (int[] offset : AUTO_WARMUP_REQUIRED_OFFSETS) {
+            int chunkX = centerChunkX + offset[0];
+            int chunkZ = centerChunkZ + offset[1];
+            if (!minecraft.level.hasChunk(chunkX, chunkZ)) continue;
+            if (!repository.hasFreshDisplayTileSource(view, layerY, chunkX, chunkZ,
+                    DenseCaveTile.Source.LIVE)) return false;
+        }
+        if (!repository.hasFreshDisplayTileSource(view, layerY,
+                centerChunkX, centerChunkZ, DenseCaveTile.Source.LIVE)) {
+            return false;
+        }
+        int centerPageX = Math.floorDiv(centerChunkX, 4);
+        int centerPageZ = Math.floorDiv(centerChunkZ, 4);
+        return UnifiedCaveTextureManager.getInstance().isPageProjectionResolved(
+                view, layerY, centerPageX, centerPageZ);
+    }
+
     /** Foreground gameplay scan: complete nearby chunk tiles centre-first. */
     public void scanAroundPlayer(Minecraft minecraft, int blockRadius) {
         if (!usable(minecraft)) return;
         int centerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
         int centerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
-        int liveRadius = Math.max(2, minecraft.options.renderDistance().get() + 2);
-        int requestedRadius = Math.max(1, (blockRadius + 15) >> 4);
-        int chunkRadius = Math.min(liveRadius, requestedRadius);
+        int liveRadius = Math.max(2, minecraft.options.getEffectiveRenderDistance() + 2);
+        /*
+         * Durable Cave collection still follows loaded chunks through packet and
+         * background/archive lanes. This 20 Hz display scheduler is only the local
+         * fallback/hot writer; the renderer publishes its exact MINIMAP rectangle
+         * separately below, so this path must not duplicate the entire loaded set.
+         */
+        // This 20 Hz pass is only a fallback/hot writer. The minimap renderer
+        // publishes its exact visible bounds through scanVisibleArea(), so walking
+        // the entire render-distance square here duplicated hundreds of tiles every
+        // AUTO Cave session and was the largest source of transition churn.
+        int chunkRadius = Math.min(liveRadius, GAMEPLAY_FALLBACK_RADIUS_CHUNKS);
         CaveView view = CaveMode.isFullView(minecraft) ? CaveView.FULL : CaveView.LAYERED;
         int layerY = CaveMode.getLayerY(minecraft);
         /*
@@ -196,12 +307,10 @@ public final class CavePipeline {
         int layerY = CaveMode.getLayerY(minecraft);
         displayScheduler.admitLoadedChunk(minecraft.level, view, layerY,
                 centerChunkX, centerChunkZ, 1_150_000);
-        int hotRadius = CaveModeTransitionPolicy.liveRadius(3);
-        displayScheduler.enqueueViewport(minecraft.level, view, layerY,
-                centerChunkX - hotRadius, centerChunkX + hotRadius,
-                centerChunkZ - hotRadius, centerChunkZ + hotRadius,
-                centerChunkX, centerChunkZ, 1_050_000,
-                MapRequestLane.MINIMAP);
+        // Discovery belongs to the persistent render-distance viewport published
+        // by scanAroundPlayer/scanVisibleArea. Replacing it every render frame with
+        // a 7x7 hot window reset the rolling cursor before outer loaded chunks were
+        // ever revisited. This path only resumes already-admitted work.
         displayScheduler.process(minecraft.level,
                 System.nanoTime() + CaveModeTransitionPolicy.foregroundBudget(budgetNanos));
         updateTelemetry();
@@ -322,47 +431,72 @@ public final class CavePipeline {
 
         int playerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
         int playerChunkZ = ((int) Math.floor(minecraft.player.getZ())) >> 4;
+        int liveRadius = Math.max(2,
+                minecraft.options.getEffectiveRenderDistance() + 2);
         // The player hot set is independent of a panned fullscreen frontier. Model
-        // it as the short-lived MINIMAP lane instead of persistent demand: a player
-        // who travels must not leave unavailable/deferred cave tasks permanently in
-        // the queue. The actual minimap call already owns this lane, so only add the
-        // independent hot set while a fullscreen viewport is active.
+        // it as the MINIMAP lane instead of persistent demand. Unlike the old 3x3
+        // seed, it owns the complete loaded render-distance square and cycles until
+        // every still-loaded unfinished chunk has been admitted.
         if (effectiveLane == MapRequestLane.FULLSCREEN) {
             displayScheduler.enqueueViewport(minecraft.level, view, layerY,
-                    playerChunkX - 1, playerChunkX + 1,
-                    playerChunkZ - 1, playerChunkZ + 1,
+                    playerChunkX - liveRadius, playerChunkX + liveRadius,
+                    playerChunkZ - liveRadius, playerChunkZ + liveRadius,
                     playerChunkX, playerChunkZ,
                     MapRequestLane.MINIMAP.priorityBase() + 500_000,
                     MapRequestLane.MINIMAP);
         }
-        int liveRadius = Math.max(2, minecraft.options.renderDistance().get() + 3);
-        int minChunkX = Math.max(viewportMinChunkX - 1, playerChunkX - liveRadius);
-        int maxChunkX = Math.min(viewportMaxChunkX + 1, playerChunkX + liveRadius);
-        int minChunkZ = Math.max(viewportMinChunkZ - 1, playerChunkZ - liveRadius);
-        int maxChunkZ = Math.min(viewportMaxChunkZ + 1, playerChunkZ + liveRadius);
-        if (CaveScreenSpacePolicy.restrictLiveProjectionToFocusPage(scale, effectiveLane)) {
-            // At the normal cave zoom-out floor one exact page is only 4x4 screen
-            // pixels. Keep live projection to the single focus page; saved-data
-            // admission advances separately and branch/root textures cover the view.
-            int focusChunkX = ((int) Math.floor(focusX)) >> 4;
-            int focusChunkZ = ((int) Math.floor(focusZ)) >> 4;
-            int firstFocusChunkX = Math.floorDiv(focusChunkX, 4) * 4;
-            int firstFocusChunkZ = Math.floorDiv(focusChunkZ, 4) * 4;
-            minChunkX = Math.max(minChunkX, firstFocusChunkX);
-            maxChunkX = Math.min(maxChunkX, firstFocusChunkX + 3);
-            minChunkZ = Math.max(minChunkZ, firstFocusChunkZ);
-            maxChunkZ = Math.min(maxChunkZ, firstFocusChunkZ + 3);
+        int minChunkX;
+        int maxChunkX;
+        int minChunkZ;
+        int maxChunkZ;
+        if (effectiveLane == MapRequestLane.MINIMAP) {
+            /*
+             * Presentation demand must follow the real minimap rectangle, not the
+             * complete Minecraft render-distance square. Durable vertical archive
+             * capture is owned independently by scheduler/packet/background paths.
+             * Xaero likewise constrains the cave writer around the centre when cave
+             * mode is entering instead of rebuilding every loaded chunk at once.
+             */
+            minChunkX = Math.max(playerChunkX - liveRadius,
+                    viewportMinChunkX - MINIMAP_VIEWPORT_HALO_CHUNKS);
+            maxChunkX = Math.min(playerChunkX + liveRadius,
+                    viewportMaxChunkX + MINIMAP_VIEWPORT_HALO_CHUNKS);
+            minChunkZ = Math.max(playerChunkZ - liveRadius,
+                    viewportMinChunkZ - MINIMAP_VIEWPORT_HALO_CHUNKS);
+            maxChunkZ = Math.min(playerChunkZ + liveRadius,
+                    viewportMaxChunkZ + MINIMAP_VIEWPORT_HALO_CHUNKS);
+        } else {
+            // Saved-data admission owns the complete fullscreen viewport. The
+            // live projector owns every actually loaded chunk, independent of
+            // the camera rectangle; level.hasChunk() remains the final guard in
+            // CaveDisplayScheduler. Do not intersect these bounds with the
+            // viewport or travelling/panning can leave valid loaded chunks
+            // outside the durable cave frontier.
+            minChunkX = playerChunkX - liveRadius;
+            maxChunkX = playerChunkX + liveRadius;
+            minChunkZ = playerChunkZ - liveRadius;
+            maxChunkZ = playerChunkZ + liveRadius;
         }
-        if (minChunkX <= maxChunkX && minChunkZ <= maxChunkZ) {
+        // Far-zoom fullscreen is a presentation/world-save viewport, not a second
+        // mutable live writer. When fullscreen is active the complete loaded player
+        // hot-set has already been admitted above through the MINIMAP lane. PASS101
+        // admitted the exact same chunk square again as FULLSCREEN; TaskKey merging
+        // avoided duplicate builders, but two live ViewportState owners then kept
+        // old tasks mutually alive during zoom/layer handoff. The log consequently
+        // sat at queued=256 with cancelled=0 even while the player was stationary.
+        // Xaero has one live writer and lets world-map consumers read its retained
+        // products, so keep one live authority here as well. Non-fullscreen callers
+        // still admit their own lane normally.
+        if (effectiveLane != MapRequestLane.FULLSCREEN
+                && minChunkX <= maxChunkX && minChunkZ <= maxChunkZ) {
             displayScheduler.enqueueViewport(minecraft.level, view, layerY,
                     minChunkX, maxChunkX, minChunkZ, maxChunkZ,
                     (minChunkX + maxChunkX) * 0.5, (minChunkZ + maxChunkZ) * 0.5,
                     effectiveLane.priorityBase(), effectiveLane);
         }
-        // The player-hot MINIMAP lane above is independent of the panned/zoomed
-        // fullscreen frontier. Drain it even when the live viewport intersection is
-        // empty, otherwise the marker can remain surrounded by old/blank cave leaves
-        // until the camera is moved back over the live chunk window.
+        // The player-hot MINIMAP live writer above is independent of the
+        // panned/zoomed fullscreen presentation frontier. Drain it even when the
+        // inspected map is far from the player so live cave collection continues.
         MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
         long budget = effectiveLane == MapRequestLane.MINIMAP
                 ? governor.gameplayScanBudgetNanos(true)
@@ -386,7 +520,6 @@ public final class CavePipeline {
             boolean revalidation = tile.isColumnScanned(blockX & 15, blockZ & 15);
             boolean changed = repository.commitColumn(tile, index, data);
             if (changed) {
-                markCurrentDisplayStale(blockX >> 4, blockZ >> 4);
                 enqueueCurrentDisplayPatch(blockX >> 4, blockZ >> 4,
                         blockX & 15, blockZ & 15, 1_600_000);
             }
@@ -430,8 +563,10 @@ public final class CavePipeline {
             readiness.markChunkChanged(chunkX, chunkZ);
             repository.invalidateLoadedTile(chunkX, chunkZ);
         }
-        repository.markDisplayRangeStaleAllLayers(
-                chunkX, chunkX, chunkZ, chunkZ, 4096);
+        if (geometryChanged) {
+            repository.markDisplayRangeStaleAllLayers(
+                    chunkX, chunkX, chunkZ, chunkZ, 4096);
+        }
         // Light packets can arrive in bursts while a chunk is settling. Cave
         // topology/emissive flags come from BlockState, so rebuilding the complete
         // vertical archive for light-only changes is both redundant and extremely
@@ -454,8 +589,9 @@ public final class CavePipeline {
     /** Chunk unload revokes authority but deliberately preserves cached pixels. */
     public void onChunkUnavailable(int chunkX, int chunkZ, int reasons) {
         readiness.markChunkChanged(chunkX, chunkZ);
-        repository.markDisplayRangeStaleAllLayers(
-                chunkX, chunkX, chunkZ, chunkZ, 4096);
+        // Unload revokes LIVE authority, not saved/archive correctness. Keep the
+        // last-good display page authoritative so a render-distance edge does not
+        // trigger an Anvil reread loop while the player stands or turns around.
         displayScheduler.cancelChunk(chunkX, chunkZ);
     }
 
@@ -466,7 +602,6 @@ public final class CavePipeline {
     public void requestColumnRecheck(int blockX, int blockZ) {
         int chunkX = blockX >> 4;
         int chunkZ = blockZ >> 4;
-        markCurrentDisplayStale(chunkX, chunkZ);
         enqueueCurrentDisplayPatch(chunkX, chunkZ,
                 blockX & 15, blockZ & 15, 1_400_000);
         if (repository.requestColumnRecheck(blockX, blockZ)) {
@@ -558,9 +693,10 @@ public final class CavePipeline {
                 }
             }
         }
-        UnifiedCaveTextureManager.getInstance().requestVisiblePages(
-                CaveView.LAYERED, topY, minX, maxX, minZ, maxZ, scale,
-                MapRequestLane.BACKGROUND);
+        // Deliberately stop here. Adjacent-band warmup owns only retained
+        // repository/source cache population. Sending a BACKGROUND viewport to
+        // UnifiedCaveTextureManager used to call activateLayerProjection(), retire
+        // the visible Top-Y and restart all exact/branch work every 500 ms.
     }
 
     private void markAndEnqueueWarmupRing(Minecraft minecraft,
@@ -745,15 +881,6 @@ public final class CavePipeline {
             queued |= repository.requestColumnRecheck(blockX, blockZ);
         }
         if (queued) scheduler.enqueueRevalidation(chunkX, chunkZ, 650_000);
-    }
-
-    private void markCurrentDisplayStale(int chunkX, int chunkZ) {
-        Minecraft minecraft = Minecraft.getInstance();
-        if (!usable(minecraft)) return;
-        CaveView view = CaveMode.isFullView(minecraft)
-                ? CaveView.FULL : CaveView.LAYERED;
-        repository.markDisplayTileStale(view, CaveMode.getLayerY(minecraft),
-                chunkX, chunkZ);
     }
 
     private void enqueueCurrentDisplayReplacement(int chunkX, int chunkZ,

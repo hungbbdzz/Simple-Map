@@ -46,6 +46,10 @@ public final class MapArchitectureCoordinator {
         MapUploadEngine.getInstance().drain(
                 System.nanoTime() + 1_000_000L, 2 * 1024 * 1024);
         MapGpuPageTableService.getInstance().swapAtFrameBoundary();
+        MapTextureManager.getInstance().onPageTableFrameBoundary();
+        MapOverviewTextureManager.getInstance().onPageTableFrameBoundary();
+        com.velorise.simplemap.client.cave.UnifiedCaveTextureManager.getInstance()
+                .onPageTableFrameBoundary();
     }
 
     public void onWorldLeave() {

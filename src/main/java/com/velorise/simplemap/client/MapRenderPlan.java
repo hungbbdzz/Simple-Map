@@ -25,11 +25,13 @@ import java.util.List;
  * exact page or branch node.</p>
  */
 final class MapRenderPlan {
+    /** Stable 512x512 compatibility texture retained below every finer LOD. */
+    static final int PHASE_LEGACY_UNDERLAY = 2;
     /** Region-centric M4 coverage always stays below factor-2 refinement. */
     static final int PHASE_REGION_COARSE = 4;
     static final int PHASE_BRANCH_BASE = 16;
     /** Exact fallback drawn immediately below the density-correct L1 branch. */
-    static final int PHASE_L1_EXACT_UNDERLAY = 27;
+    static final int PHASE_L1_EXACT_UNDERLAY = 19;
     static final int PHASE_EXACT = 96;
     static final int PHASE_GLOW = 128;
 
@@ -166,7 +168,7 @@ final class MapRenderPlan {
     }
 
     static final class Builder {
-        private static final int MAX_QUADS = 8_192;
+        private static final int MAX_QUADS = 32_768;
         private static final int FLOATS_PER_VERTEX = 4;
         private static final int VERTICES_PER_QUAD = 4;
         private static final int FLOATS_PER_QUAD = FLOATS_PER_VERTEX * VERTICES_PER_QUAD;
@@ -178,10 +180,18 @@ final class MapRenderPlan {
         private final MapGpuInstancePlan.Builder instances =
                 new MapGpuInstancePlan.Builder();
         private final long[] pending = new long[256];
+        /** Primitive open-addressed dedup; avoids O(N^2) pending-region scans. */
+        private final long[] pendingSet = new long[512];
+        private final boolean[] pendingSetUsed = new boolean[512];
+        /** One-plan region availability cache; avoids repeated synchronized/file-cache probes. */
+        private final long[] sourceRegionKeys = new long[256];
+        private final byte[] sourceRegionStates = new byte[256];
+        private final boolean[] sourceRegionUsed = new boolean[256];
         private int pendingCount;
         private int instanceCount;
         private int exactPages;
         private int branchNodes;
+        private int legacyFallbacks;
         private boolean logicalExactCoverage;
 
         boolean add(ResourceLocation texture, int phase,
@@ -205,9 +215,19 @@ final class MapRenderPlan {
 
         boolean addTile(TileKey key, int phase,
                 int x, int y, int width, int height) {
+            return addTile(key, phase, x, y, width, height,
+                    0.0f, 0.0f, 1.0f, 1.0f, 0);
+        }
+
+        boolean addTile(TileKey key, int phase,
+                int x, int y, int width, int height,
+                float localU0, float localV0, float localU1, float localV1,
+                int requiredCoverageMask) {
             if (key == null || width <= 0 || height <= 0
                     || quads.size() + instanceCount >= MAX_QUADS) return false;
-            boolean added = instances.add(key, phase, x, y, width, height);
+            boolean added = instances.add(key, phase, x, y, width, height,
+                    localU0, localV0, localU1, localV1,
+                    requiredCoverageMask);
             if (added) instanceCount++;
             return added;
         }
@@ -224,17 +244,56 @@ final class MapRenderPlan {
             branchNodes++;
         }
 
+        void legacy() {
+            legacyFallbacks++;
+        }
+
         void logicalExactCoverage() {
             logicalExactCoverage = true;
         }
 
-        void pending(int regionX, int regionZ) {
-            if (pendingCount >= pending.length) return;
+
+        boolean sourceRegionAvailable(MapManager manager, int regionX, int regionZ) {
+            if (manager == null) return false;
             long packed = ((long) regionX << 32) ^ (regionZ & 0xFFFFFFFFL);
-            for (int index = 0; index < pendingCount; index++) {
-                if (pending[index] == packed) return;
+            int slot = (int) mixPendingKey(packed) & (sourceRegionKeys.length - 1);
+            int probes = 0;
+            while (sourceRegionUsed[slot] && probes++ < sourceRegionKeys.length) {
+                if (sourceRegionKeys[slot] == packed) {
+                    return sourceRegionStates[slot] == 2;
+                }
+                slot = (slot + 1) & (sourceRegionKeys.length - 1);
             }
+            boolean available = manager.hasRegionFile(regionX, regionZ)
+                    || manager.isRegionLoadedInCache(regionX, regionZ);
+            if (probes < sourceRegionKeys.length) {
+                sourceRegionUsed[slot] = true;
+                sourceRegionKeys[slot] = packed;
+                sourceRegionStates[slot] = (byte) (available ? 2 : 1);
+            }
+            return available;
+        }
+
+        void pending(int regionX, int regionZ) {
+            long packed = ((long) regionX << 32) ^ (regionZ & 0xFFFFFFFFL);
+            int slot = (int) mixPendingKey(packed) & (pendingSet.length - 1);
+            while (pendingSetUsed[slot]) {
+                if (pendingSet[slot] == packed) return;
+                slot = (slot + 1) & (pendingSet.length - 1);
+            }
+            if (pendingCount >= pending.length) return;
+            pendingSetUsed[slot] = true;
+            pendingSet[slot] = packed;
             pending[pendingCount++] = packed;
+        }
+
+        private static long mixPendingKey(long value) {
+            value ^= value >>> 33;
+            value *= 0xff51afd7ed558ccdl;
+            value ^= value >>> 33;
+            value *= 0xc4ceb9fe1a85ec53l;
+            value ^= value >>> 33;
+            return value;
         }
 
         MapRenderPlan build(long topologyRevision) {
@@ -277,7 +336,7 @@ final class MapRenderPlan {
             int[] glowPhases = collectPhases(immutableGlow, instancePlan, true);
             return new MapRenderPlan(immutableBase, immutableGlow,
                     instancePlan, basePhases, glowPhases, pendingArray,
-                    new MapDrawResult(exactPages, branchNodes, 0),
+                    new MapDrawResult(exactPages, branchNodes, legacyFallbacks),
                     topologyRevision, System.nanoTime(),
                     quads.size() + instancePlan.size(),
                     base.size() + glow.size() + (instancePlan.size() == 0 ? 0 : 1),

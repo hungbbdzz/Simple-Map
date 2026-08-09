@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.surface;
 
 import com.velorise.simplemap.client.RegionSurfaceLodService;
+import com.velorise.simplemap.client.MapRequestLane;
 import com.velorise.simplemap.client.cave.CaveAtlasRegion;
 import com.velorise.simplemap.client.lod.RegionLodGraph;
 import com.velorise.simplemap.client.pipeline.RevisionStamp;
@@ -17,7 +18,7 @@ public final class SurfaceProjectionService {
             int focusPageX, int focusPageZ) {
         RegionSurfaceLodService.getInstance().setVisibleView(stamp, logicalScale,
                 minPageX, maxPageX, minPageZ, maxPageZ,
-                focusPageX, focusPageZ);
+                focusPageX, focusPageZ, MapRequestLane.FULLSCREEN);
     }
 
     public void publish(boolean focused, long deadlineNanos) {

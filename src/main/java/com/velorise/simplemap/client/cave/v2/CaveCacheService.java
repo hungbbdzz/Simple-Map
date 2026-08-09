@@ -15,6 +15,10 @@ public final class CaveCacheService {
         return CaveArchiveV2Service.getInstance().ingest(snapshot);
     }
 
+    public boolean ingest(CompactCaveTile compact) {
+        return CaveArchiveV2Service.getInstance().ingest(compact);
+    }
+
     public CompactCaveTile get(int chunkX, int chunkZ) {
         return CaveArchiveV2Service.getInstance().get(chunkX, chunkZ);
     }

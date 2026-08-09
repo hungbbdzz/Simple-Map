@@ -10,6 +10,7 @@ public enum MapPipelineStage {
     ANVIL_READ,
     DATA_FIX,
     CHUNK_DECODE,
+    WORLD_SOURCE_FANOUT,
     SOURCE_WAIT,
     SURFACE_CAPTURE,
     SURFACE_ASSEMBLY,

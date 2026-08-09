@@ -18,9 +18,7 @@ public final class ChunkSnapshot {
     private final long sourceRevision;
     private final long[] packedPixels;
     private final int[] tints;
-    private final short[] surfaceHeights;
     private final byte[] lightLevels;
-    private final byte[] visualFlags;
     private final Completeness completeness;
 
     public ChunkSnapshot(int localChunkX, int localChunkZ, long sourceRevision,
@@ -52,18 +50,9 @@ public final class ChunkSnapshot {
         this.tints = copy ? Arrays.copyOf(tints, PIXELS) : tints;
         this.lightLevels = lightLevels == null ? new byte[PIXELS]
                 : copy ? Arrays.copyOf(lightLevels, PIXELS) : lightLevels;
-        this.surfaceHeights = new short[PIXELS];
-        this.visualFlags = new byte[PIXELS];
         int known = 0;
-        for (int index = 0; index < PIXELS; index++) {
-            long packed = this.packedPixels[index];
-            if (MapBlockData.isEmpty(packed)) {
-                surfaceHeights[index] = Short.MIN_VALUE;
-                continue;
-            }
-            known++;
-            surfaceHeights[index] = MapBlockData.topY(packed);
-            visualFlags[index] = MapBlockData.flags(packed);
+        for (long packed : this.packedPixels) {
+            if (!MapBlockData.isEmpty(packed)) known++;
         }
         this.completeness = known == 0 ? Completeness.UNKNOWN
                 : known == PIXELS ? Completeness.COMPLETE : Completeness.PARTIAL;
@@ -76,9 +65,7 @@ public final class ChunkSnapshot {
 
     public long[] packedPixels() { return Arrays.copyOf(packedPixels, PIXELS); }
     public int[] tints() { return Arrays.copyOf(tints, PIXELS); }
-    public short[] surfaceHeights() { return Arrays.copyOf(surfaceHeights, PIXELS); }
     public byte[] lightLevels() { return Arrays.copyOf(lightLevels, PIXELS); }
-    public byte[] visualFlags() { return Arrays.copyOf(visualFlags, PIXELS); }
 
     long[] packedPixelsUnsafe() { return packedPixels; }
     int[] tintsUnsafe() { return tints; }

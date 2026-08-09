@@ -1,5 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.DimensionMapProfile;
+import com.velorise.simplemap.client.MapManager;
 import net.minecraft.world.level.Level;
 
 /**
@@ -55,10 +57,17 @@ public final class CaveDimensionProfile {
                 && id.equals(liveLevel.dimension().location().toString())) {
             return capability(liveLevel);
         }
+        DimensionMapProfile profile = MapManager.getInstance()
+                .getCurrentDimensionProfile();
+        if (profile != null && id.equals(profile.resourceId()) && profile.known()) {
+            if (profile.hasCeiling()) return Capability.FULL;
+            if (profile.hasSkyLight()) return Capability.LAYERED;
+            return Capability.SURFACE_ONLY;
+        }
+        // Unknown custom remote dimensions stay conservative until visited once.
         return switch (id) {
             case "minecraft:the_nether" -> Capability.FULL;
             case "minecraft:overworld" -> Capability.LAYERED;
-            case "minecraft:the_end" -> Capability.SURFACE_ONLY;
             default -> Capability.SURFACE_ONLY;
         };
     }

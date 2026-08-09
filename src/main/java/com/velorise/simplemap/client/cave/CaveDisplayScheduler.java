@@ -30,20 +30,20 @@ final class CaveDisplayScheduler {
      * 64x64 pages are enough build-ahead; the rolling page frontier revisits work
      * that could not be admitted.
      */
-    private static final int MAX_TASKS = 128;
+    private static final int MAX_TASKS = 256;
     /**
      * Primitive packet-arrival frontier. It deliberately owns only the newest
      * travel history: one chunk is completed coherently before the next becomes
      * foreground demand, while the bounded FIFO drops cold history behind a very
      * fast player instead of creating an unbounded post-travel backlog.
      */
-    private static final int MAX_LOADED_CHUNK_FRONTIER = 192;
+    private static final int MAX_LOADED_CHUNK_FRONTIER = 8192;
     private static final int MAX_HEAD_RETRY_PULSES = 160;
-    private static final int LOADED_CHUNKS_ADMITTED_PER_PULSE = 6;
-    private static final int LOADED_CHUNKS_INSPECTED_PER_PULSE = 24;
-    private static final int COLUMN_BURST = 8;
+    private static final int LOADED_CHUNKS_ADMITTED_PER_PULSE = 48;
+    private static final int LOADED_CHUNKS_INSPECTED_PER_PULSE = 1024;
+    private static final int COLUMN_BURST = 64;
     /** Deadline checks inside one vertical column, not merely between columns. */
-    private static final int COLUMN_VERTICAL_BURST = 8;
+    private static final int COLUMN_VERTICAL_BURST = 16;
     private static final long VIEWPORT_REFRESH_NANOS = 150_000_000L;
 
     private final CaveTileRepository repository;
@@ -170,6 +170,39 @@ final class CaveDisplayScheduler {
         }
     }
 
+    /**
+     * Source-only AUTO warmup. Unlike enqueueViewport this does not create a
+     * MINIMAP presentation lease, so preparing Cave behind a still-visible Surface
+     * frame cannot generate foreground handoff/revoke churn. Completed tiles remain
+     * in CaveTileRepository and the real minimap viewport can publish them after the
+     * display latch opens.
+     */
+    void enqueueWarmupWindow(Level level, CaveView view, int layerY,
+            int centerChunkX, int centerChunkZ, int radius, int basePriority) {
+        if (level == null || radius < 0) return;
+        activateMode(view, layerY);
+        int ordinal = 0;
+        for (int ring = 0; ring <= radius; ring++) {
+            for (int dz = -ring; dz <= ring; dz++) {
+                for (int dx = -ring; dx <= ring; dx++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
+                    int chunkX = centerChunkX + dx;
+                    int chunkZ = centerChunkZ + dz;
+                    int priority = basePriority - ordinal++ * 2_000;
+                    if (!level.hasChunk(chunkX, chunkZ)
+                            || repository.hasFreshDisplayTileSource(view, layerY,
+                                    chunkX, chunkZ, DenseCaveTile.Source.LIVE)) {
+                        continue;
+                    }
+                    // null lane = finite source transaction only. It does not
+                    // register a VisiblePlanner/foreground rectangle and disappears
+                    // after commit. The ring traversal is allocation-free.
+                    enqueue(chunkX, chunkZ, view, layerY, priority, null, -1, false);
+                }
+            }
+        }
+    }
+
     int loadedChunkFrontierSize() {
         return loadedChunkFrontier.size();
     }
@@ -252,8 +285,10 @@ final class CaveDisplayScheduler {
                 state.fullscreenPageCursor = 0;
                 state.completedCycles++;
             }
-            int pageBudget = com.velorise.simplemap.client.MapPerformanceGovernor
-                    .getInstance().underPressure() ? 2 : 4;
+            com.velorise.simplemap.client.MapPerformanceGovernor governor =
+                    com.velorise.simplemap.client.MapPerformanceGovernor.getInstance();
+            int pageBudget = governor.underPressure() ? 2
+                    : governor.hasStreamingHeadroom() ? 8 : 4;
             for (int page = 0; page < pageBudget
                     && state.fullscreenPageCursor < totalPages; page++) {
                 int ordinal = state.fullscreenPageCursor++;
@@ -297,7 +332,7 @@ final class CaveDisplayScheduler {
             state.completedCycles++;
         }
         int chunkBudget = com.velorise.simplemap.client.MapPerformanceGovernor
-                .getInstance().underPressure() ? 12 : 36;
+                .getInstance().underPressure() ? 48 : 128;
         chunkBudget = CaveModeTransitionPolicy.viewportChunkBudget(chunkBudget);
         int considered = 0;
         while (considered < chunkBudget && state.chunkCursor < totalChunks) {
@@ -379,7 +414,7 @@ final class CaveDisplayScheduler {
             return;
         }
         if (queued.size() >= MAX_TASKS
-                && (viewportLane != null || !evictWeakViewportTask(priority))) return;
+                && !evictWeakViewportTask(priority)) return;
         Task task = new Task(key, layerY, priority, sequence++, repository.generation(),
                 viewportLane != null, fullProjection);
         if (!fullProjection) task.addPatchColumn(patchColumn);
@@ -649,6 +684,7 @@ final class CaveDisplayScheduler {
         private int maxChunkZ = Integer.MIN_VALUE;
         private long lastEnqueueNanos;
         private long[] pagePlan = new long[0];
+        private CaveLoadHierarchy.OrdinalIndex pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(new long[0]);
         private int fullscreenPageCursor;
         private long[] chunkPlan = new long[0];
         private int chunkCursor;
@@ -692,6 +728,7 @@ final class CaveDisplayScheduler {
                             centerPageX, centerPageZ, true, continuousPan,
                             previousMinPageX, previousMaxPageX,
                             previousMinPageZ, previousMaxPageZ);
+                    pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(pagePlan);
                     fullscreenPageCursor = 0;
                     chunkPlan = new long[0];
                     chunkCursor = 0;
@@ -701,6 +738,7 @@ final class CaveDisplayScheduler {
                             centerChunkX, centerChunkZ);
                     chunkCursor = 0;
                     pagePlan = new long[0];
+                    pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(new long[0]);
                     fullscreenPageCursor = 0;
                 }
                 completedCycles = 0L;
@@ -749,17 +787,8 @@ final class CaveDisplayScheduler {
         private int fullscreenPriority(int chunkX, int chunkZ, int basePriority) {
             int pageX = Math.floorDiv(chunkX, 4);
             int pageZ = Math.floorDiv(chunkZ, 4);
-            int minPageX = Math.floorDiv(minChunkX, 4);
-            int maxPageX = Math.floorDiv(maxChunkX, 4);
-            int minPageZ = Math.floorDiv(minChunkZ, 4);
-            int maxPageZ = Math.floorDiv(maxChunkZ, 4);
-            int centerPageX = clamp((int) Math.floor(centerChunkX / 4.0),
-                    minPageX, maxPageX);
-            int centerPageZ = clamp((int) Math.floor(centerChunkZ / 4.0),
-                    minPageZ, maxPageZ);
-            int ordinal = CaveLoadHierarchy.centerOutOrdinal(
-                    minPageX, maxPageX, minPageZ, maxPageZ,
-                    centerPageX, centerPageZ, pageX, pageZ);
+            int ordinal = pageOrdinals.getOrDefault(
+                    CaveLoadHierarchy.pack(pageX, pageZ), -1);
             if (ordinal < 0) ordinal = 0;
 
             // A page is only revealed transactionally, but completing its four-by-four
@@ -798,6 +827,7 @@ final class CaveDisplayScheduler {
             minChunkX = maxChunkX = minChunkZ = maxChunkZ = Integer.MIN_VALUE;
             lastEnqueueNanos = 0L;
             pagePlan = new long[0];
+            pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(new long[0]);
             fullscreenPageCursor = 0;
             chunkPlan = new long[0];
             chunkCursor = 0;

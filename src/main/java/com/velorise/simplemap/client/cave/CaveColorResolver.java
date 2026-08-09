@@ -182,19 +182,11 @@ public final class CaveColorResolver {
         }
         if (rgb == 0) rgb = fallbackColor(state);
 
-        if (MapConfig.blockColourMode == 0) {
-            boolean leaves = visual.leaves();
-            boolean cherry = visual.fixedTextureColor();
-            boolean grass = visual.grass();
-            MapColor mapColor;
-            try {
-                mapColor = state.getMapColor(level, pos);
-            } catch (Throwable ignored) {
-                mapColor = MapColor.NONE;
-            }
-            boolean wood = mapColor == MapColor.WOOD || visual.wood();
-            rgb = enrich(rgb, leaves, cherry, grass, wood);
-        }
+        // Accurate material sampling must remain identical to the Surface input.
+        // CavePageStyler applies MapAccurateColorFilter after cave depth/light
+        // composition. Applying a second saturation/brightness transform here made
+        // Nether palettes clip to red/cyan and meant Cave "Accurate" was not the
+        // same colour pipeline as Surface "Accurate".
 
         if (includeEmissionBoost && state.getLightEmission() > 0) {
             rgb = boostEmission(rgb, state.getLightEmission());
@@ -237,19 +229,8 @@ public final class CaveColorResolver {
             }
         }
 
-        if (MapConfig.blockColourMode == 0) {
-            boolean leaves = visual.leaves();
-            boolean cherry = visual.fixedTextureColor();
-            boolean grass = visual.grass();
-            MapColor mapColor;
-            try {
-                mapColor = state.getMapColor(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
-            } catch (Throwable ignored) {
-                mapColor = MapColor.NONE;
-            }
-            boolean wood = mapColor == MapColor.WOOD || visual.wood();
-            rgb = enrich(rgb, leaves, cherry, grass, wood);
-        }
+        // Do not pre-enrich offline cave material colours. They pass through the
+        // same final Accurate filter as live cave and Surface pixels.
         if (includeEmissionBoost && state.getLightEmission() > 0) {
             rgb = boostEmission(rgb, state.getLightEmission());
         }
@@ -295,7 +276,7 @@ public final class CaveColorResolver {
             } catch (Throwable ignored) {
             }
         }
-        return blendWater(floorAbgr, waterRgb, depth, false);
+        return blendWater(floorAbgr, waterRgb, depth);
     }
 
     private static int liftForOffline(int abgr) {
@@ -311,14 +292,23 @@ public final class CaveColorResolver {
     private int waterOverlay(Level level, BlockPos waterPos, int floorAbgr, int depth) {
         int waterRgb = liveBiomeTint(level, waterPos,
                 BlockTintPolicy.NONE, true);
-        return blendWater(floorAbgr, waterRgb, depth, true);
+        return blendWater(floorAbgr, waterRgb, depth);
     }
 
-    private static int blendWater(int floorAbgr, int waterRgb, int depth,
-            boolean attenuate) {
-        float amount = Math.min(0.82f, 0.34f + Math.max(1, depth) * 0.055f);
-        float attenuation = attenuate ? Math.max(0.72f,
-                (float) Math.pow(0.982f, Math.max(0, depth - 2))) : 1.0f;
+    private static int blendWater(int floorAbgr, int waterRgb, int depth) {
+        /*
+         * Match Xaero's overlay model instead of changing water RGB/alpha with
+         * depth. A liquid overlay always contributes alpha 191/255; additional
+         * water blocks accumulate 0..15 opacity and reduce the light reaching the
+         * basin floor. Archive columns collapse that overlay stack into one raw
+         * colour, so encode only the floor-light loss here and leave normal cave
+         * depth/light grading to CavePageStyler.
+         */
+        int opacity = Math.min(15, Math.max(1, depth));
+        int remainingSun = Math.max(0, 15 - opacity);
+        float floorBrightness = (9.0f + remainingSun) / 24.0f;
+        float waterAlpha = 191.0f / 255.0f;
+        float floorWeight = (1.0f - waterAlpha) * floorBrightness;
         int floorRed = floorAbgr & 0xFF;
         int floorGreen = (floorAbgr >>> 8) & 0xFF;
         int floorBlue = (floorAbgr >>> 16) & 0xFF;
@@ -326,9 +316,12 @@ public final class CaveColorResolver {
         int waterGreen = (waterRgb >>> 8) & 0xFF;
         int waterBlue = waterRgb & 0xFF;
 
-        int red = clamp(Math.round((floorRed + (waterRed - floorRed) * amount) * attenuation));
-        int green = clamp(Math.round((floorGreen + (waterGreen - floorGreen) * amount) * attenuation));
-        int blue = clamp(Math.round((floorBlue + (waterBlue - floorBlue) * amount) * attenuation));
+        int red = clamp(Math.round(floorRed * floorWeight
+                + waterRed * waterAlpha));
+        int green = clamp(Math.round(floorGreen * floorWeight
+                + waterGreen * waterAlpha));
+        int blue = clamp(Math.round(floorBlue * floorWeight
+                + waterBlue * waterAlpha));
         return 0xFF000000 | (blue << 16) | (green << 8) | red;
     }
 
@@ -363,20 +356,6 @@ public final class CaveColorResolver {
         int red = clamp(Math.round(((rgb >>> 16) & 0xFF) * boost));
         int green = clamp(Math.round(((rgb >>> 8) & 0xFF) * boost));
         int blue = clamp(Math.round((rgb & 0xFF) * boost));
-        return (red << 16) | (green << 8) | blue;
-    }
-
-    private static int enrich(int rgb, boolean leaves, boolean cherry,
-            boolean grass, boolean wood) {
-        int red = (rgb >>> 16) & 0xFF;
-        int green = (rgb >>> 8) & 0xFF;
-        int blue = rgb & 0xFF;
-        float luma = red * 0.2126f + green * 0.7152f + blue * 0.0722f;
-        float saturation = cherry ? 1.05f : (leaves || grass ? 1.10f : 1.06f);
-        float brightness = cherry ? 0.98f : (leaves ? 0.96f : (grass ? 0.98f : (wood ? 0.94f : 0.98f)));
-        red = clamp(Math.round((luma + (red - luma) * saturation) * brightness));
-        green = clamp(Math.round((luma + (green - luma) * saturation) * brightness));
-        blue = clamp(Math.round((luma + (blue - luma) * saturation) * brightness));
         return (red << 16) | (green << 8) | blue;
     }
 

@@ -16,11 +16,15 @@ public final class CaveProjectionController {
     public void request(CaveView view, int layerY,
             double minX, double maxX, double minZ, double maxZ,
             float scale, double focusX, double focusZ, MapRequestLane lane) {
+        int projectionLayerY = layerY;
         if (view == CaveView.LAYERED) {
-            // The facade owns Xaero-style loading/loaded layer handoff. Requesting
-            // the unified atlas directly exposed old and new bands page-by-page.
-            CaveTextureManager.getInstance().requestVisiblePages(layerY,
+            // The facade owns Xaero-style target/writer/display separation. During
+            // vertical movement the minimap keeps its stable writer layer instead
+            // of starting one focus projection for every transient player Y.
+            CaveTextureManager caveTextures = CaveTextureManager.getInstance();
+            caveTextures.requestVisiblePages(layerY,
                     minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
+            projectionLayerY = caveTextures.projectionLayerForLane(layerY, lane);
         } else {
             UnifiedCaveTextureManager.getInstance().requestVisiblePages(view, layerY,
                     minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
@@ -31,7 +35,7 @@ public final class CaveProjectionController {
             CaveProjectionServiceV2.getInstance().fullSummary(chunkX, chunkZ);
         } else {
             CaveProjectionServiceV2.getInstance().layered(chunkX, chunkZ,
-                    layerY, 0L);
+                    projectionLayerY, 0L);
         }
     }
 }

@@ -147,8 +147,8 @@ public final class M2M3CoreCheck {
 
     private static void checkSurfaceBatchPolicy() {
         require(SurfaceBatchPolicy.chooseBatchSize(MapRequestLane.FULLSCREEN,
-                        false, false, 16) == 2,
-                "cold fullscreen demand did not coalesce to 2x2");
+                        false, false, 16) == 1,
+                "cold fullscreen demand was not bounded to one coherent leaf");
         require(SurfaceBatchPolicy.chooseBatchSize(MapRequestLane.MINIMAP,
                         true, true, 3) == 2,
                 "warm minimap demand did not expand to 2x2");
@@ -181,18 +181,25 @@ public final class M2M3CoreCheck {
                 "0.18x surface view did not select density-correct L2");
         require(MapLodPolicy.branchLevel(0.06f, 3) == 3,
                 "far surface view exceeded the L3 quality floor");
+        require(MapLodPolicy.branchLevel(MapConfig.MINIMUM_ZOOM_SCALE, 3) == 3,
+                "minimum supported cave zoom did not retain the Xaero L3 floor");
+        require(MapMemoryBudgetPolicy.caveBranchColumns(3) >= 24,
+                "detail cave branch atlas cannot retain a useful 16:9 working set");
+        require(MapMemoryBudgetPolicy.caveBranchColumns(4)
+                        == MapMemoryBudgetPolicy.branchHighColumns(),
+                "coarse cave levels incorrectly inherited the enlarged detail atlas");
 
         MapRenderScalePolicy.Scales fbo = MapRenderScalePolicy.fullscreenFbo(
                 0.29f, 2.0);
         require(Math.abs(fbo.renderPixelsPerBlock() - 0.58f) < 0.0001f,
                 "physical FBO geometry scale was not expanded by GUI scale");
-        require(Math.abs(fbo.policyPixelsPerBlock() - 0.29f) < 0.0001f,
-                "LOD policy scale was incorrectly expanded by GUI scale");
-        require(MapLodPolicy.branchLevel(fbo.policyPixelsPerBlock(), 3) == 1,
-                "fullscreen FBO shifted a logical L1 view back to L0");
+        require(Math.abs(fbo.policyPixelsPerBlock() - 0.58f) < 0.0001f,
+                "LOD policy did not use the physical framebuffer density");
+        require(MapLodPolicy.branchLevel(fbo.policyPixelsPerBlock(), 3) == 0,
+                "physical 0.58 px/block view incorrectly selected a blurred branch level");
 
         MapSurfaceDemandPolicy.trim(-1000.0, 1000.0,
-                -500.0, 500.0, fbo.policyPixelsPerBlock());
+                -500.0, 500.0, 0.29f);
         MapSurfaceDemandPolicy.Snapshot demand = MapSurfaceDemandPolicy.snapshot();
         require(!demand.trimmed() && demand.exactActiveWindow() == 16,
                 "logical 0.29x demand policy did not preserve adaptive chunk work");

@@ -156,6 +156,30 @@ public final class DenseCaveTile {
     byte[] overlayLightUnsafe() { return overlayLight; }
     byte[] overlayFlagsUnsafe() { return overlayFlags; }
 
+    /**
+     * Compares immutable projection payload while deliberately ignoring the
+     * monotonic source revision. Re-decoding the same Anvil chunk creates a new
+     * source object/revision; treating that as new cave geometry repeatedly
+     * invalidated exact pages even though every pixel was identical.
+     */
+    boolean sameProjectionContent(DenseCaveTile other) {
+        if (other == null || chunkX != other.chunkX || chunkZ != other.chunkZ
+                || view != other.view || layerY != other.layerY
+                || projectionTopY != other.projectionTopY
+                || populatedColumns != other.populatedColumns) return false;
+        return Arrays.equals(baseColors, other.baseColors)
+                && Arrays.equals(floorY, other.floorY)
+                && Arrays.equals(topY, other.topY)
+                && Arrays.equals(flags, other.flags)
+                && Arrays.equals(baseLight, other.baseLight)
+                && Arrays.equals(overlayCounts, other.overlayCounts)
+                && Arrays.equals(overlayColors, other.overlayColors)
+                && Arrays.equals(overlayAlpha, other.overlayAlpha)
+                && Arrays.equals(overlayY, other.overlayY)
+                && Arrays.equals(overlayLight, other.overlayLight)
+                && Arrays.equals(overlayFlags, other.overlayFlags);
+    }
+
     public static int index(int localX, int localZ) {
         return (localZ & 15) * SIZE + (localX & 15);
     }

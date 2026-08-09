@@ -34,17 +34,21 @@ import java.util.function.Supplier;
 public final class MapWorkScheduler {
     private static final int PROCESSORS = Math.max(2,
             Runtime.getRuntime().availableProcessors());
+    // Scale beyond the old four-worker ceiling, but never consume the whole CPU.
+    // Minecraft render, integrated-server and chunk-meshing threads keep at least
+    // two logical processors and map CPU concurrency is capped at eight.
     private static final int CPU_THREADS = Math.max(2,
-            Math.min(4, Math.max(2, PROCESSORS / 3)));
-    private static final int IO_THREADS = 2;
+            Math.min(8, Math.max(2, PROCESSORS - 2)));
+    private static final int IO_THREADS = Math.max(2,
+            Math.min(4, Math.max(2, PROCESSORS / 4)));
     private static final MapRequestLane[] REQUEST_LANES = MapRequestLane.values();
 
     /** Cost units are deliberately coarse; they represent retained snapshots and
      * expected CPU/IO occupancy, not milliseconds. */
-    private static final long CPU_SOFT_COST = 640L;
-    private static final long CPU_HARD_COST = 960L;
-    private static final long IO_SOFT_COST = 320L;
-    private static final long IO_HARD_COST = 512L;
+    private static final long CPU_SOFT_COST = 1_280L;
+    private static final long CPU_HARD_COST = 1_920L;
+    private static final long IO_SOFT_COST = 640L;
+    private static final long IO_HARD_COST = 1_024L;
 
     private static final AtomicLong SEQUENCE = new AtomicLong();
     private static final AtomicLong CPU_QUEUED_COST = new AtomicLong();
@@ -113,6 +117,7 @@ public final class MapWorkScheduler {
     /** Work type controls global ordering after the viewport lane. */
     public enum WorkType {
         MINIMAP_EXACT(90, true),
+        REGION_PROJECTION(88, true),
         EXACT_BUILD(80, true),
         SOURCE_DECODE(70, false),
         SOURCE_PROJECTION(65, false),
@@ -480,7 +485,7 @@ public final class MapWorkScheduler {
         return switch (type) {
             case SOURCE_DECODE, DISK_READ ->
                     MapMemoryLeaseManager.Category.PENDING_SOURCE;
-            case MINIMAP_EXACT, EXACT_BUILD, SOURCE_PROJECTION, LEGACY_BUILD ->
+            case MINIMAP_EXACT, REGION_PROJECTION, EXACT_BUILD, SOURCE_PROJECTION, LEGACY_BUILD ->
                     MapMemoryLeaseManager.Category.PENDING_PROJECTION;
             case BRANCH_DERIVE -> MapMemoryLeaseManager.Category.PENDING_LOD;
             case DISK_WRITE, CACHE_MAINTENANCE ->
@@ -490,7 +495,7 @@ public final class MapWorkScheduler {
 
     private static long estimateRetainedBytes(WorkType type, int cost) {
         long unit = switch (type) {
-            case MINIMAP_EXACT, EXACT_BUILD, SOURCE_PROJECTION -> 96L << 10;
+            case MINIMAP_EXACT, REGION_PROJECTION, EXACT_BUILD, SOURCE_PROJECTION -> 96L << 10;
             case SOURCE_DECODE, DISK_READ -> 80L << 10;
             case BRANCH_DERIVE -> 64L << 10;
             case LEGACY_BUILD -> 48L << 10;

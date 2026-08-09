@@ -164,7 +164,7 @@ final class MapTextureBuildWorker {
             int updateSubtiles = requestedSubtileMask
                     & MapPageLayout.completeSubtileMask(knownRows);
             int[] pageStyled = SurfaceColorizer.colorizePageWindow(
-                    pixels, tints, stride, halo, worldPageStartX, worldPageStartZ,
+                    pixels, tints, known, stride, halo, worldPageStartX, worldPageStartZ,
                     biomePalette, blockPalette, biomeLookup, blockColors,
                     tintPolicies, tintDisabledBlocks, colourMode, showFlowers,
                     terrainSlopes, profile, updateSubtiles, valid);
@@ -227,17 +227,32 @@ final class MapTextureBuildWorker {
             int compactPixels = compactStride * compactStride;
             int halo = source.halo();
 
-            // One worker-local scratch window is reused for every leaf in the
-            // transaction. Only styled/glow/known output survives publication.
-            long[] pixels = new long[compactPixels];
-            int[] tints = new int[compactPixels];
-            byte[] lights = new byte[compactPixels];
-            byte[] known = new byte[compactPixels];
+            /*
+             * A 1x1 transaction is already exactly one PAGE_SNAPSHOT_SIZE window.
+             * PASS102 nevertheless allocated a second long/int/byte/byte 66x66
+             * scratch set and copied the assembled source into it. Minimap is now
+             * deliberately 1x1, so that duplicate accounted for four avoidable
+             * primitive arrays on every live page build. Borrow the immutable
+             * worker-local assembly directly for 1x1 and keep reusable compact
+             * scratch only for multi-page fullscreen batches.
+             */
+            boolean directSinglePage = source.pagesWide() == 1
+                    && source.pagesHigh() == 1
+                    && source.stride() == compactStride
+                    && source.height() == compactStride;
+            long[] pixels = directSinglePage ? source.pixelsUnsafe()
+                    : new long[compactPixels];
+            int[] tints = directSinglePage ? source.tintsUnsafe()
+                    : new int[compactPixels];
+            byte[] lights = directSinglePage ? source.lightUnsafe()
+                    : new byte[compactPixels];
+            byte[] known = directSinglePage ? source.knownUnsafe()
+                    : new byte[compactPixels];
             byte[] smoothedLights = new byte[MapPageLayout.PAGE_SIZE
                     * MapPageLayout.PAGE_SIZE];
-            IntFunction<Biome> biomeLookup = style.biomeLookup();
             List<String> biomePalette = source.biomePalette();
             List<String> blockPalette = source.blockPalette();
+            IntFunction<Biome> biomeLookup = style.biomeLookup(biomePalette);
 
             for (int pageZ = 0; pageZ < source.pagesHigh(); pageZ++) {
                 for (int pageX = 0; pageX < source.pagesWide(); pageX++) {
@@ -246,17 +261,19 @@ final class MapTextureBuildWorker {
                     check(valid);
                     int sourceX = pageX * MapPageLayout.PAGE_SIZE;
                     int sourceZ = pageZ * MapPageLayout.PAGE_SIZE;
-                    for (int z = 0; z < compactStride; z++) {
-                        int from = (sourceZ + z) * source.stride() + sourceX;
-                        int to = z * compactStride;
-                        System.arraycopy(source.pixelsUnsafe(), from,
-                                pixels, to, compactStride);
-                        System.arraycopy(source.tintsUnsafe(), from,
-                                tints, to, compactStride);
-                        System.arraycopy(source.lightUnsafe(), from,
-                                lights, to, compactStride);
-                        System.arraycopy(source.knownUnsafe(), from,
-                                known, to, compactStride);
+                    if (!directSinglePage) {
+                        for (int z = 0; z < compactStride; z++) {
+                            int from = (sourceZ + z) * source.stride() + sourceX;
+                            int to = z * compactStride;
+                            System.arraycopy(source.pixelsUnsafe(), from,
+                                    pixels, to, compactStride);
+                            System.arraycopy(source.tintsUnsafe(), from,
+                                    tints, to, compactStride);
+                            System.arraycopy(source.lightUnsafe(), from,
+                                    lights, to, compactStride);
+                            System.arraycopy(source.knownUnsafe(), from,
+                                    known, to, compactStride);
+                        }
                     }
                     int worldPageStartX = source.worldPageStartX()
                             + pageX * MapPageLayout.PAGE_SIZE;
@@ -267,7 +284,7 @@ final class MapTextureBuildWorker {
                     int updateSubtiles = requestedSubtileMasks[pageIndex]
                             & MapPageLayout.completeSubtileMask(knownRows);
                     int[] styled = SurfaceColorizer.colorizePageWindow(
-                            pixels, tints, compactStride, halo,
+                            pixels, tints, known, compactStride, halo,
                             worldPageStartX, worldPageStartZ,
                             biomePalette, blockPalette, biomeLookup,
                             style.blockColors(), style.tintPolicies(),
@@ -306,21 +323,26 @@ final class MapTextureBuildWorker {
     }
 
     /**
-     * Lightweight direct projection from the already resident region. The source
-     * is sampled at the final level-0 density before it leaves the region lock, so
-     * this path allocates and colorizes 66x66 cells instead of assembling the
-     * complete 514x514 region window merely to discard 63/64 of it.
+     * Lightweight direct projection from the already resident region. PASS118
+     * uses a 4-block supersample grid and linearly reduces 2x2 styled samples into
+     * each final level-0 texel. This removes the point-sampled 8x8 alias pattern
+     * without cloning/colorizing the full 512x512 region.
      */
     static CompletableFuture<PreparedBranch> tryBuildRegionLodLevel0(
             RegionLodGraph.Lease lease, MapManager.RegionLodSnapshot source,
             MapStyleSnapshot style, BooleanSupplier stillValid,
             int executorPriority) {
+        int sampledOutputSize = source == null ? 0
+                : source.stride() - source.halo() * 2;
         if (lease == null || source == null || style == null
-                || lease.key().level() != 0 || source.stride() != 66
-                || source.halo() != 1
-                || source.pixelsUnsafe().length != 66 * 66
-                || source.tintsUnsafe().length != 66 * 66
-                || source.knownUnsafe().length != 66 * 66) {
+                || lease.key().level() != 0 || source.halo() != 1
+                || source.sampleStep() != 4 || sampledOutputSize != 128
+                || source.pixelsUnsafe().length
+                        != source.stride() * source.stride()
+                || source.tintsUnsafe().length
+                        != source.pixelsUnsafe().length
+                || source.knownUnsafe().length
+                        != source.pixelsUnsafe().length) {
             return null;
         }
         MapRequestLane lane = MapWorkScheduler.laneForExecutorPriority(
@@ -329,29 +351,60 @@ final class MapTextureBuildWorker {
                 lane.priorityBase(), 12, stillValid, () -> {
             BooleanSupplier valid = guarded(stillValid);
             check(valid);
-            int[] output = SurfaceColorizer.colorizePageWindow(
-                    source.pixelsUnsafe(), source.tintsUnsafe(), source.stride(),
-                    source.halo(), source.regionX() * MapPageLayout.REGION_SIZE,
-                    source.regionZ() * MapPageLayout.REGION_SIZE,
+            int[] supersampled = SurfaceColorizer.colorizeSampleWindow(
+                    source.pixelsUnsafe(), source.tintsUnsafe(), source.knownUnsafe(),
+                    source.stride(),
+                    source.halo(), sampledOutputSize,
+                    source.regionX() * MapPageLayout.REGION_SIZE
+                            + source.sampleStep() / 2,
+                    source.regionZ() * MapPageLayout.REGION_SIZE
+                            + source.sampleStep() / 2,
+                    source.sampleStep(),
                     Arrays.asList(source.biomePaletteUnsafe()),
                     Arrays.asList(source.blockPaletteUnsafe()),
                     style.biomeLookup(), style.blockColors(),
                     style.tintPolicies(), style.tintDisabledBlocks(),
                     style.colourMode(), style.showFlowers(),
                     style.terrainSlopes(), style.profile(), valid);
-
+            int[] output = new int[64 * 64];
             long[] knownRows = new long[64];
             byte[] known = source.knownUnsafe();
             int stride = source.stride();
             int halo = source.halo();
             for (int y = 0; y < 64; y++) {
                 if ((y & 15) == 0) check(valid);
-                long row = 0L;
-                int offset = (y + halo) * stride + halo;
+                int sampleY = y << 1;
                 for (int x = 0; x < 64; x++) {
-                    if (known[offset + x] != 0) row |= 1L << x;
+                    int sampleX = x << 1;
+                    int knownCount = 0;
+                    long red = 0L;
+                    long green = 0L;
+                    long blue = 0L;
+                    int colored = 0;
+                    for (int dz = 0; dz < 2; dz++) {
+                        int sourceY = sampleY + dz;
+                        int knownRowOffset = (sourceY + halo) * stride + halo;
+                        int colorRowOffset = sourceY * sampledOutputSize;
+                        for (int dx = 0; dx < 2; dx++) {
+                            int sourceX = sampleX + dx;
+                            if (known[knownRowOffset + sourceX] == 0) continue;
+                            knownCount++;
+                            int color = supersampled[colorRowOffset + sourceX];
+                            if ((color >>> 24) == 0) continue;
+                            colored++;
+                            red += color & 0xFF;
+                            green += (color >>> 8) & 0xFF;
+                            blue += (color >>> 16) & 0xFF;
+                        }
+                    }
+                    if (knownCount > 0) knownRows[y] |= 1L << x;
+                    if (colored > 0) {
+                        output[y * 64 + x] = 0xFF000000
+                                | ((int) (blue / colored) << 16)
+                                | ((int) (green / colored) << 8)
+                                | (int) (red / colored);
+                    }
                 }
-                knownRows[y] = row;
             }
 
             long knownMask = 0L;

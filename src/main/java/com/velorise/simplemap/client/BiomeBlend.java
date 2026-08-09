@@ -2,7 +2,7 @@ package com.velorise.simplemap.client;
 
 import net.minecraft.world.level.biome.Biome;
 
-/** Pure 3x3 biome color blending over packed region pixels. */
+/** Xaero-style cross-kernel biome color blending over packed map pixels. */
 public final class BiomeBlend {
     public static final int BLEND_RADIUS = 1;
     private static final int SIZE = 512;
@@ -18,7 +18,7 @@ public final class BiomeBlend {
     public static int blendGrass(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup, int px, int pz,
             int width, int height) {
-        return blend(pixelData, biomeLookup, px, pz, width, height,
+        return blend(pixelData, biomeLookup, px, pz, width, height, false,
                 BiomeColors::getGrassColor);
     }
 
@@ -30,7 +30,7 @@ public final class BiomeBlend {
     public static int blendFoliage(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup, int px, int pz,
             int width, int height) {
-        return blend(pixelData, biomeLookup, px, pz, width, height,
+        return blend(pixelData, biomeLookup, px, pz, width, height, false,
                 BiomeColors::getFoliageColor);
     }
 
@@ -42,7 +42,7 @@ public final class BiomeBlend {
     public static int blendWater(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup, int px, int pz,
             int width, int height) {
-        return blend(pixelData, biomeLookup, px, pz, width, height,
+        return blend(pixelData, biomeLookup, px, pz, width, height, true,
                 BiomeColors::getWaterColor);
     }
 
@@ -53,13 +53,19 @@ public final class BiomeBlend {
 
     private static int blend(long[] pixelData,
             java.util.function.IntFunction<Biome> biomeLookup,
-            int px, int pz, int width, int height, ColorExtractor extractor) {
+            int px, int pz, int width, int height, boolean includeDiagonals,
+            ColorExtractor extractor) {
         int red = 0;
         int green = 0;
         int blue = 0;
         int count = 0;
         for (int dz = -BLEND_RADIUS; dz <= BLEND_RADIUS; dz++) {
             for (int dx = -BLEND_RADIUS; dx <= BLEND_RADIUS; dx++) {
+                // Keep the current Xaero-style cross for land, but restore the
+                // beta SimpleMap 3x3 kernel for water. The supplied beta screenshot
+                // is a known-good ocean baseline and its wider liquid tint blend
+                // avoids exposing per-chunk edge context in the compact water model.
+                if (!includeDiagonals && dx != 0 && dz != 0) continue;
                 int sampleX = px + dx;
                 int sampleZ = pz + dz;
                 if (sampleX < 0 || sampleX >= width || sampleZ < 0 || sampleZ >= height) continue;

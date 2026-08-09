@@ -220,11 +220,9 @@ public class WaypointListScreen extends Screen {
     private void toggleTracked(WaypointManager.Waypoint waypoint) {
         boolean tracked = isTracked(waypoint);
         if (tracked) {
-            MapConfig.pinActive = false;
+            PinNavigation.clear();
         } else {
-            MapConfig.pinWorldX = waypoint.x;
-            MapConfig.pinWorldZ = waypoint.z;
-            MapConfig.pinActive = true;
+            PinNavigation.activate(waypoint.x, waypoint.z);
         }
         MapManager.getInstance().savePin();
         if (!tracked) openOnMap(waypoint);

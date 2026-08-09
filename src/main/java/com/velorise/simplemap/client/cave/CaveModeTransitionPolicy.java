@@ -56,6 +56,10 @@ public final class CaveModeTransitionPolicy {
     }
 
     public static long foregroundBudget(long normal) {
-        return Math.max(0L, normal);
+        long safe = Math.max(0L, normal);
+        // The first visible Cave frames should publish retained/prewarmed products,
+        // not consume a multi-millisecond source slice. Xaero similarly gates the
+        // loadedCaving switch while its writer cursor advances under a hard limit.
+        return active() ? Math.min(safe, 300_000L) : safe;
     }
 }

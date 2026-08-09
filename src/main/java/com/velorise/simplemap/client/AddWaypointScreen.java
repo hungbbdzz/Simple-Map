@@ -397,8 +397,7 @@ public class AddWaypointScreen extends Screen {
             return;
         }
         if (trackedOriginal) {
-            MapConfig.pinWorldX = replacement.x;
-            MapConfig.pinWorldZ = replacement.z;
+            PinNavigation.updateDestination(replacement.x, replacement.z);
             MapManager.getInstance().savePin();
         }
         restorePreviousMapView();

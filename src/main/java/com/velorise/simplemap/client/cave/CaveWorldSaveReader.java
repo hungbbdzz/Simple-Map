@@ -1,5 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.cave.archive.CaveArchiveV2Service;
+
 import com.velorise.simplemap.client.GeneratedChunkIndex;
 import com.velorise.simplemap.client.MapCancellationToken;
 import com.velorise.simplemap.client.MapDebugRecorder;
@@ -20,6 +22,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.EnumMap;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,29 +33,34 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Read-only singleplayer bridge from Anvil world-save data to dense cave pages.
  *
- * <p>The scheduling unit is a 64x64 page (4x4 Minecraft chunks). Fullscreen
- * candidates are restricted to the visible rectangle and admitted in stable screen
- * centre-out slices with low concurrency. The page itself may decode its sixteen chunks in
- * parallel, but publication remains page-coherent and LOD derives afterwards.</p>
+ * <p>Fullscreen source scheduling is native-region based. One 32x32-chunk Anvil
+ * region plus a one-chunk styling halo is imported through Minecraft's shared
+ * RegionFileStorage-backed reader; visible 64x64 page dependencies are decoded
+ * first and the remaining generated chunks continue in the background. Minimap
+ * and compatibility paths retain bounded page transactions, while final cave
+ * projection and CIMG persistence are owned by the region transaction service.</p>
+
  */
 public final class CaveWorldSaveReader {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final CaveWorldSaveReader INSTANCE = new CaveWorldSaveReader();
     private static final boolean DISABLED =
             Boolean.getBoolean("simplemap.disableCaveWorldSaveReader");
-    private static final int MAX_QUEUED_PAGES = 1024;
+    private static final int MAX_QUEUED_PAGES = 4096;
     /** Adaptive page transaction limits; global CPU/IO pressure can reduce these to one. */
     private static final int PRESSURE_IN_FLIGHT_PAGES = 1;
-    private static final int GAMEPLAY_IN_FLIGHT_PAGES = 3;
-    /* Three pages retain source/IO overlap without releasing up to 96 expensive
-     * vertical projections at once after a dimension switch. */
-    private static final int FULLSCREEN_IN_FLIGHT_PAGES = 6;
+    private static final int GAMEPLAY_IN_FLIGHT_PAGES = 4;
+    /* A healthy fullscreen cold build keeps eight 4x4-chunk page transactions
+     * resident. Fixed-region ordering gives NVMe reads, palette decode and projection
+     * enough overlap without serialising publication behind one slow page. Pressure
+     * control still contracts this aggressively. */
+    private static final int FULLSCREEN_IN_FLIGHT_PAGES = 8;
     private static final long MISSING_RETRY_MS = 30_000L;
     private static final long FAILED_RETRY_MS = 8_000L;
     /**
      * A page that already contains useful leaves is not a failed page. Retry its
-     * unresolved holes quickly while preserving the leaves that were published by
-     * the previous pass. This keeps the player neighbourhood coherent when one
+     * unresolved holes quickly while preserving leaves from the previous pass.
+     * This keeps the player neighbourhood coherent when one
      * Anvil chunk is briefly busy or its decode is deferred by pressure control.
      */
     private static final long PARTIAL_REPAIR_RETRY_MS = 80L;
@@ -63,20 +71,45 @@ public final class CaveWorldSaveReader {
     /** Recenter source priority only after the inspected point moves meaningfully. */
     private static final int FULLSCREEN_RECENTER_THRESHOLD_PAGES = 2;
     private static final long SOURCE_PREFETCH_INTERVAL_MS = 40L;
+    /** 4x4 page body plus the policy's one-chunk dependency halo. */
+    private static final int SURFACE_SOURCE_WINDOW_CHUNKS = 6;
+    private static final int[] SURFACE_SOURCE_WINDOW_ORDER =
+            CaveLoadHierarchy.buildCenterOutCellOrder(SURFACE_SOURCE_WINDOW_CHUNKS);
+    /** Native page body plus one decoded chunk on every side for final styling. */
+    private static final int CAVE_SOURCE_WINDOW_CHUNKS = 6;
+    private static final int CAVE_SOURCE_WINDOW_COUNT =
+            CAVE_SOURCE_WINDOW_CHUNKS * CAVE_SOURCE_WINDOW_CHUNKS;
+    private static final int CAVE_SOURCE_HALO = 1;
+    private static final int[] CAVE_SOURCE_WINDOW_ORDER =
+            CaveLoadHierarchy.buildCenterOutCellOrder(CAVE_SOURCE_WINDOW_CHUNKS);
     private final CaveTileRepository repository = CaveTileRepository.getInstance();
     private final CaveDisplayProjector projector = new CaveDisplayProjector();
     private final DecodedWorldRegionCache sourceCache = DecodedWorldRegionCache.getInstance();
+    private final CaveNativeRegionImportService nativeRegionImporter =
+            CaveNativeRegionImportService.getInstance();
+    private final AnvilPagePresenceIndex anvilPresence =
+            AnvilPagePresenceIndex.getInstance();
     private final SurfaceWorldSaveReconstructor surfaceReconstructor =
             SurfaceWorldSaveReconstructor.getInstance();
     private final PriorityQueue<PageTask> queue = new PriorityQueue<>();
     private final Map<PageTaskKey, PageTask> queued = new HashMap<>();
     private final Map<PageTaskKey, PageTask> inFlightTasks = new HashMap<>();
+    /**
+     * Full 4x4 source pages are assembled off-repository across deferred Anvil
+     * passes. Repository authority changes only after all sixteen central chunks
+     * are PRESENT, ABSENT or already covered by a stronger resident source.
+     */
+    private final Map<PageRetryKey, PageAssembly> pendingPageAssemblies = new HashMap<>();
+    /** Generation stamp for pages resolved entirely by archive plus known absence. */
+    private final Map<PageRetryKey, Long> archiveResolvedPages = new HashMap<>();
+    /** Stable resolved display-page fingerprint; suppresses identical Anvil replay even when raw archive revisions advance. */
+    private final Map<PageRetryKey, Long> resolvedPageStamps = new HashMap<>();
     private final Map<PageRetryKey, Long> retryAfter = new HashMap<>();
     /* Projection callbacks compete with exact-page builds (whose captured queue
      * peaked at 3.1 s). Classify them separately so decoded-source work runs first;
      * global scheduler limits plus the page gate below bound their concurrency. */
     private final PriorityDecodeExecutor pageWorkers = new PriorityDecodeExecutor(
-            MapWorkScheduler.WorkType.SOURCE_PROJECTION, 12);
+            MapWorkScheduler.WorkType.SOURCE_PROJECTION, 16);
     private final EnumMap<MapRequestLane, ViewportState> viewports =
             new EnumMap<>(MapRequestLane.class);
     private final MapPipelineTelemetry pipelineTelemetry = MapPipelineTelemetry.getInstance();
@@ -113,6 +146,20 @@ public final class CaveWorldSaveReader {
         return inFlightTasks.size();
     }
 
+    /**
+     * Returns true only when the current singleplayer Anvil header snapshot proves
+     * that a fullscreen page contains no generated chunk. Unknown/multiplayer
+     * pages deliberately return false: presentation may wait for CVD/CIMG or live
+     * data, but it must never skip an unresolved page and expose a black hole.
+     */
+    public synchronized boolean isFullscreenPageKnownAbsent(String dimension,
+            CaveView view, int normalizedLayer, int projectionTopY,
+            int globalPageX, int globalPageZ) {
+        ViewportState state = viewports.get(MapRequestLane.FULLSCREEN);
+        return state != null && state.isKnownAbsent(dimension, view,
+                normalizedLayer, projectionTopY, globalPageX, globalPageZ);
+    }
+
     public synchronized void reset() {
         epoch++;
         for (PageTask task : queued.values()) task.cancel();
@@ -120,6 +167,9 @@ public final class CaveWorldSaveReader {
         queue.clear();
         queued.clear();
         inFlightTasks.clear();
+        pendingPageAssemblies.clear();
+        archiveResolvedPages.clear();
+        resolvedPageStamps.clear();
         retryAfter.clear();
         for (ViewportState state : viewports.values()) state.clear();
         prefetchDimension = "";
@@ -130,11 +180,17 @@ public final class CaveWorldSaveReader {
         prefetchPlanCursor = 0;
         lastSourcePrefetchMs = 0L;
         lastSourcePrefetchRestartMs = 0L;
+        anvilPresence.reset();
+        surfaceReconstructor.reset();
+        CaveRegionProjectionService.getInstance().reset();
+        nativeRegionImporter.reset();
     }
 
     /** Removes queued/in-flight work no longer owned after a lane is hidden. */
     public synchronized void suspendLane(MapRequestLane lane) {
         if (lane == null) return;
+        nativeRegionImporter.suspendSurfaceLane(lane);
+        nativeRegionImporter.suspendCaveLane(lane);
         ViewportState state = viewports.get(lane);
         if (state != null) state.clear();
         long now = System.currentTimeMillis();
@@ -149,11 +205,14 @@ public final class CaveWorldSaveReader {
     public synchronized void clearSourceCache() {
         sourceCache.reset();
         surfaceReconstructor.reset();
+        anvilPresence.reset();
         prefetchDimension = "";
         prefetchCenterPageX = prefetchCenterPageZ = Integer.MIN_VALUE;
         prefetchPagePlan = new long[0];
         prefetchPlanCursor = 0;
         lastSourcePrefetchRestartMs = 0L;
+        CaveRegionProjectionService.getInstance().reset();
+        nativeRegionImporter.reset();
     }
 
     /**
@@ -165,6 +224,13 @@ public final class CaveWorldSaveReader {
             int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ,
             double centerChunkX, double centerChunkZ, float scale,
             MapRequestLane lane) {
+        if (!Boolean.getBoolean("simplemap.useLegacyWorldSavePipelines")) {
+            WorldSaveProjectionPipeline.getInstance().requestVisible(minecraft,
+                    WorldProjection.SURFACE, Integer.MAX_VALUE,
+                    minChunkX, maxChunkX, minChunkZ, maxChunkZ,
+                    centerChunkX, centerChunkZ, scale, lane);
+            return;
+        }
         sourceCache.maintain();
         // Projection completions arrive in bursts from the Anvil workers. Apply
         // them through a small client-thread slice before admitting more work so
@@ -212,7 +278,7 @@ public final class CaveWorldSaveReader {
                 lastSourcePrefetchRestartMs = now;
             } else if (prefetchPlanCursor >= prefetchPagePlan.length) {
                 // A pressured pass may have deferred some chunks. Revisit the same
-                // deterministic centre-out plan instead of treating one attempted
+                // deterministic viewport scanline plan instead of treating one attempted
                 // pass as permanent completion.
                 if (now - lastSourcePrefetchRestartMs < 500L) return;
                 prefetchMinPageX = minPageX;
@@ -251,8 +317,12 @@ public final class CaveWorldSaveReader {
                 int firstChunkZ = (pageZ << 2) - halo;
                 int window = 4 + halo * 2;
                 boolean sourceSaturated = false;
-                for (int localX = 0; localX < window; localX++) {
-                    for (int localZ = 0; localZ < window; localZ++) {
+                int[] windowOrder = window == SURFACE_SOURCE_WINDOW_CHUNKS
+                        ? SURFACE_SOURCE_WINDOW_ORDER
+                        : CaveLoadHierarchy.buildCenterOutCellOrder(window);
+                for (int packedLocal : windowOrder) {
+                        int localX = packedLocal % window;
+                        int localZ = packedLocal / window;
                         int sourceChunkX = firstChunkX + localX;
                         int sourceChunkZ = firstChunkZ + localZ;
                         if (MapManager.getInstance().isChunkSurfaceComplete(
@@ -260,15 +330,15 @@ public final class CaveWorldSaveReader {
                         GeneratedChunkIndex.State state = generated.state(
                                 serverLevel, sourceChunkX, sourceChunkZ);
                         if (state == GeneratedChunkIndex.State.KNOWN_ABSENT) continue;
-                        // Loaded chunks belong to the resumable live scanner. Anvil
-                        // reconstruction of the same chunk duplicated NBT/DataFix,
-                        // projection and the final 256-column commit, which is the
-                        // dominant allocation spike in live dimensions. A remotely
-                        // viewed dimension still uses its ServerLevel save normally.
+                        // Only a chunk that is loaded *now* belongs to the resumable
+                        // live scanner. GeneratedChunkIndex.LIVE is historical: it
+                        // remains LIVE after the client unloads the chunk. Treating
+                        // that state as current residency permanently skipped disk
+                        // repair for partially scanned fly-over chunks and left black
+                        // holes along fast-travel routes.
                         if (viewedLiveDimension
-                                && (state == GeneratedChunkIndex.State.LIVE
-                                        || minecraft.level.hasChunk(
-                                                sourceChunkX, sourceChunkZ))) {
+                                && minecraft.level.hasChunk(
+                                        sourceChunkX, sourceChunkZ)) {
                             continue;
                         }
                         if (surfaceReconstructor.isPending(
@@ -286,11 +356,9 @@ public final class CaveWorldSaveReader {
                         }
                         surfaceReconstructor.request(serverLevel,
                                 sourceChunkX, sourceChunkZ, sourceLease);
-                    }
-                    if (sourceSaturated) break;
                 }
                 if (sourceSaturated) {
-                    // Revisit the same centre-out window after the current source
+                    // Revisit the same viewport scanline window after the current source
                     // leaves complete. Pending/complete leaves are skipped cheaply.
                     prefetchPlanCursor = Math.max(0, prefetchPlanCursor - 1);
                     break;
@@ -312,12 +380,23 @@ public final class CaveWorldSaveReader {
             int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ,
             double centerChunkX, double centerChunkZ, float scale,
             MapRequestLane lane) {
+        if (!Boolean.getBoolean("simplemap.useLegacyWorldSavePipelines")) {
+            WorldProjection projection = view == CaveView.FULL
+                    ? WorldProjection.FULL : WorldProjection.LAYERED;
+            WorldSaveProjectionPipeline.getInstance().requestVisible(minecraft,
+                    projection, layerY, minChunkX, maxChunkX,
+                    minChunkZ, maxChunkZ, centerChunkX, centerChunkZ,
+                    scale, lane);
+            return;
+        }
         sourceCache.maintain();
-        if (DISABLED || minecraft == null || minecraft.level == null
-                || minecraft.getSingleplayerServer() == null) return;
+        nativeRegionImporter.maintain();
+        CaveRegionProjectionService.getInstance().maintain();
+        if (DISABLED || minecraft == null || minecraft.level == null) return;
         ServerLevel serverLevel = resolveViewedServerLevel(minecraft);
-        if (serverLevel == null) return;
-        GeneratedChunkIndex.getInstance().observeLevel(serverLevel);
+        if (serverLevel != null) {
+            GeneratedChunkIndex.getInstance().observeLevel(serverLevel);
+        }
 
         MapRequestLane effectiveLane = lane == null
                 ? MapRequestLane.FULLSCREEN : lane;
@@ -326,6 +405,10 @@ public final class CaveWorldSaveReader {
         int maximumPageX = Math.floorDiv(Math.max(minChunkX, maxChunkX), 4);
         int minimumPageZ = Math.floorDiv(Math.min(minChunkZ, maxChunkZ), 4);
         int maximumPageZ = Math.floorDiv(Math.max(minChunkZ, maxChunkZ), 4);
+        int foregroundMinPageX = minimumPageX;
+        int foregroundMaxPageX = maximumPageX;
+        int foregroundMinPageZ = minimumPageZ;
+        int foregroundMaxPageZ = maximumPageZ;
         int rawCenterPageX = (int) Math.floor(centerChunkX / 4.0);
         int rawCenterPageZ = (int) Math.floor(centerChunkZ / 4.0);
         if (effectiveLane == MapRequestLane.FULLSCREEN) {
@@ -338,18 +421,30 @@ public final class CaveWorldSaveReader {
             maximumPageZ += FULLSCREEN_STICKY_HALO_PAGES;
         }
         if (effectiveLane == MapRequestLane.MINIMAP) {
-            minimumPageX = Math.max(minimumPageX - MapViewLoadPlanner.MINIMAP_HALO_PAGES,
-                    rawCenterPageX - MapViewLoadPlanner.MINIMAP_MAX_RADIUS_PAGES);
-            maximumPageX = Math.min(maximumPageX + MapViewLoadPlanner.MINIMAP_HALO_PAGES,
-                    rawCenterPageX + MapViewLoadPlanner.MINIMAP_MAX_RADIUS_PAGES);
-            minimumPageZ = Math.max(minimumPageZ - MapViewLoadPlanner.MINIMAP_HALO_PAGES,
-                    rawCenterPageZ - MapViewLoadPlanner.MINIMAP_MAX_RADIUS_PAGES);
-            maximumPageZ = Math.min(maximumPageZ + MapViewLoadPlanner.MINIMAP_HALO_PAGES,
-                    rawCenterPageZ + MapViewLoadPlanner.MINIMAP_MAX_RADIUS_PAGES);
+            /*
+             * Xaero's world-map integration renders every 64-block tile inside the
+             * actual minimap bounds from the same region cache as its fullscreen
+             * map. Keep this saved-source frontier viewport-complete as well. The
+             * exact GPU manager independently limits hot leaves to Minecraft's
+             * loaded radius, while LOD branches make this broader source progress
+             * immediately reusable by both map surfaces.
+             */
+            minimumPageX -= MapViewLoadPlanner.MINIMAP_HALO_PAGES;
+            maximumPageX += MapViewLoadPlanner.MINIMAP_HALO_PAGES;
+            minimumPageZ -= MapViewLoadPlanner.MINIMAP_HALO_PAGES;
+            maximumPageZ += MapViewLoadPlanner.MINIMAP_HALO_PAGES;
+            foregroundMinPageX = minimumPageX;
+            foregroundMaxPageX = maximumPageX;
+            foregroundMinPageZ = minimumPageZ;
+            foregroundMaxPageZ = maximumPageZ;
         }
         int centerPageX = clamp(rawCenterPageX, minimumPageX, maximumPageX);
         int centerPageZ = clamp(rawCenterPageZ, minimumPageZ, maximumPageZ);
-        String dimension = serverLevel.dimension().location().toString();
+        String dimension = resolveViewedDimensionId(minecraft, serverLevel);
+        if (dimension.isEmpty()) return;
+        AnvilPagePresenceIndex.Snapshot anvilSnapshot =
+                serverLevel != null && effectiveLane == MapRequestLane.FULLSCREEN
+                        ? anvilPresence.snapshot(serverLevel) : null;
         long now = System.currentTimeMillis();
         long repositoryGeneration = repository.generation();
 
@@ -369,7 +464,7 @@ public final class CaveWorldSaveReader {
                             effectiveLane, FULLSCREEN_RECENTER_THRESHOLD_PAGES);
             if (sameBandRetarget) {
                 // Keep old same-band decodes alive as valid visual fallback. Restart
-                // the centre-out source cursor for the new exact Top-Y, but do not
+                // the viewport scanline source cursor for the new exact Top-Y, but do not
                 // revoke in-flight ownership merely because caveStart changed inside
                 // the same 16-block cache band.
                 state.retargetProjection(layerY);
@@ -390,14 +485,42 @@ public final class CaveWorldSaveReader {
                 pruneUnwantedQueuedLocked(now);
                 cancelUnwantedInFlightLocked(now);
             } else if (recentered) {
-                // Reorder the remaining source frontier around the point currently
-                // inspected, but retain every overlapping queued/in-flight leaf.
+                // Kept for non-wavefront compatibility; fullscreen currently never
+                // recentres because focus does not affect fixed row order.
                 state.recenter(centerPageX, centerPageZ, effectiveLane);
                 handoffLaneGenerationLocked(effectiveLane, state, now);
             } else {
                 state.centerPageX = centerPageX;
                 state.centerPageZ = centerPageZ;
             }
+            if (anvilSnapshot != null && anvilSnapshot.ready()) {
+                int before = state.pagePlan.length;
+                boolean filtered = state.applySourceFilter(
+                        anvilSnapshot.pages(), anvilSnapshot.revision(), effectiveLane);
+                if (filtered) {
+                    MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                    int firstPageX = state.pagePlan.length == 0
+                            ? Integer.MIN_VALUE : CaveLoadHierarchy.x(state.pagePlan[0]);
+                    int firstPageZ = state.pagePlan.length == 0
+                            ? Integer.MIN_VALUE : CaveLoadHierarchy.z(state.pagePlan[0]);
+                    recorder.event("CAVE_ANVIL_PAGE_PLAN",
+                            "order=viewport_scanline_sweep_top_left"
+                                    + " focus_page=" + centerPageX + ',' + centerPageZ
+                                    + " first_page=" + firstPageX + ',' + firstPageZ
+                                    + " viewport_pages=" + before
+                                    + " generated_pages=" + state.pagePlan.length
+                                    + " region_files=" + anvilSnapshot.regionFiles()
+                                    + " chunks=" + anvilSnapshot.chunks());
+                }
+            }
+            /* PASS114: the native reader may keep a sticky source halo, but only
+             * the renderer-owned page rectangle is foreground presentation demand. */
+            state.foregroundPagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
+                    foregroundMinPageX, foregroundMaxPageX,
+                    foregroundMinPageZ, foregroundMaxPageZ,
+                    clamp(rawCenterPageX, foregroundMinPageX, foregroundMaxPageX),
+                    clamp(rawCenterPageZ, foregroundMinPageZ, foregroundMaxPageZ),
+                    effectiveLane == MapRequestLane.FULLSCREEN);
             state.lastSeenMs = now;
 
             boolean pressured = MapPerformanceGovernor.getInstance().underPressure();
@@ -413,43 +536,34 @@ public final class CaveWorldSaveReader {
                 int admission = CaveScreenSpacePolicy.sourceAdmissionBudget(
                         scale, effectiveLane, pressured);
                 if (effectiveLane == MapRequestLane.FULLSCREEN) {
-                    if (state.pagePlan.length > 0 && admission > 0) {
-                        if (state.pageCursor >= state.pagePlan.length) {
-                            state.pageCursor = 0;
-                        }
-                        int capacity = Math.max(0,
-                                laneAdmissionLimitLocked(effectiveLane)
-                                        - activeTaskCountLocked(effectiveLane));
-                        int admissionLimit = Math.min(admission, capacity);
-                        int admitted = 0;
-                        int considered = 0;
-                        int considerationBudget = Math.max(16, admissionLimit * 8);
-                        while (state.pageCursor < state.pagePlan.length
-                                && admitted < admissionLimit
-                                && considered < considerationBudget
-                                && queued.size() < MAX_QUEUED_PAGES) {
-                            int ordinal = state.pageCursor;
-                            long packedPage = state.pagePlan[state.pageCursor++];
-                            considered++;
-                            int globalPageX = CaveLoadHierarchy.x(packedPage);
-                            int globalPageZ = CaveLoadHierarchy.z(packedPage);
-                            if (admitVisiblePageLocked(serverLevel, state,
-                                    dimension, view, layerY, normalizedLayer,
-                                    globalPageX, globalPageZ, ordinal,
-                                    effectiveLane, currentEpoch,
-                                    repositoryGeneration, now)) {
-                                pipelineTelemetry.recordPageAdmission(effectiveLane);
-                                admitted++;
-                            }
-                        }
+                    /*
+                     * PASS76 source authority is one native 32x32-chunk transaction,
+                     * not sixty-four independent 6x6 page reads. Minecraft's
+                     * RegionFileStorage keeps the .mca handle shared while the region
+                     * importer decodes only the union of visible page halos. Overlap
+                     * stays reusable in the source cache when the viewport moves.
+                     */
+                    if (serverLevel != null && state.pagePlan.length > 0) {
+                        /*
+                         * The reader's dimension is the raw resource id
+                         * (minecraft:overworld), while every rendered cave key uses
+                         * MapManager's cache namespace (overworld). Passing the raw
+                         * id made the GPU drain reject every imported page.
+                         */
+                        String projectionDimension = MapManager.getInstance()
+                                .getDimensionCacheKey();
+                        nativeRegionImporter.requestViewport(serverLevel,
+                                projectionDimension, view, layerY, state.pagePlan,
+                                state.foregroundPagePlan, centerPageX, centerPageZ,
+                                effectiveLane, repositoryGeneration, anvilSnapshot);
+                        cancelLegacyFullscreenPageTasksLocked();
+                        state.pageCursor = state.pagePlan.length;
                         state.updateSliceIndex = state.pageCursor
                                 / MapViewLoadPlanner.FULLSCREEN_SLICE_SIZE;
-                        if (state.pageCursor >= state.pagePlan.length) {
-                            state.completedCycles++;
-                            state.nextPassMs = now
-                                    + CaveScreenSpacePolicy.completedSourcePlanPauseMs(
-                                            scale, effectiveLane, pressured);
-                        }
+                        state.completedCycles++;
+                        state.nextPassMs = now
+                                + CaveScreenSpacePolicy.completedSourcePlanPauseMs(
+                                        scale, effectiveLane, pressured);
                     }
                 } else {
                     int considered = 0;
@@ -481,7 +595,7 @@ public final class CaveWorldSaveReader {
 
             }
         }
-        pump(serverLevel);
+        if (serverLevel != null) pump(serverLevel);
     }
 
     /** Resolves the map's viewed dimension, which can differ from the player level. */
@@ -494,52 +608,179 @@ public final class CaveWorldSaveReader {
         return minecraft.getSingleplayerServer().getLevel(key);
     }
 
+    /**
+     * Resolves the persistent-cache namespace even when no integrated server is
+     * available. This intentionally does not claim access to a remote server's
+     * Anvil files: a null {@code serverLevel} enables presentation-cache replay
+     * only, while source decoding remains singleplayer/LAN-host authoritative.
+     */
+    private static String resolveViewedDimensionId(Minecraft minecraft,
+            ServerLevel serverLevel) {
+        if (serverLevel != null) {
+            return serverLevel.dimension().location().toString();
+        }
+        String viewed = MapManager.getInstance().getCurrentDimensionResourceId();
+        if (viewed != null && ResourceLocation.tryParse(viewed) != null) return viewed;
+        return minecraft != null && minecraft.level != null
+                ? minecraft.level.dimension().location().toString() : "";
+    }
+
     private boolean admitVisiblePageLocked(ServerLevel serverLevel,
             ViewportState state, String dimension, CaveView view, int layerY,
             int normalizedLayer, int globalPageX, int globalPageZ, int ordinal,
             MapRequestLane lane, long currentEpoch, long repositoryGeneration,
             long now) {
+        // Presentation-ready .cvd data wins the first race. Rebuilding the same
+        // page from Anvil NBT while its region cache is already being read caused
+        // thousands of superseding source commits and very few GPU-ready pages.
+        repository.requestDisplayPageLoad(view, layerY,
+                globalPageX, globalPageZ, lane);
+        if (repository.hasPendingDisplayPageLoad(view, layerY,
+                globalPageX, globalPageZ)) return false;
         if (repository.hasFreshDisplayPageSource(view, layerY,
                 globalPageX, globalPageZ, DenseCaveTile.Source.WORLD_SAVE)) return false;
+
+        // Persistent archive identity may outlive its resident compact tile. Refill
+        // the one visible 4x4-chunk page from SMR2 before paying for another Anvil
+        // decode. This path also works for remote clients where Anvil is unavailable.
+        if (repository.requestIndexedArchivePageLoad(view, layerY,
+                globalPageX, globalPageZ, lane)) return false;
+
+        // A remote multiplayer client cannot read the server's region files.
+        // Cache replay above is still valid and must not be blocked by that fact.
+        if (serverLevel == null) return false;
 
         PageTaskKey key = new PageTaskKey(dimension,
                 globalPageX, globalPageZ, view, normalizedLayer);
         PageRetryKey retryKey = new PageRetryKey(key, layerY);
         Long blockedUntil = retryAfter.get(retryKey);
         if (blockedUntil != null && blockedUntil > now) return false;
+        Long resolvedStamp = resolvedPageStamps.get(retryKey);
+        long currentResolutionStamp = repository.getDisplayPageResolutionStamp(
+                view, layerY, globalPageX, globalPageZ);
+        if (resolvedStamp != null && currentResolutionStamp != 0L
+                && resolvedStamp.longValue() == currentResolutionStamp) {
+            return false;
+        }
 
         int firstChunkX = globalPageX << 2;
         int firstChunkZ = globalPageZ << 2;
         int knownPresent = 0;
         int knownAbsent = 0;
+        int archivePresent = 0;
+        int archiveOrAbsentCoverage = 0;
+        boolean[] absentPage = new boolean[16];
+        CaveArchiveV2Service archive = CaveArchiveV2Service.getInstance();
         GeneratedChunkIndex generated = GeneratedChunkIndex.getInstance();
         for (int localX = 0; localX < 4; localX++) {
             for (int localZ = 0; localZ < 4; localZ++) {
-                GeneratedChunkIndex.State generatedState = generated.state(serverLevel,
-                        firstChunkX + localX, firstChunkZ + localZ);
+                int chunkX = firstChunkX + localX;
+                int chunkZ = firstChunkZ + localZ;
+                GeneratedChunkIndex.State generatedState = generated.state(
+                        serverLevel, chunkX, chunkZ);
                 if (generatedState == GeneratedChunkIndex.State.LIVE
                         || generatedState == GeneratedChunkIndex.State.SAVED_PRESENT) {
                     knownPresent++;
                 } else if (generatedState == GeneratedChunkIndex.State.KNOWN_ABSENT) {
                     knownAbsent++;
+                    absentPage[localX * 4 + localZ] = true;
+                }
+                boolean archived = archiveCoversView(archive, view, chunkX, chunkZ);
+                if (archived) archivePresent++;
+                if (archived
+                        || generatedState == GeneratedChunkIndex.State.KNOWN_ABSENT) {
+                    archiveOrAbsentCoverage++;
+                }
+            }
+        }
+        int sourceWindowCoverage = 0;
+        int sourceWindowFirstChunkX = firstChunkX - CAVE_SOURCE_HALO;
+        int sourceWindowFirstChunkZ = firstChunkZ - CAVE_SOURCE_HALO;
+        for (int localZ = 0; localZ < CAVE_SOURCE_WINDOW_CHUNKS; localZ++) {
+            for (int localX = 0; localX < CAVE_SOURCE_WINDOW_CHUNKS; localX++) {
+                int chunkX = sourceWindowFirstChunkX + localX;
+                int chunkZ = sourceWindowFirstChunkZ + localZ;
+                GeneratedChunkIndex.State generatedState = generated.state(
+                        serverLevel, chunkX, chunkZ);
+                if (archiveCoversView(archive, view, chunkX, chunkZ)
+                        || generatedState == GeneratedChunkIndex.State.KNOWN_ABSENT) {
+                    sourceWindowCoverage++;
                 }
             }
         }
         if (knownAbsent == 16) {
-            boolean[] absentPage = new boolean[16];
-            java.util.Arrays.fill(absentPage, true);
             repository.commitDisplayPage(java.util.List.of(), view, layerY,
                     firstChunkX, firstChunkZ, absentPage, repositoryGeneration);
+            long absentResolutionStamp = repository.getDisplayPageResolutionStamp(
+                    view, layerY, globalPageX, globalPageZ);
+            if (absentResolutionStamp != 0L) {
+                resolvedPageStamps.put(retryKey, absentResolutionStamp);
+                CaveRegionProjectionService.getInstance().request(serverLevel,
+                        dimension, view, layerY, globalPageX, globalPageZ,
+                        lane, lane.priorityBase() + 640_000 - ordinal * 250,
+                        repositoryGeneration);
+            }
             return true;
+        }
+        /* Sparse explored pages often contain archive data for every generated
+         * chunk plus several header-proven absent chunks. Treat that union as a
+         * complete page: project the present chunks from RAM and publish the
+         * absence mask once, instead of decoding the same .mca for each Top-Y. */
+        if (archiveOrAbsentCoverage == 16) {
+            PageRetryKey archiveKey = new PageRetryKey(key, layerY);
+            /* The archive itself is already the resolved source. Do not publish an
+             * empty retained=16 transaction merely to acknowledge it. Only the
+             * explicit absence mask can change repository state; the stable page
+             * fingerprint records the archive-backed resolution and suppresses all
+             * later Anvil admissions until archive content really changes. */
+            if (knownAbsent > 0) {
+                repository.commitDisplayPage(java.util.List.of(), view, layerY,
+                        firstChunkX, firstChunkZ, absentPage, repositoryGeneration);
+            }
+            long archiveResolutionStamp = repository.getDisplayPageResolutionStamp(
+                    view, layerY, globalPageX, globalPageZ);
+            Long previousArchiveStamp = archiveResolvedPages.get(archiveKey);
+            if (archiveResolutionStamp != 0L) {
+                archiveResolvedPages.put(archiveKey, archiveResolutionStamp);
+                if (sourceWindowCoverage == CAVE_SOURCE_WINDOW_COUNT) {
+                    resolvedPageStamps.put(archiveKey, archiveResolutionStamp);
+                }
+            }
+            if (previousArchiveStamp == null
+                    || previousArchiveStamp.longValue() != archiveResolutionStamp) {
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent("CAVE_SOURCE_ARCHIVE_BYPASS", 100L)) {
+                    recorder.event("CAVE_SOURCE_ARCHIVE_BYPASS",
+                            "page=" + globalPageX + ',' + globalPageZ
+                                    + " view=" + view
+                                    + " top_y=" + layerY
+                                    + " archive=" + archivePresent
+                                    + " absent=" + knownAbsent
+                                    + " coverage=16 halo_coverage="
+                                    + sourceWindowCoverage + "/"
+                                    + CAVE_SOURCE_WINDOW_COUNT + " stamp="
+                                    + archiveResolutionStamp);
+                }
+            }
+            if (sourceWindowCoverage == CAVE_SOURCE_WINDOW_COUNT
+                    && archiveResolutionStamp != 0L) {
+                CaveRegionProjectionService.getInstance().request(serverLevel,
+                        dimension, view, layerY, globalPageX, globalPageZ,
+                        lane, lane.priorityBase() + 640_000 - ordinal * 250,
+                        repositoryGeneration);
+                return true;
+            }
+            // Central source is already authoritative, but the final leaf still
+            // needs its one-chunk border. Fall through to one halo import task.
         }
 
         int dx = globalPageX - state.centerPageX;
         int dz = globalPageZ - state.centerPageZ;
         int priority;
         if (lane == MapRequestLane.FULLSCREEN) {
-            // Fullscreen source order follows the stable centre-out ordinal only.
-            // Readiness may affect when a page completes, but it must not let a
-            // distant edge page jump ahead of the inspected centre frontier.
+            // Fullscreen source order follows the fixed wavefront ordinal. Cached
+            // leaves can complete early, but source admission never jumps from the
+            // top row to a distant camera-centred ring.
             priority = lane.priorityBase() + 220_000
                     - Math.min(180_000, ordinal * 900);
         } else {
@@ -550,6 +791,27 @@ public final class CaveWorldSaveReader {
         }
         return enqueueLocked(key, layerY, priority, lane,
                 currentEpoch, repositoryGeneration);
+    }
+
+    private void cancelLegacyFullscreenPageTasksLocked() {
+        var queuedIterator = queued.entrySet().iterator();
+        while (queuedIterator.hasNext()) {
+            Map.Entry<PageTaskKey, PageTask> entry = queuedIterator.next();
+            PageTask task = entry.getValue();
+            if (task.lane != MapRequestLane.FULLSCREEN) continue;
+            task.cancel();
+            queuedIterator.remove();
+        }
+        queue.removeIf(task -> task.lane == MapRequestLane.FULLSCREEN);
+        var inFlightIterator = inFlightTasks.entrySet().iterator();
+        while (inFlightIterator.hasNext()) {
+            Map.Entry<PageTaskKey, PageTask> entry = inFlightIterator.next();
+            PageTask task = entry.getValue();
+            if (task.lane != MapRequestLane.FULLSCREEN) continue;
+            task.cancel();
+            inFlightIterator.remove();
+            pipelineTelemetry.recordTaskCancelledBeforeRun();
+        }
     }
 
     private int activeTaskCountLocked(MapRequestLane lane) {
@@ -569,15 +831,13 @@ public final class CaveWorldSaveReader {
         if (inFlight != null) {
             long now = System.currentTimeMillis();
             boolean sameProjection = inFlight.projectionTopY == projectionTopY;
-            boolean sameBandFallback = key.view() == CaveView.LAYERED
-                    && key.layerY() == DenseCaveTile.normalizeLayer(
-                            CaveView.LAYERED, projectionTopY);
-            if ((sameProjection || sameBandFallback)
-                    && wantedByAnyViewportLocked(inFlight, now)) return false;
+            if (sameProjection && wantedByAnyViewportLocked(inFlight, now)) {
+                return false;
+            }
             // Do not let an obsolete Top-Y/mode transaction own one of the bounded
             // decode slots until all sixteen source futures eventually complete.
             // Its token prevents stale publication; removing the ownership here
-            // lets the current centre-out page start immediately.
+            // lets the current wavefront page start immediately.
             if (inFlightTasks.remove(key, inFlight)) {
                 inFlight.cancel();
                 pipelineTelemetry.recordTaskCancelledBeforeRun();
@@ -613,13 +873,72 @@ public final class CaveWorldSaveReader {
                 if (task == null) return;
                 if (task.epoch != epoch
                         || !repository.isGenerationCurrent(task.repositoryGeneration)
+                        || repository.hasPendingDisplayPageLoad(task.key.view(),
+                                task.projectionTopY, task.key.globalPageX(),
+                                task.key.globalPageZ())
                         || repository.hasFreshDisplayPageSource(task.key.view(),
                                 task.projectionTopY, task.key.globalPageX(),
                                 task.key.globalPageZ(), DenseCaveTile.Source.WORLD_SAVE)) continue;
+                int requiredDecodes = requiredForegroundDecodes(serverLevel, task);
+                DecodedWorldRegionCache.PageReservation reservation =
+                        sourceCache.reserveForegroundDecodes(requiredDecodes);
+                if (reservation == null) {
+                    // Keep the earliest wavefront page at the head. The reservation
+                    // is atomic: once admitted, all newly decoded leaves can start
+                    // even if the adaptive limit changes during the loop.
+                    queued.put(task.key, task);
+                    queue.offer(task);
+                    return;
+                }
                 inFlightTasks.put(task.key, task);
+                task.reservation = reservation;
             }
             readPage(serverLevel, task);
         }
+    }
+
+    private int requiredForegroundDecodes(ServerLevel serverLevel,
+            PageTask task) {
+        int firstChunkX = (task.key.globalPageX() << 2) - CAVE_SOURCE_HALO;
+        int firstChunkZ = (task.key.globalPageZ() << 2) - CAVE_SOURCE_HALO;
+        int required = 0;
+        CaveArchiveV2Service archive = CaveArchiveV2Service.getInstance();
+        for (int localZ = 0; localZ < CAVE_SOURCE_WINDOW_CHUNKS; localZ++) {
+            for (int localX = 0; localX < CAVE_SOURCE_WINDOW_CHUNKS; localX++) {
+                int chunkX = firstChunkX + localX;
+                int chunkZ = firstChunkZ + localZ;
+                boolean central = isCentralSourceCell(localX, localZ);
+                if (central && repository.hasFreshDisplayTileOrKnownEmpty(
+                        task.key.view(), task.projectionTopY, chunkX, chunkZ,
+                        DenseCaveTile.Source.WORLD_SAVE)) continue;
+                if (archiveCoversView(archive, task.key.view(), chunkX, chunkZ)) continue;
+                if (sourceCache.requiresForegroundDecode(
+                        serverLevel, chunkX, chunkZ)) required++;
+            }
+        }
+        return required;
+    }
+
+    private static boolean archiveCoversView(CaveArchiveV2Service archive,
+            CaveView view, int chunkX, int chunkZ) {
+        return view == CaveView.FULL
+                ? archive.hasFullProjectionChunk(chunkX, chunkZ)
+                : archive.hasCompleteChunk(chunkX, chunkZ);
+    }
+
+    private static boolean isCentralSourceCell(int localX, int localZ) {
+        return localX >= CAVE_SOURCE_HALO
+                && localX < CAVE_SOURCE_HALO + CaveLoadHierarchy.CHUNKS_PER_PAGE
+                && localZ >= CAVE_SOURCE_HALO
+                && localZ < CAVE_SOURCE_HALO + CaveLoadHierarchy.CHUNKS_PER_PAGE;
+    }
+
+    private static int centralSourceIndex(int sourceIndex) {
+        int localX = sourceIndex % CAVE_SOURCE_WINDOW_CHUNKS;
+        int localZ = sourceIndex / CAVE_SOURCE_WINDOW_CHUNKS;
+        if (!isCentralSourceCell(localX, localZ)) return -1;
+        return (localZ - CAVE_SOURCE_HALO) * CaveLoadHierarchy.CHUNKS_PER_PAGE
+                + (localX - CAVE_SOURCE_HALO);
     }
 
     /**
@@ -635,7 +954,9 @@ public final class CaveWorldSaveReader {
                 || MapWorkScheduler.ioTotalCost() > 520;
         int limit = hasQueuedLaneLocked(MapRequestLane.FULLSCREEN)
                 ? FULLSCREEN_IN_FLIGHT_PAGES : GAMEPLAY_IN_FLIGHT_PAGES;
-        if (schedulerBusy) limit = Math.min(limit, GAMEPLAY_IN_FLIGHT_PAGES);
+        if (schedulerBusy) limit = Math.min(limit,
+                hasQueuedLaneLocked(MapRequestLane.FULLSCREEN) ? 6
+                        : GAMEPLAY_IN_FLIGHT_PAGES);
         // Preserve a dedicated player-centred transaction when fullscreen work is
         // already occupying the decode window.
         if (hasQueuedMinimapLocked() && !hasInFlightMinimapLocked()) {
@@ -645,11 +966,11 @@ public final class CaveWorldSaveReader {
     }
 
     private int laneAdmissionLimitLocked(MapRequestLane lane) {
-        if (lane == MapRequestLane.MINIMAP) return 3;
+        if (lane == MapRequestLane.MINIMAP) return 6;
         if (lane == MapRequestLane.FULLSCREEN) {
             MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
-            if (governor.underPressure()) return 1;
-            return governor.hasStreamingHeadroom() ? 8 : 5;
+            if (governor.underPressure()) return 2;
+            return governor.hasStreamingHeadroom() ? 12 : 8;
         }
         return lane == MapRequestLane.BACKGROUND ? 1 : 2;
     }
@@ -678,65 +999,140 @@ public final class CaveWorldSaveReader {
 
     @SuppressWarnings("unchecked")
     private void readPage(ServerLevel serverLevel, PageTask task) {
-        int firstChunkX = task.key.globalPageX() << 2;
-        int firstChunkZ = task.key.globalPageZ() << 2;
+        int firstChunkX = (task.key.globalPageX() << 2) - CAVE_SOURCE_HALO;
+        int firstChunkZ = (task.key.globalPageZ() << 2) - CAVE_SOURCE_HALO;
         DecodedWorldRegionCache.SourceLease[] leases =
-                new DecodedWorldRegionCache.SourceLease[16];
+                new DecodedWorldRegionCache.SourceLease[CAVE_SOURCE_WINDOW_COUNT];
         CompletableFuture<DecodedWorldRegionCache.Result>[] sources =
-                new CompletableFuture[16];
-        boolean[] alreadyResolved = new boolean[16];
-        int retainedResolvedCount = 0;
+                new CompletableFuture[CAVE_SOURCE_WINDOW_COUNT];
+        PageRetryKey assemblyKey = new PageRetryKey(task.key, task.projectionTopY);
+        PageAssembly assembly;
+        synchronized (this) {
+            assembly = pendingPageAssemblies.get(assemblyKey);
+            if (assembly == null || !assembly.matches(task.epoch,
+                    task.repositoryGeneration)) {
+                assembly = new PageAssembly(task.epoch, task.repositoryGeneration);
+                pendingPageAssemblies.put(assemblyKey, assembly);
+            }
+            assembly.touch();
+        }
+
         int unresolvedCount = 0;
         long sourceWaitStart = System.nanoTime();
-        for (int order = 0; order < 16; order++) {
-            int index = CaveLoadHierarchy.orderedChunkIndex(order);
-            int localX = index & 3;
-            int localZ = index >>> 2;
-            if (repository.hasFreshDisplayTileOrKnownEmpty(task.key.view(),
-                    task.projectionTopY, firstChunkX + localX,
-                    firstChunkZ + localZ, DenseCaveTile.Source.WORLD_SAVE)) {
-                alreadyResolved[index] = true;
-                retainedResolvedCount++;
+        CaveArchiveV2Service archive = CaveArchiveV2Service.getInstance();
+        for (int order = 0; order < CAVE_SOURCE_WINDOW_COUNT; order++) {
+            int index = CAVE_SOURCE_WINDOW_ORDER[order];
+            if (assembly.isResolved(index)) continue;
+            int localX = index % CAVE_SOURCE_WINDOW_CHUNKS;
+            int localZ = index / CAVE_SOURCE_WINDOW_CHUNKS;
+            int chunkX = firstChunkX + localX;
+            int chunkZ = firstChunkZ + localZ;
+            boolean central = isCentralSourceCell(localX, localZ);
+            if ((central && repository.hasFreshDisplayTileOrKnownEmpty(
+                    task.key.view(), task.projectionTopY, chunkX, chunkZ,
+                    DenseCaveTile.Source.WORLD_SAVE))
+                    || archiveCoversView(archive, task.key.view(), chunkX, chunkZ)) {
+                assembly.stageRetained(index);
                 continue;
             }
-            // Each source leaf owns its own completion. The old page-wide allOf()
-            // made one slow/deferred Anvil chunk hold fifteen ready cave chunks
-            // hostage, producing the visible 16x16/64x64 black holes after pan.
-            leases[index] = sourceCache.requestLease(serverLevel,
-                    firstChunkX + localX, firstChunkZ + localZ, task.lane);
+            leases[index] = sourceCache.requestReservedLease(serverLevel,
+                    chunkX, chunkZ, task.lane, task.reservation);
             sources[index] = leases[index].future();
             unresolvedCount++;
-            // A denied leaf means the shared decoder is full. Leave the rest of
-            // the 4x4 page for the next resumable pass; manufacturing callbacks
-            // for all remaining DEFERRED leaves only creates allocation/GC churn.
-            if (leases[index].isImmediatelyDeferred()) break;
         }
+        task.closeReservation();
         task.installLeases(leases);
 
+        if (assembly.isComplete()) {
+            task.releaseLeases();
+            publishCompletedAssembly(serverLevel, task, assemblyKey, assembly);
+            finish(task, 0L);
+            pump(serverLevel);
+            return;
+        }
         if (unresolvedCount == 0) {
             task.releaseLeases();
-            finish(task, 0L);
+            finish(task, PARTIAL_REPAIR_RETRY_MS);
             pump(serverLevel);
             return;
         }
 
         PageReadTransaction transaction = new PageReadTransaction(
-                unresolvedCount, retainedResolvedCount, sourceWaitStart);
-        for (int index = 0; index < 16; index++) {
-            if (alreadyResolved[index]) continue;
+                unresolvedCount, sourceWaitStart, assembly);
+        for (int index = 0; index < CAVE_SOURCE_WINDOW_COUNT; index++) {
+            if (sources[index] == null) continue;
             final int sourceIndex = index;
-            CompletableFuture<DecodedWorldRegionCache.Result> source = sources[index];
-            if (source == null) continue;
-            source.whenCompleteAsync((result, sourceFailure) ->
+            sources[index].whenCompleteAsync((result, sourceFailure) ->
                     completePageSource(serverLevel, task, transaction,
-                            sourceIndex, firstChunkX, firstChunkZ,
+                            assemblyKey, sourceIndex, firstChunkX, firstChunkZ,
                             result, sourceFailure),
                     pageWorkers.dynamic(task.lane::executorPriority));
         }
     }
 
+    private void publishCompletedAssembly(ServerLevel serverLevel, PageTask task,
+            PageRetryKey assemblyKey, PageAssembly assembly) {
+        if (!assembly.isComplete() || !isCurrent(task)) return;
+        int centralFirstChunkX = task.key.globalPageX() << 2;
+        int centralFirstChunkZ = task.key.globalPageZ() << 2;
+        PageAssembly.Snapshot snapshot = assembly.snapshot();
+        long preCommitStamp = repository.getDisplayPageResolutionStamp(
+                task.key.view(), task.projectionTopY,
+                task.key.globalPageX(), task.key.globalPageZ());
+        boolean retainedOnly = snapshot.presentCount() == 0
+                && snapshot.absentCount() == 0
+                && snapshot.retainedCount() == 16;
+        boolean changed = false;
+        if (!retainedOnly || preCommitStamp == 0L) {
+            changed = repository.commitDisplayPage(snapshot.replacements(),
+                    task.key.view(), task.projectionTopY,
+                    centralFirstChunkX, centralFirstChunkZ,
+                    snapshot.knownAbsent(), task.repositoryGeneration);
+        }
+        long committedPageRevision = repository.getPageRevision(
+                task.key.view(), task.projectionTopY,
+                task.key.globalPageX(), task.key.globalPageZ());
+        long resolvedStamp = repository.getDisplayPageResolutionStamp(
+                task.key.view(), task.projectionTopY,
+                task.key.globalPageX(), task.key.globalPageZ());
+        synchronized (this) {
+            pendingPageAssemblies.remove(assemblyKey, assembly);
+            if (resolvedStamp != 0L) resolvedPageStamps.put(
+                    assemblyKey, resolvedStamp);
+        }
+        if (resolvedStamp != 0L && committedPageRevision != 0L) {
+            CaveRegionProjectionService.getInstance().request(serverLevel,
+                    task.key.dimension(), task.key.view(), task.projectionTopY,
+                    task.key.globalPageX(), task.key.globalPageZ(), task.lane,
+                    task.priority + 420_000, task.repositoryGeneration);
+        }
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (retainedOnly && preCommitStamp != 0L) {
+            if (recorder.shouldEmitEvent(
+                    "CAVE_SOURCE_RETAINED_PAGE_SKIPPED:" + task.key, 500L)) {
+                recorder.event("CAVE_SOURCE_RETAINED_PAGE_SKIPPED",
+                        "page=" + task.key.globalPageX() + ','
+                                + task.key.globalPageZ() + " lane=" + task.lane
+                                + " stamp=" + resolvedStamp
+                                + " halo_resolved=" + snapshot.haloResolvedCount());
+            }
+        } else if (recorder.shouldEmitEvent(
+                "CAVE_SOURCE_PAGE_COMMIT:" + task.key, 100L)) {
+            recorder.event("CAVE_SOURCE_PAGE_COMMIT",
+                    "page=" + task.key.globalPageX() + ','
+                            + task.key.globalPageZ() + " lane=" + task.lane
+                            + " present=" + snapshot.presentCount()
+                            + " absent=" + snapshot.absentCount()
+                            + " retained=" + snapshot.retainedCount()
+                            + " resolved=16 halo_resolved="
+                            + snapshot.haloResolvedCount()
+                            + " atomic=true changed=" + changed
+                            + " page_revision=" + committedPageRevision);
+        }
+    }
+
     private void completePageSource(ServerLevel serverLevel, PageTask task,
-            PageReadTransaction transaction, int index,
+            PageReadTransaction transaction, PageRetryKey assemblyKey, int index,
             int firstChunkX, int firstChunkZ,
             DecodedWorldRegionCache.Result result, Throwable sourceFailure) {
         boolean present = false;
@@ -755,35 +1151,34 @@ public final class CaveWorldSaveReader {
             }
 
             pipelineTelemetry.recordSourceState(result.state().name());
-            int localX = index & 3;
-            int localZ = index >>> 2;
+            int localX = index % CAVE_SOURCE_WINDOW_CHUNKS;
+            int localZ = index / CAVE_SOURCE_WINDOW_CHUNKS;
+            boolean central = isCentralSourceCell(localX, localZ);
             switch (result.state()) {
                 case PRESENT -> {
-                    task.token.checkpoint("cave-project-start-" + index);
+                    task.token.checkpoint("cave-archive-start-" + index);
                     long projectionStart = System.nanoTime();
-                    DenseCaveTile tile = result.source().projectCave(
-                            projector, task.key.view(), task.projectionTopY,
-                            DenseCaveTile.Source.WORLD_SAVE, task.token);
+                    CaveChunkTile.Snapshot archive = result.source()
+                            .ensureVerticalArchive(task.token);
+                    DenseCaveTile tile = null;
+                    if (central && archive != null) {
+                        tile = result.source().projectCave(
+                                projector, task.key.view(), task.projectionTopY,
+                                DenseCaveTile.Source.WORLD_SAVE, task.token);
+                    }
                     pipelineTelemetry.recordStageNanos(MapPipelineStage.CAVE_PROJECTION,
                             System.nanoTime() - projectionStart);
-                    task.token.checkpoint("cave-project-finished-" + index);
-                    if (isCurrent(task)) {
-                        repository.commitDisplayPage(List.of(tile), task.key.view(),
-                                task.projectionTopY, firstChunkX, firstChunkZ,
-                                null, task.repositoryGeneration);
+                    task.token.checkpoint("cave-archive-finished-" + index);
+                    if (isCurrent(task) && archive != null) {
+                        transaction.stagePresent(index, tile);
                         present = true;
                     } else {
                         deferred = true;
                     }
                 }
                 case ABSENT -> {
-                    boolean[] absentLeaf = new boolean[16];
-                    // CaveTileRepository uses X-major page indexing.
-                    absentLeaf[localX * 4 + localZ] = true;
                     if (isCurrent(task)) {
-                        repository.commitDisplayPage(List.of(), task.key.view(),
-                                task.projectionTopY, firstChunkX, firstChunkZ,
-                                absentLeaf, task.repositoryGeneration);
+                        transaction.stageAbsent(index);
                         absent = true;
                     } else {
                         deferred = true;
@@ -797,14 +1192,36 @@ public final class CaveWorldSaveReader {
         } catch (Throwable chunkFailure) {
             failed = true;
             LOGGER.debug("Could not build cave source leaf {},{} in page {},{}",
-                    firstChunkX + (index & 3), firstChunkZ + (index >>> 2),
+                    firstChunkX + index % CAVE_SOURCE_WINDOW_CHUNKS,
+                    firstChunkZ + index / CAVE_SOURCE_WINDOW_CHUNKS,
                     task.key.globalPageX(), task.key.globalPageZ(), chunkFailure);
         } finally {
             task.releaseLease(index);
             if (transaction.complete(present, absent, failed, deferred)) {
                 pipelineTelemetry.recordStageNanos(MapPipelineStage.SOURCE_WAIT,
                         System.nanoTime() - transaction.sourceWaitStartNanos());
-                finish(task, transaction.retryDelayMs());
+                if (transaction.assembly().isComplete()) {
+                    publishCompletedAssembly(serverLevel, task, assemblyKey,
+                            transaction.assembly());
+                } else {
+                    MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                    if (recorder.shouldEmitEvent(
+                            "CAVE_SOURCE_PAGE_STAGED:" + task.key, 250L)) {
+                        recorder.event("CAVE_SOURCE_PAGE_STAGED",
+                                "page=" + task.key.globalPageX() + ','
+                                        + task.key.globalPageZ()
+                                        + " lane=" + task.lane
+                                        + " resolved="
+                                        + transaction.assembly().resolvedCount()
+                                        + "/" + CAVE_SOURCE_WINDOW_COUNT
+                                        + " deferred="
+                                        + transaction.deferredCount());
+                    }
+                }
+                long retryDelay = transaction.assembly().isComplete()
+                        ? transaction.completedRetryDelayMs()
+                        : transaction.retryDelayMs();
+                finish(task, retryDelay);
                 pump(serverLevel);
             }
         }
@@ -829,6 +1246,11 @@ public final class CaveWorldSaveReader {
                 retryAfter.put(retryKey, now + retryDelayMs);
             } else {
                 retryAfter.remove(retryKey);
+                if (!wantedByAnyViewportLocked(task, now)
+                        || task.epoch != epoch
+                        || !repository.isGenerationCurrent(task.repositoryGeneration)) {
+                    pendingPageAssemblies.remove(retryKey);
+                }
             }
         }
     }
@@ -843,11 +1265,39 @@ public final class CaveWorldSaveReader {
             task.cancel();
             pipelineTelemetry.recordTaskCancelledBeforeRun();
         }
+        pendingPageAssemblies.keySet().removeIf(
+                key -> !wantedAssemblyByAnyViewportLocked(key, now));
+        archiveResolvedPages.keySet().removeIf(
+                key -> !wantedAssemblyByAnyViewportLocked(key, now));
+        resolvedPageStamps.keySet().removeIf(
+                key -> !wantedAssemblyByAnyViewportLocked(key, now));
+    }
+
+    private boolean wantedAssemblyByAnyViewportLocked(PageRetryKey key, long now) {
+        if (key == null) return false;
+        PageTaskKey page = key.page();
+        for (Map.Entry<MapRequestLane, ViewportState> entry : viewports.entrySet()) {
+            ViewportState state = entry.getValue();
+            if (!state.isFresh(now, entry.getKey())) continue;
+            if (!page.dimension().equals(state.dimension)
+                    || page.view() != state.view
+                    || page.layerY() != state.layerY
+                    || key.projectionTopY() != state.projectionTopY) {
+                continue;
+            }
+            if (page.globalPageX() >= state.minPageX
+                    && page.globalPageX() <= state.maxPageX
+                    && page.globalPageZ() >= state.minPageZ
+                    && page.globalPageZ() <= state.maxPageZ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
      * Hands a moving viewport to its new rectangle without revoking overlapping
-     * page transactions. Queued overlap work is reinserted with the new centre-out
+     * page transactions. Queued overlap work is reinserted with the new fixed-region
      * priority; in-flight overlap work keeps its sixteen source leases. Only pages
      * outside every live viewport are cancelled.
      */
@@ -953,21 +1403,22 @@ public final class CaveWorldSaveReader {
         return false;
     }
 
-    /** Aggregates one page transaction without delaying publication of ready leaves. */
+    /** Counts one asynchronous source slice while the durable PageAssembly keeps
+     * resolved leaves across retries without exposing partial repository revisions. */
     private static final class PageReadTransaction {
         private int remaining;
-        private final int retainedResolved;
         private final long sourceWaitStartNanos;
+        private final PageAssembly assembly;
         private int present;
         private int absent;
         private int failed;
         private int deferred;
 
-        private PageReadTransaction(int remaining, int retainedResolved,
-                long sourceWaitStartNanos) {
+        private PageReadTransaction(int remaining, long sourceWaitStartNanos,
+                PageAssembly assembly) {
             this.remaining = remaining;
-            this.retainedResolved = retainedResolved;
             this.sourceWaitStartNanos = sourceWaitStartNanos;
+            this.assembly = assembly;
         }
 
         private synchronized boolean complete(boolean present, boolean absent,
@@ -980,19 +1431,140 @@ public final class CaveWorldSaveReader {
             return remaining == 0;
         }
 
-        private long sourceWaitStartNanos() {
-            return sourceWaitStartNanos;
+        private void stagePresent(int sourceIndex, DenseCaveTile tile) {
+            assembly.stagePresent(sourceIndex, tile);
         }
 
+        private void stageAbsent(int sourceIndex) {
+            assembly.stageAbsent(sourceIndex);
+        }
+
+        private PageAssembly assembly() { return assembly; }
+        private synchronized int deferredCount() { return deferred; }
+        private long sourceWaitStartNanos() { return sourceWaitStartNanos; }
+
         private synchronized long retryDelayMs() {
-            boolean partialProgress = retainedResolved > 0 || present > 0 || absent > 0;
             if (deferred > 0) return DEFERRED_RETRY_MS;
-            if (failed > 0 && partialProgress) return PARTIAL_REPAIR_RETRY_MS;
+            if (failed > 0 && assembly.resolvedCount() > 0) {
+                return PARTIAL_REPAIR_RETRY_MS;
+            }
             if (failed > 0) return FAILED_RETRY_MS;
-            if (present == 0 && absent == 16) return MISSING_RETRY_MS;
-            return 0L;
+            return PARTIAL_REPAIR_RETRY_MS;
+        }
+
+        private synchronized long completedRetryDelayMs() {
+            return assembly.absentCount() == 16 ? MISSING_RETRY_MS : 1_000L;
         }
     }
+
+    private static final class PageAssembly {
+        private static final long FULL_SOURCE_MASK =
+                (1L << CAVE_SOURCE_WINDOW_COUNT) - 1L;
+        private final long epoch;
+        private final long repositoryGeneration;
+        private final DenseCaveTile[] replacements =
+                new DenseCaveTile[CaveLoadHierarchy.CHUNKS_PER_PAGE_COUNT];
+        /** Repository consumes absent central leaves in X-major order. */
+        private final boolean[] knownAbsent =
+                new boolean[CaveLoadHierarchy.CHUNKS_PER_PAGE_COUNT];
+        private long resolvedMask;
+        private long retainedMask;
+        private long lastTouchedMs;
+
+        private PageAssembly(long epoch, long repositoryGeneration) {
+            this.epoch = epoch;
+            this.repositoryGeneration = repositoryGeneration;
+            touch();
+        }
+
+        private boolean matches(long epoch, long generation) {
+            return this.epoch == epoch && repositoryGeneration == generation;
+        }
+
+        private synchronized void touch() {
+            lastTouchedMs = System.currentTimeMillis();
+        }
+
+        private synchronized boolean isResolved(int sourceIndex) {
+            return sourceIndex >= 0 && sourceIndex < CAVE_SOURCE_WINDOW_COUNT
+                    && (resolvedMask & (1L << sourceIndex)) != 0L;
+        }
+
+        private synchronized void stageRetained(int sourceIndex) {
+            if (sourceIndex < 0 || sourceIndex >= CAVE_SOURCE_WINDOW_COUNT) return;
+            resolvedMask |= 1L << sourceIndex;
+            retainedMask |= 1L << sourceIndex;
+            touch();
+        }
+
+        private synchronized void stagePresent(int sourceIndex, DenseCaveTile tile) {
+            if (sourceIndex < 0 || sourceIndex >= CAVE_SOURCE_WINDOW_COUNT) return;
+            int centralIndex = centralSourceIndex(sourceIndex);
+            if (centralIndex >= 0 && tile != null) {
+                replacements[centralIndex] = tile;
+            }
+            resolvedMask |= 1L << sourceIndex;
+            retainedMask &= ~(1L << sourceIndex);
+            touch();
+        }
+
+        private synchronized void stageAbsent(int sourceIndex) {
+            if (sourceIndex < 0 || sourceIndex >= CAVE_SOURCE_WINDOW_COUNT) return;
+            int centralIndex = centralSourceIndex(sourceIndex);
+            if (centralIndex >= 0) {
+                int localX = centralIndex % CaveLoadHierarchy.CHUNKS_PER_PAGE;
+                int localZ = centralIndex / CaveLoadHierarchy.CHUNKS_PER_PAGE;
+                int repositoryIndex = localX * CaveLoadHierarchy.CHUNKS_PER_PAGE
+                        + localZ;
+                knownAbsent[repositoryIndex] = true;
+            }
+            resolvedMask |= 1L << sourceIndex;
+            retainedMask &= ~(1L << sourceIndex);
+            touch();
+        }
+
+        private synchronized boolean isComplete() {
+            return resolvedMask == FULL_SOURCE_MASK;
+        }
+
+        private synchronized int resolvedCount() {
+            return Long.bitCount(resolvedMask);
+        }
+
+        private synchronized int absentCount() {
+            int count = 0;
+            for (boolean absent : knownAbsent) if (absent) count++;
+            return count;
+        }
+
+        private synchronized Snapshot snapshot() {
+            ArrayList<DenseCaveTile> result = new ArrayList<>();
+            int retainedCentral = 0;
+            for (int order = 0;
+                    order < CaveLoadHierarchy.CHUNKS_PER_PAGE_COUNT; order++) {
+                int centralIndex = CaveLoadHierarchy.orderedChunkIndex(order);
+                DenseCaveTile tile = replacements[centralIndex];
+                if (tile != null) result.add(tile);
+                int localX = centralIndex % CaveLoadHierarchy.CHUNKS_PER_PAGE
+                        + CAVE_SOURCE_HALO;
+                int localZ = centralIndex / CaveLoadHierarchy.CHUNKS_PER_PAGE
+                        + CAVE_SOURCE_HALO;
+                int sourceIndex = localZ * CAVE_SOURCE_WINDOW_CHUNKS + localX;
+                if ((retainedMask & (1L << sourceIndex)) != 0L) {
+                    retainedCentral++;
+                }
+            }
+            int haloResolved = Long.bitCount(resolvedMask) - 16;
+            return new Snapshot(result, knownAbsent.clone(), result.size(),
+                    absentCount(), retainedCentral, Math.max(0, haloResolved));
+        }
+
+        private record Snapshot(List<DenseCaveTile> replacements,
+                boolean[] knownAbsent, int presentCount, int absentCount,
+                int retainedCount, int haloResolvedCount) {
+        }
+    }
+
 
     private static final class ViewportState {
         private String dimension = "";
@@ -1006,6 +1578,13 @@ public final class CaveWorldSaveReader {
         private int centerPageX = Integer.MIN_VALUE;
         private int centerPageZ = Integer.MIN_VALUE;
         private long[] pagePlan = new long[0];
+        /** Real presentation plan; pagePlan may additionally contain source-only halo. */
+        private long[] foregroundPagePlan = new long[0];
+        private CaveLoadHierarchy.OrdinalIndex pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(new long[0]);
+        private long sourcePlanRevision = Long.MIN_VALUE;
+        /** Immutable generated-page bitmap from the latest complete Anvil header scan. */
+        private java.util.Set<Long> sourcePresentPages = java.util.Set.of();
+        private boolean sourceFilterReady;
         private int pageCursor;
         private int updateSliceIndex;
         private long completedCycles;
@@ -1043,20 +1622,21 @@ public final class CaveWorldSaveReader {
 
         private boolean shouldRecenter(int centerPageX, int centerPageZ,
                 MapRequestLane lane, int thresholdPages) {
-            if (lane != MapRequestLane.FULLSCREEN || this.centerPageX == Integer.MIN_VALUE) {
-                return false;
-            }
-            return Math.max(Math.abs(centerPageX - this.centerPageX),
-                    Math.abs(centerPageZ - this.centerPageZ)) >= Math.max(1, thresholdPages);
+            // Fullscreen source order is fixed by the viewport's world-coordinate
+            // rectangle. Moving the cursor/focus inside that rectangle must not
+            // restart the viewport scanline read plan.
+            return false;
         }
 
         private void recenter(int centerPageX, int centerPageZ, MapRequestLane lane) {
             this.centerPageX = centerPageX;
             this.centerPageZ = centerPageZ;
-            pagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
-                    minPageX, maxPageX, minPageZ, maxPageZ,
-                    centerPageX, centerPageZ, lane == MapRequestLane.FULLSCREEN,
-                    false, minPageX, maxPageX, minPageZ, maxPageZ);
+            pagePlan = buildSourcePlan(minPageX, maxPageX, minPageZ, maxPageZ,
+                    centerPageX, centerPageZ, lane);
+            pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(pagePlan);
+            sourcePlanRevision = Long.MIN_VALUE;
+            sourcePresentPages = java.util.Set.of();
+            sourceFilterReady = false;
             pageCursor = 0;
             updateSliceIndex = 0;
             completedCycles = 0L;
@@ -1098,16 +1678,61 @@ public final class CaveWorldSaveReader {
             this.maxPageZ = maxPageZ;
             this.centerPageX = centerPageX;
             this.centerPageZ = centerPageZ;
-            pagePlan = CaveLoadHierarchy.buildVisiblePagePlan(
-                    minPageX, maxPageX, minPageZ, maxPageZ,
-                    centerPageX, centerPageZ, lane == MapRequestLane.FULLSCREEN,
-                    continuousPan, previousMinPageX, previousMaxPageX,
-                    previousMinPageZ, previousMaxPageZ);
+            pagePlan = buildSourcePlan(minPageX, maxPageX, minPageZ, maxPageZ,
+                    centerPageX, centerPageZ, lane);
+            pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(pagePlan);
+            sourcePlanRevision = Long.MIN_VALUE;
+            sourcePresentPages = java.util.Set.of();
+            sourceFilterReady = false;
             pageCursor = 0;
             updateSliceIndex = 0;
             completedCycles = 0L;
             nextPassMs = 0L;
             lastRequestMs = 0L;
+        }
+
+        private static long[] buildSourcePlan(int minPageX, int maxPageX,
+                int minPageZ, int maxPageZ, int centerPageX, int centerPageZ,
+                MapRequestLane lane) {
+            return CaveLoadHierarchy.buildVisiblePagePlan(
+                    minPageX, maxPageX, minPageZ, maxPageZ,
+                    centerPageX, centerPageZ,
+                    lane == MapRequestLane.FULLSCREEN);
+        }
+
+        private boolean applySourceFilter(java.util.Set<Long> presentPages,
+                long revision, MapRequestLane lane) {
+            if (lane != MapRequestLane.FULLSCREEN
+                    || sourcePlanRevision == revision) return false;
+            long[] fullPlan = CaveLoadHierarchy.buildVisiblePagePlan(
+                    minPageX, maxPageX, minPageZ, maxPageZ,
+                    centerPageX, centerPageZ, true);
+            pagePlan = CaveLoadHierarchy.retainPresentPages(fullPlan, presentPages);
+            pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(pagePlan);
+            sourcePresentPages = presentPages == null
+                    ? java.util.Set.of() : presentPages;
+            sourceFilterReady = true;
+            sourcePlanRevision = revision;
+            pageCursor = 0;
+            updateSliceIndex = 0;
+            completedCycles = 0L;
+            nextPassMs = 0L;
+            lastRequestMs = 0L;
+            return true;
+        }
+
+        private boolean isKnownAbsent(String dimension, CaveView view,
+                int normalizedLayer, int projectionTopY,
+                int globalPageX, int globalPageZ) {
+            if (!sourceFilterReady || !this.dimension.equals(dimension)
+                    || this.view != view || this.layerY != normalizedLayer
+                    || this.projectionTopY != projectionTopY
+                    || globalPageX < minPageX || globalPageX > maxPageX
+                    || globalPageZ < minPageZ || globalPageZ > maxPageZ) {
+                return false;
+            }
+            return !sourcePresentPages.contains(
+                    CaveLoadHierarchy.pack(globalPageX, globalPageZ));
         }
 
         private static boolean rectanglesOverlap(int firstMinX, int firstMaxX,
@@ -1118,9 +1743,8 @@ public final class CaveWorldSaveReader {
         }
 
         private int ordinalOf(int pageX, int pageZ) {
-            return CaveLoadHierarchy.centerOutOrdinal(
-                    minPageX, maxPageX, minPageZ, maxPageZ,
-                    centerPageX, centerPageZ, pageX, pageZ);
+            return pageOrdinals.getOrDefault(
+                    CaveLoadHierarchy.pack(pageX, pageZ), -1);
         }
 
         private int priorityFor(PageTask task, MapRequestLane lane) {
@@ -1160,6 +1784,10 @@ public final class CaveWorldSaveReader {
             minPageX = maxPageX = minPageZ = maxPageZ = Integer.MIN_VALUE;
             centerPageX = centerPageZ = Integer.MIN_VALUE;
             pagePlan = new long[0];
+            pageOrdinals = CaveLoadHierarchy.buildOrdinalIndex(new long[0]);
+            sourcePlanRevision = Long.MIN_VALUE;
+            sourcePresentPages = java.util.Set.of();
+            sourceFilterReady = false;
             pageCursor = 0;
             updateSliceIndex = 0;
             completedCycles = 0L;
@@ -1203,6 +1831,7 @@ public final class CaveWorldSaveReader {
         private final long repositoryGeneration;
         private final MapCancellationToken token = new MapCancellationToken(null);
         private DecodedWorldRegionCache.SourceLease[] sourceLeases;
+        private DecodedWorldRegionCache.PageReservation reservation;
         private boolean cancelled;
 
         private PageTask(PageTaskKey key, int projectionTopY, int priority,
@@ -1234,10 +1863,17 @@ public final class CaveWorldSaveReader {
             if (cancelled) releaseLeasesLocked();
         }
 
+        private synchronized void closeReservation() {
+            DecodedWorldRegionCache.PageReservation current = reservation;
+            reservation = null;
+            if (current != null) current.close();
+        }
+
         private synchronized void cancel() {
             if (cancelled) return;
             cancelled = true;
             token.cancel();
+            closeReservation();
             releaseLeasesLocked();
         }
 

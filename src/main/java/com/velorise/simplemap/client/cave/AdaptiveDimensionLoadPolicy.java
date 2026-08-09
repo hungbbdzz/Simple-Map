@@ -38,10 +38,15 @@ public final class AdaptiveDimensionLoadPolicy {
      */
     public static int surfacePageBudget(Topology topology, boolean fullscreen,
             boolean pressured, boolean movingFast, float scale) {
-        if (pressured || movingFast || !fullscreen) return 1;
-        if (topology == Topology.DARK_OPEN) return 2;
-        if (topology == Topology.HARD_CEILING) return 1;
-        return scale < 0.12f ? 1 : 2;
+        if (pressured || movingFast || !fullscreen) return 2;
+        if (topology == Topology.HARD_CEILING) return 6;
+        /*
+         * Local-world reconstruction is a bounded region-file import, not a live
+         * chunk scan. Keep enough coherent 6x6 windows moving to cover an existing
+         * 8x8-page generated footprint in seconds while the reconstructor's apply
+         * queue provides the frame-time backpressure.
+         */
+        return 8;
     }
 
     /** Rebuild only after a meaningful pan/zoom, not every page-edge crossing. */

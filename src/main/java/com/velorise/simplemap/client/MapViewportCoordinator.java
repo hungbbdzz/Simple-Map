@@ -3,6 +3,7 @@ package com.velorise.simplemap.client;
 import com.velorise.simplemap.client.surface.SurfaceDemandController;
 import com.velorise.simplemap.client.cave.v2.CaveProjectionController;
 import com.velorise.simplemap.client.cave.CaveWorldSaveReader;
+import com.velorise.simplemap.client.cave.CaveView;
 import com.velorise.simplemap.client.cave.CaveScreenSpacePolicy;
 import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
 import net.minecraft.client.Minecraft;
@@ -33,6 +34,10 @@ public final class MapViewportCoordinator {
      * parents while normal gameplay continues.
      */
     private long lastBackgroundSurfaceRun;
+    /** Player render-distance source maintenance is independent from MapScreen. */
+    private long lastLoadedSurfaceHaloRun;
+    private long lastHiddenCaveHaloRun;
+    private long lastSuspendedTeleportEpoch = Long.MIN_VALUE;
     // Background publication repairs/widens the retained surface cache. It must
     // not compete one-for-one with the visible minimap request every client tick.
     private static final long BACKGROUND_SURFACE_INTERVAL_NANOS = 250_000_000L;
@@ -42,6 +47,10 @@ public final class MapViewportCoordinator {
     private static final int BACKGROUND_SURFACE_MIN_RADIUS = 96;
     private static final int BACKGROUND_SURFACE_MAX_RADIUS = 256;
     private static final int CAVE_BACKGROUND_SURFACE_MAX_RADIUS = 128;
+    private static final long LOADED_SURFACE_HALO_INTERVAL_NANOS = 50_000_000L;
+    private static final long HIDDEN_CAVE_HALO_INTERVAL_NANOS = 150_000_000L;
+    private static final long LOADED_SURFACE_HALO_GAME_BUDGET_NANOS = 6_000_000L;
+    private static final long LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS = 5_000_000L;
     private LayerStreamState layerStream = new LayerStreamState();
 
     private MapViewportCoordinator() {
@@ -108,8 +117,15 @@ public final class MapViewportCoordinator {
         governor.setFullscreenState(true, interacting);
         governor.setFocus(clampedFocusX, clampedFocusZ);
         if (openingFullscreen) {
-            UnifiedCaveTextureManager.getInstance().suspendLane(MapRequestLane.MINIMAP);
-            CaveWorldSaveReader.getInstance().suspendLane(MapRequestLane.MINIMAP);
+            /*
+             * Do not revoke the player-local writer when MapScreen opens. Xaero
+             * keeps its minimap loading set alive behind the fullscreen map; only
+             * the visible renderer changes. Revoking MINIMAP ownership here caused
+             * loaded chunks and completed cave pages to accumulate until the screen
+             * closed, at which point they appeared in one sudden burst.
+             */
+            lastLoadedSurfaceHaloRun = 0L;
+            lastHiddenCaveHaloRun = 0L;
         }
     }
 
@@ -176,22 +192,27 @@ public final class MapViewportCoordinator {
         lastLayerUploadRun = 0L;
         lastAdjacentWarmupRun = 0L;
         lastBackgroundSurfaceRun = 0L;
+        lastLoadedSurfaceHaloRun = 0L;
+        lastHiddenCaveHaloRun = 0L;
     }
 
-    /** Retain render mailboxes but revoke every expensive lane during movement. */
+    /**
+     * Quarantines the discontinuous player-local lane once after teleport. The
+     * fullscreen world-map viewport is independent from the player's position and
+     * must retain its valid work/mailbox when the player teleports while MapScreen
+     * remains open. Revoking FULLSCREEN here was the source of persistent black
+     * rectangles: the unchanged viewer lost ownership while the new MINIMAP halo
+     * simultaneously reused atlas slots.
+     */
     public void suspendForMovement() {
         MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
-        MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
         UnifiedCaveTextureManager.getInstance().suspendLane(MapRequestLane.MINIMAP);
-        UnifiedCaveTextureManager.getInstance().suspendLane(MapRequestLane.FULLSCREEN);
         CaveWorldSaveReader.getInstance().suspendLane(MapRequestLane.MINIMAP);
-        CaveWorldSaveReader.getInstance().suspendLane(MapRequestLane.FULLSCREEN);
         MapPublicationCoordinator.getInstance().beginTick();
         MapPublicationCoordinator.getInstance().setPublicationAllowed(false);
-        lastFullscreenRun = 0L;
         lastMinimapRun = 0L;
-        lastLayerUploadRun = 0L;
-        layerStream = new LayerStreamState();
+        lastLoadedSurfaceHaloRun = 0L;
+        lastHiddenCaveHaloRun = 0L;
     }
 
     public void closeFullscreen() {
@@ -220,6 +241,9 @@ public final class MapViewportCoordinator {
         lastLayerUploadRun = 0L;
         lastAdjacentWarmupRun = 0L;
         lastBackgroundSurfaceRun = 0L;
+        lastLoadedSurfaceHaloRun = 0L;
+        lastHiddenCaveHaloRun = 0L;
+        lastSuspendedTeleportEpoch = Long.MIN_VALUE;
         layerStream = new LayerStreamState();
         MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
         MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
@@ -233,8 +257,21 @@ public final class MapViewportCoordinator {
     public void tick(Minecraft minecraft,
             MapPerformanceGovernor.ObservationProfile profile) {
         if (minecraft == null || minecraft.level == null || minecraft.player == null) return;
-        if (MapActivityGate.getInstance().blocksForegroundStreaming()) {
-            suspendForMovement();
+        MapActivityGate activityGate = MapActivityGate.getInstance();
+        if (activityGate.blocksForegroundStreaming()) {
+            long teleportEpoch = activityGate.teleportEpoch();
+            if (lastSuspendedTeleportEpoch != teleportEpoch) {
+                lastSuspendedTeleportEpoch = teleportEpoch;
+                suspendForMovement();
+            } else {
+                // Do not bump MINIMAP/FULLSCREEN generations on every quarantine
+                // tick. That repeatedly invalidated the destination work we had just
+                // submitted and is the main teleport-only consistency failure.
+                MapPublicationCoordinator publication =
+                        MapPublicationCoordinator.getInstance();
+                publication.beginTick();
+                publication.setPublicationAllowed(false);
+            }
             return;
         }
         if (profile == null) profile = MapPerformanceGovernor.getInstance()
@@ -251,6 +288,7 @@ public final class MapViewportCoordinator {
         // admission on a hidden minimap render lane. CPU live observation continues
         // elsewhere; exact cave IO and GPU publication belong to the visible map.
         Request minimap = minimapRequest;
+        tickLoadedPlayerHalo(minecraft, now, fullscreenVisible, publication);
         if (!fullscreenVisible && minimap != null
                 && now - minimap.submittedNanos < 500_000_000L
                 && now - lastMinimapRun >= profile.minimapIntervalNanos()) {
@@ -352,6 +390,59 @@ public final class MapViewportCoordinator {
         }
         tickAdjacentLayerWarmup(minecraft, now, fullscreen, minimap, profile);
         publication.setPublicationAllowed(profile.allowPublication());
+    }
+
+
+    /**
+     * Keeps every currently loaded Minecraft chunk flowing into the Surface
+     * repository even while a fullscreen map owns the visible viewport. Loaded
+     * render-distance coverage is a minimap invariant, not optional background
+     * prefetch: BACKGROUND requests are intentionally centre-limited to 3x3 pages
+     * by MapTextureManager and therefore stranded the outer halo whenever MapScreen
+     * was open. Keep this demand on the MINIMAP lane; fullscreen still owns its own
+     * visible lane and GPU publication budget.
+     */
+    private void tickLoadedPlayerHalo(Minecraft minecraft, long now,
+            boolean fullscreenVisible, MapPublicationCoordinator publication) {
+        if (!MapManager.getInstance().isViewingLiveDimension()) return;
+        int renderDistance = Math.max(2,
+                minecraft.options.getEffectiveRenderDistance());
+        int radius = Math.max(64, (renderDistance + 1) * 16);
+        if (now - lastLoadedSurfaceHaloRun >= LOADED_SURFACE_HALO_INTERVAL_NANOS) {
+            lastLoadedSurfaceHaloRun = now;
+            long budget = fullscreenVisible
+                    ? LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS
+                    : LOADED_SURFACE_HALO_GAME_BUDGET_NANOS;
+            ChunkScanner.getInstance().maintainLoadedSurfaceHalo(
+                    minecraft, radius, budget);
+            double centerX = minecraft.player.getX();
+            double centerZ = minecraft.player.getZ();
+            SurfaceDemandController.getInstance().submit(
+                    new SurfaceDemandController.Request(
+                            centerX - radius, centerX + radius,
+                            centerZ - radius, centerZ + radius,
+                            centerX, centerZ, 1.0f,
+                            MapRequestLane.MINIMAP,
+                            false));
+            publication.requestSurface(MapRequestLane.MINIMAP, false);
+        }
+
+        if (!fullscreenVisible || !CaveMode.isActive(minecraft)
+                || now - lastHiddenCaveHaloRun < HIDDEN_CAVE_HALO_INTERVAL_NANOS) {
+            return;
+        }
+        lastHiddenCaveHaloRun = now;
+        CaveView view = CaveMode.isFullView(minecraft)
+                ? CaveView.FULL : CaveView.LAYERED;
+        int topY = view == CaveView.FULL
+                ? Integer.MIN_VALUE : CaveMode.getLayerY(minecraft);
+        double centerX = minecraft.player.getX();
+        double centerZ = minecraft.player.getZ();
+        CaveProjectionController.getInstance().request(
+                view, topY,
+                centerX - radius, centerX + radius,
+                centerZ - radius, centerZ + radius,
+                1.0f, centerX, centerZ, MapRequestLane.BACKGROUND);
     }
 
     /**
