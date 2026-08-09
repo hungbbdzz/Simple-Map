@@ -91,10 +91,15 @@ public class MapConfig {
     public static float pinScale = 0.5f;
     public static boolean autoClearPin = true;
 
-    // Pin navigation marker (session-persistent, not saved to disk)
+    // Pin navigation marker. The route origin is captured once when the pin is
+    // created, then retained with the per-dimension pin so guide dots remain fixed
+    // to world blocks instead of following the player or viewport.
     public static boolean pinActive = false;
     public static double pinWorldX = 0;
     public static double pinWorldZ = 0;
+    public static boolean pinRouteStartValid = false;
+    public static double pinRouteStartWorldX = 0;
+    public static double pinRouteStartWorldZ = 0;
 
     // Minimap rotation config
     public static boolean minimapRotate = true; // Toggle whether minimap rotates with player

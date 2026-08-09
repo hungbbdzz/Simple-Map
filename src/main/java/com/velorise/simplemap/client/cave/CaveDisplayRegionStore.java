@@ -9,6 +9,8 @@ import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -18,13 +20,19 @@ import java.util.zip.CRC32;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
+import com.velorise.simplemap.client.MapConfig;
+
 /** Append-only random-access store for dense display tiles (.cvd). */
 final class CaveDisplayRegionStore {
     private static final int REGION_MAGIC = 0x43564431; // CVD1
-    private static final int REGION_VERSION = 4;
+    /*
+     * v7 invalidates dense projections derived from the old live Cave roof-entry
+     * heuristic and pre-PASS117 archive water material composition.
+     */
+    private static final int REGION_VERSION = 7;
     private static final int RECORD_MAGIC = 0x4454494C; // DTIL
     private static final int TILE_MAGIC = 0x44435431; // DCT1
-    private static final int TILE_VERSION = 5;
+    private static final int TILE_VERSION = 8;
     private static final int HEADER_BYTES = Integer.BYTES * 2;
     private static final int RECORD_HEADER_BYTES = Integer.BYTES * 7;
     private static final int MAX_PAYLOAD = 1 << 20;
@@ -36,8 +44,10 @@ final class CaveDisplayRegionStore {
     static Map<DenseCaveTileKey, RecordPointer> rebuildIndex(File directory) {
         Map<DenseCaveTileKey, RecordPointer> result = new HashMap<>();
         if (directory == null || !directory.isDirectory()) return result;
+        String prefix = colourNamespacePrefix();
         File[] files = directory.listFiles((dir, name) -> name != null
-                && name.matches("r\\.-?\\d+\\.-?\\d+\\.cvd"));
+                && name.matches(java.util.regex.Pattern.quote(prefix)
+                        + "r\\.-?\\d+\\.-?\\d+\\.cvd"));
         if (files == null) return result;
         for (File file : files) scan(file, result);
         return result;
@@ -109,6 +119,57 @@ final class CaveDisplayRegionStore {
         if ((int) crc.getValue() != pointer.checksum()) return null;
         DenseCaveTile tile = decode(payload);
         return tile != null && DenseCaveTileKey.of(tile).equals(pointer.key()) ? tile : null;
+    }
+
+    /**
+     * Reads a display-cache batch from one region with a single file handle.
+     *
+     * <p>The fullscreen map normally asks for dozens or hundreds of neighbouring
+     * 16x16 projections at once. Opening the same .cvd file and constructing a
+     * GZIP stream in a separate scheduler task for every projection made cache
+     * replay slower than rebuilding from the Minecraft save. Region archives in
+     * mature map renderers are consumed as one ordered stream; sorting the latest
+     * append-only records by offset gives this store the same IO shape while
+     * retaining its random-access format.</p>
+     */
+    static Map<DenseCaveTileKey, DenseCaveTile> readMany(File directory,
+            List<RecordPointer> requested) throws IOException {
+        Map<DenseCaveTileKey, DenseCaveTile> result = new LinkedHashMap<>();
+        if (directory == null || requested == null || requested.isEmpty()) return result;
+
+        List<RecordPointer> pointers = new ArrayList<>(requested.size());
+        int regionX = requested.get(0).regionX();
+        int regionZ = requested.get(0).regionZ();
+        for (RecordPointer pointer : requested) {
+            if (pointer != null && pointer.regionX() == regionX
+                    && pointer.regionZ() == regionZ) pointers.add(pointer);
+        }
+        if (pointers.isEmpty()) return result;
+        pointers.sort(Comparator.comparingLong(RecordPointer::offset));
+
+        File file = file(directory, regionX, regionZ);
+        if (!file.isFile()) return result;
+        synchronized (lock(file)) {
+            try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+                long fileLength = input.length();
+                for (RecordPointer pointer : pointers) {
+                    if (pointer.offset() < HEADER_BYTES || pointer.length() <= 0
+                            || pointer.length() > MAX_PAYLOAD
+                            || pointer.offset() + pointer.length() > fileLength) continue;
+                    byte[] payload = new byte[pointer.length()];
+                    input.seek(pointer.offset());
+                    input.readFully(payload);
+                    CRC32 crc = new CRC32();
+                    crc.update(payload);
+                    if ((int) crc.getValue() != pointer.checksum()) continue;
+                    DenseCaveTile tile = decode(payload);
+                    if (tile != null && DenseCaveTileKey.of(tile).equals(pointer.key())) {
+                        result.put(pointer.key(), tile);
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     private static void scan(File file, Map<DenseCaveTileKey, RecordPointer> output) {
@@ -260,11 +321,20 @@ final class CaveDisplayRegionStore {
     }
 
     private static File file(File directory, int regionX, int regionZ) {
-        return new File(directory, "r." + regionX + "." + regionZ + ".cvd");
+        return new File(directory, colourNamespacePrefix() + "r."
+                + regionX + "." + regionZ + ".cvd");
+    }
+
+    /** Persistent cave material colour depends on colour mode and visual schema. */
+    private static String colourNamespacePrefix() {
+        return "c4-m" + Math.max(0, MapConfig.blockColourMode) + "-";
     }
 
     private static int[] regionCoordinates(File file) {
-        String[] parts = file.getName().split("\\.");
+        String name = file.getName();
+        String prefix = colourNamespacePrefix();
+        if (!name.startsWith(prefix)) return null;
+        String[] parts = name.substring(prefix.length()).split("\\.");
         if (parts.length != 4) return null;
         try {
             return new int[] { Integer.parseInt(parts[1]), Integer.parseInt(parts[2]) };

@@ -1,6 +1,8 @@
 package com.velorise.simplemap.client;
 
 import com.velorise.simplemap.client.persistence.v2.MapPersistenceV2Service;
+import com.velorise.simplemap.client.cave.archive.CaveArchiveV2Service;
+import com.velorise.simplemap.client.cave.projection.CaveProjectionServiceV2;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.velorise.simplemap.client.pipeline.MapWorkGraph;
@@ -76,6 +78,9 @@ public class MapManager {
     private String currentDimensionId = "";
     /** Canonical registry id, e.g. minecraft:the_nether or modid:moon. */
     private volatile String currentDimensionResourceId = "minecraft:overworld";
+    /** Persisted target-dimension metadata; never borrowed from a remote live level. */
+    private volatile DimensionMapProfile currentDimensionProfile =
+            DimensionMapProfile.fallback("minecraft:overworld");
     private String liveDimensionId = "overworld";
     private String liveDimensionResourceId = "minecraft:overworld";
     /** Per-ClientLevel world identity cache. This method is called every client
@@ -221,17 +226,30 @@ public class MapManager {
             loadLearningState(worldDirectory);
             WaypointManager.getInstance().updateWorldDir(worldDirectory);
             configureDimension(liveStorageId, liveResourceId);
+            observeLiveDimensionProfile(level, worldDirectory, liveStorageId, liveResourceId);
             MapSessionManager.getInstance().open(currentWorldId, liveResourceId);
             rememberObservedWorldIdentity(level, worldId, worldDirectory,
                     liveStorageId, liveResourceId);
             return;
         }
 
+        observeLiveDimensionProfile(level, worldDirectory, liveStorageId, liveResourceId);
         rememberObservedWorldIdentity(level, worldId, worldDirectory,
                 liveStorageId, liveResourceId);
         if (viewDimensionOverride != null) return;
         if (!liveStorageId.equals(currentDimensionId)) {
             switchDimensionData(liveStorageId, liveResourceId, true);
+        }
+    }
+
+    private void observeLiveDimensionProfile(Level level, File worldDirectory,
+            String storageId, String resourceId) {
+        if (level == null || worldDirectory == null) return;
+        DimensionMapProfile observed = DimensionMapProfile.fromLevel(level, resourceId);
+        File dimensionDirectory = new File(worldDirectory, storageId);
+        observed.save(dimensionDirectory.toPath());
+        if (resourceId.equals(currentDimensionResourceId)) {
+            currentDimensionProfile = observed;
         }
     }
 
@@ -334,6 +352,14 @@ public class MapManager {
             LOGGER.warn("Could not create SimpleMap dimension directory {}", currentDimensionDir);
         }
         writeDimensionMetadata(currentDimensionDir, resourceId);
+        currentDimensionProfile = DimensionMapProfile.resolve(
+                currentDimensionDir.toPath(), resourceId);
+
+        // Dimension is an archive/projection ownership boundary. Activate it before
+        // CaveMapManager opens its repository because persistence replay can index
+        // compact tiles immediately from setBaseDirectory().
+        CaveArchiveV2Service.getInstance().activateDimension(resourceId);
+        CaveProjectionServiceV2.getInstance().activateDimension(resourceId);
 
         MapLightManager.getInstance().setCacheDirectory(
                 new File(currentWorldDir, "light_cache/" + storageId));
@@ -439,6 +465,20 @@ public class MapManager {
 
     public String getCurrentDimensionResourceId() {
         return currentDimensionResourceId;
+    }
+
+    /** Metadata of the map dimension currently being rendered/browsed. */
+    public DimensionMapProfile getCurrentDimensionProfile() {
+        return currentDimensionProfile;
+    }
+
+    /** Persisted metadata for any discovered dimension in the current world. */
+    public synchronized DimensionMapProfile getDimensionProfile(String dimensionId) {
+        String canonical = canonicalDimensionId(dimensionId);
+        if (canonical.equals(currentDimensionResourceId)) return currentDimensionProfile;
+        if (currentWorldDir == null) return DimensionMapProfile.fallback(canonical);
+        File directory = new File(currentWorldDir, dimensionStorageId(canonical));
+        return DimensionMapProfile.resolve(directory.toPath(), canonical);
     }
 
     public String getLiveDimensionResourceId() {
@@ -580,6 +620,16 @@ public class MapManager {
         Region region = getRegion(blockX >> 9, blockZ >> 9, false);
         return region != null && region.isLoaded()
                 && region.isChunkSurfaceComplete((blockX & 511) >>> 4,
+                        (blockZ & 511) >>> 4);
+    }
+
+    /** O(1) count used to reject legacy/placeholder chunks completed as all EMPTY. */
+    public int knownSurfaceColumnCount(int chunkX, int chunkZ) {
+        int blockX = chunkX << 4;
+        int blockZ = chunkZ << 4;
+        Region region = getRegion(blockX >> 9, blockZ >> 9, false);
+        return region == null || !region.isLoaded() ? 0
+                : region.knownSurfaceColumnCount((blockX & 511) >>> 4,
                         (blockZ & 511) >>> 4);
     }
 
@@ -992,6 +1042,10 @@ public class MapManager {
         MapLightManager.getInstance().flushAndClear();
         CaveMapManager.getInstance().flushAndClear();
         FullCaveMapManager.getInstance().flushAndClear();
+        // True world/session reset. Dimension navigation intentionally does not
+        // clear these retained per-dimension archives/projections.
+        CaveProjectionServiceV2.getInstance().clear();
+        CaveArchiveV2Service.getInstance().clear();
         CaveTextureManager.getInstance().clearCache();
         FullCaveTextureManager.getInstance().clearCache();
         VerticalCaveArchiveManager.getInstance().flushAndClear();
@@ -1013,6 +1067,7 @@ public class MapManager {
         currentWorldId = "";
         currentDimensionId = "";
         currentDimensionResourceId = "minecraft:overworld";
+        currentDimensionProfile = DimensionMapProfile.fallback("minecraft:overworld");
         liveDimensionId = "overworld";
         liveDimensionResourceId = "minecraft:overworld";
         clearObservedWorldIdentity();
@@ -1023,6 +1078,9 @@ public class MapManager {
         MapConfig.pinActive = false;
         MapConfig.pinWorldX = 0;
         MapConfig.pinWorldZ = 0;
+        MapConfig.pinRouteStartValid = false;
+        MapConfig.pinRouteStartWorldX = 0;
+        MapConfig.pinRouteStartWorldZ = 0;
     }
 
     private void saveDirtyRegionsAsync() {
@@ -1375,6 +1433,8 @@ public class MapManager {
         private long sourceRevision = 1L;
         private long paletteRevision = 1L;
         private final long[] chunkRevisions = new long[32 * 32];
+        /** Content changed during the current private 16x16 writer transaction. */
+        private final boolean[] surfaceTransactionDirty = new boolean[32 * 32];
 
         private Region(int rx, int rz, long generation) {
             this.rx = rx;
@@ -1517,14 +1577,44 @@ public class MapManager {
             }
         }
 
-        /** Marks the row-major 16x16 transaction complete, including known void. */
+        public int knownSurfaceColumnCount(int localChunkX, int localChunkZ) {
+            if (localChunkX < 0 || localChunkX >= 32
+                    || localChunkZ < 0 || localChunkZ >= 32) return 0;
+            lock.lock();
+            try {
+                return knownColumnsPerChunk[localChunkZ * 32 + localChunkX]
+                        & 0xFFFF;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * Finishes the private row-major 16x16 writer transaction. A positive
+         * revision means this transaction actually published new authority: either
+         * some pixel/tint changed, or completion changed from unknown to complete.
+         * Re-scanning an already-complete byte-identical chunk returns zero.
+         *
+         * <p>PASS120 returned the old positive chunk revision for every no-op scan.
+         * MapManager interpreted that as a fresh publication and dirtied the exact
+         * page plus its halo again, producing 4,084 atomic page refreshes in the
+         * supplied ~248 s run. Xaero only updates a MapTileChunk buffer when its tile
+         * transaction actually changed; mirror that invariant here.</p>
+         */
         public long finishSurfaceChunkTransaction(int localChunkX, int localChunkZ) {
             if (localChunkX < 0 || localChunkX >= 32
                     || localChunkZ < 0 || localChunkZ >= 32) return 0L;
             lock.lock();
             try {
                 int chunkIndex = localChunkZ * 32 + localChunkX;
-                if (SurfaceChunkCoverage.markComplete(completeChunks, chunkIndex)) {
+                boolean contentChanged = surfaceTransactionDirty[chunkIndex];
+                surfaceTransactionDirty[chunkIndex] = false;
+                boolean completionChanged = SurfaceChunkCoverage.markComplete(
+                        completeChunks, chunkIndex);
+                if (!contentChanged && !completionChanged) return 0L;
+                if (!contentChanged) {
+                    // Completion itself is source authority (notably v4->v5 water
+                    // migration where retained pixels can compare byte-identical).
                     chunkRevisions[chunkIndex] = ++sourceRevision;
                 }
                 return chunkRevisions[chunkIndex];
@@ -1618,6 +1708,7 @@ public class MapManager {
                 if (changed > 0) {
                     long revision = ++sourceRevision;
                     chunkRevisions[chunkIndex] = revision;
+                    surfaceTransactionDirty[chunkIndex] = true;
                 }
                 return new SurfaceChunkCommit(changed,
                         chunkCompleteUnsafe(chunkIndex),
@@ -1759,17 +1850,19 @@ public class MapManager {
         }
 
         /**
-         * Captures the density-correct 64x64 level-0 fallback for this 512x512
-         * region. One sample represents an 8x8 block cell; a one-cell halo is
-         * retained for slope/color shading. This is deliberately about 55 KiB,
-         * rather than cloning and colorizing the full multi-megabyte region every
-         * time a coarse fallback is refreshed.
+         * Captures a supersampled level-0 fallback source for this 512x512
+         * region. PASS117 took one centre sample for every 8x8 output texel. That
+         * point sampling aliased ocean-floor detail into the regular dashed/grid
+         * pattern visible at wide zoom. PASS118 samples every 4 blocks (128x128)
+         * and the worker linearly reduces 2x2 styled samples into each 8x8 output
+         * texel, matching Xaero's filtered child-to-branch minification much more
+         * closely without cloning the full 512x512 region.
          */
         public RegionLodSnapshot snapshotLodLevel0() {
-            final int outputSize = 64;
+            final int outputSize = 128;
             final int halo = 1;
             final int stride = outputSize + halo * 2;
-            final int sampleStep = 8;
+            final int sampleStep = 4;
             lock.lock();
             try {
                 long[] sampledPixels = new long[stride * stride];
@@ -1798,7 +1891,8 @@ public class MapManager {
                     }
                 }
                 return RegionLodSnapshot.owned(rx, rz, sourceRevision,
-                        stride, halo, knownCells, sampledPixels, sampledTints,
+                        stride, halo, sampleStep, knownCells,
+                        sampledPixels, sampledTints,
                         sampledKnown, biomePalette.toArray(new String[0]),
                         blockPalette.toArray(new String[0]));
             } finally {
@@ -1968,6 +2062,7 @@ public class MapManager {
         private final long sourceRevision;
         private final int stride;
         private final int halo;
+        private final int sampleStep;
         private final int knownCells;
         private final long[] pixels;
         private final int[] tints;
@@ -1976,14 +2071,15 @@ public class MapManager {
         private final String[] blockPalette;
 
         private RegionLodSnapshot(int regionX, int regionZ,
-                long sourceRevision, int stride, int halo, int knownCells,
-                long[] pixels, int[] tints, byte[] known,
+                long sourceRevision, int stride, int halo, int sampleStep,
+                int knownCells, long[] pixels, int[] tints, byte[] known,
                 String[] biomePalette, String[] blockPalette) {
             this.regionX = regionX;
             this.regionZ = regionZ;
             this.sourceRevision = Math.max(1L, sourceRevision);
             this.stride = stride;
             this.halo = halo;
+            this.sampleStep = Math.max(1, sampleStep);
             this.knownCells = Math.max(0, knownCells);
             this.pixels = pixels;
             this.tints = tints;
@@ -1993,11 +2089,11 @@ public class MapManager {
         }
 
         static RegionLodSnapshot owned(int regionX, int regionZ,
-                long sourceRevision, int stride, int halo, int knownCells,
-                long[] pixels, int[] tints, byte[] known,
+                long sourceRevision, int stride, int halo, int sampleStep,
+                int knownCells, long[] pixels, int[] tints, byte[] known,
                 String[] biomePalette, String[] blockPalette) {
             return new RegionLodSnapshot(regionX, regionZ, sourceRevision,
-                    stride, halo, knownCells, pixels, tints, known,
+                    stride, halo, sampleStep, knownCells, pixels, tints, known,
                     biomePalette, blockPalette);
         }
 
@@ -2006,6 +2102,7 @@ public class MapManager {
         public long sourceRevision() { return sourceRevision; }
         public int stride() { return stride; }
         public int halo() { return halo; }
+        public int sampleStep() { return sampleStep; }
         public int knownCells() { return knownCells; }
         public long[] pixelsUnsafe() { return pixels; }
         public int[] tintsUnsafe() { return tints; }
@@ -2134,34 +2231,56 @@ public class MapManager {
         public boolean active;
         public double x;
         public double z;
+        // Nullable for backward compatibility with pre-PASS128 pin.json files.
+        public Boolean routeStartValid;
+        public Double routeStartX;
+        public Double routeStartZ;
     }
 
     private void loadPin() {
         if (currentDimensionDir == null) {
-            MapConfig.pinActive = false;
+            resetPinState();
             return;
         }
         File file = new File(currentDimensionDir, "pin.json");
         if (!file.exists()) {
-            MapConfig.pinActive = false;
-            MapConfig.pinWorldX = 0;
-            MapConfig.pinWorldZ = 0;
+            resetPinState();
             return;
         }
         try (var reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8)) {
             PinData data = GSON.fromJson(reader, PinData.class);
-            if (data == null || !Double.isFinite(data.x) || !Double.isFinite(data.z)
-                    || Math.abs(data.x) > 30_000_000.0 || Math.abs(data.z) > 30_000_000.0) {
+            if (data == null || !validPinCoordinate(data.x)
+                    || !validPinCoordinate(data.z)) {
                 throw new IOException("Invalid pin coordinates");
             }
             MapConfig.pinActive = data.active;
             MapConfig.pinWorldX = data.x;
             MapConfig.pinWorldZ = data.z;
+            boolean validRouteStart = Boolean.TRUE.equals(data.routeStartValid)
+                    && data.routeStartX != null && data.routeStartZ != null
+                    && validPinCoordinate(data.routeStartX)
+                    && validPinCoordinate(data.routeStartZ);
+            MapConfig.pinRouteStartValid = data.active && validRouteStart;
+            MapConfig.pinRouteStartWorldX = validRouteStart ? data.routeStartX : 0.0;
+            MapConfig.pinRouteStartWorldZ = validRouteStart ? data.routeStartZ : 0.0;
         } catch (Exception exception) {
             LOGGER.error("Failed to load pin data; preserving unreadable file", exception);
-            MapConfig.pinActive = false;
+            resetPinState();
             quarantineSmallJson(file);
         }
+    }
+
+    private static boolean validPinCoordinate(double value) {
+        return Double.isFinite(value) && Math.abs(value) <= 30_000_000.0;
+    }
+
+    private static void resetPinState() {
+        MapConfig.pinActive = false;
+        MapConfig.pinWorldX = 0.0;
+        MapConfig.pinWorldZ = 0.0;
+        MapConfig.pinRouteStartValid = false;
+        MapConfig.pinRouteStartWorldX = 0.0;
+        MapConfig.pinRouteStartWorldZ = 0.0;
     }
 
     public synchronized void savePin() {
@@ -2173,13 +2292,19 @@ public class MapManager {
             temporary = Files.createTempFile(currentDimensionDir.toPath(), "pin.", ".tmp");
             try (Writer writer = Files.newBufferedWriter(temporary, StandardCharsets.UTF_8)) {
                 PinData data = new PinData();
-                boolean validCoordinates = Double.isFinite(MapConfig.pinWorldX)
-                        && Double.isFinite(MapConfig.pinWorldZ)
-                        && Math.abs(MapConfig.pinWorldX) <= 30_000_000.0
-                        && Math.abs(MapConfig.pinWorldZ) <= 30_000_000.0;
+                boolean validCoordinates = validPinCoordinate(MapConfig.pinWorldX)
+                        && validPinCoordinate(MapConfig.pinWorldZ);
+                boolean validRouteStart = MapConfig.pinRouteStartValid
+                        && validPinCoordinate(MapConfig.pinRouteStartWorldX)
+                        && validPinCoordinate(MapConfig.pinRouteStartWorldZ);
                 data.active = MapConfig.pinActive && validCoordinates;
                 data.x = validCoordinates ? MapConfig.pinWorldX : 0.0;
                 data.z = validCoordinates ? MapConfig.pinWorldZ : 0.0;
+                data.routeStartValid = data.active && validRouteStart;
+                data.routeStartX = validRouteStart
+                        ? MapConfig.pinRouteStartWorldX : null;
+                data.routeStartZ = validRouteStart
+                        ? MapConfig.pinRouteStartWorldZ : null;
                 GSON.toJson(data, writer);
             }
             moveReplacing(temporary, file.toPath());

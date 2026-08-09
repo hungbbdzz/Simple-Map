@@ -7,6 +7,7 @@ import com.velorise.simplemap.client.MapPipelineStage;
 import com.velorise.simplemap.client.MapPipelineTelemetry;
 import com.velorise.simplemap.client.MapPerformanceGovernor;
 import com.velorise.simplemap.client.MapRequestLane;
+import com.velorise.simplemap.client.MapWorkScheduler;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
@@ -43,6 +44,13 @@ final class DecodedWorldRegionCache {
     private static final DecodedWorldRegionCache INSTANCE = new DecodedWorldRegionCache();
     private static final long MISSING_RETRY_MS = 30_000L;
     private static final long FAILED_RETRY_MS = 8_000L;
+    /**
+     * Do not start more disk reads merely to park their decoded NBT behind a long
+     * shared CPU queue. Eight global map workers need only a few queued waves;
+     * higher-priority exact/branch work must be allowed to drain first.
+     */
+    private static final int SOURCE_CPU_QUEUE_SOFT_LIMIT = 24;
+    private static final int SOURCE_CPU_QUEUE_PRESSURE_LIMIT = 8;
 
     private final LinkedHashMap<RegionKey, DecodedRegion> regions =
             new LinkedHashMap<>(32, 0.75f, true);
@@ -50,12 +58,16 @@ final class DecodedWorldRegionCache {
     private long epoch = 1L;
     private int inFlight;
     private int inFlightPrefetch;
+    /** Slots atomically reserved by admitted 64x64 foreground page transactions. */
+    private int reservedForegroundDecodes;
     private long residentBytes;
     private final MapPipelineTelemetry pipelineTelemetry = MapPipelineTelemetry.getInstance();
 
     private DecodedWorldRegionCache() {
         int available = Runtime.getRuntime().availableProcessors();
-        int threads = Math.max(2, Math.min(6, Math.max(1, available / 3)));
+        // Decode several complete page transactions in parallel without competing
+        // with every Minecraft worker. Source admission remains the memory gate.
+        int threads = Math.max(4, Math.min(12, Math.max(4, available / 2)));
         decodeWorkers = new PriorityDecodeExecutor(threads);
     }
 
@@ -74,6 +86,7 @@ final class DecodedWorldRegionCache {
         residentBytes = 0L;
         inFlight = 0;
         inFlightPrefetch = 0;
+        reservedForegroundDecodes = 0;
     }
 
     synchronized int residentCount() {
@@ -92,6 +105,68 @@ final class DecodedWorldRegionCache {
 
     synchronized int inFlightCount() {
         return inFlight;
+    }
+
+    /** Returns true when this chunk would consume a new Anvil/decode slot. */
+    synchronized boolean requiresForegroundDecode(ServerLevel level,
+            int chunkX, int chunkZ) {
+        if (level == null) return false;
+        String dimension = level.dimension().location().toString();
+        RegionKey regionKey = new RegionKey(dimension,
+                Math.floorDiv(chunkX, 32), Math.floorDiv(chunkZ, 32));
+        DecodedRegion region = regions.get(regionKey);
+        if (region == null) return true;
+        int localIndex = Math.floorMod(chunkZ, 32) * 32
+                + Math.floorMod(chunkX, 32);
+        Entry entry = region.entries[localIndex];
+        if (entry == null) return true;
+        if (entry.future != null) return false;
+        if (entry.result == null) return true;
+        long now = System.currentTimeMillis();
+        return entry.result.state != State.PRESENT && now >= entry.retryAfterMs;
+    }
+
+    /**
+     * Page-atomic source admission. A 64x64 page must be able to reserve every
+     * currently uncached 16x16 leaf before it enters the in-flight page window.
+     * Otherwise one denied leaf causes repeated 40/80 ms partial repair passes and
+     * turns a one-second wavefront into tens of seconds of scattered completion.
+     */
+    synchronized boolean canAdmitForegroundDecodes(int required) {
+        if (required <= 0) return true;
+        int queueLimit = MapPerformanceGovernor.getInstance().underPressure()
+                ? SOURCE_CPU_QUEUE_PRESSURE_LIMIT : SOURCE_CPU_QUEUE_SOFT_LIMIT;
+        if (MapWorkScheduler.cpuQueuedCount() >= queueLimit) return false;
+        AdaptiveWorldSourceBudget.Snapshot budget = budgetLocked();
+        int maximumInFlight = budget.maximumInFlight();
+        if (MapPerformanceGovernor.getInstance().underPressure()) {
+            maximumInFlight = 64;
+        }
+        return inFlight + reservedForegroundDecodes + required <= maximumInFlight;
+    }
+
+    /**
+     * Atomically reserves every new decode needed by one 64x64 page. The adaptive
+     * budget can shrink after the first chunk starts; without this reservation the
+     * remaining source-window leaves were rejected and the same page retried
+     * hundreds of times one chunk at a time.
+     */
+    synchronized PageReservation reserveForegroundDecodes(int required) {
+        int safeRequired = Math.max(0, required);
+        if (safeRequired == 0) return new PageReservation(this, 0);
+        int queueLimit = MapPerformanceGovernor.getInstance().underPressure()
+                ? SOURCE_CPU_QUEUE_PRESSURE_LIMIT : SOURCE_CPU_QUEUE_SOFT_LIMIT;
+        if (MapWorkScheduler.cpuQueuedCount() >= queueLimit) return null;
+        AdaptiveWorldSourceBudget.Snapshot budget = budgetLocked();
+        int maximumInFlight = budget.maximumInFlight();
+        if (MapPerformanceGovernor.getInstance().underPressure()) {
+            maximumInFlight = 64;
+        }
+        if (inFlight + reservedForegroundDecodes + safeRequired > maximumInFlight) {
+            return null;
+        }
+        reservedForegroundDecodes += safeRequired;
+        return new PageReservation(this, safeRequired);
     }
 
     synchronized void maintain() {
@@ -124,15 +199,21 @@ final class DecodedWorldRegionCache {
     SourceLease requestLease(ServerLevel level, int chunkX, int chunkZ,
             MapRequestLane lane) {
         return requestInternal(level, chunkX, chunkZ,
-                lane == null ? MapRequestLane.FULLSCREEN : lane);
+                lane == null ? MapRequestLane.FULLSCREEN : lane, null);
+    }
+
+    SourceLease requestReservedLease(ServerLevel level, int chunkX, int chunkZ,
+            MapRequestLane lane, PageReservation reservation) {
+        return requestInternal(level, chunkX, chunkZ,
+                lane == null ? MapRequestLane.FULLSCREEN : lane, reservation);
     }
 
     SourceLease prefetchLease(ServerLevel level, int chunkX, int chunkZ) {
-        return requestInternal(level, chunkX, chunkZ, MapRequestLane.PREFETCH);
+        return requestInternal(level, chunkX, chunkZ, MapRequestLane.PREFETCH, null);
     }
 
     private SourceLease requestInternal(ServerLevel level, int chunkX, int chunkZ,
-            MapRequestLane lane) {
+            MapRequestLane lane, PageReservation reservation) {
         boolean foreground = lane != MapRequestLane.PREFETCH;
         if (level == null) return SourceLease.detached(Result.deferred(), pipelineTelemetry);
         String dimension = level.dimension().location().toString();
@@ -172,15 +253,17 @@ final class DecodedWorldRegionCache {
             int maximumInFlight = budget.maximumInFlight();
             int maximumPrefetch = budget.maximumPrefetch();
             if (MapPerformanceGovernor.getInstance().underPressure()) {
-                // One cave page previously admitted twelve simultaneous NBT/DataFix
-                // decodes while the game was already missing its frame target.
-                // Two leaves retain IO overlap but bound the allocation burst; the
-                // page transaction is resumable and keeps all published leaves.
-                maximumInFlight = Math.min(maximumInFlight, 2);
+                // Fullscreen source authority is page-atomic with a 6x6 styling
+                // halo. Retain capacity for at least one complete 36-chunk source
+                // transaction; smaller limits create fragments that cannot publish.
+                maximumInFlight = lane == MapRequestLane.FULLSCREEN
+                        ? 64 : Math.min(maximumInFlight, 4);
                 maximumPrefetch = Math.min(maximumPrefetch, 1);
             }
-            if (inFlight >= maximumInFlight
-                    || (!foreground && inFlightPrefetch >= maximumPrefetch)) {
+            boolean reserved = reservation != null
+                    && reservation.consumeLocked();
+            if (!reserved && (inFlight + reservedForegroundDecodes >= maximumInFlight
+                    || (!foreground && inFlightPrefetch >= maximumPrefetch))) {
                 return SourceLease.detached(Result.deferred(), pipelineTelemetry);
             }
 
@@ -260,6 +343,9 @@ final class DecodedWorldRegionCache {
                 entry.token.cancel();
                 pipelineTelemetry.recordSourceDecodeCancelledNoConsumers();
             }
+            // A single leased chunk must not pin the other 1023 decoded chunks in
+            // its Anvil region. Re-evaluate entry-granular eviction as leases close.
+            trimLocked();
         }
     }
 
@@ -395,21 +481,60 @@ final class DecodedWorldRegionCache {
         int maximumRegions = Math.max(16, Math.min(256,
                 (int) Math.max(1L, target / (2L << 20))));
         if (residentBytes <= target && regions.size() <= maximumRegions) return;
-        var regionIterator = regions.entrySet().iterator();
-        while ((residentBytes > target || regions.size() > maximumRegions)
-                && regionIterator.hasNext()) {
-            DecodedRegion region = regionIterator.next().getValue();
-            boolean hasInFlight = false;
-            for (Entry entry : region.entries) {
-                if (entry != null && (entry.future != null || entry.totalLeases > 0)) {
-                    hasInFlight = true;
-                    break;
+
+        boolean madeProgress;
+        do {
+            madeProgress = false;
+            var regionIterator = regions.entrySet().iterator();
+            while ((residentBytes > target || regions.size() > maximumRegions)
+                    && regionIterator.hasNext()) {
+                DecodedRegion region = regionIterator.next().getValue();
+                boolean hasActiveEntry = false;
+                for (Entry entry : region.entries) {
+                    if (entry != null
+                            && (entry.future != null || entry.totalLeases > 0)) {
+                        hasActiveEntry = true;
+                        break;
+                    }
+                }
+
+                if (!hasActiveEntry) {
+                    residentBytes = Math.max(0L,
+                            residentBytes - region.residentBytes);
+                    regionIterator.remove();
+                    madeProgress = true;
+                    continue;
+                }
+
+                // PASS93 evicted only whole 32x32 Anvil regions. One active source
+                // lease therefore pinned up to 1024 decoded NBT chunks and left the
+                // cache 20x above its adaptive target. Evict unleased PRESENT
+                // entries inside the otherwise-active region. Compact Surface/Cave
+                // products have already been fanned out, so the source can be
+                // decoded again later only if another projection truly needs it.
+                if (residentBytes > target) {
+                    for (Entry entry : region.entries) {
+                        if (residentBytes <= target) break;
+                        State state = entry == null || entry.result == null
+                                ? null : entry.result.state;
+                        if (entry == null
+                                || !DecodedSourceEvictionPolicy.evictable(
+                                        entry.future != null,
+                                        entry.totalLeases, state)) continue;
+                        long bytes = entry.result.estimatedBytes;
+                        entry.result = null;
+                        entry.retryAfterMs = 0L;
+                        residentBytes = Math.max(0L, residentBytes - bytes);
+                        region.residentBytes = Math.max(0L,
+                                region.residentBytes - bytes);
+                        region.presentCount = Math.max(0,
+                                region.presentCount - 1);
+                        madeProgress = true;
+                    }
                 }
             }
-            if (hasInFlight) continue;
-            residentBytes = Math.max(0L, residentBytes - region.residentBytes);
-            regionIterator.remove();
-        }
+        } while ((residentBytes > target || regions.size() > maximumRegions)
+                && madeProgress);
     }
 
     private static Throwable unwrap(Throwable throwable) {
@@ -462,6 +587,36 @@ final class DecodedWorldRegionCache {
 
         private DecodedRegion(RegionKey key) {
             this.key = key;
+        }
+    }
+
+    static final class PageReservation implements AutoCloseable {
+        private final DecodedWorldRegionCache owner;
+        private int remaining;
+        private boolean closed;
+
+        private PageReservation(DecodedWorldRegionCache owner, int remaining) {
+            this.owner = owner;
+            this.remaining = Math.max(0, remaining);
+        }
+
+        private boolean consumeLocked() {
+            if (closed || remaining <= 0) return false;
+            remaining--;
+            owner.reservedForegroundDecodes = Math.max(0,
+                    owner.reservedForegroundDecodes - 1);
+            return true;
+        }
+
+        @Override
+        public void close() {
+            synchronized (owner) {
+                if (closed) return;
+                closed = true;
+                owner.reservedForegroundDecodes = Math.max(0,
+                        owner.reservedForegroundDecodes - remaining);
+                remaining = 0;
+            }
         }
     }
 

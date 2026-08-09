@@ -16,6 +16,12 @@ public final class MapActivityGate {
     private static final MapActivityGate INSTANCE = new MapActivityGate();
     public static final long MOVEMENT_SETTLE_NANOS = 3_000_000_000L;
     public static final long TELEPORT_QUARANTINE_NANOS = 350_000_000L;
+    /**
+     * Destination chunks can arrive over several client ticks after a position jump.
+     * Keep their exact-page demand repairable for a bounded window instead of
+     * declaring currently-missing subtiles terminally empty.
+     */
+    public static final long TELEPORT_RECOVERY_NANOS = 5_000_000_000L;
     private static final double POSITION_EPSILON_SQ = 0.0004D;
     private static final double VELOCITY_EPSILON_SQ = 0.0004D;
     private static final double TELEPORT_DISTANCE_SQ = 64.0D * 64.0D;
@@ -23,6 +29,9 @@ public final class MapActivityGate {
     private volatile boolean movementWindow;
     private volatile boolean activelyMoving;
     private volatile long movementEpoch;
+    /** Increments for every teleport/dimension handoff, even inside one movement window. */
+    private volatile long teleportEpoch;
+    private volatile long teleportRecoveryUntilNanos;
     private volatile double horizontalSpeedSquared;
     private volatile long foregroundBlockedUntilNanos;
     private Level observedLevel;
@@ -64,6 +73,8 @@ public final class MapActivityGate {
         if (activelyMoving) lastMovementNanos = now;
         if (levelChanged || distanceSq > TELEPORT_DISTANCE_SQ) {
             foregroundBlockedUntilNanos = now + TELEPORT_QUARANTINE_NANOS;
+            teleportRecoveryUntilNanos = now + TELEPORT_RECOVERY_NANOS;
+            teleportEpoch++;
         }
         boolean nextWindow = lastMovementNanos != 0L
                 && now - lastMovementNanos < MOVEMENT_SETTLE_NANOS;
@@ -93,12 +104,22 @@ public final class MapActivityGate {
 
     public long movementEpoch() { return movementEpoch; }
 
+    /** Distinct from movementEpoch: repeated teleports must each revoke old ownership once. */
+    public long teleportEpoch() { return teleportEpoch; }
+
+    public boolean isTeleportRecoveryActive() {
+        long now = lastUpdateNanos == 0L ? System.nanoTime() : lastUpdateNanos;
+        return teleportEpoch != 0L && now < teleportRecoveryUntilNanos;
+    }
+
     public synchronized void reset() {
         movementWindow = false;
         activelyMoving = false;
         movementEpoch = 0L;
+        teleportEpoch = 0L;
         horizontalSpeedSquared = 0.0D;
         foregroundBlockedUntilNanos = 0L;
+        teleportRecoveryUntilNanos = 0L;
         observedLevel = null;
         lastX = Double.NaN;
         lastZ = Double.NaN;

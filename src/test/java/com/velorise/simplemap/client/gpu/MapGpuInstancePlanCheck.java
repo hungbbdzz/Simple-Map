@@ -39,12 +39,25 @@ public final class MapGpuInstancePlanCheck {
         require(plan.firstIndexAfter(96) == 3, "phase upper bound failed");
         require(plan.firstIndexAtOrAfter(129) == 4, "end lower bound failed");
 
+        MapGpuInstancePlan.Builder masked = new MapGpuInstancePlan.Builder();
+        require(masked.add(first96, 96, 0, 0, 16, 16,
+                        0.25f, 0.5f, 0.5f, 0.75f, 1 << 9),
+                "masked subtile add failed");
+        MapGpuInstancePlan maskedPlan = masked.build();
+        require(maskedPlan.localU0(0) == 0.25f
+                        && maskedPlan.localV0(0) == 0.5f
+                        && maskedPlan.localU1(0) == 0.5f
+                        && maskedPlan.localV1(0) == 0.75f
+                        && maskedPlan.requiredCoverageMask(0) == (1 << 9),
+                "subtile UV/coverage metadata was not retained");
+
         randomizedStableOrdering();
 
         Set<String> fields = Arrays.stream(MapGpuInstancePlan.class.getDeclaredFields())
                 .map(Field::getName).collect(Collectors.toSet());
-        require(fields.equals(Set.of("keys", "phases", "rects", "size")),
-                "fallback texture/UV state returned to the logical plan: " + fields);
+        require(fields.equals(Set.of("keys", "phases", "rects",
+                        "localUvs", "requiredCoverageMasks", "size")),
+                "unexpected logical-plan state: " + fields);
 
         System.out.println("MAP_GPU_INSTANCE_PLAN_PASS");
     }

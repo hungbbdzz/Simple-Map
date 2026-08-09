@@ -11,15 +11,23 @@ package com.velorise.simplemap.client;
  * area the player is actually inspecting becomes sharp before distant edges.
  * Cursor movement is not part of the load key or candidate priority.</p>
  *
- * <p>The minimap is intentionally different. It requests a compact exact-leaf
- * halo around the camera/player in centre-out order, allowing the small visible
- * area to become complete before unrelated fullscreen work.</p>
+ * <p>The minimap is intentionally different. It requests the Minecraft-loaded
+ * working set around the camera/player in centre-out order. Coarser world-map
+ * branches may cover the rest of a far-zoom cave viewport, while these exact
+ * leaves keep the player's immediate surroundings current.</p>
  */
 public final class MapViewLoadPlanner {
     public static final int FULLSCREEN_SLICE_SIZE = 100;
     public static final int FULLSCREEN_SHORTLIST_SIZE = 10;
     public static final int MINIMAP_HALO_PAGES = 1;
-    public static final int MINIMAP_MAX_RADIUS_PAGES = 3;
+    /**
+     * Maximum exact working radius needed by Minecraft's supported client render
+     * distances. Xaero's standalone 9x9 chunk writer is not the policy used when
+     * its world-map integration is active: that path renders the actual minimap
+     * bounds from the shared region cache. The old radius of two pages confused
+     * those two paths and permanently limited Simple Map to a 320x320-block island.
+     */
+    public static final int MINIMAP_MAX_RADIUS_PAGES = 10;
 
     private MapViewLoadPlanner() {
     }
@@ -219,23 +227,41 @@ public final class MapViewLoadPlanner {
         }
     }
 
+    /** Covers the loaded chunk radius, page-alignment slack and one repair halo. */
+    public static int minimapWorkingRadiusPages(int renderDistanceChunks) {
+        int loadedRadiusChunks = Math.max(2, renderDistanceChunks + 3);
+        int alignedPages = (loadedRadiusChunks + 3) / 4;
+        return Math.max(2, Math.min(MINIMAP_MAX_RADIUS_PAGES,
+                alignedPages + MINIMAP_HALO_PAGES));
+    }
+
     /**
      * Fills a bounded minimap exact-leaf halo in deterministic centre-out order.
-     * The visible rectangle is expanded by one page, then capped to a small radius
-     * so extreme minimap zoom cannot flood the exact pipeline.
+     * The visible rectangle is expanded by one page, then capped to the caller's
+     * loaded-world working radius so extreme zoom cannot flood the exact pipeline.
      */
     public static int fillMinimapHalo(int visibleMinX, int visibleMaxX,
             int visibleMinZ, int visibleMaxZ, int centerX, int centerZ,
             long[] output) {
+        return fillMinimapHalo(visibleMinX, visibleMaxX,
+                visibleMinZ, visibleMaxZ, centerX, centerZ,
+                MINIMAP_MAX_RADIUS_PAGES, output);
+    }
+
+    public static int fillMinimapHalo(int visibleMinX, int visibleMaxX,
+            int visibleMinZ, int visibleMaxZ, int centerX, int centerZ,
+            int maximumRadiusPages, long[] output) {
         if (output == null || output.length == 0) return 0;
+        int safeRadius = Math.max(1,
+                Math.min(MINIMAP_MAX_RADIUS_PAGES, maximumRadiusPages));
         int minX = Math.max(Math.min(visibleMinX, visibleMaxX) - MINIMAP_HALO_PAGES,
-                centerX - MINIMAP_MAX_RADIUS_PAGES);
+                centerX - safeRadius);
         int maxX = Math.min(Math.max(visibleMinX, visibleMaxX) + MINIMAP_HALO_PAGES,
-                centerX + MINIMAP_MAX_RADIUS_PAGES);
+                centerX + safeRadius);
         int minZ = Math.max(Math.min(visibleMinZ, visibleMaxZ) - MINIMAP_HALO_PAGES,
-                centerZ - MINIMAP_MAX_RADIUS_PAGES);
+                centerZ - safeRadius);
         int maxZ = Math.min(Math.max(visibleMinZ, visibleMaxZ) + MINIMAP_HALO_PAGES,
-                centerZ + MINIMAP_MAX_RADIUS_PAGES);
+                centerZ + safeRadius);
         int maximumRadius = Math.max(
                 Math.max(Math.abs(centerX - minX), Math.abs(maxX - centerX)),
                 Math.max(Math.abs(centerZ - minZ), Math.abs(maxZ - centerZ)));

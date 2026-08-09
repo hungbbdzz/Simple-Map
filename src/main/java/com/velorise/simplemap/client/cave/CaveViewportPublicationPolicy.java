@@ -8,7 +8,7 @@ package com.velorise.simplemap.client.cave;
  * burst while preserving immediate first publication after a Y-projection change.</p>
  */
 final class CaveViewportPublicationPolicy {
-    static final long FULLSCREEN_LAYERED_INTERVAL_MS = 50L;
+    static final long FULLSCREEN_LAYERED_INTERVAL_MS = 16L;
 
     private CaveViewportPublicationPolicy() { }
 

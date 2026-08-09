@@ -19,11 +19,15 @@ public final class AdaptiveDimensionLoadPolicyCheck {
                 "surface leaf lost its one-chunk edge halo");
         require(AdaptiveDimensionLoadPolicy.surfacePageBudget(
                         AdaptiveDimensionLoadPolicy.Topology.DARK_OPEN,
-                        true, false, false, 0.08f) == 2,
+                        true, false, false, 0.08f) == 8,
                 "dark/open far zoom did not retain its reconstruction frontier");
         require(AdaptiveDimensionLoadPolicy.surfacePageBudget(
+                        AdaptiveDimensionLoadPolicy.Topology.SKYLIT_OPEN,
+                        true, false, false, 0.18f) == 8,
+                "healthy overworld fullscreen did not use available source headroom");
+        require(AdaptiveDimensionLoadPolicy.surfacePageBudget(
                         AdaptiveDimensionLoadPolicy.Topology.DARK_OPEN,
-                        true, true, false, 0.5f) == 1,
+                        true, true, false, 0.5f) == 2,
                 "pressure did not collapse source admission");
         require(!AdaptiveDimensionLoadPolicy.shouldRetarget(
                         0, 8, 0, 8, 4, 4,

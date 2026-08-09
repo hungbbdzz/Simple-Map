@@ -6,7 +6,9 @@ import java.util.Arrays;
  * Immutable primitive cavity archive for one X/Z column.
  *
  * Runs are stored highest-first. Each run describes an open interval whose first
- * solid/fluid-visible floor is {@code bottomY}. The same archive is reused by
+ * solid/fluid-visible floor is {@code bottomY}. Geometry is reusable across cave
+ * layers; the surrounding CVR namespace isolates the raw material colours by
+ * colour mode/schema. The same archive is reused by
  * Layered and Full Cave projections, so changing Top-Y never re-reads the world.
  */
 public final class CaveColumnData {
@@ -369,6 +371,25 @@ public final class CaveColumnData {
 
     private Candidate candidate(int index) {
         return new Candidate(topY[index], bottomY[index], colors[index], flags[index]);
+    }
+
+    /**
+     * Equality of the fields actually serialized by CompactCaveTile. Scan-window
+     * bounds are runtime acquisition metadata and are intentionally absent from the
+     * compact archive. Revalidating only those bounds must therefore not rebuild and
+     * re-ingest a byte-identical compact tile.
+     */
+    public boolean archiveContentEquals(CaveColumnData other) {
+        if (other == this) return true;
+        if (other == null || count != other.count
+                || fullHeightComplete != other.fullHeightComplete) return false;
+        for (int i = 0; i < count; i++) {
+            if (topY[i] != other.topY[i]
+                    || bottomY[i] != other.bottomY[i]
+                    || colors[i] != other.colors[i]
+                    || flags[i] != other.flags[i]) return false;
+        }
+        return true;
     }
 
     public boolean contentEquals(CaveColumnData other) {

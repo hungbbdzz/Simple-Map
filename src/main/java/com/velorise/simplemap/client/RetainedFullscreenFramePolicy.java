@@ -95,9 +95,14 @@ final class RetainedFullscreenFramePolicy {
         nextNightMode = nightMode;
     }
 
-    Decision decision(long nowNanos, long streamingIntervalNanos) {
+    Decision decision(long nowNanos, long streamingIntervalNanos,
+            boolean suppressStreamingRedraw) {
         if (!valid || hardChanged()) return Decision.REDRAW_HARD;
         if (!streamingChanged()) return Decision.REUSE;
+        // During drag/momentum/zoom settling, keep translating the last coherent
+        // snapshot. Replaying the whole atlas every 70-80 ms creates the rhythmic
+        // micro-stutter seen in PASS70. One coalesced redraw follows interaction.
+        if (suppressStreamingRedraw) return Decision.DEFER_STREAMING;
         long interval = Math.max(0L, streamingIntervalNanos);
         long elapsed = nowNanos - lastRedrawNanos;
         return elapsed < 0L || elapsed >= interval

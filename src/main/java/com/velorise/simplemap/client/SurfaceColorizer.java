@@ -12,6 +12,8 @@ import java.util.function.IntFunction;
 public final class SurfaceColorizer {
     private static final int SIZE = 512;
     private static final int VANILLA_WATER = 0xFF3F76E4;
+    /** Xaero World Map uses this opaque colour for a mapped air-only/void column. */
+    private static final int XAERO_VOID_ABGR = 0xFF17000A;
 
     private SurfaceColorizer() {
     }
@@ -77,13 +79,16 @@ public final class SurfaceColorizer {
                  * and region/chunk boundaries as false rectangular shadows. Fluids therefore
                  * keep a flat lighting layer; land and cave terrain retain full relief.
                  */
-                boolean vanillaWater = fluidPixel && colourMode == 1
-                        && !MapBlockData.isGlowing(packed);
-                float shade = vanillaWater
-                        ? vanillaWaterShade(MapBlockData.waterDepth(packed), px, pz)
-                        : fluidPixel ? 1.0f
-                        : calculateShade(pixels, px, pz, SIZE, SIZE, reliefY, terrainSlopes);
-                if (!vanillaWater) {
+                /*
+                 * Water is already a final translucent overlay over the stored floor
+                 * colour. Do not apply a second depth multiplier here: PASS88 shaded
+                 * the same depth twice and turned one-block depth changes into the
+                 * horizontal/vertical dash field visible in warm oceans.
+                 */
+                float shade = fluidPixel ? 1.0f
+                        : calculateShade(pixels, px, pz, SIZE, SIZE,
+                                reliefY, terrainSlopes);
+                if (!fluidPixel) {
                     shade *= 1.0f + microNoise(index, packed, reliefY);
                 }
                 red = clamp(Math.round(red * shade));
@@ -92,7 +97,7 @@ public final class SurfaceColorizer {
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0) {
-                    argb = applyAccurateFinish(argb,
+                    argb = MapAccurateColorFilter.applyArgb(argb,
                             MapBlockData.isLeaves(packed),
                             MapBlockData.isFluid(packed));
                 }
@@ -124,7 +129,23 @@ public final class SurfaceColorizer {
             int terrainSlopes,
             int profile,
             BooleanSupplier stillValid) {
-        return colorizePageWindow(pixels, tints, stride, halo,
+        return colorizePageWindow(pixels, tints, null, stride, halo,
+                worldPageStartX, worldPageStartZ, biomePalette, blockPalette,
+                biomeLookup, blockColors, tintPolicies, tintDisabledBlocks,
+                colourMode, showFlowers, terrainSlopes, profile,
+                MapPageLayout.FULL_SUBTILE_MASK, stillValid);
+    }
+
+    public static int[] colorizePageWindow(long[] pixels, int[] tints,
+            byte[] known, int stride, int halo, int worldPageStartX,
+            int worldPageStartZ, List<String> biomePalette,
+            List<String> blockPalette, IntFunction<Biome> biomeLookup,
+            Map<String, Integer> blockColors,
+            Map<String, BlockTintPolicy> tintPolicies,
+            Set<String> tintDisabledBlocks, int colourMode,
+            boolean showFlowers, int terrainSlopes, int profile,
+            BooleanSupplier stillValid) {
+        return colorizePageWindow(pixels, tints, known, stride, halo,
                 worldPageStartX, worldPageStartZ, biomePalette, blockPalette,
                 biomeLookup, blockColors, tintPolicies, tintDisabledBlocks,
                 colourMode, showFlowers, terrainSlopes, profile,
@@ -137,8 +158,8 @@ public final class SurfaceColorizer {
      * the changed 16x16 rectangles directly into an existing atlas leaf.
      */
     public static int[] colorizePageWindow(long[] pixels, int[] tints,
-            int stride, int halo, int worldPageStartX, int worldPageStartZ,
-            List<String> biomePalette,
+            byte[] known, int stride, int halo, int worldPageStartX,
+            int worldPageStartZ, List<String> biomePalette,
             List<String> blockPalette,
             IntFunction<Biome> biomeLookup,
             Map<String, Integer> blockColors,
@@ -174,10 +195,18 @@ public final class SurfaceColorizer {
                 int px = halo + localX;
                 int index = pz * stride + px;
                 long packed = pixels[index];
-                if (MapBlockData.isEmpty(packed)
-                        || (MapBlockData.isFlower(packed) && !showFlowers)) {
+                if (MapBlockData.isEmpty(packed)) {
+                    // Xaero distinguishes mapped void from undiscovered map data.
+                    // SimpleMap already carries the same distinction in the source
+                    // coverage byte; preserve it in the styled texture instead of
+                    // making known End void transparent like an unvisited chunk.
+                    if (known != null && known.length == pixels.length
+                            && known[index] != 0) {
+                        output[pageRow + localX] = XAERO_VOID_ABGR;
+                    }
                     continue;
                 }
+                if (MapBlockData.isFlower(packed) && !showFlowers) continue;
 
                 int baseColor = resolveBaseColor(packed, tints[index], blockPalette,
                         blockColors, tintPolicies, tintDisabledBlocks, biomeLookup,
@@ -191,16 +220,12 @@ public final class SurfaceColorizer {
                 boolean fluidPixel = MapBlockData.isFluid(packed);
                 int worldX = worldPageStartX + localX;
                 int worldZ = worldPageStartZ + localZ;
-                boolean vanillaWater = fluidPixel && colourMode == 1
-                        && !MapBlockData.isGlowing(packed);
-                float shade = vanillaWater
-                        ? vanillaWaterShade(MapBlockData.waterDepth(packed), worldX, worldZ)
-                        : fluidPixel ? 1.0f
+                float shade = fluidPixel ? 1.0f
                         : calculateShade(pixels, px, pz, stride, stride,
                                 reliefY, terrainSlopes);
                 int regionLocalX = Math.floorMod(worldX, SIZE);
                 int regionLocalZ = Math.floorMod(worldZ, SIZE);
-                if (!vanillaWater) {
+                if (!fluidPixel) {
                     shade *= 1.0f + microNoise(regionLocalZ * SIZE + regionLocalX,
                             packed, reliefY);
                 }
@@ -210,7 +235,7 @@ public final class SurfaceColorizer {
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0) {
-                    argb = applyAccurateFinish(argb,
+                    argb = MapAccurateColorFilter.applyArgb(argb,
                             MapBlockData.isLeaves(packed),
                             MapBlockData.isFluid(packed));
                 }
@@ -218,6 +243,87 @@ public final class SurfaceColorizer {
                         | (argb & 0x0000FF00)
                         | ((argb >>> 16) & 0xFF);
                 output[pageRow + localX] = MapColorProfile.apply(abgr, profile);
+            }
+        }
+        return output;
+    }
+
+    /**
+     * Styles a regularly sampled region grid for coarse Surface LOD. Unlike the
+     * exact-page helper, neighbouring samples may represent several world blocks.
+     * The returned image keeps the source-grid density; the caller performs the
+     * final linear reduction to its branch texture.
+     */
+    static int[] colorizeSampleWindow(long[] pixels, int[] tints,
+            byte[] known, int stride, int halo, int outputSize, int worldStartX,
+            int worldStartZ, int worldSampleStep,
+            List<String> biomePalette, List<String> blockPalette,
+            IntFunction<Biome> biomeLookup, Map<String, Integer> blockColors,
+            Map<String, BlockTintPolicy> tintPolicies,
+            Set<String> tintDisabledBlocks, int colourMode,
+            boolean showFlowers, int terrainSlopes, int profile,
+            BooleanSupplier stillValid) {
+        if (outputSize <= 0 || worldSampleStep <= 0
+                || stride < outputSize + halo * 2
+                || pixels == null || pixels.length != stride * stride
+                || tints == null || tints.length != pixels.length) {
+            throw new IllegalArgumentException("Invalid sampled surface window");
+        }
+        int[] output = new int[outputSize * outputSize];
+        for (int localZ = 0; localZ < outputSize; localZ++) {
+            if ((localZ & 15) == 0 && !stillValid.getAsBoolean()) {
+                throw new java.util.concurrent.CancellationException(
+                        "Stale SimpleMap sampled Surface job");
+            }
+            int pz = halo + localZ;
+            int outputRow = localZ * outputSize;
+            for (int localX = 0; localX < outputSize; localX++) {
+                int px = halo + localX;
+                int index = pz * stride + px;
+                long packed = pixels[index];
+                if (MapBlockData.isEmpty(packed)) {
+                    if (known != null && known.length == pixels.length
+                            && known[index] != 0) {
+                        output[outputRow + localX] = XAERO_VOID_ABGR;
+                    }
+                    continue;
+                }
+                if (MapBlockData.isFlower(packed) && !showFlowers) continue;
+                int baseColor = resolveBaseColor(packed, tints[index],
+                        blockPalette, blockColors, tintPolicies,
+                        tintDisabledBlocks, biomeLookup, pixels, px, pz,
+                        stride, stride, colourMode);
+                if (baseColor == 0) continue;
+                int red = (baseColor >>> 16) & 0xFF;
+                int green = (baseColor >>> 8) & 0xFF;
+                int blue = baseColor & 0xFF;
+                int reliefY = MapBlockData.reliefY(packed);
+                boolean fluidPixel = MapBlockData.isFluid(packed);
+                float shade = fluidPixel ? 1.0f
+                        : calculateShade(pixels, px, pz, stride, stride,
+                                reliefY, terrainSlopes);
+                int worldX = worldStartX + localX * worldSampleStep;
+                int worldZ = worldStartZ + localZ * worldSampleStep;
+                if (!fluidPixel) {
+                    int regionLocalX = Math.floorMod(worldX, SIZE);
+                    int regionLocalZ = Math.floorMod(worldZ, SIZE);
+                    shade *= 1.0f + microNoise(
+                            regionLocalZ * SIZE + regionLocalX,
+                            packed, reliefY);
+                }
+                red = clamp(Math.round(red * shade));
+                green = clamp(Math.round(green * shade));
+                blue = clamp(Math.round(blue * shade));
+                int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
+                if (colourMode == 0) {
+                    argb = MapAccurateColorFilter.applyArgb(argb,
+                            MapBlockData.isLeaves(packed), fluidPixel);
+                }
+                int abgr = 0xFF000000 | ((argb & 0xFF) << 16)
+                        | (argb & 0x0000FF00)
+                        | ((argb >>> 16) & 0xFF);
+                output[outputRow + localX] = MapColorProfile.apply(abgr,
+                        profile);
             }
         }
         return output;
@@ -262,27 +368,21 @@ public final class SurfaceColorizer {
             // For water pixels blockId points at the solid floor, not the water
             // block. This lets shallow water reveal sand/stone/grass instead of
             // becoming one flat blue sheet.
-            int floorColor = blockName == null
+            /*
+             * Xaero accumulates one transparent-water overlay while walking the
+             * liquid column and composites it over that column's final opaque
+             * floor. Simple Map already stores that floor identity in the packed
+             * water sample, so use it directly. A 5x5 depth/floor blur mixed
+             * unrelated columns and amplified sparse Warm Ocean floor patterns into
+             * long horizontal/vertical dashes.
+             */
+            String floorId = blockId(packed, blockPalette);
+            int floorColor = floorId == null
                     ? 0xFF5E6B63
-                    : blockColors.getOrDefault(blockName, 0xFF5E6B63);
-            int depth = Math.min(64, MapBlockData.waterDepth(packed));
-            float waterAmount;
-            if (colourMode == 1) {
-                waterAmount = clamp01(0.42f + depth * 0.035f);
-            } else {
-                waterAmount = clamp01(0.25f + depth * 0.045f);
-            }
-            waterAmount = Math.min(colourMode == 1 ? 0.94f : 0.92f, waterAmount);
-            int mixed = mixRgb(floorColor, waterTint, waterAmount);
-
-            // Accurate mode keeps smooth depth attenuation. Vanilla mode uses a
-            // gentler base because its discrete checker brightness carries the
-            // classic filled-map depth bands.
-            float attenuation = colourMode == 1
-                    ? (float) Math.pow(0.988, Math.max(0, depth - 2))
-                    : (float) Math.pow(0.975, Math.max(0, depth - 2));
-            attenuation = Math.max(colourMode == 1 ? 0.72f : 0.46f, attenuation);
-            return scaleRgb(mixed, attenuation);
+                    : blockColors.getOrDefault(floorId, 0xFF5E6B63);
+            int waterDepth = Math.max(1, MapBlockData.waterDepth(packed));
+            return composeWaterOverlay(waterTint, floorColor, waterDepth,
+                    colourMode == 1);
         }
 
         int texture = blockName == null ? 0 : blockColors.getOrDefault(blockName, 0);
@@ -301,13 +401,24 @@ public final class SurfaceColorizer {
                         visual == null ? BlockTintPolicy.NONE : visual.tintPolicy());
         boolean tintDisabled = blockName != null && tintDisabledBlocks.contains(blockName);
 
-        // Version-3 surface regions preserve the exact value returned by the
-        // registered BlockColors provider at scan time. This is authoritative for
-        // modded foliage: a tinted model can still deliberately return no tint, or
-        // return a fixed/custom tint that is not the biome foliage colour.
-        if (colourMode == 0 && texture != 0 && !tintDisabled) {
+        /*
+         * Never use a scan-time provider colour for biome-driven blocks. The live
+         * BlockColors call is evaluated against whichever neighbouring chunks happen
+         * to be loaded at capture time, so persisting it bakes one slightly different
+         * green value into every 16x16 chunk. At close zoom those values become the
+         * vertical/horizontal chunk grid visible across grass, leaves and water.
+         *
+         * Xaero persists biome identity and evaluates tint while composing the map
+         * tile against neighbouring map data. Do the equivalent here: standard
+         * GRASS/FOLIAGE/SPRUCE/BIRCH policies always flow through BiomeBlend below.
+         * A provider result remains authoritative only for policy NONE, which is the
+         * custom/fixed tint case that cannot be reconstructed from biome identity.
+         */
+        if (colourMode == 0 && texture != 0 && !tintDisabled
+                && usesStoredProviderTint(policy)) {
             if (SurfaceTintData.hasColor(storedTint)) {
-                return applyBiomeTint(texture, 0xFF000000 | SurfaceTintData.rgb(storedTint), 1.0f);
+                return applyBiomeTint(texture,
+                        0xFF000000 | SurfaceTintData.rgb(storedTint), 1.0f);
             }
             if (storedTint == SurfaceTintData.NONE)
                 return texture;
@@ -349,6 +460,10 @@ public final class SurfaceColorizer {
         }
 
         return texture;
+    }
+
+    static boolean usesStoredProviderTint(BlockTintPolicy policy) {
+        return policy == null || policy == BlockTintPolicy.NONE;
     }
 
     /**
@@ -426,20 +541,31 @@ public final class SurfaceColorizer {
     }
 
     /**
-     * Basic vanilla-map water dither. Depth selects a discrete brightness band and
-     * block parity alternates the neighbouring shade, producing the familiar
-     * checker pattern without changing the stored terrain data.
+     * Restored from the supplied beta SimpleMap implementation, whose ocean
+     * rendering is the known-good visual baseline. The newer retained renderer
+     * should not reinterpret water as a literal stack of Xaero overlay records:
+     * SimpleMap stores one compact column containing the biome-tinted liquid, the
+     * opaque basin-floor block and the exact depth. Reuse the beta compositor on
+     * that representation so shallow columns reveal their floor while increasing
+     * depth smoothly dominates the floor with water and attenuates the result.
      */
-    private static float vanillaWaterShade(int depth, int worldX, int worldZ) {
-        boolean lightCell = ((worldX ^ worldZ) & 1) == 0;
-        float centre;
-        if (depth <= 1) centre = 1.06f;
-        else if (depth <= 4) centre = 1.00f;
-        else if (depth <= 8) centre = 0.93f;
-        else if (depth <= 16) centre = 0.86f;
-        else centre = 0.79f;
-        float contrast = depth <= 2 ? 0.035f : 0.055f;
-        return centre + (lightCell ? contrast : -contrast);
+    static int composeWaterOverlay(int waterTint, int floorColor,
+            int waterDepth, boolean vanillaMode) {
+        int depth = Math.min(64, Math.max(1, waterDepth));
+        float waterAmount = vanillaMode
+                ? clamp01(0.42f + depth * 0.035f)
+                : clamp01(0.25f + depth * 0.045f);
+        waterAmount = Math.min(vanillaMode ? 0.94f : 0.92f, waterAmount);
+        int mixed = mixRgb(floorColor, waterTint, waterAmount);
+        float attenuation = (float) Math.pow(0.975, Math.max(0, depth - 2));
+        attenuation = Math.max(0.46f, attenuation);
+        return scaleRgb(mixed, attenuation);
+    }
+
+    /** Compatibility helper for tests/old call sites: one-block shallow water. */
+    static int composeWaterOverlay(int waterTint, int floorColor,
+            boolean vanillaMode) {
+        return composeWaterOverlay(waterTint, floorColor, 1, vanillaMode);
     }
 
     private static float microNoise(int linearIndex, long packed, int y) {
@@ -473,39 +599,6 @@ public final class SurfaceColorizer {
         int r = clamp(Math.round(clamp01(outR) * 255.0f));
         int g = clamp(Math.round(clamp01(outG) * 255.0f));
         int b = clamp(Math.round(clamp01(outB) * 255.0f));
-        return 0xFF000000 | (r << 16) | (g << 8) | b;
-    }
-
-    /**
-     * Accurate mode should stay slightly darker and more grounded than vanilla,
-     * especially on normal Minecraft foliage and terrain. Apply a gentle
-     * mid-tone compression instead of the faint bright film users reported.
-     */
-    private static int applyAccurateFinish(int argb, boolean leaves, boolean fluid) {
-        float red = ((argb >>> 16) & 0xFF) / 255.0f;
-        float green = ((argb >>> 8) & 0xFF) / 255.0f;
-        float blue = (argb & 0xFF) / 255.0f;
-
-        float luminance = red * 0.2126f + green * 0.7152f + blue * 0.0722f;
-        float saturation = fluid ? 1.00f : (leaves ? 1.04f : 1.02f);
-        red = luminance + (red - luminance) * saturation;
-        green = luminance + (green - luminance) * saturation;
-        blue = luminance + (blue - luminance) * saturation;
-
-        float gamma = fluid ? 1.04f : (leaves ? 1.14f : 1.10f);
-        red = (float) Math.pow(clamp01(red), gamma);
-        green = (float) Math.pow(clamp01(green), gamma);
-        blue = (float) Math.pow(clamp01(blue), gamma);
-
-        float contrast = fluid ? 1.02f : (leaves ? 1.08f : 1.05f);
-        float brightness = fluid ? 0.97f : (leaves ? 0.90f : 0.94f);
-        red = ((red - 0.5f) * contrast + 0.5f) * brightness;
-        green = ((green - 0.5f) * contrast + 0.5f) * brightness;
-        blue = ((blue - 0.5f) * contrast + 0.5f) * brightness;
-
-        int r = clamp(Math.round(clamp01(red) * 255.0f));
-        int g = clamp(Math.round(clamp01(green) * 255.0f));
-        int b = clamp(Math.round(clamp01(blue) * 255.0f));
         return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 

@@ -101,6 +101,28 @@ public final class MapLodPolicy {
         return footprint <= leaveCoarser ? candidateLevel : previousLevel;
     }
 
+    /**
+     * Cave-specific LOD stabilization around Xaero-style user-scale boundaries.
+     *
+     * <p>Cave hierarchy selection is driven by logical map zoom, not GUI-scaled
+     * framebuffer density. A narrow two-percent guard removes wheel jitter without
+     * retaining exact L0 deep into the range where an L1 root should already be the
+     * visible authority.</p>
+     */
+    public static int stabilizeCaveBranchLevel(int candidateLevel, int previousLevel,
+            float logicalPixelsPerBlock) {
+        if (previousLevel < 0 || candidateLevel == previousLevel) return candidateLevel;
+        if (Math.abs(candidateLevel - previousLevel) > 1) return candidateLevel;
+
+        double footprint = blocksPerScreenPixel(logicalPixelsPerBlock);
+        if (candidateLevel > previousLevel) {
+            double enterCoarser = (1 << candidateLevel) * 1.02;
+            return footprint >= enterCoarser ? candidateLevel : previousLevel;
+        }
+        double leaveCoarser = (1 << previousLevel) * 0.98;
+        return footprint <= leaveCoarser ? candidateLevel : previousLevel;
+    }
+
     public static int leafMipLevel(float pixelsPerBlock, int maximumMip) {
         double footprint = blocksPerScreenPixel(pixelsPerBlock);
         int level = footprint < 2.0 ? 0

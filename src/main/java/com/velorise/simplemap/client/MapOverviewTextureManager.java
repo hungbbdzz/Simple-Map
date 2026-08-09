@@ -80,6 +80,12 @@ public final class MapOverviewTextureManager {
         return INSTANCE;
     }
 
+    /** Called after the GPU page-table swap once per rendered frame. */
+    public void onPageTableFrameBoundary() {
+        surfaceLodTree.onPageTableFrameBoundary();
+        regionLodService.onPageTableFrameBoundary();
+    }
+
     public ResourceLocation getSurface(int rx, int rz, int stride, boolean cachedOnly) {
         return get(new Key(currentDimension(), MODE_SURFACE, 0, rx, rz,
                 normalizeStride(stride)), cachedOnly);
@@ -211,6 +217,14 @@ public final class MapOverviewTextureManager {
     public void setPreferredSurfaceView(float scale, int hierarchyLevel,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
             int focusPageX, int focusPageZ) {
+        setPreferredSurfaceView(scale, hierarchyLevel,
+                minPageX, maxPageX, minPageZ, maxPageZ,
+                focusPageX, focusPageZ, MapRequestLane.FULLSCREEN);
+    }
+
+    public void setPreferredSurfaceView(float scale, int hierarchyLevel,
+            int minPageX, int maxPageX, int minPageZ, int maxPageZ,
+            int focusPageX, int focusPageZ, MapRequestLane lane) {
         setPreferredSurfaceScale(scale);
         int preferred = Math.max(1, hierarchyLevel);
         surfaceLodTree.setVisibleWindow(currentDimension(), preferred,
@@ -218,7 +232,7 @@ public final class MapOverviewTextureManager {
         regionLodService.setVisibleView(
                 MapSessionManager.getInstance().activeStamp(), scale,
                 minPageX, maxPageX, minPageZ, maxPageZ,
-                focusPageX, focusPageZ);
+                focusPageX, focusPageZ, lane);
     }
 
     public CaveAtlasRegion peekSurfaceBranch(int level, int nodeX, int nodeZ) {
@@ -679,7 +693,7 @@ public final class MapOverviewTextureManager {
                     blockColors, tintPolicies, tintDisabledBlocks,
                     colourMode, showFlowers, terrainSlopes, profile);
             return new MapTextureBuildWorker.PreparedSingle(
-                    downsamplePixels(styled, stride), revision);
+                    downsamplePixels(styled, stride, false), revision);
         }, MapWorkScheduler.cpuExecutor(MapRequestLane.BACKGROUND,
                 MapWorkScheduler.WorkType.LEGACY_BUILD, 0, 48, () -> true));
     }
@@ -692,7 +706,7 @@ public final class MapOverviewTextureManager {
         int[] source = region.snapshotPixels();
         return CompletableFuture.supplyAsync(() ->
                 new MapTextureBuildWorker.PreparedSingle(
-                        downsamplePixels(source, key.stride), revision), MapWorkScheduler.cpuExecutor(MapRequestLane.BACKGROUND,
+                        downsamplePixels(source, key.stride, true), revision), MapWorkScheduler.cpuExecutor(MapRequestLane.BACKGROUND,
                 MapWorkScheduler.WorkType.LEGACY_BUILD, 0, 48, () -> true));
     }
 
@@ -705,49 +719,77 @@ public final class MapOverviewTextureManager {
         int[] source = region.snapshotPixels();
         return CompletableFuture.supplyAsync(() ->
                 new MapTextureBuildWorker.PreparedSingle(
-                        downsamplePixels(source, key.stride), revision), MapWorkScheduler.cpuExecutor(MapRequestLane.BACKGROUND,
+                        downsamplePixels(source, key.stride, true), revision), MapWorkScheduler.cpuExecutor(MapRequestLane.BACKGROUND,
                 MapWorkScheduler.WorkType.LEGACY_BUILD, 0, 48, () -> true));
     }
 
-    private static int[] downsamplePixels(int[] source, int stride) {
+    private static int[] downsamplePixels(int[] source, int stride,
+            boolean preserveThinFeatures) {
         int outputSize = 512 / stride;
         int[] colors = new int[outputSize * outputSize];
         for (int z = 0; z < outputSize; z++) {
             int sourceZ = z * stride;
             for (int x = 0; x < outputSize; x++) {
                 int sourceX = x * stride;
-                colors[z * outputSize + x] = averageVisibleBlock(
-                        source, sourceX, sourceZ, stride);
+                colors[z * outputSize + x] = representativeVisibleBlock(
+                        source, sourceX, sourceZ, stride, preserveThinFeatures);
             }
         }
         return colors;
     }
 
-    /** Alpha-aware box reduction keeps thin visible cave lines from disappearing. */
-    private static int averageVisibleBlock(int[] source, int startX, int startZ, int stride) {
+    /**
+     * Chooses an existing high-salience texel instead of manufacturing a muddy
+     * average color. This keeps rivers, cave lines and biome edges readable when
+     * a large saved region is represented by a small overview texture.
+     */
+    private static int representativeVisibleBlock(int[] source, int startX,
+            int startZ, int stride, boolean preserveThinFeatures) {
         long red = 0L;
         long green = 0L;
         long blue = 0L;
-        long alpha = 0L;
-        int maximumAlpha = 0;
+        int count = 0;
+        int maxAlpha = 0;
+        int salient = 0;
+        int salientScore = Integer.MIN_VALUE;
         for (int dz = 0; dz < stride; dz++) {
             int row = (startZ + dz) * 512 + startX;
             for (int dx = 0; dx < stride; dx++) {
                 int value = source[row + dx];
-                int a = (value >>> 24) & 0xFF;
-                if (a == 0 || value == 0) continue;
-                red += (long) (value & 0xFF) * a;
-                green += (long) ((value >>> 8) & 0xFF) * a;
-                blue += (long) ((value >>> 16) & 0xFF) * a;
-                alpha += a;
-                maximumAlpha = Math.max(maximumAlpha, a);
+                int alpha = (value >>> 24) & 0xFF;
+                if (alpha == 0 || value == 0) continue;
+                int r = value & 0xFF;
+                int g = (value >>> 8) & 0xFF;
+                int b = (value >>> 16) & 0xFF;
+                red += r;
+                green += g;
+                blue += b;
+                maxAlpha = Math.max(maxAlpha, alpha);
+                count++;
+                if (preserveThinFeatures) {
+                    int chroma = Math.max(r, Math.max(g, b))
+                            - Math.min(r, Math.min(g, b));
+                    int score = chroma * 8 + r * 3 + g * 6 + b;
+                    if (score > salientScore) {
+                        salientScore = score;
+                        salient = value;
+                    }
+                }
             }
         }
-        if (alpha == 0L) return 0;
-        int r = (int) (red / alpha);
-        int g = (int) (green / alpha);
-        int b = (int) (blue / alpha);
-        return (maximumAlpha << 24) | (b << 16) | (g << 8) | r;
+        if (count == 0) return 0;
+        int r = (int) (red / count);
+        int g = (int) (green / count);
+        int b = (int) (blue / count);
+        if (preserveThinFeatures && salient != 0) {
+            // Blend a quarter of the strongest cave/water/emissive texel into the
+            // area mean. All samples still contribute, while one-pixel structures
+            // remain visible at multi-region zoom levels.
+            r = (r * 3 + (salient & 0xFF)) / 4;
+            g = (g * 3 + ((salient >>> 8) & 0xFF)) / 4;
+            b = (b * 3 + ((salient >>> 16) & 0xFF)) / 4;
+        }
+        return (Math.max(224, maxAlpha) << 24) | (b << 16) | (g << 8) | r;
     }
 
     private void apply(TextureInfo info, MapTextureBuildWorker.PreparedSingle prepared) {
@@ -777,18 +819,14 @@ public final class MapOverviewTextureManager {
                 residentKey, MapRequestLane.BACKGROUND);
     }
 
-    /**
-     * Match Xaero's useful sampling split for low-detail parents: linear
-     * minification avoids shimmer while nearest magnification preserves pixel
-     * edges. Parent textures have no atlas neighbours, so CLAMP_TO_EDGE is safe.
-     */
+    /** Parent pixels are already density-reduced representative samples. */
     private static void configureOverviewSampling(DynamicTexture texture) {
         if (!RenderSystem.isOnRenderThreadOrInit()) {
             RenderSystem.recordRenderCall(() -> configureOverviewSampling(texture));
             return;
         }
         GlStateManager._bindTexture(texture.getId());
-        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);

@@ -39,14 +39,6 @@ public final class MapMutationBus {
             MovementMutationPolicy.PRECISE_CHUNK_WORKING_SET;
     private static final int COLUMN_COMPACTION_PER_TICK = 128;
     private static final int HOT_RADIUS_CHUNKS = 4;
-    /**
-     * Surface travel capture uses a slightly wider current-player window than
-     * Cave. Packet order starts at the render-distance edge, so admitting every
-     * packet filled the FIFO with cold chunks and delayed the path underneath the
-     * player. A 13x13 chunk window records useful surroundings while the rolling
-     * centre-out scanner remains responsible for the rest of the loaded view.
-     */
-    private static final int SURFACE_TRAVEL_RADIUS_CHUNKS = 6;
     private static final int COLUMN_WORK_PER_TICK = 64;
     private static final int CHUNK_EXPANSION_PER_TICK = 2;
     /* The scanner checks the wall-clock deadline every eight columns. Let one
@@ -147,9 +139,14 @@ public final class MapMutationBus {
             // frame deadline, matching Xaero's writer queue rather than scanning in
             // the packet callback.
             GeneratedChunkIndex.getInstance().markLive(level, chunkX, chunkZ);
-            if (isTravelChunk(chunkX, chunkZ, SURFACE_TRAVEL_RADIUS_CHUNKS)) {
-                ChunkScanner.getInstance().enqueueLoadedSurfaceChunk(chunkX, chunkZ);
-            }
+            /*
+             * PASS108: every chunk-data packet is an O(1) authoritative Surface
+             * ingress event. The old fixed radius=6 gate meant chunks that Minecraft
+             * had already loaded inside a larger render distance were invisible to
+             * the writer and depended on a slow fallback sweep. ChunkScanner owns
+             * queue bounds, stale-distance rejection and frame-budgeted capture.
+             */
+            ChunkScanner.getInstance().enqueueLoadedSurfaceChunk(chunkX, chunkZ);
             // Cave projection is substantially more expensive than Surface capture.
             // Only packets inside the player-hot 9x9 chunk window enter the travel
             // frontier; render-distance edge packets remain available to the normal

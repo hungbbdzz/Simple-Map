@@ -338,12 +338,11 @@ public final class RegionLodDeriver {
 
     private static ReducedColor reduceBlock(ChildSnapshot child,
             int sourceStartX, int sourceStartY, int sampleSpan) {
-        long alpha = 0L;
-        long red = 0L;
-        long green = 0L;
-        long blue = 0L;
         int knownCount = 0;
         int coloredCount = 0;
+        long redTotal = 0L;
+        long greenTotal = 0L;
+        long blueTotal = 0L;
         for (int y = 0; y < sampleSpan; y++) {
             int sourceY = sourceStartY + y;
             long knownRow = child.knownRows[sourceY];
@@ -356,30 +355,26 @@ public final class RegionLodDeriver {
                 int a = color >>> 24;
                 if (a == 0) continue;
                 coloredCount++;
-                alpha += a;
-                blue += (color >>> 16) & 0xFF;
-                green += (color >>> 8) & 0xFF;
-                red += color & 0xFF;
+                redTotal += color & 0xFF;
+                greenTotal += (color >>> 8) & 0xFF;
+                blueTotal += (color >>> 16) & 0xFF;
             }
         }
         if (knownCount == 0) return ReducedColor.UNKNOWN;
         if (coloredCount == 0) return new ReducedColor(true, 0);
-        int a = (int) (alpha / coloredCount);
-        int b = (int) (blue / coloredCount);
-        int g = (int) (green / coloredCount);
-        int r = (int) (red / coloredCount);
-        return new ReducedColor(true,
-                (a << 24) | (b << 16) | (g << 8) | r);
+        return new ReducedColor(true, packMeanColor(
+                (int) (redTotal / coloredCount),
+                (int) (greenTotal / coloredCount),
+                (int) (blueTotal / coloredCount)));
     }
 
     private static ReducedColor reduceBlock(int[] pixels, long[] knownRows,
             int sourceStartX, int sourceStartY, int sampleSpan) {
-        long alpha = 0L;
-        long red = 0L;
-        long green = 0L;
-        long blue = 0L;
         int knownCount = 0;
         int coloredCount = 0;
+        long redTotal = 0L;
+        long greenTotal = 0L;
+        long blueTotal = 0L;
         for (int y = 0; y < sampleSpan; y++) {
             int sourceY = sourceStartY + y;
             long knownRow = knownRows[sourceY];
@@ -392,20 +387,53 @@ public final class RegionLodDeriver {
                 int a = color >>> 24;
                 if (a == 0) continue;
                 coloredCount++;
-                alpha += a;
-                blue += (color >>> 16) & 0xFF;
-                green += (color >>> 8) & 0xFF;
-                red += color & 0xFF;
+                redTotal += color & 0xFF;
+                greenTotal += (color >>> 8) & 0xFF;
+                blueTotal += (color >>> 16) & 0xFF;
             }
         }
         if (knownCount == 0) return ReducedColor.UNKNOWN;
         if (coloredCount == 0) return new ReducedColor(true, 0);
-        int a = (int) (alpha / coloredCount);
-        int b = (int) (blue / coloredCount);
-        int g = (int) (green / coloredCount);
-        int r = (int) (red / coloredCount);
-        return new ReducedColor(true,
-                (a << 24) | (b << 16) | (g << 8) | r);
+        return new ReducedColor(true, packMeanColor(
+                (int) (redTotal / coloredCount),
+                (int) (greenTotal / coloredCount),
+                (int) (blueTotal / coloredCount)));
+    }
+
+    private static int packMeanColor(int red, int green, int blue) {
+        // The branch hierarchy is the minification filter. Averaging all covered
+        // texels matches Xaero's linear child-to-parent FBO reduction and retains
+        // roads, rivers, foliage edges and cave strokes that medoid selection lost.
+        return 0xFF000000 | (Math.max(0, Math.min(255, blue)) << 16)
+                | (Math.max(0, Math.min(255, green)) << 8)
+                | Math.max(0, Math.min(255, red));
+    }
+
+    private static int closestColor(int[] pixels, long[] knownRows,
+            int sourceStartX, int sourceStartY, int sampleSpan,
+            int meanRed, int meanGreen, int meanBlue) {
+        int best = 0;
+        int bestDistance = Integer.MAX_VALUE;
+        for (int y = 0; y < sampleSpan; y++) {
+            int sourceY = sourceStartY + y;
+            long knownRow = knownRows[sourceY];
+            int sourceRow = sourceY * TEXTURE_SIZE;
+            for (int x = 0; x < sampleSpan; x++) {
+                int sourceX = sourceStartX + x;
+                if ((knownRow & (1L << sourceX)) == 0L) continue;
+                int color = pixels[sourceRow + sourceX];
+                if ((color >>> 24) == 0) continue;
+                int dr = (color & 0xFF) - meanRed;
+                int dg = ((color >>> 8) & 0xFF) - meanGreen;
+                int db = ((color >>> 16) & 0xFF) - meanBlue;
+                int distance = dr * dr + dg * dg + db * db;
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = color;
+                }
+            }
+        }
+        return best;
     }
 
     private static int[] dirtyRect(int level, long dirtyChildMask) {

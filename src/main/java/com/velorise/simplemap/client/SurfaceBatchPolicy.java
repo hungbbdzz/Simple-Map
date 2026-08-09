@@ -28,10 +28,12 @@ public final class SurfaceBatchPolicy {
             return demand >= 2 ? 2 : 1;
         }
         int demand = Math.max(0, demandedInFourByFour);
+        // A foreground super-batch is profitable only after its focused leaf has
+        // coherent source coverage. Before that, 2x2/4x4 capture repeatedly
+        // materialised mostly-empty neighbours and amplified partial publications.
+        if (!sourceReady) return 1;
         if (effective == MapRequestLane.MINIMAP) return demand >= 2 ? 2 : 1;
-        // Cold fullscreen demand starts with a 2x2 source transaction. Widen to
-        // 4x4 only after retained source coverage proves the larger batch useful.
-        if (sourceReady && demand >= 8) return 4;
+        if (demand >= 8) return 4;
         return demand >= 2 ? 2 : 1;
     }
 

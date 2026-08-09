@@ -439,37 +439,46 @@ public class MinimapRenderer {
         double playerZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
         double zoom = effectiveZoom;
 
-        // Center of minimap
         float cx = mx + size / 2.0f;
         float cy = my + size / 2.0f;
-
         double worldDX = MapConfig.pinWorldX - playerX;
         double worldDZ = MapConfig.pinWorldZ - playerZ;
 
-        float dirX, dirZ;
-        if (MapConfig.minimapRotate) {
-            float playerYaw = net.minecraft.util.Mth.rotLerp(partialTick, player.yRotO, player.getYRot());
-            double angleRad = Math.toRadians(180.0f - playerYaw);
-            double cos = Math.cos(angleRad);
-            double sin = Math.sin(angleRad);
-            dirX = (float) (worldDX * cos - worldDZ * sin);
-            dirZ = (float) (worldDX * sin + worldDZ * cos);
-        } else {
-            dirX = (float) worldDX;
-            dirZ = (float) worldDZ;
-        }
+        // Prefer the exact retained-FBO composition transform. Terrain can reuse a
+        // snapped physical-pixel anchor for many HUD frames; projecting the pin from
+        // an independently rounded live formula is mathematically close but can
+        // oscillate by one logical pixel relative to the texture. Reading the final
+        // crop/scale/yaw transform pins the marker to the same map pixels.
+        MinimapFramebufferRenderer framebuffer = MinimapFramebufferRenderer.getInstance();
+        MinimapFramebufferRenderer.HudPoint pinPoint = framebuffer.projectWorldToHud(
+                MapConfig.pinWorldX, MapConfig.pinWorldZ);
 
-        float scrDX = (float) (dirX * zoom);
-        float scrDZ = (float) (dirZ * zoom);
+        double cos = 1.0;
+        double sin = 0.0;
+        if (MapConfig.minimapRotate) {
+            float playerYaw = net.minecraft.util.Mth.rotLerp(partialTick,
+                    player.yRotO, player.getYRot());
+            double angleRad = Math.toRadians(-playerYaw - 180.0f);
+            cos = Math.cos(angleRad);
+            sin = Math.sin(angleRad);
+        }
+        float scrDX;
+        float scrDZ;
+        if (pinPoint != null) {
+            scrDX = pinPoint.x() - cx;
+            scrDZ = pinPoint.y() - cy;
+        } else {
+            scrDX = (float) ((worldDX * cos - worldDZ * sin) * zoom);
+            scrDZ = (float) ((worldDX * sin + worldDZ * cos) * zoom);
+        }
         float dist2D = (float) Math.sqrt(scrDX * scrDX + scrDZ * scrDZ);
 
-        float iconX, iconZ;
+        float iconX;
+        float iconZ;
         boolean offMap = false;
-
         if (MapConfig.minimapCircle) {
-            // Circular clamping boundary
             float maxCircleRadius = size / 2.0f + borderThickness / 2.0f;
-            if (dist2D <= maxCircleRadius) {
+            if (dist2D <= maxCircleRadius || dist2D <= 0.0001f) {
                 iconX = cx + scrDX;
                 iconZ = cy + scrDZ;
             } else {
@@ -478,21 +487,15 @@ public class MinimapRenderer {
                 offMap = true;
             }
         } else {
-            // Square clamping boundary
-            float limit = size / 2.0f + (borderThickness / 2.0f);
+            float limit = size / 2.0f + borderThickness / 2.0f;
             if (Math.abs(scrDX) <= limit && Math.abs(scrDZ) <= limit) {
                 iconX = cx + scrDX;
                 iconZ = cy + scrDZ;
             } else {
                 float maxVal = Math.max(Math.abs(scrDX), Math.abs(scrDZ));
-                if (maxVal > 0) {
-                    float t = limit / maxVal;
-                    iconX = cx + scrDX * t;
-                    iconZ = cy + scrDZ * t;
-                } else {
-                    iconX = cx;
-                    iconZ = cy;
-                }
+                float t = maxVal > 0.0001f ? limit / maxVal : 0.0f;
+                iconX = maxVal > 0.0001f ? cx + scrDX * t : cx;
+                iconZ = maxVal > 0.0001f ? cy + scrDZ * t : cy;
                 offMap = true;
             }
         }
@@ -500,42 +503,72 @@ public class MinimapRenderer {
         int markerSize = Math.max(2, (int) (8 * MapConfig.pinScale));
         int halfSize = markerSize / 2;
 
-        // The route and marker are live HUD overlays. They are deliberately not
-        // baked into the retained map framebuffer, otherwise exact player motion
-        // invalidates every atlas replay while a pin is active. A short screen-space
-        // dotted segment has bounded cost independent of world distance.
-        float routeDX = iconX - cx;
-        float routeDZ = iconZ - cy;
-        float routeLength = (float) Math.sqrt(routeDX * routeDX + routeDZ * routeDZ);
-        if (routeLength > markerSize + 6.0f) {
-            int pointerColor = MapRenderer.getInstance().getActualPointerColor(
-                    MapConfig.playerPointerColor);
-            int routeColor = (pointerColor & 0x00FFFFFF) | 0xCC000000;
-            float nx = routeDX / routeLength;
-            float nz = routeDZ / routeLength;
-            float start = 6.0f;
-            float end = Math.max(start, routeLength - halfSize - 2.0f);
-            float step = Math.max(5.0f, 7.0f * Math.max(0.6f, MapConfig.pinScale));
-            for (float distance = start; distance < end; distance += step) {
-                int dotX = Math.round(cx + nx * distance);
-                int dotY = Math.round(cy + nz * distance);
-                guiGraphics.fill(dotX, dotY, dotX + 1, dotY + 1, routeColor);
+        // Navigation geometry is always live player -> destination. Dot phase is
+        // destination-anchored and selected only after the complete world segment is
+        // known, so offscreen clipping cannot re-space the guide line.
+        PinNavigation.Route route = PinNavigation.currentRoute(playerX, playerZ);
+        if (route != null && zoom > 0.0001) {
+            double halfWorld = (size * 0.5 + borderThickness + 2.0)
+                    * 1.5 / zoom;
+            PinNavigation.DotRange dots = PinNavigation.visibleDots(route,
+                    playerX - halfWorld, playerX + halfWorld,
+                    playerZ - halfWorld, playerZ + halfWorld,
+                    5.0 / zoom, PinNavigation.MAX_VISIBLE_ROUTE_DOTS);
+            if (!dots.isEmpty()) {
+                int pointerColor = MapRenderer.getInstance().getActualPointerColor(
+                        MapConfig.playerPointerColor);
+                int routeColor = (pointerColor & 0x00FFFFFF) | 0xCC000000;
+                float routeLimit = Math.max(1.0f, size * 0.5f - 1.0f);
+                for (int index = dots.firstIndex();
+                        index <= dots.lastIndex(); index += dots.stride()) {
+                    double dotWorldX = PinNavigation.dotWorldX(route, index);
+                    double dotWorldZ = PinNavigation.dotWorldZ(route, index);
+                    MinimapFramebufferRenderer.HudPoint dotPoint =
+                            framebuffer.projectWorldToHud(dotWorldX, dotWorldZ);
+                    float dotScreenX;
+                    float dotScreenZ;
+                    if (dotPoint != null) {
+                        dotScreenX = dotPoint.x() - cx;
+                        dotScreenZ = dotPoint.y() - cy;
+                    } else {
+                        double dotDX = dotWorldX - playerX;
+                        double dotDZ = dotWorldZ - playerZ;
+                        dotScreenX = (float) ((dotDX * cos - dotDZ * sin) * zoom);
+                        dotScreenZ = (float) ((dotDX * sin + dotDZ * cos) * zoom);
+                    }
+                    boolean inside = MapConfig.minimapCircle
+                            ? dotScreenX * dotScreenX + dotScreenZ * dotScreenZ
+                                    <= routeLimit * routeLimit
+                            : Math.abs(dotScreenX) <= routeLimit
+                                    && Math.abs(dotScreenZ) <= routeLimit;
+                    if (!inside) continue;
+                    guiGraphics.pose().pushPose();
+                    guiGraphics.pose().translate(cx + dotScreenX,
+                            cy + dotScreenZ, 0.0f);
+                    guiGraphics.fill(0, 0, 1, 1, routeColor);
+                    guiGraphics.pose().popPose();
+                }
             }
         }
 
         com.mojang.blaze3d.systems.RenderSystem.enableBlend();
         com.mojang.blaze3d.systems.RenderSystem.defaultBlendFunc();
+        // Keep the icon on the fractional HUD coordinate. Rounding the marker while
+        // the retained texture scrolls subpixel was the remaining visible jitter.
+        guiGraphics.pose().pushPose();
+        guiGraphics.pose().translate(iconX, iconZ, 0.0f);
         if (offMap) {
             com.mojang.blaze3d.systems.RenderSystem.setShaderColor(1.0f, 0.0f, 0.0f, 1.0f);
             guiGraphics.blit(PLAYER_OFF_MAP_TEXTURE,
-                    (int) iconX - halfSize, (int) iconZ - halfSize, markerSize, markerSize,
+                    -halfSize, -halfSize, markerSize, markerSize,
                     0.0f, 0.0f, 8, 8, 8, 8);
             com.mojang.blaze3d.systems.RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
         } else {
             guiGraphics.blit(RED_X_TEXTURE,
-                    (int) iconX - halfSize, (int) iconZ - halfSize,
-                    markerSize, markerSize, 0.0f, 0.0f, 8, 8, 8, 8);
+                    -halfSize, -halfSize, markerSize, markerSize,
+                    0.0f, 0.0f, 8, 8, 8, 8);
         }
+        guiGraphics.pose().popPose();
 
         double dist3D = Math.sqrt(worldDX * worldDX + worldDZ * worldDZ);
         String label;
@@ -546,14 +579,11 @@ public class MinimapRenderer {
             label = (int) dist3D + "m";
         }
         Minecraft mc = Minecraft.getInstance();
-
         float textScale = 0.6f * (MapConfig.pinScale / 0.5f);
-        int lz = (int) iconZ + halfSize + 2;
 
         guiGraphics.pose().pushPose();
-        guiGraphics.pose().translate(iconX, lz, 0);
+        guiGraphics.pose().translate(iconX, iconZ + halfSize + 2.0f, 0.0f);
         guiGraphics.pose().scale(textScale, textScale, 1.0f);
-
         int rawWidth = mc.font.width(label);
         guiGraphics.fill(-rawWidth / 2 - 2, -1, rawWidth / 2 + 2, 8, 0xAA000000);
         guiGraphics.drawString(mc.font, label, -rawWidth / 2, 0, 0xFFFFFF, false);

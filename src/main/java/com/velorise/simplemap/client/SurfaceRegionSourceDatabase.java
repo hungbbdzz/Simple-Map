@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
@@ -37,9 +38,11 @@ public final class SurfaceRegionSourceDatabase {
     // Chunk completion wakes the affected capture immediately. Keep only a slow
     // safety retry for unchanged partial windows; rebuilding the same incomplete
     // palette/remap transaction twice per second was a major allocation spike.
-    private static final long UNCHANGED_PARTIAL_RETRY_NANOS = 4_000_000_000L;
+    private static final long UNCHANGED_PARTIAL_BACKGROUND_RETRY_NANOS = 4_000_000_000L;
+    private static final long UNCHANGED_PARTIAL_FOREGROUND_RETRY_NANOS = 180_000_000L;
     private static final long CHUNK_SOURCE_BYTES = 4_608L;
     private static final int MAX_REGION_WARM_IN_FLIGHT = 2;
+    private static final int MAX_PAGE_WARM_IN_FLIGHT = 24;
     private static final ThreadLocal<CaptureScratch> CAPTURE_SCRATCH =
             ThreadLocal.withInitial(CaptureScratch::new);
     private final LinkedHashMap<SourceKey, SurfaceRegionSource> sources =
@@ -49,6 +52,12 @@ public final class SurfaceRegionSourceDatabase {
     private final Set<SourceKey> warmingRegions =
             ConcurrentHashMap.newKeySet();
     private final AtomicInteger warmingRegionCount = new AtomicInteger();
+    private final Set<PageWarmKey> warmingPages = ConcurrentHashMap.newKeySet();
+    private final AtomicInteger warmingPageCount = new AtomicInteger();
+    /** Event-driven retry fence for loaded pages that made no retained-source progress. */
+    private final ConcurrentHashMap<PageWarmKey, Long> pageWarmRetryAfterNanos =
+            new ConcurrentHashMap<>();
+    private static final long PAGE_WARM_NO_PROGRESS_RETRY_NANOS = 750_000_000L;
     /** Last materialized coverage per focused batch; avoids rebuilding unchanged partials. */
     private final Long2ObjectOpenHashMap<BatchProgressState> batchProgress =
             new Long2ObjectOpenHashMap<>(128);
@@ -174,6 +183,29 @@ public final class SurfaceRegionSourceDatabase {
     }
 
     /**
+     * One retained chunk commit is the exact-page wake authority. Keeping this in
+     * one helper prevents live scan, loaded-region warm and region-wide warm from
+     * diverging again. The page-warm retry fence is also cleared so a newly arrived
+     * chunk is consumed immediately instead of waiting for its no-progress timeout.
+     */
+    private void wakeExactPageForRetainedChunk(RevisionStamp stamp, SourceKey key,
+            int localChunkX, int localChunkZ) {
+        int localPageX = localChunkX >>> 2;
+        int localPageZ = localChunkZ >>> 2;
+        pageWarmRetryAfterNanos.remove(new PageWarmKey(
+                key.sessionId(), key.regionX(), key.regionZ(),
+                localPageX, localPageZ));
+        int worldChunkX = key.regionX() * SurfaceRegionSource.CHUNKS_PER_AXIS
+                + localChunkX;
+        int worldChunkZ = key.regionZ() * SurfaceRegionSource.CHUNKS_PER_AXIS
+                + localChunkZ;
+        MapTextureManager.getInstance().markPageDirtyForChunk(
+                worldChunkX, worldChunkZ);
+        MapTextureManager.getInstance().wakeRegionCaptureForChunk(
+                worldChunkX, worldChunkZ);
+    }
+
+    /**
      * Publishes one complete live 16x16 Surface chunk directly into the retained
      * source database. The old path waited for a later page capture probe to notice
      * that MapManager had finally reached 256 columns, which produced thousands of
@@ -230,7 +262,13 @@ public final class SurfaceRegionSourceDatabase {
                 + localChunkX;
         MapWorkGraph.getInstance().clearSourceChunkDirty(stamp,
                 regionX, regionZ, localChunkIndex);
-        MapTextureManager.getInstance().wakeRegionCaptureForChunk(chunkX, chunkZ);
+        /*
+         * The retained source commit is the single publication authority. Do not
+         * depend on the caller also remembering to dirty the exact page: live scans,
+         * cache replay and saved-world reconstruction all converge through this path.
+         * dirtyPageQueued coalesces the harmless duplicate from the live scanner.
+         */
+        wakeExactPageForRetainedChunk(stamp, key, localChunkX, localChunkZ);
         if (!leafWasReady && source.leafSourceReady(localPageX, localPageZ)) {
             Minecraft minecraft = Minecraft.getInstance();
             Runnable wakeLod = () -> RegionSurfaceLodService.getInstance()
@@ -252,13 +290,132 @@ public final class SurfaceRegionSourceDatabase {
     }
 
     /**
-     * Copies a loaded saved region into the retained 16x16 source database on a
-     * worker thread. Pass 12 populated this database only through render-thread
-     * capture attempts capped at a few dozen chunks, so a 512x512 region could
-     * take many seconds before its coarse LOD had useful coverage. The region
-     * arrays are SimpleMap-owned and lock-protected, so warming them off-thread is
-     * safe and keeps Minecraft Level/Chunk objects out of background work.
+     * Clean retained 16x16 source chunks currently available to one exact leaf.
+     * The live minimap uses this instead of consulting MapManager.Region.
      */
+    public int leafPresentSubtileMask(RevisionStamp stamp, int regionX,
+            int regionZ, int localPageX, int localPageZ) {
+        if (stamp == null || !stamp.isCurrent()) return 0;
+        synchronized (sources) {
+            SurfaceRegionSource source = sources.get(new SourceKey(
+                    stamp.sessionId(), regionX, regionZ));
+            return source == null ? 0
+                    : source.leafPresentSubtileMask(localPageX, localPageZ);
+        }
+    }
+
+    /**
+     * Warms only one 64x64 exact page (4x4 chunks) into the retained source.
+     *
+     * Renderer demand is page-scoped. Scanning all 32x32 chunks of a loaded
+     * MapManager.Region for every unresolved exact page made the writer do up to
+     * 1024 revision checks when Xaero's MapTileChunk transaction needs only 16.
+     * Region-wide warming remains available for coarse/LOD reconstruction.
+     */
+    public boolean warmLoadedPage(RevisionStamp stamp, int regionX, int regionZ,
+            int localPageX, int localPageZ, MapRequestLane lane) {
+        if (stamp == null || !stamp.isCurrent()
+                || localPageX < 0 || localPageX >= MapPageLayout.PAGES_PER_REGION
+                || localPageZ < 0 || localPageZ >= MapPageLayout.PAGES_PER_REGION) {
+            return false;
+        }
+        PageWarmKey warmKey = new PageWarmKey(stamp.sessionId(), regionX, regionZ,
+                localPageX, localPageZ);
+        Long retryAfter = pageWarmRetryAfterNanos.get(warmKey);
+        long nowNanos = System.nanoTime();
+        if (retryAfter != null) {
+            if (nowNanos < retryAfter) return true;
+            pageWarmRetryAfterNanos.remove(warmKey, retryAfter);
+        }
+        if (!warmingPages.add(warmKey)) return true;
+        if (warmingPageCount.incrementAndGet() > MAX_PAGE_WARM_IN_FLIGHT) {
+            releaseWarmPage(warmKey);
+            return false;
+        }
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.FULLSCREEN : lane;
+        CompletableFuture<Integer> future = MapWorkScheduler.tryCpuFuture(
+                effectiveLane, MapWorkScheduler.WorkType.SOURCE_DECODE,
+                effectiveLane.priorityBase() + 180_000, 16,
+                stamp::isCurrent,
+                () -> warmLoadedPageNow(stamp, warmKey, effectiveLane));
+        if (future == null) {
+            releaseWarmPage(warmKey);
+            return false;
+        }
+        future.whenComplete((captured, failure) -> {
+            releaseWarmPage(warmKey);
+            int progress = captured == null ? 0 : captured;
+            if (failure == null && progress > 0 && stamp.isCurrent()) {
+                pageWarmRetryAfterNanos.remove(warmKey);
+                Minecraft.getInstance().execute(() ->
+                        RegionSurfaceLodService.getInstance()
+                                .onRegionSourceWarmed(regionX, regionZ));
+            } else if (failure == null && stamp.isCurrent()) {
+                // Xaero advances a persistent writer cursor instead of rescanning an
+                // unavailable tile every render frame. Retain the same event-driven
+                // behaviour here: chunk publication clears this fence immediately.
+                pageWarmRetryAfterNanos.put(warmKey, System.nanoTime()
+                        + PAGE_WARM_NO_PROGRESS_RETRY_NANOS);
+            }
+        });
+        return true;
+    }
+
+    private void releaseWarmPage(PageWarmKey key) {
+        warmingPages.remove(key);
+        warmingPageCount.updateAndGet(value -> Math.max(0, value - 1));
+    }
+
+    private int warmLoadedPageNow(RevisionStamp stamp, PageWarmKey key,
+            MapRequestLane lane) {
+        MapManager.Region region = MapManager.getInstance().getRegion(
+                key.regionX(), key.regionZ(), false);
+        if (region == null || !region.isLoaded() || !stamp.isCurrent()) return 0;
+        SourceKey sourceKey = new SourceKey(
+                key.sessionId(), key.regionX(), key.regionZ());
+        SurfaceRegionSource source = getOrCreateSource(
+                sourceKey, stamp, key.regionX(), key.regionZ());
+        MapManager.RegionSourcePalette palette =
+                region.snapshotSourcePaletteIfChanged(source.paletteRevision());
+        if (palette != null) source.updatePalette(palette);
+
+        int startChunkX = key.localPageX() * 4;
+        int startChunkZ = key.localPageZ() * 4;
+        int captured = 0;
+        for (int chunkZ = startChunkZ;
+                chunkZ < startChunkZ + 4 && stamp.isCurrent(); chunkZ++) {
+            for (int chunkX = startChunkX;
+                    chunkX < startChunkX + 4 && stamp.isCurrent(); chunkX++) {
+                long revision = region.chunkRevision(chunkX, chunkZ);
+                if (!source.needsCapture(chunkX, chunkZ, revision)
+                        || !region.isChunkSurfaceComplete(chunkX, chunkZ)) {
+                    continue;
+                }
+                MapMemoryLeaseManager.Lease chunkLease =
+                        acquireChunkLease(sourceKey, lane);
+                if (chunkLease == null) return captured;
+                MapManager.RegionChunkSnapshot snapshot =
+                        region.snapshotChunk(chunkX, chunkZ, null);
+                if (snapshot == null) {
+                    chunkLease.close();
+                    continue;
+                }
+                boolean committed = source.commit(ChunkSnapshot.takeOwnership(
+                        snapshot.localChunkX(), snapshot.localChunkZ(),
+                        snapshot.sourceRevision(), snapshot.packedPixelsUnsafe(),
+                        snapshot.tintsUnsafe(), snapshot.lightLevelsUnsafe()),
+                        chunkLease);
+                if (!committed) continue;
+                captured++;
+                MapWorkGraph.getInstance().clearSourceChunkDirty(stamp,
+                        key.regionX(), key.regionZ(), chunkZ * 32 + chunkX);
+                wakeExactPageForRetainedChunk(stamp, sourceKey, chunkX, chunkZ);
+            }
+        }
+        return captured;
+    }
+
     public boolean warmLoadedRegion(RevisionStamp stamp, int regionX,
             int regionZ, MapRequestLane lane) {
         if (stamp == null || !stamp.isCurrent()) return false;
@@ -332,6 +489,7 @@ public final class SurfaceRegionSourceDatabase {
                     captured++;
                     MapWorkGraph.getInstance().clearSourceChunkDirty(stamp,
                             key.regionX(), key.regionZ(), chunkZ * 32 + chunkX);
+                    wakeExactPageForRetainedChunk(stamp, key, chunkX, chunkZ);
                 }
             }
         }
@@ -354,6 +512,9 @@ public final class SurfaceRegionSourceDatabase {
         }
         resetCaptureAllowance();
         warmingRegions.removeIf(key -> key.sessionId() == sessionId);
+        warmingPages.removeIf(key -> key.sessionId() == sessionId);
+        pageWarmRetryAfterNanos.keySet().removeIf(
+                key -> key.sessionId() == sessionId);
     }
 
     public void clear() {
@@ -370,6 +531,9 @@ public final class SurfaceRegionSourceDatabase {
         resetCaptureAllowance();
         warmingRegions.clear();
         warmingRegionCount.set(0);
+        warmingPages.clear();
+        warmingPageCount.set(0);
+        pageWarmRetryAfterNanos.clear();
     }
 
     /**
@@ -395,7 +559,6 @@ public final class SurfaceRegionSourceDatabase {
 
         CaptureScratch scratch = CAPTURE_SCRATCH.get();
         MapMemoryLeaseManager.Lease memoryLease = null;
-        boolean viewsTransferred = false;
         try {
             int halo = MapPageLayout.PAGE_HALO;
             int width = pagesWide * MapPageLayout.PAGE_SIZE + halo * 2;
@@ -543,7 +706,7 @@ public final class SurfaceRegionSourceDatabase {
             if (!shouldMaterializeBatch(progressKey, stamp.sessionId(), regionX,
                     regionZ, batchPageX, batchPageZ, focusPageX, focusPageZ,
                     pagesWide, pagesHigh, includeLight, progressSignature,
-                    strictReady, nowNanos)) {
+                    strictReady, lane, nowNanos)) {
                 captureDeferred.incrementAndGet();
                 return null;
             }
@@ -565,41 +728,45 @@ public final class SurfaceRegionSourceDatabase {
                         focusBodyReadiness, focusReadiness);
             }
 
-            List<String> biomePalette = new ArrayList<>();
-            List<String> blockPalette = new ArrayList<>();
-            Map<String, Integer> biomeIds = new HashMap<>();
-            Map<String, Integer> blockIds = new HashMap<>();
-            RegionSlice[] slices = new RegionSlice[sourceRegionCount];
+            RegionProbeSlice[] slices = new RegionProbeSlice[sourceRegionCount];
             int sliceCount = 0;
             long sourceRevision = 0L;
             for (int index = 0; index < sourceRegionCount; index++) {
                 SurfaceRegionSource.Probe probe = scratch.probes[index];
-                if (probe != null) scratch.views[index] = probe.acquireView();
-            }
-            scratch.closeProbes(sourceRegionCount);
-            for (int index = 0; index < sourceRegionCount; index++) {
-                SurfaceRegionSource.View view = scratch.views[index];
-                if (view == null) continue;
+                if (probe == null) continue;
+                SurfaceRegionSource.ProbeMetadata metadata =
+                        probe.snapshotMetadataUnsafe();
+                // Palette identity must stay stable across admission. Source data
+                // itself may advance meanwhile: a newer chunk snapshot with the
+                // same palette is safe and is preferable to cancelling a minimap
+                // plan just because an unrelated chunk in this 512x512 region
+                // published during the capture.
+                if (metadata == null
+                        || metadata.paletteRevision() != scratch.revisions[index * 2 + 1]) {
+                    captureDeferred.incrementAndGet();
+                    return null;
+                }
                 int coordinateX = minRegionX + index % sourceRegionWidth;
                 int coordinateZ = minRegionZ + index / sourceRegionWidth;
-                sourceRevision = Math.max(sourceRevision, view.sourceRevision());
-                int[] biomeRemap = buildBiomeRemap(view.biomePaletteUnsafe(),
-                        biomePalette, biomeIds);
-                int[] blockRemap = buildBlockRemap(view.blockPaletteUnsafe(),
-                        blockPalette, blockIds);
-                slices[sliceCount++] = new RegionSlice(
-                        new RegionCoordinate(coordinateX, coordinateZ),
-                        view, biomeRemap, blockRemap);
+                sourceRevision = Math.max(sourceRevision, metadata.sourceRevision());
+                slices[sliceCount++] = new RegionProbeSlice(
+                        new RegionCoordinate(coordinateX, coordinateZ), probe,
+                        metadata.sourceRevision(), metadata.paletteRevision(),
+                        metadata.biomePalette(), metadata.blockPalette());
             }
-            RegionSlice[] retainedSlices = sliceCount == slices.length
+            RegionProbeSlice[] retainedSlices = sliceCount == slices.length
                     ? slices : Arrays.copyOf(slices, sliceCount);
             BatchSourcePlan plan = new BatchSourcePlan(stamp, regionX, regionZ,
                     batchPageX, batchPageZ, pagesWide, pagesHigh,
                     worldPageStartX, worldPageStartZ, width, height, halo,
-                    Math.max(1L, sourceRevision), retainedSlices,
-                    List.copyOf(biomePalette), List.copyOf(blockPalette), memoryLease);
+                    Math.max(1L, sourceRevision), retainedSlices, memoryLease);
+            // Transfer all probe lifetime pins atomically only after the plan was
+            // constructed successfully. The finally block still owns them before
+            // this point and therefore closes every pin on any admission failure.
+            for (int index = 0; index < sourceRegionCount; index++) {
+                scratch.probes[index] = null;
+            }
             memoryLease = null;
-            viewsTransferred = true;
             markBatchMaterialized(progressKey, stamp.sessionId(), regionX, regionZ,
                     batchPageX, batchPageZ, focusPageX, focusPageZ,
                     pagesWide, pagesHigh, includeLight, progressSignature,
@@ -609,12 +776,27 @@ public final class SurfaceRegionSourceDatabase {
             throw failure;
         } finally {
             scratch.closeProbes(MAX_CAPTURE_REGIONS);
-            if (!viewsTransferred) scratch.closeViews(MAX_CAPTURE_REGIONS);
-            else scratch.clearViews(MAX_CAPTURE_REGIONS);
             if (memoryLease != null) memoryLease.close();
+            long captureNanos = System.nanoTime() - startedNanos;
             MapPipelineTelemetry.getInstance().recordStageNanos(
-                    MapPipelineStage.SURFACE_CAPTURE,
-                    System.nanoTime() - startedNanos);
+                    MapPipelineStage.SURFACE_CAPTURE, captureNanos);
+            // SURFACE_CAPTURE intentionally covers the complete retained-source
+            // plan, not only mutable Region.snapshotChunk(). Emit a sampled slow
+            // event with lane/geometry so the next log can distinguish a harmless
+            // fullscreen throughput spike from a latency-sensitive minimap capture.
+            if (captureNanos >= 4_000_000L) {
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                String slowKey = "SURFACE_CAPTURE_SLOW:"
+                        + (lane == null ? "null" : lane.name());
+                if (recorder.shouldEmitEvent(slowKey, 250L)) {
+                    recorder.event("SURFACE_CAPTURE_SLOW",
+                            "lane=" + lane + " pages=" + pagesWide + 'x' + pagesHigh
+                                    + " focus=" + focusPageX + ',' + focusPageZ
+                                    + " elapsed_ms="
+                                    + String.format(java.util.Locale.ROOT, "%.3f",
+                                            captureNanos / 1_000_000.0));
+                }
+            }
         }
     }
 
@@ -624,77 +806,28 @@ public final class SurfaceRegionSourceDatabase {
             int focusWorldStartZ, int focusWorldEndX, int focusWorldEndZ,
             boolean includeLight, MapRequestLane lane,
             CaptureBudget remainingCaptures) {
-        MapManager.Region region = MapManager.getInstance().getRegion(regionX, regionZ, false);
-        if (region == null || !region.isLoaded()) return null;
         SourceKey key = new SourceKey(stamp.sessionId(), regionX, regionZ);
-        SurfaceRegionSource source = getOrCreateSource(key, stamp, regionX, regionZ);
-        MapManager.RegionSourcePalette palette =
-                region.snapshotSourcePaletteIfChanged(source.paletteRevision());
-        if (palette != null) source.updatePalette(palette);
 
-        int regionWorldX = regionX * MapPageLayout.REGION_SIZE;
-        int regionWorldZ = regionZ * MapPageLayout.REGION_SIZE;
-        int localMinX = Math.max(0, windowStartX - regionWorldX);
-        int localMinZ = Math.max(0, windowStartZ - regionWorldZ);
-        int localMaxX = Math.min(MapPageLayout.REGION_SIZE - 1,
-                windowEndX - regionWorldX);
-        int localMaxZ = Math.min(MapPageLayout.REGION_SIZE - 1,
-                windowEndZ - regionWorldZ);
-        if (localMinX > localMaxX || localMinZ > localMaxZ) return source.acquireProbe();
-
-        MapLightManager.LightRegion lightRegion = includeLight
-                ? MapLightManager.getInstance().getRegion(regionX, regionZ, true) : null;
-        int minChunkX = localMinX >>> 4;
-        int maxChunkX = localMaxX >>> 4;
-        int minChunkZ = localMinZ >>> 4;
-        int maxChunkZ = localMaxZ >>> 4;
         /*
-         * Do not allocate/sort a ChunkCoordinate object for every missing chunk on
-         * every capture attempt. The previous path was especially expensive while
-         * flying into new terrain: thousands of rejected plans created short-lived
-         * lists and comparator traffic on the client thread. Three centre-out
-         * priority tiers preserve the focus-body/halo ordering with zero per-chunk
-         * allocation.
+         * PASS109 / Xaero single retained authority:
+         *
+         * No renderer lane is allowed to rebuild source state while capturing a
+         * batch plan. PASS108 kept MINIMAP probe-only but FULLSCREEN/BACKGROUND
+         * could still snapshot MapManager.Region here. The same logical page could
+         * therefore be considered ready by two different authorities and revisions,
+         * which is exactly the sort of lane-dependent asynchronous publication seen
+         * in the PASS108 run.
+         *
+         * Live ChunkScanner, saved-world reconstruction and region warming all
+         * converge through publishCompletedChunk()/warmLoadedPage()/
+         * warmLoadedRegion(). Rendering
+         * consumes only the immutable retained source. If it is not ready, the
+         * demand path requests/wakes the writer and this probe simply defers.
          */
-        long focusCenterWorldX = ((long) focusWorldStartX + focusWorldEndX) >> 1;
-        long focusCenterWorldZ = ((long) focusWorldStartZ + focusWorldEndZ) >> 1;
-        int focusChunkX = clamp((int) Math.floorDiv(
-                focusCenterWorldX - regionWorldX, 16L), minChunkX, maxChunkX);
-        int focusChunkZ = clamp((int) Math.floorDiv(
-                focusCenterWorldZ - regionWorldZ, 16L), minChunkZ, maxChunkZ);
-        int maximumRing = Math.max(
-                Math.max(Math.abs(focusChunkX - minChunkX),
-                        Math.abs(maxChunkX - focusChunkX)),
-                Math.max(Math.abs(focusChunkZ - minChunkZ),
-                        Math.abs(maxChunkZ - focusChunkZ)));
-        capture:
-        for (int tier = 0; tier < 3; tier++) {
-            for (int ring = 0; ring <= maximumRing; ring++) {
-                for (int dz = -ring; dz <= ring; dz++) {
-                    for (int dx = -ring; dx <= ring; dx++) {
-                        if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
-                        if (remainingCaptures == null
-                                || remainingCaptures.remaining <= 0
-                                || System.nanoTime() >= remainingCaptures.deadlineNanos) {
-                            break capture;
-                        }
-                        int chunkX = focusChunkX + dx;
-                        int chunkZ = focusChunkZ + dz;
-                        if (chunkX < minChunkX || chunkX > maxChunkX
-                                || chunkZ < minChunkZ || chunkZ > maxChunkZ) continue;
-                        if (captureTier(regionWorldX, regionWorldZ, chunkX, chunkZ,
-                                focusWorldStartX, focusWorldStartZ,
-                                focusWorldEndX, focusWorldEndZ) != tier) continue;
-                        long revision = region.chunkRevision(chunkX, chunkZ);
-                        if (!source.needsCapture(chunkX, chunkZ, revision)) continue;
-                        captureSourceChunk(stamp, key, lane, source, region,
-                                lightRegion, regionX, regionZ, chunkX, chunkZ,
-                                remainingCaptures);
-                    }
-                }
-            }
+        synchronized (sources) {
+            SurfaceRegionSource retained = sources.get(key);
+            return retained == null ? null : retained.acquireProbe();
         }
-        return source.acquireProbe();
     }
 
     private void captureSourceChunk(RevisionStamp stamp, SourceKey key,
@@ -883,7 +1016,7 @@ public final class SurfaceRegionSourceDatabase {
             int regionX, int regionZ, int batchPageX, int batchPageZ,
             int focusPageX, int focusPageZ, int pagesWide, int pagesHigh,
             boolean includeLight, long signature, boolean strictReady,
-            long nowNanos) {
+            MapRequestLane lane, long nowNanos) {
         synchronized (batchProgress) {
             BatchProgressState state = batchProgress.get(key);
             if (state == null || !state.matches(sessionId, regionX, regionZ,
@@ -894,8 +1027,11 @@ public final class SurfaceRegionSourceDatabase {
             if (state.signature != signature || (strictReady && !state.strictReady)) {
                 return true;
             }
-            return nowNanos - state.materializedNanos
-                    >= UNCHANGED_PARTIAL_RETRY_NANOS;
+            long retryNanos = lane == MapRequestLane.MINIMAP
+                    || lane == MapRequestLane.FULLSCREEN
+                    ? UNCHANGED_PARTIAL_FOREGROUND_RETRY_NANOS
+                    : UNCHANGED_PARTIAL_BACKGROUND_RETRY_NANOS;
+            return nowNanos - state.materializedNanos >= retryNanos;
         }
     }
 
@@ -988,8 +1124,6 @@ public final class SurfaceRegionSourceDatabase {
     private static final class CaptureScratch {
         private final SurfaceRegionSource.Probe[] probes =
                 new SurfaceRegionSource.Probe[MAX_CAPTURE_REGIONS];
-        private final SurfaceRegionSource.View[] views =
-                new SurfaceRegionSource.View[MAX_CAPTURE_REGIONS];
         private final long[] coordinatePlan = new long[MAX_CAPTURE_REGIONS];
         private final long[] presentMasks = new long[MAX_CAPTURE_REGIONS
                 * SurfaceRegionSource.DIRTY_WORDS];
@@ -1002,7 +1136,6 @@ public final class SurfaceRegionSourceDatabase {
         private void begin(int regionCount, int captureAllowance,
                 long timeBudgetNanos) {
             closeProbes(MAX_CAPTURE_REGIONS);
-            closeViews(MAX_CAPTURE_REGIONS);
             Arrays.fill(coordinatePlan, 0L);
             Arrays.fill(presentMasks, 0L);
             Arrays.fill(dirtyMasks, 0L);
@@ -1014,7 +1147,6 @@ public final class SurfaceRegionSourceDatabase {
                     ? Long.MAX_VALUE : now + budget;
             for (int index = regionCount; index < MAX_CAPTURE_REGIONS; index++) {
                 probes[index] = null;
-                views[index] = null;
             }
         }
 
@@ -1025,20 +1157,6 @@ public final class SurfaceRegionSourceDatabase {
                 probes[index] = null;
                 if (probe != null) probe.close();
             }
-        }
-
-        private void closeViews(int count) {
-            int limit = Math.min(count, views.length);
-            for (int index = 0; index < limit; index++) {
-                SurfaceRegionSource.View view = views[index];
-                views[index] = null;
-                if (view != null) view.close();
-            }
-        }
-
-        private void clearViews(int count) {
-            int limit = Math.min(count, views.length);
-            for (int index = 0; index < limit; index++) views[index] = null;
         }
     }
 
@@ -1207,6 +1325,13 @@ public final class SurfaceRegionSourceDatabase {
                         destinationKnown[destinationIndex] = 1;
                         destinationTints[destinationIndex] = sourceTints[sourceIndex];
                         destinationLights[destinationIndex] = sourceLights[sourceIndex];
+                        if (blockRemap == null && biomeRemap == null) {
+                            // Single-region batches already use the exact retained
+                            // region palette. Preserve packed IDs verbatim instead
+                            // of allocating union maps/remap arrays for every page.
+                            destinationPixels[destinationIndex] = packed;
+                            continue;
+                        }
                         if (MapBlockData.isEmpty(packed)) continue;
                         short sourceBlock = MapBlockData.blockId(packed);
                         short outputBlock = MapBlockData.NO_BLOCK;
@@ -1227,6 +1352,38 @@ public final class SurfaceRegionSourceDatabase {
                 }
             }
         }
+    }
+
+    private static void mergePalette(String[] source, List<String> output,
+            Map<String, Integer> indices, String fallback, int maximumEntries) {
+        if (source == null) return;
+        for (String raw : source) {
+            String id = raw == null || raw.isBlank() ? fallback : raw;
+            if (indices.containsKey(id)) continue;
+            int mapped = output.size() >= maximumEntries
+                    ? Math.max(0, maximumEntries - 1) : output.size();
+            if (mapped == output.size()) output.add(id);
+            indices.put(id, mapped);
+        }
+    }
+
+    private static int[] buildRemapAgainstPalette(String[] source,
+            Map<String, Integer> indices, String fallback) {
+        if (source == null) return new int[0];
+        int[] remap = new int[source.length];
+        Integer fallbackIndex = indices.get(fallback);
+        int safeFallback = fallbackIndex == null ? 0 : fallbackIndex;
+        for (int index = 0; index < source.length; index++) {
+            String id = source[index] == null || source[index].isBlank()
+                    ? fallback : source[index];
+            Integer mapped = indices.get(id);
+            if (mapped == null) {
+                throw new CancellationException(
+                        "Surface palette advanced after batch admission");
+            }
+            remap[index] = mapped == null ? safeFallback : mapped;
+        }
+        return remap;
     }
 
     private static int[] buildBiomeRemap(String[] source, List<String> output,
@@ -1264,10 +1421,13 @@ public final class SurfaceRegionSourceDatabase {
     }
 
     private record SourceKey(long sessionId, int regionX, int regionZ) { }
+    private record PageWarmKey(long sessionId, int regionX, int regionZ,
+            int localPageX, int localPageZ) { }
     private record RegionCoordinate(int regionX, int regionZ) { }
-    private record RegionSlice(RegionCoordinate coordinate,
-            SurfaceRegionSource.View view, int[] biomeRemap,
-            int[] blockRemap) { }
+    private record RegionProbeSlice(RegionCoordinate coordinate,
+            SurfaceRegionSource.Probe probe, long sourceRevision,
+            long paletteRevision, String[] biomePalette,
+            String[] blockPalette) { }
 
     /**
      * Immutable, worker-consumable source transaction. It retains immutable chunk
@@ -1289,9 +1449,7 @@ public final class SurfaceRegionSourceDatabase {
         private final int height;
         private final int halo;
         private final long sourceRevision;
-        private final RegionSlice[] slices;
-        private final List<String> biomePalette;
-        private final List<String> blockPalette;
+        private final RegionProbeSlice[] slices;
         private final MapMemoryLeaseManager.Lease memoryLease;
         private int activeAssemblies;
         private boolean closeRequested;
@@ -1300,8 +1458,7 @@ public final class SurfaceRegionSourceDatabase {
         private BatchSourcePlan(RevisionStamp stamp, int regionX, int regionZ,
                 int batchPageX, int batchPageZ, int pagesWide, int pagesHigh,
                 int worldPageStartX, int worldPageStartZ, int stride, int height,
-                int halo, long sourceRevision, RegionSlice[] slices,
-                List<String> biomePalette, List<String> blockPalette,
+                int halo, long sourceRevision, RegionProbeSlice[] slices,
                 MapMemoryLeaseManager.Lease memoryLease) {
             this.stamp = stamp;
             this.regionX = regionX;
@@ -1318,8 +1475,6 @@ public final class SurfaceRegionSourceDatabase {
             this.sourceRevision = sourceRevision;
             // captureBatchPlan passes a fresh, exact-sized array owned by this plan.
             this.slices = slices;
-            this.biomePalette = biomePalette;
-            this.blockPalette = blockPalette;
             this.memoryLease = memoryLease;
         }
 
@@ -1336,8 +1491,26 @@ public final class SurfaceRegionSourceDatabase {
         public int height() { return height; }
         public int halo() { return halo; }
         public long sourceRevision() { return sourceRevision; }
-        public List<String> biomePalette() { return biomePalette; }
-        public List<String> blockPalette() { return blockPalette; }
+
+        /**
+         * Visits the immutable raw palette entries captured at admission without
+         * constructing the final union palette on the render thread. Style
+         * resources are client-thread-affine, while palette union/remap remains
+         * worker-owned in {@link #assemble(BooleanSupplier)}.
+         */
+        void forEachBiomePaletteEntry(Consumer<String> consumer) {
+            if (consumer == null) return;
+            for (RegionProbeSlice slice : slices) {
+                for (String id : slice.biomePalette()) consumer.accept(id);
+            }
+        }
+
+        void forEachBlockPaletteEntry(Consumer<String> consumer) {
+            if (consumer == null) return;
+            for (RegionProbeSlice slice : slices) {
+                for (String id : slice.blockPalette()) consumer.accept(id);
+            }
+        }
 
         AssembledBatchWindow assemble(BooleanSupplier valid) {
             synchronized (this) {
@@ -1356,16 +1529,71 @@ public final class SurfaceRegionSourceDatabase {
                 Arrays.fill(tints, SurfaceTintData.UNKNOWN);
                 int windowStartX = worldPageStartX - halo;
                 int windowStartZ = worldPageStartZ - halo;
-                for (RegionSlice slice : slices) {
+                /*
+                 * The overwhelmingly common 1x1 page transaction stays inside one
+                 * 512x512 retained source region. Xaero keeps that tile's retained
+                 * palette identity; rebuilding a HashMap union and two remap arrays
+                 * for such a local transaction is pure allocation churn. Only
+                 * cross-region batches need palette union/remapping.
+                 */
+                if (slices.length == 1) {
+                    RegionProbeSlice slice = slices[0];
+                    SurfaceRegionSource.View view = slice.probe().acquireView(
+                            slice.paletteRevision());
+                    if (view == null) {
+                        throw new CancellationException(
+                                "Surface palette advanced after batch admission");
+                    }
+                    try {
+                        copyRegionIntersection(slice.coordinate(), view,
+                                windowStartX, windowStartZ, stride, height,
+                                pixels, tints, lights, known, null, null, valid);
+                        return new AssembledBatchWindow(this, pixels, tints, lights, known,
+                                Arrays.asList(slice.biomePalette()),
+                                Arrays.asList(slice.blockPalette()));
+                    } finally {
+                        view.close();
+                    }
+                }
+
+                // Cross-region palette union/remap remains worker-owned.
+                List<String> biomePalette = new ArrayList<>();
+                List<String> blockPalette = new ArrayList<>();
+                Map<String, Integer> biomeIds = new HashMap<>();
+                Map<String, Integer> blockIds = new HashMap<>();
+                for (RegionProbeSlice slice : slices) {
+                    mergePalette(slice.biomePalette(), biomePalette, biomeIds,
+                            "minecraft:plains", 255);
+                    mergePalette(slice.blockPalette(), blockPalette, blockIds,
+                            "minecraft:air", 65_535);
+                }
+                for (RegionProbeSlice slice : slices) {
                     if (valid != null && !valid.getAsBoolean()) {
                         throw new CancellationException("Surface batch assembly cancelled");
                     }
-                    copyRegionIntersection(slice.coordinate(), slice.view(),
-                            windowStartX, windowStartZ, stride, height,
-                            pixels, tints, lights, known, slice.biomeRemap(),
-                            slice.blockRemap(), valid);
+                    SurfaceRegionSource.View view = slice.probe().acquireView(
+                            slice.paletteRevision());
+                    if (view == null) {
+                        throw new CancellationException(
+                                "Surface palette advanced after batch admission");
+                    }
+                    try {
+                        int[] biomeRemap = buildRemapAgainstPalette(
+                                view.biomePaletteUnsafe(), biomeIds,
+                                "minecraft:plains");
+                        int[] blockRemap = buildRemapAgainstPalette(
+                                view.blockPaletteUnsafe(), blockIds,
+                                "minecraft:air");
+                        copyRegionIntersection(slice.coordinate(), view,
+                                windowStartX, windowStartZ, stride, height,
+                                pixels, tints, lights, known, biomeRemap,
+                                blockRemap, valid);
+                    } finally {
+                        view.close();
+                    }
                 }
-                return new AssembledBatchWindow(this, pixels, tints, lights, known);
+                return new AssembledBatchWindow(this, pixels, tints, lights, known,
+                        List.copyOf(biomePalette), List.copyOf(blockPalette));
             } finally {
                 MapPipelineTelemetry.getInstance().recordStageNanos(
                         MapPipelineStage.SURFACE_ASSEMBLY,
@@ -1389,7 +1617,7 @@ public final class SurfaceRegionSourceDatabase {
         private void releaseRetainedState() {
             if (closed) return;
             closed = true;
-            for (RegionSlice slice : slices) slice.view().close();
+            for (RegionProbeSlice slice : slices) slice.probe().close();
             memoryLease.close();
         }
     }
@@ -1401,14 +1629,19 @@ public final class SurfaceRegionSourceDatabase {
         private final int[] tints;
         private final byte[] light;
         private final byte[] known;
+        private final List<String> biomePalette;
+        private final List<String> blockPalette;
 
         private AssembledBatchWindow(BatchSourcePlan plan, long[] pixels,
-                int[] tints, byte[] light, byte[] known) {
+                int[] tints, byte[] light, byte[] known,
+                List<String> biomePalette, List<String> blockPalette) {
             this.plan = plan;
             this.pixels = pixels;
             this.tints = tints;
             this.light = light;
             this.known = known;
+            this.biomePalette = biomePalette;
+            this.blockPalette = blockPalette;
         }
 
         RevisionStamp stamp() { return plan.stamp(); }
@@ -1424,8 +1657,8 @@ public final class SurfaceRegionSourceDatabase {
         int height() { return plan.height(); }
         int halo() { return plan.halo(); }
         long sourceRevision() { return plan.sourceRevision(); }
-        List<String> biomePalette() { return plan.biomePalette(); }
-        List<String> blockPalette() { return plan.blockPalette(); }
+        List<String> biomePalette() { return biomePalette; }
+        List<String> blockPalette() { return blockPalette; }
         long[] pixelsUnsafe() { return pixels; }
         int[] tintsUnsafe() { return tints; }
         byte[] lightUnsafe() { return light; }

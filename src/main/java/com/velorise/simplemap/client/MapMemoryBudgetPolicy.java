@@ -56,6 +56,21 @@ public final class MapMemoryBudgetPolicy {
         return PROFILE.branchHighColumns;
     }
 
+    /**
+     * Cave L1-L3 are the display levels used by Xaero-style fullscreen zoom.
+     * They need enough simultaneous slots for a full 16:9 viewport at the
+     * density-correct level; otherwise the renderer is forced to a blurrier
+     * parent solely because the atlas is small.  Exact-cave capacity is a good
+     * proxy for the selected VRAM profile, capped so high-memory profiles do not
+     * reserve several oversized atlases unnecessarily.
+     */
+    public static int caveBranchColumns(int level) {
+        if (level >= 1 && level <= 3) {
+            return Math.min(32, Math.max(branchLowColumns(), caveExactColumns()));
+        }
+        return branchHighColumns();
+    }
+
     public static int legacyRegionLimit() {
         return PROFILE.legacyRegionLimit;
     }
@@ -96,21 +111,25 @@ public final class MapMemoryBudgetPolicy {
 
     /** Estimated fixed RGBA8 atlas storage for the selected profile. */
     public static long plannedAtlasBytes() {
-        long surfaceSide = 64L * surfaceLeafColumns();
+        long surfaceSide = 66L * surfaceLeafColumns();
         long surfaceExact = surfaceSide * surfaceSide * 4L * 2L;
 
         int caveColumns = caveExactColumns();
         long caveExact = 0L;
         for (int size : new int[] { 64, 32, 16, 8 }) {
-            long side = (long) size * caveColumns;
+            long side = (long) (size + 2) * caveColumns;
             caveExact += side * side * 4L;
         }
 
         long branches = 0L;
         for (int level = 1; level <= MapLodPolicy.MAX_BRANCH_LEVEL; level++) {
-            int columns = level <= 2 ? branchLowColumns() : branchHighColumns();
-            long side = 66L * columns;
-            branches += side * side * 4L * 2L; // surface + cave
+            int surfaceColumns = level <= 2
+                    ? branchLowColumns() : branchHighColumns();
+            int branchCaveColumns = caveBranchColumns(level);
+            long branchSurfaceSide = 66L * surfaceColumns;
+            long caveSide = 66L * branchCaveColumns;
+            branches += branchSurfaceSide * branchSurfaceSide * 4L;
+            branches += caveSide * caveSide * 4L;
         }
         return surfaceExact + caveExact + branches;
     }
@@ -165,7 +184,7 @@ public final class MapMemoryBudgetPolicy {
                 return new Profile(20, 24, 14, 10, 6, 48, 12L);
             }
             if (budgetMiB <= 112) {
-                return new Profile(24, 32, 16, 12, 12, 96, 20L);
+                return new Profile(24, 36, 16, 12, 12, 96, 20L);
             }
             return new Profile(32, 48, 24, 16, 24, 160, 32L);
         }

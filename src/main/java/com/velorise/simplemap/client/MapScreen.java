@@ -242,8 +242,12 @@ public class MapScreen extends Screen {
             caveLayerModeButton.active = MapConfig.getEffectiveCaveMapMode() != 0;
 
             if (MapConfig.getEffectiveCaveMapMode() != 0) {
-                int minimumY = this.minecraft.level.getMinBuildHeight();
-                int maximumY = this.minecraft.level.getMaxBuildHeight() - 1;
+                DimensionMapProfile viewedProfile = MapManager.getInstance()
+                        .getCurrentDimensionProfile();
+                int minimumY = viewedProfile == null
+                        ? this.minecraft.level.getMinBuildHeight() : viewedProfile.minY();
+                int maximumY = viewedProfile == null
+                        ? this.minecraft.level.getMaxBuildHeight() - 1 : viewedProfile.maxY();
                 double initialValue = CaveMode.hasManualTopY(this.minecraft)
                         ? CaveLayerSlider.normalizeNumeric(CaveMode.getSelectedTopY(this.minecraft), minimumY, maximumY)
                         : 0.0;
@@ -336,6 +340,7 @@ public class MapScreen extends Screen {
         if ("LIVE".equals(selectedDimension)) manager.returnToLiveDimension(this.minecraft);
         else manager.switchToDimension(selectedDimension);
         restoreDimensionCamera(previous, selectedDimension);
+        if (caveLayerSlider != null) caveLayerSlider.syncBoundsFromDimension();
         cursorCacheValid = false;
         isPopupMenuOpen = false;
         updateToolbarTooltips();
@@ -363,13 +368,16 @@ public class MapScreen extends Screen {
                     ? MapManager.getInstance().getLiveDimensionResourceId() : previous;
             String to = "LIVE".equals(target)
                     ? MapManager.getInstance().getLiveDimensionResourceId() : target;
-            if ("minecraft:overworld".equals(from) && "minecraft:the_nether".equals(to)) {
-                centerX /= 8.0;
-                centerZ /= 8.0;
-            } else if ("minecraft:the_nether".equals(from)
-                    && "minecraft:overworld".equals(to)) {
-                centerX *= 8.0;
-                centerZ *= 8.0;
+            // Xaero derives cross-dimension map coordinates from each target
+            // DimensionType.coordinateScale(), not hard-coded Overworld/Nether ids.
+            // Persisted profiles extend the same behavior to modded dimensions.
+            MapManager mapManager = MapManager.getInstance();
+            DimensionMapProfile fromProfile = mapManager.getDimensionProfile(from);
+            DimensionMapProfile toProfile = mapManager.getDimensionProfile(to);
+            double ratio = fromProfile.coordinateScale() / toProfile.coordinateScale();
+            if (Double.isFinite(ratio) && ratio > 0.0) {
+                centerX *= ratio;
+                centerZ *= ratio;
             }
         }
         cancelMotionAndOpenAnimation();
@@ -551,10 +559,11 @@ public class MapScreen extends Screen {
                 / Math.max(0.0001f, demandScale);
         double demandHalfH = (vh * 0.5 + demandGuard)
                 / Math.max(0.0001f, demandScale);
+        boolean viewportInteracting = isViewportInteracting(frameNow);
         MapViewportCoordinator.getInstance().submitFullscreen(
                 centerX - demandHalfW, centerX + demandHalfW,
                 centerZ - demandHalfH, centerZ + demandHalfH,
-                demandScale, centerX, centerZ, isViewportInteracting(frameNow));
+                demandScale, centerX, centerZ, viewportInteracting);
 
         // Draw map fullscreen, North-up, no rotation. The optional pixel-aligned
         // framebuffer retains the atlas replay and applies bounded pan motion as
@@ -564,7 +573,7 @@ public class MapScreen extends Screen {
                 currentRenderScale)) {
             framebufferRendered = FullscreenMapFramebufferRenderer.getInstance().render(
                     guiGraphics, vx, vy, vw, vh, centerX, centerZ,
-                    scale, currentRenderScale, partialTick);
+                    scale, currentRenderScale, partialTick, viewportInteracting);
         }
         if (!framebufferRendered) {
             MapRenderer.getInstance().drawMap(
@@ -786,16 +795,26 @@ public class MapScreen extends Screen {
     }
 
     private String getZoomText() {
-        float displayedScale = Math.max(getMinimumStableScale(), this.scale);
-        boolean oneDecimal = displayedScale >= 10.0f;
-        int quantized = Math.round(displayedScale * (oneDecimal ? 10.0f : 100.0f));
-        int key = (quantized << 1) | (oneDecimal ? 1 : 0);
+        // MapScreen.scale is expressed in logical GUI pixels per block. Xaero's
+        // fullscreen label is effectively physical framebuffer pixels per block on
+        // a 1080p display. Printing the logical value made 0.262x in Simple Map look
+        // comparable to 0.262x in Xaero even though GUI scale 3 renders it at 0.786
+        // physical pixels/block. Report the actual screen density so screenshots and
+        // performance tests use the same unit.
+        double guiScale = this.minecraft == null || this.minecraft.getWindow() == null
+                ? 1.0D : Math.max(1.0D, this.minecraft.getWindow().getGuiScale());
+        float displayedScale = (float) (Math.max(getMinimumStableScale(), this.scale)
+                * guiScale);
+        int decimals = displayedScale < 1.0f ? 3 : displayedScale < 10.0f ? 2 : 1;
+        int divisor = decimals == 3 ? 1000 : decimals == 2 ? 100 : 10;
+        int quantized = Math.round(displayedScale * divisor);
+        int key = quantized * 31 + divisor;
         if (key == cachedZoomTextKey) return cachedZoomText;
-        int divisor = oneDecimal ? 10 : 100;
         int fraction = Math.abs(quantized % divisor);
         overlayTextBuilder.setLength(0);
         overlayTextBuilder.append(quantized / divisor).append('.');
-        if (!oneDecimal && fraction < 10) overlayTextBuilder.append('0');
+        if (decimals >= 2 && fraction < divisor / 10) overlayTextBuilder.append('0');
+        if (decimals == 3 && fraction < 10) overlayTextBuilder.append('0');
         overlayTextBuilder.append(fraction).append('x');
         cachedZoomTextKey = key;
         cachedZoomText = overlayTextBuilder.toString();
@@ -934,8 +953,8 @@ public class MapScreen extends Screen {
             }
 
             int layerY = CaveMode.getLayerY(this.minecraft);
-            int maximumY = CaveMode.getScanMaximum(level, layerY);
-            int minimumY = CaveMode.getScanMinimum(level, layerY);
+            int maximumY = CaveMode.getViewedScanMaximum(this.minecraft, layerY);
+            int minimumY = CaveMode.getViewedScanMinimum(this.minecraft, layerY);
             VerticalCaveArchiveManager.Candidate candidate =
                     VerticalCaveArchiveManager.getInstance().getCandidate(
                             bx, bz, maximumY, minimumY);
@@ -1320,11 +1339,9 @@ public class MapScreen extends Screen {
                         Math.abs(MapConfig.pinWorldX - clickedWaypoint.x) < 0.01 &&
                         Math.abs(MapConfig.pinWorldZ - clickedWaypoint.z) < 0.01;
                     if (isCurrentlyFollowing) {
-                        MapConfig.pinActive = false;
+                        PinNavigation.clear();
                     } else {
-                        MapConfig.pinWorldX = clickedWaypoint.x;
-                        MapConfig.pinWorldZ = clickedWaypoint.z;
-                        MapConfig.pinActive = true;
+                        PinNavigation.activate(clickedWaypoint.x, clickedWaypoint.z);
                     }
                     MapManager.getInstance().savePin();
                     isPopupMenuOpen = false;
@@ -1433,11 +1450,9 @@ public class MapScreen extends Screen {
 
                 // Click same pin again within 4 screen-pixels -> remove
                 if (MapConfig.pinActive && Math.abs(snappedPinX - MapConfig.pinWorldX) < 4.0 / currentRenderScale && Math.abs(snappedPinZ - MapConfig.pinWorldZ) < 4.0 / currentRenderScale) {
-                    MapConfig.pinActive = false;
+                    PinNavigation.clear();
                 } else {
-                    MapConfig.pinWorldX = snappedPinX;
-                    MapConfig.pinWorldZ = snappedPinZ;
-                    MapConfig.pinActive = true;
+                    PinNavigation.activate(snappedPinX, snappedPinZ);
                 }
                 MapManager.getInstance().savePin();
             }
@@ -1520,8 +1535,8 @@ public class MapScreen extends Screen {
 
     private final class CaveLayerSlider extends AbstractSliderButton {
         private static final double AUTO_ZONE = 0.045;
-        private final int minimumY;
-        private final int maximumY;
+        private int minimumY;
+        private int maximumY;
         private boolean dragging;
 
         private CaveLayerSlider(int x, int y, int width, int height,
@@ -1537,6 +1552,20 @@ public class MapScreen extends Screen {
                     ? normalizeNumeric(CaveMode.getSelectedTopY(MapScreen.this.minecraft), minimumY, maximumY)
                     : 0.0;
             updateMessage();
+        }
+
+        private void syncBoundsFromDimension() {
+            DimensionMapProfile profile = MapManager.getInstance()
+                    .getCurrentDimensionProfile();
+            if (profile != null) {
+                this.minimumY = profile.minY();
+                this.maximumY = profile.maxY();
+            } else if (MapScreen.this.minecraft != null
+                    && MapScreen.this.minecraft.level != null) {
+                this.minimumY = MapScreen.this.minecraft.level.getMinBuildHeight();
+                this.maximumY = MapScreen.this.minecraft.level.getMaxBuildHeight() - 1;
+            }
+            syncFromMode();
         }
 
         private boolean isDragging() {

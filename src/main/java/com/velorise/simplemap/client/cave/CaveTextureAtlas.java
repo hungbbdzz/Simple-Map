@@ -4,6 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.velorise.simplemap.client.MapLodPolicy;
 import com.velorise.simplemap.client.MapAtlasMemoryTracker;
 import com.velorise.simplemap.client.MapMemoryBudgetPolicy;
+import com.velorise.simplemap.client.gpu.CaveAtlasPboUploader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
 import java.util.ArrayDeque;
@@ -11,7 +12,7 @@ import java.util.ArrayDeque;
 /**
  * Shared exact cave-page atlas with compact page mip levels.
  *
- * Every LOD uses the same 48x48 slot index, so switching zoom levels only changes
+ * Every LOD uses the same profile-sized slot index, so switching zoom levels only changes
  * the texture and source rectangle. Every atlas level is represented by a custom
  * GPU-only AbstractTexture, so resource reloads recreate storage without retaining
  * an atlas-sized NativeImage on the Java/native heap.
@@ -29,12 +30,19 @@ final class CaveTextureAtlas {
     private final int[] textureIds = new int[LOD_COUNT];
     private final boolean[] allocatedSlots = new boolean[SLOT_COUNT];
     private final ArrayDeque<Integer> freeSlots = new ArrayDeque<>(SLOT_COUNT);
-    private final CavePboUploader uploader = new CavePboUploader();
+    /** Published slots removed from the back table but still visible in the front table. */
+    private final ArrayDeque<Integer> quarantinedSlots = new ArrayDeque<>();
+    private final CaveAtlasPboUploader uploader = new CaveAtlasPboUploader();
+    private final int[][] gutteredUploads = new int[LOD_COUNT][];
 
     private boolean initialized;
     private long storageGeneration;
 
     CaveTextureAtlas() {
+        for (int lod = 0; lod < LOD_COUNT; lod++) {
+            int pitch = LOD_SIZES[lod] + 2;
+            gutteredUploads[lod] = new int[pitch * pitch];
+        }
         refillFreeSlots();
     }
 
@@ -44,6 +52,10 @@ final class CaveTextureAtlas {
 
     long storageGeneration() {
         return storageGeneration;
+    }
+
+    boolean hasQuarantinedSlots() {
+        return !quarantinedSlots.isEmpty();
     }
 
     int availableSlotCount() {
@@ -65,11 +77,28 @@ final class CaveTextureAtlas {
         freeSlots.addLast(slot);
     }
 
+    /** Release a slot that was visible through the front page table. */
+    void releasePublishedSlot(int slot) {
+        if (slot < 0 || slot >= SLOT_COUNT || !allocatedSlots[slot]) return;
+        if (!quarantinedSlots.contains(slot)) quarantinedSlots.addLast(slot);
+    }
+
+    void onPageTableFrameBoundary() {
+        RenderSystem.assertOnRenderThreadOrInit();
+        while (!quarantinedSlots.isEmpty()) {
+            int slot = quarantinedSlots.removeFirst();
+            if (slot < 0 || slot >= SLOT_COUNT || !allocatedSlots[slot]) continue;
+            allocatedSlots[slot] = false;
+            freeSlots.addLast(slot);
+        }
+    }
+
     void resetSlots() {
         RenderSystem.assertOnRenderThreadOrInit();
         for (int slot = 0; slot < allocatedSlots.length; slot++) {
             allocatedSlots[slot] = false;
         }
+        quarantinedSlots.clear();
         refillFreeSlots();
     }
 
@@ -81,9 +110,10 @@ final class CaveTextureAtlas {
         if (!initialized || slot < 0 || slot >= SLOT_COUNT
                 || !allocatedSlots[slot] || lod < 0 || lod >= LOD_COUNT) return null;
         int pageSize = LOD_SIZES[lod];
-        int atlasSize = pageSize * SLOT_COLUMNS;
-        int sourceX = (slot % SLOT_COLUMNS) * pageSize;
-        int sourceY = (slot / SLOT_COLUMNS) * pageSize;
+        int pitch = pageSize + 2;
+        int atlasSize = pitch * SLOT_COLUMNS;
+        int sourceX = (slot % SLOT_COLUMNS) * pitch + 1;
+        int sourceY = (slot / SLOT_COLUMNS) * pitch + 1;
         return new CaveAtlasRegion(locations[lod], sourceX, sourceY,
                 pageSize, atlasSize);
     }
@@ -97,11 +127,13 @@ final class CaveTextureAtlas {
         if (lod < 0 || lod >= LOD_COUNT || dirty == null || dirty.isEmpty()) return;
 
         int pageSize = LOD_SIZES[lod];
-        int atlasX = (slot % SLOT_COLUMNS) * pageSize + dirty.minX();
-        int atlasY = (slot / SLOT_COLUMNS) * pageSize + dirty.minY();
+        int pitch = pageSize + 2;
+        int[] guttered = gutteredUploads[lod];
+        AtlasGutter.copyOnePixelBorder(pixels, pageSize, guttered);
+        int atlasX = (slot % SLOT_COLUMNS) * pitch;
+        int atlasY = (slot / SLOT_COLUMNS) * pitch;
         uploader.upload(textureIds[lod], atlasX, atlasY,
-                dirty.width(), dirty.height(), pixels, pageSize,
-                dirty.minX(), dirty.minY());
+                pitch, pitch, guttered, pitch, 0, 0);
     }
 
     static int lodSize(int lod) {
@@ -118,7 +150,7 @@ final class CaveTextureAtlas {
         Minecraft minecraft = Minecraft.getInstance();
         for (int lod = 0; lod < LOD_COUNT; lod++) {
             int pageSize = LOD_SIZES[lod];
-            int atlasSize = pageSize * SLOT_COLUMNS;
+            int atlasSize = (pageSize + 2) * SLOT_COLUMNS;
             ResourceLocation location = ResourceLocation.fromNamespaceAndPath(
                     "simplemap", "cave_atlas/lod_" + pageSize);
             CaveAtlasTexture texture = new CaveAtlasTexture(atlasSize, this::markStorageAllocated);

@@ -18,6 +18,12 @@ final class SurfaceBranchAtlas {
     private final int slotCount;
     private final boolean[] allocated;
     private final ArrayDeque<Integer> free;
+    /**
+     * Retired slots are not reusable until the render-plan/page-table frame
+     * boundary. Cached Surface plans can contain raw branch-atlas UVs, so
+     * immediate reuse can make an old world quad sample a newly uploaded node.
+     */
+    private final ArrayDeque<Integer> quarantined = new ArrayDeque<>();
     private final CavePboUploader uploader = new CavePboUploader();
     private final int[] gutteredUpload = new int[PITCH * PITCH];
 
@@ -63,6 +69,10 @@ final class SurfaceBranchAtlas {
         return storageGeneration;
     }
 
+    boolean hasQuarantinedSlots() {
+        return !quarantined.isEmpty();
+    }
+
     int acquireSlot() {
         RenderSystem.assertOnRenderThreadOrInit();
         initialize();
@@ -74,13 +84,27 @@ final class SurfaceBranchAtlas {
 
     void releaseSlot(int slot) {
         if (slot < 0 || slot >= slotCount || !allocated[slot]) return;
-        allocated[slot] = false;
-        free.addLast(slot);
+        // Keep ownership until the next frame boundary. An immutable render plan
+        // built before this retirement may still replay this raw atlas address
+        // during the current frame.
+        if (!quarantined.contains(slot)) quarantined.addLast(slot);
+    }
+
+    /** Releases retired raw-UV slots only after old plans are no longer current. */
+    void onPageTableFrameBoundary() {
+        RenderSystem.assertOnRenderThreadOrInit();
+        while (!quarantined.isEmpty()) {
+            int slot = quarantined.removeFirst();
+            if (slot < 0 || slot >= slotCount || !allocated[slot]) continue;
+            allocated[slot] = false;
+            free.addLast(slot);
+        }
     }
 
     void resetSlots() {
         RenderSystem.assertOnRenderThreadOrInit();
         java.util.Arrays.fill(allocated, false);
+        quarantined.clear();
         refill();
     }
 

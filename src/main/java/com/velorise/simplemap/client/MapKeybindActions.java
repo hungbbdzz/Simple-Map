@@ -161,7 +161,7 @@ public final class MapKeybindActions {
             notify(mc, "Navigation pin: none");
             return;
         }
-        MapConfig.pinActive = false;
+        PinNavigation.clear();
         MapManager.getInstance().savePin();
         notify(mc, "Navigation pin cleared");
     }

@@ -18,6 +18,8 @@ final class CaveBranchAtlas {
     private final int slotCount;
     private final boolean[] allocated;
     private final ArrayDeque<Integer> free;
+    /** Raw branch UVs may remain in the current immutable render plan. */
+    private final ArrayDeque<Integer> quarantined = new ArrayDeque<>();
     private final CavePboUploader uploader = new CavePboUploader();
     private final int[] gutteredUpload = new int[PITCH * PITCH];
 
@@ -38,12 +40,10 @@ final class CaveBranchAtlas {
     }
 
     static int slotColumnsForLevel(int level) {
-        // Low branch levels need more simultaneous nodes because they are selected
-        // while the viewport still contains many 64-block leaves. Higher levels
-        // cover exponentially more world area and fit comfortably in 16x16 slots.
-        return level <= 2
-                ? MapMemoryBudgetPolicy.branchLowColumns()
-                : MapMemoryBudgetPolicy.branchHighColumns();
+        // L1-L3 are density-selected all the way down to the supported 0.1x
+        // fullscreen zoom. Keep a complete 16:9 working set resident instead of
+        // forcing a coarser parent merely to fit the old shared branch profile.
+        return MapMemoryBudgetPolicy.caveBranchColumns(level);
     }
 
     static int slotCountForLevel(int level) {
@@ -59,8 +59,16 @@ final class CaveBranchAtlas {
         initialize();
     }
 
+    boolean initialized() {
+        return initialized;
+    }
+
     long storageGeneration() {
         return storageGeneration;
+    }
+
+    boolean hasQuarantinedSlots() {
+        return !quarantined.isEmpty();
     }
 
     int acquireSlot() {
@@ -74,13 +82,23 @@ final class CaveBranchAtlas {
 
     void releaseSlot(int slot) {
         if (slot < 0 || slot >= slotCount || !allocated[slot]) return;
-        allocated[slot] = false;
-        free.addLast(slot);
+        if (!quarantined.contains(slot)) quarantined.addLast(slot);
+    }
+
+    void onPageTableFrameBoundary() {
+        RenderSystem.assertOnRenderThreadOrInit();
+        while (!quarantined.isEmpty()) {
+            int slot = quarantined.removeFirst();
+            if (slot < 0 || slot >= slotCount || !allocated[slot]) continue;
+            allocated[slot] = false;
+            free.addLast(slot);
+        }
     }
 
     void resetSlots() {
         RenderSystem.assertOnRenderThreadOrInit();
         java.util.Arrays.fill(allocated, false);
+        quarantined.clear();
         refill();
     }
 

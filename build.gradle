@@ -143,6 +143,14 @@ tasks.register('caveLoadHierarchyCheck', JavaExec) {
     mainClass = 'com.velorise.simplemap.client.cave.CaveLoadHierarchyCheck'
 }
 
+// Fullscreen cave pages may build ahead, but cache/exact publication must never
+// jump over an unresolved page and form black islands inside loaded terrain.
+tasks.register('caveContiguousPublicationCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveContiguousPublicationCheck'
+}
+
 // AUTO dimension topology must not let repeated End-island roofs become a
 // persistent cave world, and each Layered cache key must own one immutable Top Y.
 tasks.register('caveDimensionEvidenceCheck', JavaExec) {
@@ -155,6 +163,14 @@ tasks.register('caveLayerBandCheck', JavaExec) {
     dependsOn testClasses
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.velorise.simplemap.client.cave.CaveLayerBandCheck'
+}
+
+// Cave/Full Cave must use Xaero's enter-ground -> real-air -> first-floor
+// transaction, and cache revisions must invalidate older projection semantics.
+tasks.register('caveProjectionSemanticsCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveProjectionSemanticsCheck'
 }
 
 tasks.register('adaptiveDimensionLoadCheck', JavaExec) {
@@ -219,8 +235,10 @@ tasks.register('architectureAllCheck') {
     dependsOn tasks.named('mapSessionStampCheck')
     dependsOn tasks.named('viewportLoadPlannerCheck')
     dependsOn tasks.named('caveLoadHierarchyCheck')
+    dependsOn tasks.named('caveContiguousPublicationCheck')
     dependsOn tasks.named('caveDimensionEvidenceCheck')
     dependsOn tasks.named('caveLayerBandCheck')
+    dependsOn tasks.named('caveProjectionSemanticsCheck')
     dependsOn tasks.named('caveTilePublicationPolicyCheck')
     dependsOn tasks.named('adaptiveDimensionLoadCheck')
     dependsOn tasks.named('retainedMinimapFramePolicyCheck')
@@ -308,4 +326,22 @@ tasks.register('retainedFramebufferBindingCheck', JavaExec) {
 
 tasks.named('architectureAllCheck') {
     dependsOn tasks.named('retainedFramebufferBindingCheck')
+}
+
+// PASS69: completed cave work follows current viewport ownership and cannot
+// head-of-line block foreground publication from a weak historical lane.
+tasks.register('caveCompletionLanePromotionCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveCompletionLanePromotionCheck'
+}
+
+
+// PASS81: region projection demand must stay viewport-bounded and use one
+// canonical dimension namespace from source handoff through GPU publication.
+tasks.register('cavePass81DemandLifecycleCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass81DemandLifecycleCheck'
 }

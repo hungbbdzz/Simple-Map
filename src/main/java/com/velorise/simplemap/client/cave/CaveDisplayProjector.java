@@ -2,7 +2,6 @@ package com.velorise.simplemap.client.cave;
 
 import com.velorise.simplemap.client.MapCancellationToken;
 import com.velorise.simplemap.client.MapVisualClassifier;
-import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.state.BlockState;
 
 /**
@@ -14,8 +13,6 @@ import net.minecraft.world.level.block.state.BlockState;
  */
 final class CaveDisplayProjector {
     static final int LAYER_DEPTH = 32;
-    /** Reject one-block noise pockets in column-projected cave dimensions. */
-    private static final int FULL_CAVE_MIN_HEADROOM = 2;
 
     private final CaveStateClassifier geometry = CaveStateClassifier.getInstance();
     private final MapVisualClassifier visuals = MapVisualClassifier.getInstance();
@@ -66,14 +63,22 @@ final class CaveDisplayProjector {
         boolean full = view == CaveView.FULL;
         int minimumY = source.minimumY();
         int maximumY = source.maximumY() - 1;
+        int surfaceY = clamp(source.surfaceY(localX, localZ), minimumY, maximumY);
         int highY = full
-                ? clamp(source.surfaceY(localX, localZ) + 3, minimumY, maximumY)
+                ? clamp(surfaceY + 3, minimumY, maximumY)
                 : clamp(layerY, minimumY, maximumY);
         int lowY = full
                 ? minimumY
                 : Math.max(minimumY, highY + 1 - LAYER_DEPTH);
+        /*
+         * A Layered Top-Y above the terrain roof must not treat the sky-to-ground
+         * transition as a cave. Enter the first opaque terrain transaction exactly
+         * as Full Cave does, then accept only an air/fluid cavity below it. This is
+         * the cave-start rule Xaero applies before producing a cave-layer texture.
+         */
+        boolean startsAboveTerrain = !full && highY >= surfaceY;
         output.beginColumn();
-        return new ColumnCursor(full, highY, lowY);
+        return new ColumnCursor(full || startsAboveTerrain, highY, lowY);
     }
 
     boolean projectColumnSlice(ChunkSource source, int localX, int localZ,
@@ -86,15 +91,13 @@ final class CaveDisplayProjector {
                 && System.nanoTime() < deadlineNanos) {
             int y = cursor.y;
             steps++;
-            byte sectionKind = source.sectionKind(y);
+            byte sectionKind = source.sectionKind(localX, y, localZ);
             int sectionBottom = Math.max(cursor.lowY, source.sectionBottom(y));
             if (sectionKind == CaveTileScanContext.ALL_AIR) {
                 if (!cursor.underAir) {
                     cursor.openTopY = y;
-                    cursor.cavityOpenDepth = 0;
                 }
                 cursor.underAir = true;
-                cursor.cavityOpenDepth += y - sectionBottom + 1;
                 cursor.y = sectionBottom - 1;
                 continue;
             }
@@ -108,13 +111,6 @@ final class CaveDisplayProjector {
                     continue;
                 }
                 if (!cursor.underAir) {
-                    cursor.y = sectionBottom - 1;
-                    continue;
-                }
-                if (cursor.full && cursor.cavityOpenDepth < FULL_CAVE_MIN_HEADROOM) {
-                    cursor.underAir = false;
-                    cursor.resetCavity();
-                    output.beginColumn();
                     cursor.y = sectionBottom - 1;
                     continue;
                 }
@@ -154,10 +150,8 @@ final class CaveDisplayProjector {
             if (state.isAir()) {
                 if (!cursor.underAir) {
                     cursor.openTopY = y;
-                    cursor.cavityOpenDepth = 0;
                 }
                 cursor.underAir = true;
-                cursor.cavityOpenDepth++;
                 cursor.y--;
                 continue;
             }
@@ -169,10 +163,8 @@ final class CaveDisplayProjector {
                 if (!cursor.shouldEnterGround) {
                     if (!cursor.underAir) {
                         cursor.openTopY = y;
-                        cursor.cavityOpenDepth = 0;
                     }
                     cursor.underAir = true;
-                    cursor.cavityOpenDepth++;
                     int layerColor = source.resolveFluidColor(
                             visualState, localX, y, localZ);
                     byte layerFlags = DenseCaveTile.OVERLAY_FLUID;
@@ -225,16 +217,16 @@ final class CaveDisplayProjector {
                 output.addOverlay(layerColor, visual.overlayOpacity(), y,
                         visibleLayerLight, layerFlags);
                 cursor.sawOverlay |= layerColor != 0;
-                cursor.cavityOpenDepth++;
                 cursor.y--;
                 continue;
             }
 
             if (cursor.shouldEnterGround) {
-                // Surface trees/decor do not count as the terrain roof. The first
-                // opaque terrain block begins the underground search transaction.
-                if (state.is(BlockTags.LOGS) || visual.leaves()
-                        || visual.flower() || state.canBeReplaced()) {
+                // Shared Xaero-style terrain-entry predicate. Live projection,
+                // vertical archive and decoded .mca projection must agree here or
+                // Full Cave changes layer at source-authority boundaries.
+                if (!CaveProjectionSemantics.isTerrainEntry(
+                        state, visual, collisionEmpty)) {
                     cursor.y--;
                     continue;
                 }
@@ -247,17 +239,6 @@ final class CaveDisplayProjector {
             }
 
             if (!cursor.underAir) {
-                cursor.y--;
-                continue;
-            }
-
-            if (cursor.full && cursor.cavityOpenDepth < FULL_CAVE_MIN_HEADROOM) {
-                // Tiny pockets inside Nether terrain create salt-and-pepper noise
-                // and unstable floors. Treat this solid as another roof boundary
-                // and continue to the next usable cavity in the same column.
-                cursor.underAir = false;
-                cursor.resetCavity();
-                output.beginColumn();
                 cursor.y--;
                 continue;
             }
@@ -290,7 +271,6 @@ final class CaveDisplayProjector {
     }
 
     static final class ColumnCursor {
-        private final boolean full;
         private final int lowY;
         private int y;
         private boolean underAir;
@@ -298,12 +278,10 @@ final class CaveDisplayProjector {
         private int openTopY;
         private int waterDepth;
         private int otherFluidDepth;
-        private int cavityOpenDepth;
         private boolean sawOverlay;
         private boolean done;
 
         private ColumnCursor(boolean full, int highY, int lowY) {
-            this.full = full;
             this.lowY = lowY;
             this.y = highY;
             this.underAir = full;
@@ -314,7 +292,6 @@ final class CaveDisplayProjector {
         private void resetCavity() {
             waterDepth = 0;
             otherFluidDepth = 0;
-            cavityOpenDepth = 0;
             sawOverlay = false;
         }
     }
@@ -338,6 +315,15 @@ final class CaveDisplayProjector {
         BlockState stateAt(int localX, int y, int localZ);
         default byte sectionKind(int y) {
             return CaveTileScanContext.MIXED;
+        }
+        /**
+         * Column-aware section summary. Immutable Anvil sources precompute this once
+         * during palette decode, allowing all-air/all-solid 16-block spans to be
+         * skipped for every later Full/Layered projection. Live sources can keep the
+         * section-wide default.
+         */
+        default byte sectionKind(int localX, int y, int localZ) {
+            return sectionKind(y);
         }
         default int sectionBottom(int y) {
             return Math.floorDiv(y, 16) * 16;

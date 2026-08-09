@@ -18,6 +18,9 @@ public final class FramePacingHardGateCheck {
         String viewport = readClient("MapViewportCoordinator.java");
         String texture = readClient("MapTextureManager.java");
         String caveScheduler = readCave("CaveDisplayScheduler.java");
+        String packetMixin = Files.readString(Path.of(
+                "src/main/java/com/velorise/simplemap/mixin/"
+                        + "SimpleMapClientPacketListenerMixin.java"));
 
         require(gate.contains("MOVEMENT_SETTLE_NANOS = 3_000_000_000L"),
                 "movement settle window changed unexpectedly");
@@ -47,9 +50,9 @@ public final class FramePacingHardGateCheck {
                 "high-resolution retained minimap/guard band regressed");
         require(minimap.contains("GL_TEXTURE_MIN_FILTER")
                         && minimap.contains("GL_TEXTURE_MAG_FILTER")
-                        && minimap.contains("GL11.GL_LINEAR")
-                        && minimap.contains("GL11.GL_NEAREST"),
-                "split minification/magnification sampling was removed");
+                        && minimap.contains("GL11.GL_NEAREST")
+                        && !minimap.contains("GL11.GL_LINEAR"),
+                "composed minimap can again be blurred after density-correct LOD");
 
         int surfaceEnqueue = mutation.indexOf("enqueueLoadedSurfaceChunk(chunkX, chunkZ)");
         int caveEnqueue = mutation.indexOf("enqueueLoadedChunk(chunkX, chunkZ)");
@@ -62,29 +65,54 @@ public final class FramePacingHardGateCheck {
                 "chunk packet travel ingress lost Surface authority or hot Cave filtering");
 
         require(scanner.contains("LongArrayFIFOQueue loadedSurfaceChunks")
-                        && scanner.contains("LOADED_SURFACE_QUEUE_LIMIT = 384")
+                        && scanner.contains("LOADED_SURFACE_QUEUE_LIMIT = 8_192")
                         && scanner.contains("SURFACE_CHUNK_SLICE")
                         && scanner.contains("foregroundUrgentSlice")
                         && scanner.indexOf("scanUrgentLoadedChunks(mc, 0, false, false, urgentDeadline)")
                                 < scanner.indexOf("scanQueuedSurfaceChunks(mc, deadline)"),
                 "surface fair-share FIFO/coherent chunk slicing regressed");
-        require(mutation.contains("SURFACE_TRAVEL_RADIUS_CHUNKS = 6")
-                        && mutation.contains("isTravelChunk(chunkX, chunkZ, SURFACE_TRAVEL_RADIUS_CHUNKS)"),
-                "surface packet frontier is no longer filtered to the travel window");
+        require(!mutation.contains("SURFACE_TRAVEL_RADIUS_CHUNKS")
+                        && mutation.contains("GeneratedChunkIndex.getInstance().markLive(level, chunkX, chunkZ);")
+                        && mutation.contains("ChunkScanner.getInstance().enqueueLoadedSurfaceChunk(chunkX, chunkZ);"),
+                "surface packet ingress no longer covers every client-loaded chunk");
         require(scanner.contains("loadedSurfaceChunkCursors.get(chunkKey)")
                         && scanner.contains("!loadedSurfaceChunkSet.contains(key)")
                         && scanner.contains("loadedSurfaceChunkCursors.containsKey(chunkKey)")
                         && scanner.contains("cursor == 0")
                         && scanner.contains("SURFACE_QUEUE_STALE_RADIUS_CHUNKS = 8"),
                 "surface cursor ownership or stale FIFO pruning regressed");
+        require(scanner.contains("int inspect = loadedSurfaceChunks.size()")
+                        && scanner.contains("loadedSurfaceChunkCursors.get(currentHead) > 0")
+                        && scanner.contains("getChunkOrder(renderRadiusBlocks)"),
+                "surface travel queue no longer selects the complete near-player frontier");
+        require(packetMixin.contains("method = \"updateLevelChunk\", at = @At(\"TAIL\")")
+                        && scanner.contains("forcedSurfaceChunkRefresh.add(key)")
+                        && scanner.contains("SurfaceChunkStage")
+                        && scanner.contains("readySurfaceChunk")
+                        && scanner.contains("ChunkStatus.FULL, false")
+                        && scanner.contains("instanceof EmptyLevelChunk")
+                        && scanner.contains("knownSurfaceColumnCount(chunkX, chunkZ) > 0")
+                        && scanner.contains("finishSurfaceChunkTransaction(chunkX, chunkZ)"),
+                "Surface packet capture can again publish placeholder/partial chunks");
+        int retainedReplay = scanner.indexOf(
+                "publishCompletedSurfaceChunk(chunkX, chunkZ, MapRequestLane.MINIMAP)");
+        require(scanner.contains("hasUsableSurfaceCompletion")
+                        && scanner.contains("enqueueSeedLiveRepairChunk(chunkX, chunkZ)")
+                        && retainedReplay >= 0,
+                "world-join Surface repair again blocks retained-cache replay/reconciliation");
         require(caveScheduler.contains("LongArrayFIFOQueue loadedChunkFrontier")
-                        && caveScheduler.contains("MAX_LOADED_CHUNK_FRONTIER = 192")
+                        && caveScheduler.contains("MAX_LOADED_CHUNK_FRONTIER = 8192")
                         && caveScheduler.contains("admitLoadedChunk"),
                 "cave travel FIFO/coherent tile admission regressed");
         require(viewport.contains("prepareMovementStreaming()"),
                 "viewport scheduler no longer preserves visible lanes during movement");
+        require(!Files.readString(Path.of(
+                        "src/main/java/com/velorise/simplemap/client/cave/CaveWorldSaveReader.java"))
+                        .contains("state == GeneratedChunkIndex.State.LIVE"),
+                "historical LIVE state again suppresses unloaded Surface disk repair");
         require(texture.contains("replaceMinimapDemandWindowIfMoved")
-                        && texture.contains("clearAllPageDemandLane(MapRequestLane.MINIMAP)"),
+                        && texture.contains("clearAllPageDemandLane(MapRequestLane.MINIMAP)")
+                        && texture.contains("clearPageDemandLane(leafKey, uploadLane)"),
                 "minimap travel window no longer retires stale hot-set leases");
         System.out.println("FRAME_PACING_STREAMING_GATE_PASS");
     }

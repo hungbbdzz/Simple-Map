@@ -20,6 +20,7 @@ public final class MapObservationScheduler {
 
     private Level observedLevel;
     private long lastMovementEpoch = Long.MIN_VALUE;
+    private long lastTeleportEpoch = Long.MIN_VALUE;
     private final MapObservationTelemetry telemetry = MapObservationTelemetry.getInstance();
 
     private MapObservationScheduler() {
@@ -36,6 +37,7 @@ public final class MapObservationScheduler {
     public void reset() {
         observedLevel = null;
         lastMovementEpoch = Long.MIN_VALUE;
+        lastTeleportEpoch = Long.MIN_VALUE;
         MapActivityGate.getInstance().reset();
         GeneratedChunkIndex.getInstance().reset();
         CaveContextCache.getInstance().reset();
@@ -65,6 +67,16 @@ public final class MapObservationScheduler {
         pipeline.tickClientState(minecraft);
 
         MapActivityGate activityGate = MapActivityGate.getInstance();
+        long teleportEpoch = activityGate.teleportEpoch();
+        if (lastTeleportEpoch != teleportEpoch) {
+            lastTeleportEpoch = teleportEpoch;
+            if (teleportEpoch > 0L) {
+                // Teleport is a discontinuity, not merely another moving tick. Drop
+                // old-location Surface cursors once and bootstrap the destination
+                // render-distance halo centre-out.
+                ChunkScanner.getInstance().beginTeleportRecovery();
+            }
+        }
         boolean movementWindow = activityGate.blocksMapWork();
         if (movementWindow) {
             long epoch = activityGate.movementEpoch();

@@ -16,10 +16,11 @@ public final class RetainedFramebufferBindingCheck {
     private static void check(String file) throws Exception {
         Path path = Path.of("src/main/java/com/velorise/simplemap/client", file);
         String source = Files.readString(path);
-        int clear = source.indexOf("target.clear(Minecraft.ON_OSX);");
+        String targetName = "backTarget";
+        int clear = source.indexOf(targetName + ".clear(Minecraft.ON_OSX);");
         if (clear < 0) throw new AssertionError(file + " has no retained target clear");
         int projection = source.indexOf("RenderSystem.setProjectionMatrix", clear);
-        int rebind = source.indexOf("target.bindWrite(true);", clear + 1);
+        int rebind = source.indexOf(targetName + ".bindWrite(true);", clear + 1);
         if (rebind < 0 || projection < 0 || rebind > projection) {
             throw new AssertionError(file
                     + " must rebind the retained framebuffer after clear() and before drawing");
@@ -27,6 +28,13 @@ public final class RetainedFramebufferBindingCheck {
         if (!source.contains("result.drewAnyMapContent()")) {
             throw new AssertionError(file
                     + " must reject a clear-only retained frame and use direct fallback");
+        }
+        if (!source.contains("frontTarget")
+                || !source.contains("backTarget")
+                || !source.contains("drawRetainedUnderlay")
+                || !source.contains("swapTargets()")) {
+            throw new AssertionError(file
+                    + " must retain a front frame while composing the loading frame");
         }
         int identity = source.indexOf("modelViewStack.identity()", clear);
         int apply = source.indexOf("RenderSystem.applyModelViewMatrix()", identity);

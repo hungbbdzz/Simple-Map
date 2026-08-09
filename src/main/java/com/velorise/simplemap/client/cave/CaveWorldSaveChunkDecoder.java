@@ -6,7 +6,6 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
-import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -69,6 +68,9 @@ final class CaveWorldSaveChunkDecoder {
         int runTopY = startY;
         int waterDepth = 0;
         boolean runHadWater = false;
+        boolean runHadOtherFluid = false;
+        boolean runFluidEmissive = false;
+        int runFluidColor = 0;
 
         int y = startY;
         while (y >= minimumY) {
@@ -80,7 +82,10 @@ final class CaveWorldSaveChunkDecoder {
                     inOpenRun = true;
                     runTopY = y;
                     waterDepth = 0;
-                    runHadWater = true;
+                    runHadWater = false;
+                    runHadOtherFluid = false;
+                    runFluidEmissive = false;
+                    runFluidColor = 0;
                 }
                 runHadWater = true;
                 waterDepth++;
@@ -89,47 +94,64 @@ final class CaveWorldSaveChunkDecoder {
             }
 
             if (kind == CaveStateClassifier.OTHER_FLUID) {
-                int top = inOpenRun ? runTopY : y;
-                int color = colors.resolveOfflineFluid(state, y, minimumY, maximumY);
-                builder.add(top, y, color, CaveColumnData.FLAG_FLUID);
-                inOpenRun = false;
-                waterDepth = 0;
-                runHadWater = false;
-                var fluidType = state.getFluidState().getType();
-                y--;
-                while (y >= minimumY) {
-                    BlockState next = chunk.stateAt(localX, y, localZ);
-                    if (next.getFluidState().isEmpty()
-                            || next.getFluidState().getType() != fluidType) break;
-                    y--;
-                }
-                continue;
-            }
-
-            boolean open = kind == CaveStateClassifier.AIR
-                    || (kind == CaveStateClassifier.DYNAMIC
-                            && (classifier.info(state).collisionEmpty()
-                                    || state.canBeReplaced()));
-            if (open) {
                 if (!inOpenRun) {
                     inOpenRun = true;
                     runTopY = y;
                     waterDepth = 0;
                     runHadWater = false;
+                    runHadOtherFluid = false;
+                    runFluidEmissive = false;
+                    runFluidColor = 0;
+                }
+                runHadOtherFluid = true;
+                int fluidColor = colors.resolveDenseOfflineFluid(state, null);
+                if (fluidColor != 0) runFluidColor = fluidColor;
+                if (state.getLightEmission() > 0) runFluidEmissive = true;
+                y--;
+                continue;
+            }
+
+            if (kind == CaveStateClassifier.AIR) {
+                if (!inOpenRun) {
+                    inOpenRun = true;
+                    runTopY = y;
+                    waterDepth = 0;
+                    runHadWater = false;
+                    runHadOtherFluid = false;
+                    runFluidEmissive = false;
+                    runFluidColor = 0;
                 }
                 y--;
                 continue;
             }
 
+            CaveStateClassifier.StateInfo info = classifier.info(state);
+            MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
+            if (inOpenRun && CaveProjectionSemantics.isOpenDecoration(
+                    state, visual, info.collisionEmpty())) {
+                y--;
+                continue;
+            }
+
             if (inOpenRun) {
-                int color = colors.resolveOffline(state, y, minimumY, maximumY,
+                int color = colors.resolveDenseOffline(state, null,
                         runHadWater ? waterDepth : 0);
                 byte flags = runHadWater ? CaveColumnData.FLAG_WATER : 0;
-                if (state.getLightEmission() > 0) flags |= CaveColumnData.FLAG_EMISSIVE;
+                if (runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
+                if (state.getLightEmission() > 0 || runFluidEmissive) {
+                    flags |= CaveColumnData.FLAG_EMISSIVE;
+                }
+                if (runFluidColor != 0) {
+                    color = CaveProjectionSemantics.blendOverlay(
+                            color, runFluidColor, 112);
+                }
                 builder.add(runTopY, y, color, flags);
                 inOpenRun = false;
                 waterDepth = 0;
                 runHadWater = false;
+                runHadOtherFluid = false;
+                runFluidEmissive = false;
+                runFluidColor = 0;
             }
             y--;
         }
@@ -140,15 +162,10 @@ final class CaveWorldSaveChunkDecoder {
             int minimumY, int topY) {
         for (int y = topY; y >= minimumY; y--) {
             BlockState state = chunk.stateAt(localX, y, localZ);
-            byte kind = classifier.classify(state);
-            if (kind == CaveStateClassifier.AIR
-                    || kind == CaveStateClassifier.WATER
-                    || kind == CaveStateClassifier.OTHER_FLUID) continue;
+            CaveStateClassifier.StateInfo info = classifier.info(state);
             MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
-            if (visual.leaves() || state.is(BlockTags.LOGS)
-                    || visual.flower() || state.canBeReplaced()) continue;
-            if (kind == CaveStateClassifier.SOLID_FAST
-                    || !classifier.info(state).collisionEmpty()) return y - 1;
+            if (CaveProjectionSemantics.isTerrainEntry(
+                    state, visual, info.collisionEmpty())) return y - 1;
         }
         return minimumY;
     }

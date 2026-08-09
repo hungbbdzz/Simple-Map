@@ -28,6 +28,17 @@ public final class SurfaceChunkCoverage {
         return changed;
     }
 
+
+    public static boolean clearComplete(long[] mask, int chunkIndex) {
+        if (mask == null || mask.length != WORDS
+                || chunkIndex < 0 || chunkIndex >= CHUNK_COUNT) return false;
+        int word = chunkIndex >>> 6;
+        long bit = 1L << (chunkIndex & 63);
+        boolean changed = (mask[word] & bit) != 0L;
+        mask[word] &= ~bit;
+        return changed;
+    }
+
     /** Legacy v1-v3 files had no explicit coverage; only all-solid chunks qualify. */
     public static long[] inferLegacy(long[] pixels, int regionSize,
             long emptyPacked) {

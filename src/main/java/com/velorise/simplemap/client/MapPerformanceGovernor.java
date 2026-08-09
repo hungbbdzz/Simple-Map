@@ -93,8 +93,8 @@ public final class MapPerformanceGovernor {
     public boolean underPressure() {
         double target = targetFrameNanos();
         return pressureFrames > 8 || smoothedFrameNanos > target * 1.40D
-                || MapWorkScheduler.cpuTotalCost() > 620L
-                || MapWorkScheduler.ioTotalCost() > 360L;
+                || MapWorkScheduler.cpuTotalCost() > 1_240L
+                || MapWorkScheduler.ioTotalCost() > 680L;
     }
 
     /**
@@ -202,7 +202,12 @@ public final class MapPerformanceGovernor {
         // Cave projection is substantially more expensive per useful page than
         // surface scanning. Keep a larger but still adaptive slice so the minimap
         // does not wait seconds for the first 16x16 tiles.
-        long base = cave ? 650_000L : 300_000L;
+        // Cave exact/branch projection and GPU publication already consume their
+        // own bounded budgets. A 2 ms client-thread source slice on top of those
+        // stages caused a visible hitch every AUTO transition. Xaero advances its
+        // persistent writer under a strict elapsed-time deadline; keep this source
+        // contribution sub-millisecond and let retained work continue next frame.
+        long base = cave ? 850_000L : 300_000L;
         return Math.max(80_000L, (long) (base * headroomFactor()));
     }
 

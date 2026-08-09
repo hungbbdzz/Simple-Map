@@ -30,9 +30,10 @@ public final class CaveScreenSpacePolicy {
         return EXACT_PAGE_WORLD_SIZE * Math.max(0.0001f, pixelsPerBlock);
     }
 
-    /** Minimap always keeps exact leaves; far-zoom fullscreen is branch-first. */
+    /** Both visible maps use the shared density-correct branch cache at far zoom. */
     public static boolean branchFirst(float scale, MapRequestLane lane) {
-        return lane == MapRequestLane.FULLSCREEN
+        return (lane == MapRequestLane.FULLSCREEN
+                || lane == MapRequestLane.MINIMAP)
                 && exactPagePixels(scale) <= BRANCH_FIRST_PAGE_PIXELS;
     }
 
@@ -53,31 +54,31 @@ public final class CaveScreenSpacePolicy {
     public static int exactAdmissionBudget(float scale, MapRequestLane lane,
             boolean pressured) {
         int normal;
-        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 1 : 4;
+        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 8 : 32;
         else if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) normal = 1;
-        else if (branchOnly(scale, lane)) normal = pressured ? 1 : 3;
-        else if (pressured) normal = 1;
-        else if (scale >= 0.55f) normal = 8;
-        else if (scale >= 0.35f) normal = 6;
-        else if (scale >= 0.20f) normal = 4;
-        else normal = 2;
+        else if (branchOnly(scale, lane)) normal = pressured ? 4 : 16;
+        else if (pressured) normal = 4;
+        else if (scale >= 0.55f) normal = 40;
+        else if (scale >= 0.35f) normal = 32;
+        else if (scale >= 0.20f) normal = 24;
+        else normal = 16;
         return CaveModeTransitionPolicy.exactAdmissionBudget(normal);
     }
 
     /** Delay expensive exact refinement while branch/root coverage is foreground. */
     public static long exactEnumerationRetryMs(float scale, MapRequestLane lane) {
-        if (lane == MapRequestLane.MINIMAP) return 25L;
-        if (branchFirst(scale, lane)) return 55L;
-        if (sparseExact(scale, lane)) return 70L;
-        if (scale < 0.35f) return 60L;
-        if (scale < 0.55f) return 40L;
-        return 25L;
+        if (lane == MapRequestLane.MINIMAP) return 16L;
+        if (branchFirst(scale, lane)) return 24L;
+        if (sparseExact(scale, lane)) return 32L;
+        if (scale < 0.35f) return 24L;
+        if (scale < 0.55f) return 20L;
+        return 16L;
     }
 
     public static long completedPlanPauseMs(float scale, MapRequestLane lane) {
-        if (branchFirst(scale, lane)) return 180L;
+        if (branchFirst(scale, lane)) return 72L;
         if (sparseExact(scale, lane)) return 160L;
-        return 120L;
+        return 32L;
     }
 
     /**
@@ -89,38 +90,48 @@ public final class CaveScreenSpacePolicy {
     public static int sourceAdmissionBudget(float scale, MapRequestLane lane,
             boolean pressured) {
         int normal;
-        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 1 : 4;
+        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 6 : 20;
         else if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) normal = 1;
-        else if (branchOnly(scale, lane)) normal = pressured ? 2 : 6;
-        else if (pressured) normal = 2;
-        else if (scale >= 0.55f) normal = 12;
-        else if (scale >= 0.35f) normal = 10;
-        else if (scale >= 0.18f) normal = 8;
-        else normal = 6;
+        else if (branchOnly(scale, lane)) normal = pressured ? 12 : 48;
+        else if (pressured) normal = 4;
+        else if (scale >= 0.55f) normal = 24;
+        else if (scale >= 0.35f) normal = 20;
+        else if (scale >= 0.18f) normal = 16;
+        else normal = 20;
         return CaveModeTransitionPolicy.sourceAdmissionBudget(normal);
     }
 
     public static long sourceEnumerationRetryMs(float scale, MapRequestLane lane,
             boolean pressured) {
-        if (lane == MapRequestLane.MINIMAP) return pressured ? 70L : 25L;
-        if (branchFirst(scale, lane)) return pressured ? 140L : 50L;
-        if (sparseExact(scale, lane)) return pressured ? 140L : 60L;
-        return pressured ? 100L : 30L;
+        if (lane == MapRequestLane.MINIMAP) return pressured ? 40L : 16L;
+        if (branchFirst(scale, lane)) return pressured ? 64L : 20L;
+        if (sparseExact(scale, lane)) return pressured ? 80L : 32L;
+        return pressured ? 70L : 20L;
     }
 
     public static long completedSourcePlanPauseMs(float scale,
             MapRequestLane lane, boolean pressured) {
-        if (branchFirst(scale, lane)) return pressured ? 500L : 140L;
-        if (sparseExact(scale, lane)) return pressured ? 550L : 160L;
-        return pressured ? 650L : 120L;
+        if (branchFirst(scale, lane)) return pressured ? 160L : 48L;
+        if (sparseExact(scale, lane)) return pressured ? 240L : 72L;
+        return pressured ? 260L : 48L;
     }
 
     /**
-     * At far zoom, live chunks are useful as a single exact seed, not as a request
-     * for every loaded chunk intersecting a huge viewport.
+     * A panned far-zoom fullscreen view needs only one live seed because saved
+     * pages build its broad branch frontier. The minimap is different: it follows
+     * the player and must finish every currently loaded chunk around them. Xaero's
+     * world-map-backed minimap likewise reuses its shared cache while the live
+     * writer keeps the player neighbourhood current.
      */
     public static boolean restrictLiveProjectionToFocusPage(float scale,
             MapRequestLane lane) {
-        return branchOnly(scale, lane);
+        /*
+         * Never collapse a fullscreen world-save projection to the player page. At
+         * far zoom the renderer may prefer branches, but every visible page must still
+         * enter the shared source/projection frontier so the branch hierarchy can cover
+         * the viewport. The old focus-only rule is why wide views showed only the area
+         * around the player even though the .mca reader had decoded the whole screen.
+         */
+        return false;
     }
 }

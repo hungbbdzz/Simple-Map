@@ -76,4 +76,43 @@ public final class MapPageLayout {
         }
         return result;
     }
+    /**
+     * Returns chunk-sized publication bits only when both the 16x16 body and the
+     * projection halo required by tint/slope/depth sampling are known. Publishing
+     * a body-only subtile lets a frontier chunk look "complete" and then visibly
+     * change when its neighbour arrives. Xaero waits for neighbouring chunks before
+     * committing a tile; this is the equivalent invariant for SimpleMap pages.
+     */
+    public static int completeSubtileMaskWithHalo(byte[] known, int stride,
+            int halo) {
+        if (known == null || stride <= 0 || halo < 0
+                || known.length < stride * stride) return 0;
+        int result = 0;
+        for (int subtileZ = 0; subtileZ < SUBTILES_PER_PAGE; subtileZ++) {
+            for (int subtileX = 0; subtileX < SUBTILES_PER_PAGE; subtileX++) {
+                int bodyMinX = halo + subtileX * SUBTILE_SIZE;
+                int bodyMinZ = halo + subtileZ * SUBTILE_SIZE;
+                int minX = bodyMinX - halo;
+                int minZ = bodyMinZ - halo;
+                int maxX = bodyMinX + SUBTILE_SIZE - 1 + halo;
+                int maxZ = bodyMinZ + SUBTILE_SIZE - 1 + halo;
+                if (minX < 0 || minZ < 0 || maxX >= stride || maxZ >= stride) {
+                    continue;
+                }
+                boolean complete = true;
+                for (int z = minZ; z <= maxZ && complete; z++) {
+                    int row = z * stride;
+                    for (int x = minX; x <= maxX; x++) {
+                        if (known[row + x] == 0) {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if (complete) result |= 1 << subtileIndex(subtileX, subtileZ);
+            }
+        }
+        return result;
+    }
+
 }

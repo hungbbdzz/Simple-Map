@@ -16,8 +16,9 @@ public final class CaveAbsentDisplayPrimitiveIndexCheck {
                 "boxed known-empty projection map must not return");
         require(code.contains("absentDisplayTiles.getInt(key)"),
                 "render hot path must use primitive getInt lookups");
-        require(code.contains("Long2LongOpenHashMap pageRevisions"),
-                "page revision hot path must not box Long keys or values");
+        require(code.contains("Long2ObjectOpenHashMap<Long2LongOpenHashMap>")
+                        && code.contains("namespaceRevisions.addTo(pack("),
+                "projection-scoped page revisions must remain primitive-backed");
         require(code.contains("Long2IntOpenHashMap displayRegionChunkCounts"),
                 "Cave region-presence indexes must remain primitive");
         System.out.println("CAVE_ABSENT_DISPLAY_PRIMITIVE_INDEX_PASS");

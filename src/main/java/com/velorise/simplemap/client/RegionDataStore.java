@@ -427,6 +427,12 @@ public final class RegionDataStore {
                 }
             }
             validatePaletteReferences(pixels, biomePalette.length, blockPalette.length);
+            if (version < 6) {
+                // PASS123: retain old pixels as last-good, but force only
+                // water-bearing chunks through the restored beta compositor/source
+                // authority path before treating them as current completion.
+                invalidateLegacyFluidCompletion(pixels, completeChunks);
+            }
             return new StoredRegion(pixels, tints, biomePalette, blockPalette,
                     completeChunks);
         }
@@ -457,6 +463,43 @@ public final class RegionDataStore {
             writeTo(output, region);
         }
         return bytes.toByteArray();
+    }
+
+    /**
+     * Water migrations keep the binary pixel layout but change which producer/
+     * compositor semantics are current. Keep last-good pixels in memory and clear
+     * only water-bearing completion so the canonical live/Anvil writer repairs those
+     * chunks transactionally. PASS123 uses this v6 migration to retire water rows
+     * captured while disk and live Surface writers could race each other.
+     */
+    private static int invalidateLegacyFluidCompletion(long[] pixels,
+            long[] completeChunks) {
+        if (pixels == null || pixels.length != PIXEL_COUNT
+                || completeChunks == null
+                || completeChunks.length != COMPLETE_CHUNK_WORDS) return 0;
+        int invalidated = 0;
+        for (int chunkZ = 0; chunkZ < SurfaceChunkCoverage.CHUNKS_PER_AXIS; chunkZ++) {
+            for (int chunkX = 0; chunkX < SurfaceChunkCoverage.CHUNKS_PER_AXIS; chunkX++) {
+                int chunkIndex = chunkZ * SurfaceChunkCoverage.CHUNKS_PER_AXIS + chunkX;
+                if (!SurfaceChunkCoverage.isComplete(completeChunks, chunkIndex)) continue;
+                boolean water = false;
+                for (int z = 0; z < 16 && !water; z++) {
+                    int row = (chunkZ * 16 + z) * REGION_SIZE + chunkX * 16;
+                    for (int x = 0; x < 16; x++) {
+                        long packed = pixels[row + x];
+                        if (MapBlockData.isFluid(packed) && !MapBlockData.isGlowing(packed)) {
+                            water = true;
+                            break;
+                        }
+                    }
+                }
+                if (water && SurfaceChunkCoverage.clearComplete(
+                        completeChunks, chunkIndex)) {
+                    invalidated++;
+                }
+            }
+        }
+        return invalidated;
     }
 
     private static void writeTo(DataOutputStream output, StoredRegion region) throws IOException {
