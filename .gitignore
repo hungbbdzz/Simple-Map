@@ -25,8 +25,11 @@ SOURCE_SHA256.txt
 collect-simplemap-debug.ps1
 TotalAnalysis.md
 SIMPLE_MAP_MASTER_ROADMAP*.md
+SimpleMap_*.md
+*.zip
 V18_*.md
 V17_*.md
+
 
 # Local performance investigation and reference sources
 .simplemap-sandbox-gradle-home/
