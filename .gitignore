@@ -25,6 +25,7 @@ SOURCE_SHA256.txt
 collect-simplemap-debug.ps1
 TotalAnalysis.md
 SIMPLE_MAP_MASTER_ROADMAP*.md
+CHANGELOG.md
 SimpleMap_*.md
 *.zip
 V18_*.md
