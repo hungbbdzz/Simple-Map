@@ -123,11 +123,15 @@ public final class CaveTextureManager {
     }
 
     public static int applyCaveLighting(int abgr, int light, int verticalOffset) {
-        return CaveMapManager.applyCaveLighting(abgr, light, verticalOffset, false);
+        return CaveMapManager.applyCaveLighting(abgr, light, 0, verticalOffset, false);
     }
 
     public static int applyCaveLighting(int abgr, int light, int verticalOffset, boolean isLava) {
-        return CaveMapManager.applyCaveLighting(abgr, light, verticalOffset, isLava);
+        return CaveMapManager.applyCaveLighting(abgr, light, 0, verticalOffset, isLava);
+    }
+
+    public static int applyCaveLighting(int abgr, int blockLight, int skyLight, int verticalOffset, boolean isLava) {
+        return CaveMapManager.applyCaveLighting(abgr, blockLight, skyLight, verticalOffset, isLava);
     }
 
     private CaveTextureManager() {
@@ -220,15 +224,37 @@ public final class CaveTextureManager {
         if (activeLayerY != layerY) onLayerActivated(layerY);
     }
 
+    private static int sameBand(int oldLayer, int layerY) {
+        if (oldLayer == Integer.MIN_VALUE || layerY == Integer.MIN_VALUE) return Integer.MIN_VALUE;
+        return oldLayer;
+    }
+
     public synchronized void onLayerActivated(int layerY) {
         if (activeLayerY == layerY) return;
         int oldLayer = activeLayerY;
-        if (oldLayer != Integer.MIN_VALUE && layerY != Integer.MIN_VALUE
-                && CaveLayerBand.key(CaveView.LAYERED, oldLayer) != CaveLayerBand.key(CaveView.LAYERED, layerY)) {
-            previousLayerY = oldLayer;
+        if (oldLayer != Integer.MIN_VALUE && layerY != Integer.MIN_VALUE) {
+            // Retain previous layer for atomic whole-page swap during band/layer transitions
+            previousLayerY = sameBand(oldLayer, layerY);
             CaveMode.beginTransition();
         }
         activeLayerY = layerY;
+        int activeBand = layerY == Integer.MIN_VALUE
+                ? Integer.MIN_VALUE
+                : CaveLayerBand.key(CaveView.LAYERED, layerY);
+        synchronized (pages) {
+            for (PageEntry entry : pages.values()) {
+                if (entry.key.band() == activeBand) {
+                    entry.dirty = true;
+                }
+            }
+        }
+        synchronized (branchPages) {
+            for (BranchEntry entry : branchPages.values()) {
+                if (entry.key.band() == activeBand) {
+                    entry.dirty = true;
+                }
+            }
+        }
         contentRevision.incrementAndGet();
     }
 
@@ -770,7 +796,12 @@ public final class CaveTextureManager {
     }
 
     private synchronized boolean uploadPage(PageEntry entry, int rx, int rz, int pageX, int pageZ) {
-        CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(entry.key.band(), rx, rz, false);
+        int requestedLayer = entry.key.band();
+        if (requestedLayer != Integer.MIN_VALUE && activeLayerY != Integer.MIN_VALUE
+                && CaveLayerBand.key(CaveView.LAYERED, activeLayerY) == requestedLayer) {
+            requestedLayer = activeLayerY;
+        }
+        CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(requestedLayer, rx, rz, false);
         if (region == null || !region.isLoaded()) {
             return false;
         }
@@ -1107,7 +1138,7 @@ public final class CaveTextureManager {
     }
     private static final ThreadLocal<AnvilSliceBuffers> SLICE_BUFFERS = ThreadLocal.withInitial(AnvilSliceBuffers::new);
 
-    /** Kiểm tra xem block có phải là foliage/cây cối/hoa cỏ (không nên chặn shouldEnterGround). */
+    /** Kiểm tra xem block có phải là khối đặc thực sự của lòng đất (làm tắt shouldEnterGround ở Full Cave). */
     private static boolean isBlockPassable(String blockName) {
         return FOLIAGE_KIND_CACHE.computeIfAbsent(blockName, name -> {
             try {
@@ -1116,12 +1147,7 @@ public final class CaveTextureManager {
                 net.minecraft.world.level.block.Block blk = net.minecraft.core.registries.BuiltInRegistries.BLOCK.get(rl);
                 if (blk == null) return false;
                 net.minecraft.world.level.block.state.BlockState state = blk.defaultBlockState();
-                // Các block lá cây, gỗ, hoa cỏ, cây trồng, dây leo, tuyết mỏng
-                if (state.ignitedByLava()) return true;
-                if (state.canBeReplaced()) return true;
-                if (state.getPistonPushReaction() == net.minecraft.world.level.material.PushReaction.DESTROY) return true;
-                if (state.is(BlockTags.FENCES) || state.is(BlockTags.FENCE_GATES) || state.is(BlockTags.RAILS)) return true;
-                return false;
+                return !CaveMode.isUndergroundSolidRoof(state);
             } catch (Throwable ignored) {
                 return false;
             }
@@ -1158,9 +1184,7 @@ public final class CaveTextureManager {
 
     public boolean isLayerGenerationCurrent(long generation, int layerY) {
         if (layerY == Integer.MIN_VALUE) return generation == layerGeneration.get();
-        return generation == layerGeneration.get()
-                && CaveLayerBand.key(CaveView.LAYERED, layerY)
-                == CaveLayerBand.key(CaveView.LAYERED, activeLayerY);
+        return generation == layerGeneration.get() && layerY == activeLayerY;
     }
 
     public synchronized void setCacheDirectory(File directory) {
@@ -1183,13 +1207,9 @@ public final class CaveTextureManager {
 
     public synchronized void setActiveLayer(int layerY) {
         if (activeLayerY == layerY) return;
-        int previousBand = CaveLayerBand.key(CaveView.LAYERED, activeLayerY);
-        int nextBand = CaveLayerBand.key(CaveView.LAYERED, layerY);
         activeLayerY = layerY;
-        if (previousBand != nextBand) {
-            deferProjectionCompletions();
-            layerGeneration.incrementAndGet();
-        }
+        deferProjectionCompletions();
+        layerGeneration.incrementAndGet();
         CaveTextureManager.getInstance().onLayerActivated(layerY);
     }
 
@@ -1232,7 +1252,7 @@ public final class CaveTextureManager {
 
     public void mergeCandidate(int blockX, int blockZ, int abgrColor,
             int surfaceY, int observationTopY) {
-        setColor(Integer.MIN_VALUE, blockX, blockZ, abgrColor);
+        setPixel(Integer.MIN_VALUE, blockX, blockZ, abgrColor, surfaceY, abgrColor != 0);
     }
 
     public void setColor(int blockX, int blockZ, int abgrColor) {
@@ -1240,12 +1260,18 @@ public final class CaveTextureManager {
     }
 
     public void setColor(int layerY, int blockX, int blockZ, int abgrColor) {
+        int existingHeight = getSurfaceY(layerY, blockX, blockZ);
+        int heightToStore = abgrColor == 0 ? NO_SURFACE : existingHeight;
+        setPixel(layerY, blockX, blockZ, abgrColor, heightToStore, abgrColor != 0);
+    }
+
+    public void setPixel(int layerY, int blockX, int blockZ, int abgrColor, int surfaceY, boolean markLive) {
         int rx = blockX >> 9;
         int rz = blockZ >> 9;
         int px = blockX & 511;
         int pz = blockZ & 511;
         CaveRegion region = materialize(layerY, rx, rz, true);
-        if (region != null && region.setColor(px, pz, abgrColor)) {
+        if (region != null && region.setPixel(px, pz, abgrColor, surfaceY, layerY, markLive)) {
             markPageDirty(layerY, blockX >> 6, blockZ >> 6);
         }
     }
@@ -1277,7 +1303,19 @@ public final class CaveTextureManager {
     }
 
     public int getSurfaceY(int blockX, int blockZ) {
-        return 64;
+        Minecraft mc = Minecraft.getInstance();
+        int targetLayer = (mc != null && CaveMode.isFullView(mc)) ? Integer.MIN_VALUE : activeLayerY;
+        return getSurfaceY(targetLayer, blockX, blockZ);
+    }
+
+    public int getSurfaceY(int layerY, int blockX, int blockZ) {
+        int rx = blockX >> 9;
+        int rz = blockZ >> 9;
+        CaveRegion region = getRegion(layerY, rx, rz, false);
+        if (region != null && region.isLoaded()) {
+            return region.getHeight(blockX & 511, blockZ & 511);
+        }
+        return NO_SURFACE;
     }
 
     public CaveRegion getRegion(int rx, int rz, boolean loadIfMissing) {
@@ -1382,16 +1420,21 @@ public final class CaveTextureManager {
         if (parent != null && !parent.exists()) parent.mkdirs();
         File temp = new File(parent, file.getName() + ".tmp");
         try (DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(new GZIPOutputStream(new FileOutputStream(temp))))) {
-            dos.writeInt(0x53434437); // 'SCD7'
+            dos.writeInt(0x53434438); // 'SCD8' (includes heights & writtenAnvilLayerY)
             dos.writeInt(band);
             dos.writeInt(rx);
             dos.writeInt(rz);
             dos.writeBoolean(region.isAnvilSliced());
+            dos.writeInt(region.getWrittenAnvilLayerY());
             int[] pixels = region.getPixelsDirect();
+            short[] heights = region.getHeightsDirect();
             region.lock();
             try {
                 for (int p : pixels) {
                     dos.writeInt(p);
+                }
+                for (short h : heights) {
+                    dos.writeShort(h);
                 }
             } finally {
                 region.unlock();
@@ -1411,14 +1454,16 @@ public final class CaveTextureManager {
         if (file == null || !file.exists() || file.length() < 16) return false;
         try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new GZIPInputStream(new FileInputStream(file))))) {
             int magic = dis.readInt();
-            if (magic != 0x53434437) return false;
+            if (magic != 0x53434437 && magic != 0x53434438) return false;
             int savedLayer = dis.readInt();
             if (savedLayer != band) return false;
             int savedRx = dis.readInt();
             int savedRz = dis.readInt();
             if (savedRx != rx || savedRz != rz) return false;
             boolean anvilSliced = dis.readBoolean();
+            int savedAnvilLayerY = (magic == 0x53434438) ? dis.readInt() : band;
             int[] pixels = region.getPixelsDirect();
+            short[] heights = region.getHeightsDirect();
             boolean hasContent = false;
             region.lock();
             try {
@@ -1427,12 +1472,20 @@ public final class CaveTextureManager {
                     pixels[i] = c;
                     if (c != 0) hasContent = true;
                 }
+                if (magic == 0x53434438) {
+                    for (int i = 0; i < 512 * 512; i++) {
+                        heights[i] = dis.readShort();
+                    }
+                } else {
+                    Arrays.fill(heights, CaveRegion.NO_SURFACE);
+                }
             } finally {
                 region.unlock();
             }
             if (hasContent) {
                 if (anvilSliced) {
                     region.setAnvilSliced(true);
+                    region.setWrittenAnvilLayerY(savedAnvilLayerY);
                 }
                 region.markExactSnapshotLoaded();
                 return true;
@@ -1567,7 +1620,7 @@ public final class CaveTextureManager {
             if (!hasAnyChunk) return;
 
             int[] regPixels = region.getPixelsDirect();
-            BitSet livePix = region.getLivePixelsDirect();
+            short[] regHeights = region.getHeightsDirect();
             boolean modified = false;
 
             region.lock();
@@ -1576,26 +1629,34 @@ public final class CaveTextureManager {
                     int rowOffset = pz * 512;
                     for (int px = 0; px < 512; px++) {
                         int index = rowOffset + px;
-                        if (livePix != null && livePix.get(index)) continue;
+                        if (region.isLivePixelAtLayerLocked(px, pz, layerY)) continue;
                         int rawColor = regionRawColors[index];
-                        if (rawColor == 0) continue;
+                        if (rawColor == 0) {
+                            if (regPixels[index] != 0) {
+                                regPixels[index] = 0;
+                                regHeights[index] = CaveRegion.NO_SURFACE;
+                                modified = true;
+                            }
+                            continue;
+                        }
                         short surfaceY = regionHeights[index];
                         if (surfaceY == CaveRegion.NO_SURFACE) continue;
 
-                        byte kind = regionKinds[index];
                         float slope = calculateRegionCaveShade(regionHeights, px, pz, surfaceY);
                         int displayedColor = applyAbgrShade(rawColor, slope);
 
                         regPixels[index] = displayedColor;
+                        regHeights[index] = surfaceY;
                         modified = true;
                     }
                 }
                 if (modified) {
                     region.markHasContent();
                     region.setDirty(true);
-                    region.setAnvilSliced(true);
-                    region.markExactSnapshotLoaded();
                 }
+                region.setAnvilSliced(true);
+                region.setWrittenAnvilLayerY(layerY);
+                region.markExactSnapshotLoaded();
             } finally {
                 region.unlock();
             }
@@ -1614,7 +1675,7 @@ public final class CaveTextureManager {
         int scanMaximum = isFullCave ? dimensionCeilingCap : Math.min(dimensionCeilingCap, CaveMode.getScanMaximum(level, layerY));
         int scanMinimum = isFullCave ? level.getMinBuildHeight() : CaveMode.getScanMinimum(level, layerY);
         if (scanMaximum < scanMinimum) return false;
-        int minSecY = scanMinimum >> 4;
+        int minSecY = level.getMinBuildHeight() >> 4;
         int maxSecY = scanMaximum >> 4;
         int secSpan = maxSecY - minSecY + 1;
         DecodedSection[] sectionArray = (secSpan > 0 && secSpan <= 64) ? new DecodedSection[secSpan] : null;
@@ -1631,11 +1692,13 @@ public final class CaveTextureManager {
         }
 
         boolean isCaveDim = isCaveDimension(level);
+        boolean hasSkyLight = level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling();
         int bandCenterY = isFullCave ? (isCaveDim ? 64 : 0) : ((scanMaximum + scanMinimum) / 2);
         boolean chunkHadContent = false;
 
         int basePx = cx << 4;
         int basePz = cz << 4;
+        int worldMinY = level.getMinBuildHeight();
 
         for (int lz = 0; lz < 16; lz++) {
             int pzInRegion = basePz + lz;
@@ -1645,68 +1708,110 @@ public final class CaveTextureManager {
                 int regIdx = rowOffset + pxInRegion;
 
                 boolean shouldEnterGround = isFullCave && !isCaveDim;
-                boolean underair = false;
+                boolean underair = isFullCave;
 
                 for (int y = scanMaximum; y >= scanMinimum; y--) {
                     int secY = y >> 4;
                     int secIdx = secY - minSecY;
                     DecodedSection sec = (sectionArray != null && secIdx >= 0 && secIdx < secSpan) ? sectionArray[secIdx] : null;
-                    int kind = sec == null ? 0 : sec.getKind(lx, y & 15, lz);
+                    int kind = sec == null ? DecodedSection.KIND_AIR : sec.getKind(lx, y & 15, lz);
 
+                    // 1. In Full Cave, skip surface water, leaves, trees, glass roofs, and giant mushrooms
+                    // until entering the first real underground solid terrain block (KIND_SOLID_GROUND).
                     if (shouldEnterGround) {
-                        if (kind == 1 || kind == 3) {
+                        if (kind == DecodedSection.KIND_SOLID_GROUND) {
                             shouldEnterGround = false;
                             underair = false;
                         }
                         continue;
                     }
 
-                    if (kind == 3) {
-                        int rawCol = sec.getColor(lx, y & 15, lz);
-                        int shadeOffset = Math.round((y - bandCenterY) / 8.0f);
-                        regionHeights[regIdx] = (short) y;
-                        regionRawColors[regIdx] = applyCaveLighting(rawCol, 15, shadeOffset, true);
-                        regionKinds[regIdx] = 3;
-                        chunkHadContent = true;
-                        break;
-                    }
-
+                    // 2. While inside solid ceiling rock (!underair), skip all solid blocks, water, and lava
+                    // until encountering actual cave air or open pass-through space.
                     if (!underair) {
-                        if (kind == 0 || kind == 4) {
+                        if (kind == DecodedSection.KIND_AIR || kind == DecodedSection.KIND_INVISIBLE_PASS) {
                             underair = true;
-                        } else if (!isFullCave && kind == 2) {
-                            underair = true;
-                            resolveWaterColumn(sectionArray, minSecY, secSpan, lx, lz, y, scanMaximum, scanMinimum, bandCenterY,
-                                    regionHeights, regionRawColors, regionKinds, regIdx);
-                            chunkHadContent = true;
-                            break;
                         }
                         continue;
                     }
 
-                    if (kind == 0 || kind == 4) {
+                    // 3. Inside cave open space (underair == true): pass through air & invisible decorations.
+                    if (kind == DecodedSection.KIND_AIR || kind == DecodedSection.KIND_INVISIBLE_PASS) {
                         continue;
                     }
 
-                    if (kind == 1) {
+                    // 4. Water column inside cave (underair == true): resolve down to basin floor.
+                    if (kind == DecodedSection.KIND_WATER) {
+                        resolveWaterColumn(sectionArray, minSecY, secSpan, lx, lz, y, scanMaximum, worldMinY, bandCenterY,
+                                hasSkyLight, regionHeights, regionRawColors, regionKinds, regIdx);
+                        chunkHadContent = true;
+                        break;
+                    }
+
+                    // 5. Lava or fire inside cave (underair == true):
+                    if (kind == DecodedSection.KIND_LAVA) {
+                        int rawCol = sec.getColor(lx, y & 15, lz);
+                        int shadeOffset = Math.round((y - bandCenterY) / 8.0f);
+                        regionHeights[regIdx] = (short) y;
+                        regionRawColors[regIdx] = applyCaveLighting(rawCol, 15, 0, shadeOffset, true);
+                        regionKinds[regIdx] = DecodedSection.KIND_LAVA;
+                        chunkHadContent = true;
+                        break;
+                    }
+
+                    // 6. Thin floor block (carpet, rail, redstone_wire, glow_lichen, snow, repeater, flower):
+                    if (kind == DecodedSection.KIND_THIN_FLOOR) {
+                        int belowY = y - 1;
+                        int belowKind = DecodedSection.KIND_AIR;
+                        if (belowY >= worldMinY) {
+                            int bSecIdx = (belowY >> 4) - minSecY;
+                            DecodedSection bSec = (sectionArray != null && bSecIdx >= 0 && bSecIdx < secSpan) ? sectionArray[bSecIdx] : null;
+                            belowKind = (bSec == null) ? DecodedSection.KIND_AIR : bSec.getKind(lx, belowY & 15, lz);
+                        }
+                        // Skip ceiling-clinging thin blocks (e.g. glow lichen with air below)
+                        if (belowKind == DecodedSection.KIND_AIR || belowKind == DecodedSection.KIND_INVISIBLE_PASS) {
+                            continue;
+                        }
                         int rawCol = sec.getColor(lx, y & 15, lz);
                         int lightY = Math.min(scanMaximum, y + 1);
-                        int lightSecY = lightY >> 4;
-                        int lightSecIdx = lightSecY - minSecY;
+                        int lightSecIdx = (lightY >> 4) - minSecY;
                         DecodedSection lightSec = (sectionArray != null && lightSecIdx >= 0 && lightSecIdx < secSpan) ? sectionArray[lightSecIdx] : null;
-                        int light = (lightSec != null) ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0;
-                        int selfLight = sec.getBlockLight(lx, y & 15, lz);
-                        light = Math.max(light, selfLight);
+                        int blockLight = Math.max(
+                                lightSec != null ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0,
+                                sec.getBlockLight(lx, y & 15, lz));
+                        int skyLight = hasSkyLight
+                                ? Math.max(
+                                        lightSec != null ? lightSec.getSkyLight(lx, lightY & 15, lz) : 0,
+                                        sec.getSkyLight(lx, y & 15, lz))
+                                : 0;
+                        int effectiveY = Math.max(worldMinY, y - 1);
+                        int shadeOffset = Math.round((effectiveY - bandCenterY) / 8.0f);
+                        regionHeights[regIdx] = (short) effectiveY;
+                        regionRawColors[regIdx] = applyCaveLighting(rawCol, blockLight, skyLight, shadeOffset, false);
+                        regionKinds[regIdx] = DecodedSection.KIND_SOLID_GROUND;
+                        chunkHadContent = true;
+                        break;
+                    }
+
+                    // 7. Solid floor block (KIND_SOLID_GROUND or KIND_PASSABLE_SOLID such as mineshaft planks):
+                    if (kind == DecodedSection.KIND_SOLID_GROUND || kind == DecodedSection.KIND_PASSABLE_SOLID) {
+                        int rawCol = sec.getColor(lx, y & 15, lz);
+                        int lightY = Math.min(scanMaximum, y + 1);
+                        int lightSecIdx = (lightY >> 4) - minSecY;
+                        DecodedSection lightSec = (sectionArray != null && lightSecIdx >= 0 && lightSecIdx < secSpan) ? sectionArray[lightSecIdx] : null;
+                        int blockLight = Math.max(
+                                lightSec != null ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0,
+                                sec.getBlockLight(lx, y & 15, lz));
+                        int skyLight = hasSkyLight
+                                ? Math.max(
+                                        lightSec != null ? lightSec.getSkyLight(lx, lightY & 15, lz) : 0,
+                                        sec.getSkyLight(lx, y & 15, lz))
+                                : 0;
                         int shadeOffset = Math.round((y - bandCenterY) / 8.0f);
 
                         regionHeights[regIdx] = (short) y;
-                        regionRawColors[regIdx] = applyCaveLighting(rawCol, light, shadeOffset);
-                        regionKinds[regIdx] = 1;
-                        chunkHadContent = true;
-                        break;
-                    } else if (kind == 2) {
-                        resolveWaterColumn(sectionArray, minSecY, secSpan, lx, lz, y, scanMaximum, scanMinimum, bandCenterY,
-                                regionHeights, regionRawColors, regionKinds, regIdx);
+                        regionRawColors[regIdx] = applyCaveLighting(rawCol, blockLight, skyLight, shadeOffset, false);
+                        regionKinds[regIdx] = DecodedSection.KIND_SOLID_GROUND;
                         chunkHadContent = true;
                         break;
                     }
@@ -1718,7 +1823,7 @@ public final class CaveTextureManager {
     }
 
     private static void resolveWaterColumn(DecodedSection[] sectionArray, int minSecY, int secSpan, int lx, int lz,
-            int waterSurfaceY, int scanMaximum, int scanMinimum, int bandCenterY,
+            int waterSurfaceY, int scanMaximum, int scanMinimum, int bandCenterY, boolean hasSkyLight,
             short[] regionHeights, int[] regionRawColors, byte[] regionKinds, int regIdx) {
         int floorY = CaveRegion.NO_SURFACE;
         int floorRawColor = 0;
@@ -1728,19 +1833,20 @@ public final class CaveTextureManager {
             int wSecY = wy >> 4;
             int wSecIdx = wSecY - minSecY;
             DecodedSection wSec = (sectionArray != null && wSecIdx >= 0 && wSecIdx < secSpan) ? sectionArray[wSecIdx] : null;
-            int wk = (wSec == null) ? 0 : wSec.getKind(lx, wy & 15, lz);
-            if (wk == 2) {
+            int wk = (wSec == null) ? DecodedSection.KIND_AIR : wSec.getKind(lx, wy & 15, lz);
+            if (wk == DecodedSection.KIND_WATER) {
                 depth++;
                 continue;
             }
-            if (wk == 0 || wk == 4) {
+            if (wk == DecodedSection.KIND_AIR) {
                 break;
             }
-            if (wk == 1 || wk == 3) {
-                floorY = wy;
-                floorRawColor = wSec.getColor(lx, wy & 15, lz);
-                break;
+            if (wk == DecodedSection.KIND_INVISIBLE_PASS) {
+                continue;
             }
+            floorY = wy;
+            floorRawColor = wSec.getColor(lx, wy & 15, lz);
+            break;
         }
 
         if (floorY == CaveRegion.NO_SURFACE) {
@@ -1766,31 +1872,43 @@ public final class CaveTextureManager {
         int lightSecY = lightY >> 4;
         int lightSecIdx = lightSecY - minSecY;
         DecodedSection lightSec = (sectionArray != null && lightSecIdx >= 0 && lightSecIdx < secSpan) ? sectionArray[lightSecIdx] : null;
-        int light = (lightSec != null) ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0;
+        int blockLight = (lightSec != null) ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0;
+        int skyLight = (hasSkyLight && lightSec != null) ? lightSec.getSkyLight(lx, lightY & 15, lz) : 0;
         int shadeOffset = Math.round((floorY - bandCenterY) / 8.0f);
 
         regionHeights[regIdx] = (short) floorY;
-        regionRawColors[regIdx] = applyCaveLighting(waterBlended, light, shadeOffset);
-        regionKinds[regIdx] = 2;
+        regionRawColors[regIdx] = applyCaveLighting(waterBlended, blockLight, skyLight, shadeOffset, false);
+        regionKinds[regIdx] = DecodedSection.KIND_WATER;
     }
 
     private static final class DecodedSection {
+        static final byte KIND_AIR = 0;
+        static final byte KIND_SOLID_GROUND = 1;
+        static final byte KIND_WATER = 2;
+        static final byte KIND_LAVA = 3;
+        static final byte KIND_PASSABLE_SOLID = 4;
+        static final byte KIND_THIN_FLOOR = 5;
+        static final byte KIND_INVISIBLE_PASS = 6;
+
         final int[] paletteColors;
-        final byte[] paletteKinds; // 0 = air, 1 = solid, 2 = water, 3 = other fluid, 4 = passable/foliage
+        final byte[] paletteKinds;
         final byte[] paletteEmissions;
         final byte[] blockLight;
+        final byte[] skyLight;
         final long[] data;
         final int bitsPerEntry;
         final int valuesPerLong;
         final long mask;
         final boolean singleBlock;
 
-        private DecodedSection(int[] paletteColors, byte[] paletteKinds, byte[] paletteEmissions, byte[] blockLight,
+        private DecodedSection(int[] paletteColors, byte[] paletteKinds, byte[] paletteEmissions,
+                byte[] blockLight, byte[] skyLight,
                 long[] data, int bitsPerEntry, int valuesPerLong, long mask, boolean singleBlock) {
             this.paletteColors = paletteColors;
             this.paletteKinds = paletteKinds;
             this.paletteEmissions = paletteEmissions;
             this.blockLight = blockLight;
+            this.skyLight = skyLight;
             this.data = data;
             this.bitsPerEntry = bitsPerEntry;
             this.valuesPerLong = valuesPerLong;
@@ -1813,6 +1931,13 @@ public final class CaveTextureManager {
                     blockLight = raw;
                 }
             }
+            byte[] skyLight = null;
+            if (secTag.contains("SkyLight", Tag.TAG_BYTE_ARRAY)) {
+                byte[] raw = secTag.getByteArray("SkyLight");
+                if (raw.length == 2048) {
+                    skyLight = raw;
+                }
+            }
 
             int[] colors = new int[size];
             byte[] kinds = new byte[size];
@@ -1820,54 +1945,31 @@ public final class CaveTextureManager {
             for (int i = 0; i < size; i++) {
                 String name = pal.getCompound(i).getString("Name");
                 if (name.equals("minecraft:air") || name.equals("minecraft:cave_air") || name.equals("minecraft:void_air")) {
-                    kinds[i] = 0;
+                    kinds[i] = KIND_AIR;
                     colors[i] = 0;
                     emissions[i] = 0;
-                } else if (name.equals("minecraft:water")) {
-                    kinds[i] = 2;
-                    colors[i] = 0xFF8A4A1C; // Deep blue ABGR water
+                } else if (name.equals("minecraft:water") || name.equals("minecraft:bubble_column")) {
+                    kinds[i] = KIND_WATER;
+                    colors[i] = 0xFF8A4A1C;
                     emissions[i] = 0;
                 } else if (name.equals("minecraft:lava")) {
-                    kinds[i] = 3;
+                    kinds[i] = KIND_LAVA;
                     colors[i] = resolveBlockNameColor(name);
                     emissions[i] = 15;
                 } else if (name.equals("minecraft:fire") || name.equals("minecraft:soul_fire")) {
-                    kinds[i] = 3;
+                    kinds[i] = KIND_LAVA;
                     colors[i] = name.equals("minecraft:soul_fire") ? 0xFFFFAA00 : 0xFF00A2FF;
                     emissions[i] = 15;
-                } else if (name.contains("torch")) {
-                    kinds[i] = 4;
-                    colors[i] = resolveBlockNameColor(name);
-                    emissions[i] = name.contains("soul") ? (byte) 10 : (byte) 14;
-                } else if (name.contains("lantern")) {
-                    kinds[i] = 4;
-                    colors[i] = resolveBlockNameColor(name);
-                    emissions[i] = name.contains("soul") ? (byte) 10 : (byte) 15;
-                } else if (name.contains("campfire")) {
-                    kinds[i] = 4;
-                    colors[i] = resolveBlockNameColor(name);
-                    emissions[i] = 15;
-                } else if (name.contains("glowstone") || name.contains("shroomlight") || name.contains("froglight") || name.contains("sea_lantern")) {
-                    kinds[i] = 1;
-                    colors[i] = resolveBlockNameColor(name);
-                    emissions[i] = 15;
-                } else if (name.contains("glow_lichen")) {
-                    kinds[i] = 4;
-                    colors[i] = resolveBlockNameColor(name);
-                    emissions[i] = 7;
-                } else if (name.contains("crying_obsidian")) {
-                    kinds[i] = 1;
-                    colors[i] = resolveBlockNameColor(name);
-                    emissions[i] = 10;
                 } else {
-                    kinds[i] = isBlockPassable(name) ? (byte) 4 : (byte) 1;
-                    colors[i] = resolveBlockNameColor(name);
-                    emissions[i] = 0;
+                    byte classifiedKind = classifyBlockNameKind(name);
+                    kinds[i] = classifiedKind;
+                    colors[i] = classifiedKind == KIND_INVISIBLE_PASS ? 0 : resolveBlockNameColor(name);
+                    emissions[i] = resolveBlockNameEmission(name);
                 }
             }
 
             if (size == 1) {
-                return new DecodedSection(colors, kinds, emissions, blockLight, null, 0, 0, 0L, true);
+                return new DecodedSection(colors, kinds, emissions, blockLight, skyLight, null, 0, 0, 0L, true);
             }
 
             long[] data = bs.getLongArray("data");
@@ -1875,7 +1977,57 @@ public final class CaveTextureManager {
             int bits = Math.max(4, 32 - Integer.numberOfLeadingZeros(size - 1));
             int valuesPerLong = 64 / bits;
             long mask = (1L << bits) - 1L;
-            return new DecodedSection(colors, kinds, emissions, blockLight, data, bits, valuesPerLong, mask, false);
+            return new DecodedSection(colors, kinds, emissions, blockLight, skyLight, data, bits, valuesPerLong, mask, false);
+        }
+
+        private static byte classifyBlockNameKind(String name) {
+            try {
+                ResourceLocation rl = ResourceLocation.tryParse(name);
+                if (rl != null) {
+                    Block blk = BuiltInRegistries.BLOCK.get(rl);
+                    if (blk != null) {
+                        BlockState state = blk.defaultBlockState();
+                        if (state.isAir()) return KIND_AIR;
+                        if (state.getFluidState().is(FluidTags.WATER)) return KIND_WATER;
+                        if (!state.getFluidState().isEmpty()) return KIND_LAVA;
+                        if (CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
+                            return KIND_INVISIBLE_PASS;
+                        }
+                        if (state.is(BlockTags.LEAVES)) {
+                            return KIND_INVISIBLE_PASS;
+                        }
+                        if (CaveMode.isShortFloorBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, state)) {
+                            return KIND_THIN_FLOOR;
+                        }
+                        if (CaveMode.isUndergroundSolidRoof(state)) {
+                            return KIND_SOLID_GROUND;
+                        }
+                        return KIND_PASSABLE_SOLID;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return isBlockPassable(name) ? KIND_PASSABLE_SOLID : KIND_SOLID_GROUND;
+        }
+
+        private static byte resolveBlockNameEmission(String name) {
+            try {
+                ResourceLocation rl = ResourceLocation.tryParse(name);
+                if (rl != null) {
+                    Block blk = BuiltInRegistries.BLOCK.get(rl);
+                    if (blk != null) {
+                        return (byte) Math.max(0, Math.min(15, blk.defaultBlockState().getLightEmission()));
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            if (name.contains("glowstone") || name.contains("shroomlight")
+                    || name.contains("froglight") || name.contains("sea_lantern")
+                    || name.contains("lantern") || name.contains("campfire")) return 15;
+            if (name.contains("torch")) return 14;
+            if (name.contains("crying_obsidian")) return 10;
+            if (name.contains("glow_lichen")) return 7;
+            return 0;
         }
 
         int getPaletteIndex(int lx, int ly, int lz) {
@@ -1906,6 +2058,15 @@ public final class CaveTextureManager {
             int b = blockLight[byteIdx] & 0xFF;
             int light = (blockIdx & 1) == 0 ? (b & 0x0F) : (b >>> 4);
             return Math.max(light, emission);
+        }
+
+        int getSkyLight(int lx, int ly, int lz) {
+            if (skyLight == null || skyLight.length < 2048) return 0;
+            int blockIdx = (ly << 8) | (lz << 4) | lx;
+            int byteIdx = blockIdx >> 1;
+            if (byteIdx < 0 || byteIdx >= skyLight.length) return 0;
+            int b = skyLight[byteIdx] & 0xFF;
+            return (blockIdx & 1) == 0 ? (b & 0x0F) : (b >>> 4);
         }
     }
 
@@ -1992,23 +2153,31 @@ public final class CaveTextureManager {
     }
 
     public static int applyCaveLighting(int abgr, int light, int verticalOffset) {
-        return applyCaveLighting(abgr, light, verticalOffset, false);
+        return applyCaveLighting(abgr, light, 0, verticalOffset, false);
     }
 
     public static int applyCaveLighting(int abgr, int light, int verticalOffset, boolean isLava) {
-        float normalized = Math.max(0.0f, Math.min(1.0f, light / 15.0f));
-        float heightShade = Math.max(0.92f, Math.min(1.08f, 1.0f + verticalOffset * 0.012f));
-        float brightness = (0.85f + 0.15f * (float) Math.pow(normalized, 0.90f)) * heightShade;
-        brightness = Math.max(0.72f, Math.min(1.0f, brightness));
+        return applyCaveLighting(abgr, light, 0, verticalOffset, isLava);
+    }
+
+    public static int applyCaveLighting(int abgr, int blockLight, int skyLight, int verticalOffset, boolean isLava) {
+        int clampedBlock = Math.max(0, Math.min(15, blockLight));
+        int clampedSky = Math.max(0, Math.min(15, skyLight));
+        int effectiveLight = isLava ? 15 : Math.max(clampedBlock, clampedSky);
+        float normalized = effectiveLight / 15.0f;
+        float heightShade = Math.max(0.82f, Math.min(1.10f, 1.0f + verticalOffset * 0.025f));
+        float lightCurve = 0.50f + 0.50f * (float) Math.pow(normalized, 0.85f);
+        float brightness = Math.max(0.42f, Math.min(1.08f, lightCurve * heightShade));
+
         int red = Math.round((abgr & 0xFF) * brightness);
         int green = Math.round(((abgr >>> 8) & 0xFF) * brightness);
         int blue = Math.round(((abgr >>> 16) & 0xFF) * brightness);
 
-        if (!isLava && light > 6) {
-            float warmth = Math.min(0.25f, ((light - 6) / 9.0f) * 0.25f);
+        if (!isLava && clampedBlock > 5 && clampedBlock >= clampedSky) {
+            float warmth = Math.min(0.24f, ((clampedBlock - 5) / 10.0f) * 0.24f);
             red = Math.round(red + (255 - red) * warmth);
-            green = Math.round(green + (185 - green) * warmth);
-            blue = Math.round(blue + (80 - blue) * warmth);
+            green = Math.round(green + (190 - green) * warmth);
+            blue = Math.round(blue + (90 - blue) * warmth);
         }
         red = Math.max(0, Math.min(255, red));
         green = Math.max(0, Math.min(255, green));
@@ -2082,7 +2251,10 @@ public final class CaveTextureManager {
             RegionHolder holder = regions.get(key);
             if (holder != null) {
                 target = holder.region;
-                if (allowAnvilSlice && !target.isAnvilSliced() && target.markAnvilSlicing()) {
+                boolean layerMismatch = layerY != Integer.MIN_VALUE
+                        && target.isAnvilSliced()
+                        && target.getWrittenAnvilLayerY() != layerY;
+                if (allowAnvilSlice && (!target.isAnvilSliced() || layerMismatch) && target.markAnvilSlicing()) {
                     needsBackfill = true;
                 } else {
                     return target;
@@ -2101,25 +2273,27 @@ public final class CaveTextureManager {
             diskExecutor.execute(() -> {
                 try {
                     File diskFile = getRegionDiskFile(band, rx, rz);
-                    if (diskFile != null && diskFile.exists()) {
+                    if (diskFile != null && diskFile.exists() && !asyncTarget.isAnvilSliced()) {
                         CaveRegion temp = new CaveRegion(rx, rz, band);
                         if (loadRegionFromDisk(temp, band, rx, rz)) {
-                            asyncTarget.mergeMissingPixels(temp.getPixelsDirect());
-                            if (temp.isAnvilSliced()) {
+                            asyncTarget.mergeMissingPixels(temp.getPixelsDirect(), temp.getHeightsDirect());
+                            if (temp.isAnvilSliced() && temp.getWrittenAnvilLayerY() == layerY) {
                                 asyncTarget.setAnvilSliced(true);
+                                asyncTarget.setWrittenAnvilLayerY(temp.getWrittenAnvilLayerY());
                             }
                         }
                     }
-                    if (!asyncTarget.isAnvilSliced() && allowAnvilSlice) {
+                    if ((!asyncTarget.isAnvilSliced() || asyncTarget.getWrittenAnvilLayerY() != layerY) && allowAnvilSlice) {
                         sliceAnvilRegion(asyncTarget, layerY, rx, rz);
                         if (asyncTarget.hasContent()) {
                             saveRegionToDisk(asyncTarget, band, rx, rz);
                         }
                     }
                     if (asyncTarget.hasContent()) {
-                        CaveTextureManager.getInstance().markRegionTextureDirty(band, rx, rz);
+                        CaveTextureManager.getInstance().markRegionTextureDirty(layerY, rx, rz);
                     }
                 } finally {
+                    asyncTarget.finishAnvilSlicing();
                     asyncTarget.markLoaded();
                 }
             });
@@ -2131,16 +2305,22 @@ public final class CaveTextureManager {
             diskExecutor.execute(() -> {
                 try {
                     boolean loaded = loadRegionFromDisk(asyncTarget, band, rx, rz);
-                    if ((!loaded || !asyncTarget.isAnvilSliced()) && allowAnvilSlice) {
+                    boolean needsSlice = !loaded || !asyncTarget.isAnvilSliced()
+                            || (layerY != Integer.MIN_VALUE && asyncTarget.getWrittenAnvilLayerY() != layerY);
+                    if (needsSlice && allowAnvilSlice) {
                         if (asyncTarget.markAnvilSlicing()) {
-                            sliceAnvilRegion(asyncTarget, layerY, rx, rz);
-                            if (asyncTarget.hasContent()) {
-                                saveRegionToDisk(asyncTarget, band, rx, rz);
+                            try {
+                                sliceAnvilRegion(asyncTarget, layerY, rx, rz);
+                                if (asyncTarget.hasContent()) {
+                                    saveRegionToDisk(asyncTarget, band, rx, rz);
+                                }
+                            } finally {
+                                asyncTarget.finishAnvilSlicing();
                             }
                         }
                     }
                     if (asyncTarget.hasContent()) {
-                        CaveTextureManager.getInstance().markRegionTextureDirty(band, rx, rz);
+                        CaveTextureManager.getInstance().markRegionTextureDirty(layerY, rx, rz);
                     }
                 } finally {
                     asyncTarget.markLoaded();
@@ -2197,14 +2377,20 @@ public final class CaveTextureManager {
     private record ProjectionCompletion(MapWorkKey key, long revision, int layerY) {
     }
 
-    /** In-memory color region for one bounded cave Top-Y layer. */
+    /** In-memory color and height region for one bounded cave Top-Y layer. */
     public static final class CaveRegion {
         public static final short NO_SURFACE = Short.MIN_VALUE;
+        private static final short UNWRITTEN_LAYER = Short.MIN_VALUE;
+        private static final short FULL_CAVE_LAYER_TAG = Short.MIN_VALUE + 1;
+
         public final int rx;
         public final int rz;
         public final int band;
         private final long generation;
         private final int[] pixels = new int[512 * 512];
+        private final short[] heights = new short[512 * 512];
+        /** Per-chunk (32x32) written Top-Y layer so intra-band layer changes trigger rescans. */
+        private final short[] writtenChunkLayerY = new short[32 * 32];
         /** Pixels written from currently loaded Minecraft chunks; archive jobs may not replace them. */
         private final BitSet livePixels = new BitSet(512 * 512);
         private final BitSet liveChunks = new BitSet(32 * 32);
@@ -2215,6 +2401,7 @@ public final class CaveTextureManager {
         private volatile boolean hasContent;
         private volatile boolean dirty;
         private volatile boolean anvilSliced;
+        private volatile int writtenAnvilLayerY = Integer.MAX_VALUE;
         private final AtomicBoolean anvilSlicing = new AtomicBoolean(false);
 
         public CaveRegion(int rx, int rz) {
@@ -2230,6 +2417,13 @@ public final class CaveTextureManager {
             this.rz = rz;
             this.band = band;
             this.generation = generation;
+            Arrays.fill(this.heights, NO_SURFACE);
+            Arrays.fill(this.writtenChunkLayerY, UNWRITTEN_LAYER);
+        }
+
+        private static short encodeLayerY(int layerY) {
+            if (layerY == Integer.MIN_VALUE) return FULL_CAVE_LAYER_TAG;
+            return (short) Math.max(-32760, Math.min(32760, layerY));
         }
 
         public int getBand() {
@@ -2250,7 +2444,10 @@ public final class CaveTextureManager {
         }
         public boolean isAnvilSliced() { return anvilSliced && !closed; }
         public void setAnvilSliced(boolean sliced) { if (!closed) this.anvilSliced = sliced; }
+        public int getWrittenAnvilLayerY() { return writtenAnvilLayerY; }
+        public void setWrittenAnvilLayerY(int layerY) { this.writtenAnvilLayerY = layerY; }
         public boolean markAnvilSlicing() { return anvilSlicing.compareAndSet(false, true); }
+        public void finishAnvilSlicing() { anvilSlicing.set(false); }
         public void markHasContent() { if (!closed) this.hasContent = true; }
         public BitSet getLivePixelsDirect() { return livePixels; }
         public long getGeneration() { return generation; }
@@ -2259,6 +2456,7 @@ public final class CaveTextureManager {
         public void unlock() { lock.unlock(); }
         public void close() { closed = true; }
         public int[] getPixelsDirect() { return pixels; }
+        public short[] getHeightsDirect() { return heights; }
 
         public int[] snapshotPixels() {
             lock.lock();
@@ -2280,11 +2478,13 @@ public final class CaveTextureManager {
 
         /**
          * Merges an asynchronously loaded cache snapshot without overwriting pixels
-         * already produced by the live scanner. Layer switches mark the placeholder
-         * region usable immediately, so this merge is what prevents a late disk load
-         * from replacing fresh cave data with an older black/sparse snapshot.
+         * already produced by the live scanner.
          */
         public void mergeMissingPixels(int[] source) {
+            mergeMissingPixels(source, null);
+        }
+
+        public void mergeMissingPixels(int[] source, short[] sourceHeights) {
             lock.lock();
             try {
                 if (closed) return;
@@ -2292,6 +2492,9 @@ public final class CaveTextureManager {
                 for (int i = 0; i < length; i++) {
                     if (pixels[i] == 0 && source[i] != 0) {
                         pixels[i] = source[i];
+                        if (sourceHeights != null && i < sourceHeights.length) {
+                            heights[i] = sourceHeights[i];
+                        }
                         hasContent = true;
                     }
                 }
@@ -2306,17 +2509,45 @@ public final class CaveTextureManager {
             finally { lock.unlock(); }
         }
 
+        public int getHeight(int px, int pz) {
+            lock.lock();
+            try { return heights[pz * 512 + px]; }
+            finally { lock.unlock(); }
+        }
+
         public boolean setColor(int px, int pz, int abgrColor) {
+            int currentHeight = getHeight(px, pz);
+            return setPixel(px, pz, abgrColor,
+                    abgrColor == 0 ? NO_SURFACE : currentHeight,
+                    band, abgrColor != 0);
+        }
+
+        public boolean setPixel(int px, int pz, int abgrColor, int surfaceY, int layerY, boolean markLive) {
             lock.lock();
             try {
                 if (closed) return false;
                 int index = pz * 512 + px;
-                livePixels.set(index);
+                short clampedHeight = (abgrColor == 0 || surfaceY == NO_SURFACE)
+                        ? NO_SURFACE
+                        : (short) Math.max(-32760, Math.min(32760, surfaceY));
+                if (markLive && abgrColor != 0) {
+                    livePixels.set(index);
+                    int chunkIdx = ((pz >> 4) << 5) | (px >> 4);
+                    if (writtenChunkLayerY[chunkIdx] == UNWRITTEN_LAYER) {
+                        writtenChunkLayerY[chunkIdx] = encodeLayerY(layerY);
+                    }
+                } else if (abgrColor == 0) {
+                    livePixels.clear(index);
+                }
                 if (abgrColor != 0) hasContent = true;
-                if (pixels[index] == abgrColor) return false;
+                boolean colorChanged = pixels[index] != abgrColor;
+                boolean heightChanged = heights[index] != clampedHeight;
                 pixels[index] = abgrColor;
-                dirty = true;
-                return true;
+                heights[index] = clampedHeight;
+                if (colorChanged || heightChanged) {
+                    dirty = true;
+                }
+                return colorChanged;
             } finally {
                 lock.unlock();
             }
@@ -2331,6 +2562,15 @@ public final class CaveTextureManager {
             }
         }
 
+        public boolean isLivePixelAtLayer(int px, int pz, int layerY) {
+            lock.lock();
+            try {
+                return isLivePixelAtLayerLocked(px, pz, layerY);
+            } finally {
+                lock.unlock();
+            }
+        }
+
         public boolean isChunkLive(int cxInRegion, int czInRegion) {
             lock.lock();
             try {
@@ -2340,10 +2580,29 @@ public final class CaveTextureManager {
             }
         }
 
-        public void markChunkLive(int cxInRegion, int czInRegion) {
+        public boolean isChunkLiveAtLayer(int cxInRegion, int czInRegion, int layerY) {
             lock.lock();
             try {
-                if (!closed) liveChunks.set(czInRegion * 32 + cxInRegion);
+                int chunkIdx = czInRegion * 32 + cxInRegion;
+                return liveChunks.get(chunkIdx)
+                        && writtenChunkLayerY[chunkIdx] == encodeLayerY(layerY);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public void markChunkLive(int cxInRegion, int czInRegion) {
+            markChunkLive(cxInRegion, czInRegion, band);
+        }
+
+        public void markChunkLive(int cxInRegion, int czInRegion, int layerY) {
+            lock.lock();
+            try {
+                if (!closed) {
+                    int chunkIdx = czInRegion * 32 + cxInRegion;
+                    liveChunks.set(chunkIdx);
+                    writtenChunkLayerY[chunkIdx] = encodeLayerY(layerY);
+                }
             } finally {
                 lock.unlock();
             }
@@ -2352,6 +2611,14 @@ public final class CaveTextureManager {
         /** Caller must hold this region's lock. */
         boolean isLivePixelLocked(int index) {
             return livePixels.get(index);
+        }
+
+        /** Caller must hold this region's lock. */
+        boolean isLivePixelAtLayerLocked(int px, int pz, int layerY) {
+            int index = pz * 512 + px;
+            if (!livePixels.get(index)) return false;
+            int chunkIdx = ((pz >> 4) << 5) | (px >> 4);
+            return writtenChunkLayerY[chunkIdx] == encodeLayerY(layerY);
         }
     }
 

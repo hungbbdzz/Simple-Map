@@ -788,7 +788,9 @@ public class ChunkScanner {
         int nextBand = nextView == null ? Integer.MIN_VALUE
                 : CaveLayerBand.key(nextView, nextTopY);
 
-        boolean bandChanged = observedCaveBandY != nextBand || observedCaveView != nextView;
+        boolean bandOrLayerChanged = observedCaveBandY != nextBand
+                || observedCaveView != nextView
+                || observedCaveProjectionTopY != nextTopY;
 
         if (active && nextView == CaveView.LAYERED) {
             CaveMapManager.getInstance().setActiveLayer(nextTopY);
@@ -797,7 +799,7 @@ public class ChunkScanner {
         observedCaveBandY = nextBand;
         observedCaveProjectionTopY = nextTopY;
 
-        if (bandChanged && active && minecraft.player != null) {
+        if (bandOrLayerChanged && active && minecraft.player != null) {
             scanCaveAroundPlayerUniform(minecraft, 64);
         }
     }
@@ -1106,41 +1108,31 @@ public class ChunkScanner {
         int[] caveColors = scratch.caveColors;
         LevelChunk loadedChunk = mc.level.getChunk(chunkX, chunkZ);
         if (loadedChunk == null) return false;
+        int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
 
         for (int p = 0; p < 256; p++) {
             int blockX = (chunkX << 4) + (p & 15);
             int blockZ = (chunkZ << 4) + (p >>> 4);
-            if (!shouldRescanExplored() && isExplored(blockX, blockZ, true, fullView, layerY)) {
-                caveHeights[p] = CaveRegion.NO_SURFACE;
-                caveColors[p] = 0;
-                continue;
-            }
             long packed = getCavePixel(mc.level, loadedChunk, blockX, layerY, blockZ, fullView);
             caveHeights[p] = (short) cavePixelY(packed);
             caveColors[p] = cavePixelColor(packed);
         }
 
+        CaveMapManager caveManager = CaveMapManager.getInstance();
         for (int p = 0; p < 256; p++) {
             int rawColor = caveColors[p];
-            if (rawColor == 0) continue;
             int surfaceY = caveHeights[p];
             int blockX = (chunkX << 4) + (p & 15);
             int blockZ = (chunkZ << 4) + (p >>> 4);
-            int displayedColor;
-            if (surfaceY == CaveRegion.NO_SURFACE) {
-                displayedColor = rawColor;
-            } else {
-                float shade = calculateFastCaveShade(caveHeights, p, surfaceY, layerY, fullView);
-                displayedColor = applyAbgrShade(rawColor, shade);
+            if (rawColor == 0 || surfaceY == CaveRegion.NO_SURFACE) {
+                caveManager.setPixel(targetLayer, blockX, blockZ, 0, CaveRegion.NO_SURFACE, false);
+                continue;
             }
-            if (fullView) {
-                CaveMapManager.getInstance().setColor(Integer.MIN_VALUE, blockX, blockZ, displayedColor);
-            } else {
-                CaveMapManager.getInstance().setColor(layerY, blockX, blockZ, displayedColor);
-            }
+            float shade = calculateFastCaveShade(caveHeights, chunkX, chunkZ, p, surfaceY, targetLayer);
+            int displayedColor = applyAbgrShade(rawColor, shade);
+            caveManager.setPixel(targetLayer, blockX, blockZ, displayedColor, surfaceY, true);
         }
         markCaveChunkExplored(chunkX, chunkZ, layerY, fullView);
-        int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
         CaveTextureManager.getInstance().markPageTextureDirty(targetLayer, chunkX >> 2, chunkZ >> 2);
         urgentChunkCursors.remove(key);
         return true;
@@ -1486,17 +1478,11 @@ public class ChunkScanner {
         int rx = blockX >> 9;
         int rz = blockZ >> 9;
         int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
-        if (fullView) {
-            CaveRegion region = CaveMapManager.getInstance().getRegion(Integer.MIN_VALUE, rx, rz, false);
-            return region != null && region.isLoaded()
-                    && region.isLivePixel(blockX & 511, blockZ & 511);
-        }
-        CaveMapManager manager = CaveMapManager.getInstance();
-        CaveRegion region = manager.getRegion(targetLayer, rx, rz, false);
+        CaveRegion region = CaveMapManager.getInstance().getRegion(targetLayer, rx, rz, false);
         if (region == null || !region.isLoaded()) return false;
         int px = blockX & 511;
         int pz = blockZ & 511;
-        return region.isLivePixel(px, pz);
+        return region.isLivePixelAtLayer(px, pz, targetLayer);
     }
 
     private boolean isCaveChunkExplored(int chunkX, int chunkZ, int layerY, boolean fullView) {
@@ -1507,7 +1493,7 @@ public class ChunkScanner {
         if (region == null || !region.isLoaded()) return false;
         int cxInRegion = chunkX & 31;
         int czInRegion = chunkZ & 31;
-        return region.isChunkLive(cxInRegion, czInRegion);
+        return region.isChunkLiveAtLayer(cxInRegion, czInRegion, targetLayer);
     }
 
     private void markCaveChunkExplored(int chunkX, int chunkZ, int layerY, boolean fullView) {
@@ -1518,7 +1504,7 @@ public class ChunkScanner {
         if (region != null) {
             int cxInRegion = chunkX & 31;
             int czInRegion = chunkZ & 31;
-            region.markChunkLive(cxInRegion, czInRegion);
+            region.markChunkLive(cxInRegion, czInRegion, targetLayer);
         }
     }
 
@@ -1810,15 +1796,14 @@ public class ChunkScanner {
 
         int surfaceY = cavePixelY(pixel);
         int rawColor = cavePixelColor(pixel);
-        int displayedColor = surfaceY == CaveRegion.NO_SURFACE
-                ? rawColor
-                : applyAbgrShade(rawColor, calculateCaveTerrainShade(
-                        level, blockX, blockZ, layerY, fullView, surfaceY));
-        if (fullView) {
-            int colorToSet = surfaceY == CaveRegion.NO_SURFACE ? 0 : displayedColor;
-            CaveMapManager.getInstance().setColor(Integer.MIN_VALUE, blockX, blockZ, colorToSet);
+        int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
+        if (rawColor == 0 || surfaceY == CaveRegion.NO_SURFACE) {
+            CaveMapManager.getInstance().setPixel(targetLayer, blockX, blockZ, 0, CaveRegion.NO_SURFACE, false);
+            return;
         }
-        if (!fullView) CaveMapManager.getInstance().setColor(blockX, blockZ, displayedColor);
+        int displayedColor = applyAbgrShade(rawColor, calculateCaveTerrainShade(
+                level, blockX, blockZ, layerY, fullView, surfaceY));
+        CaveMapManager.getInstance().setPixel(targetLayer, blockX, blockZ, displayedColor, surfaceY, true);
     }
 
     private long getCavePixel(Level level, int blockX, int layerY, int blockZ, boolean fullView) {
@@ -1830,42 +1815,13 @@ public class ChunkScanner {
         if (fullView) return getFullCavePixel(level, chunk, blockX, blockZ);
         int scanMinimum = CaveMode.getScanMinimum(level, layerY);
         int scanMaximum = CaveMode.getScanMaximum(level, layerY);
-        ScanScratch scratch = scanScratch.get();
-        BlockPos.MutableBlockPos openPos = scratch.position(0, blockX, scanMaximum, blockZ);
-        BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, scanMaximum, blockZ);
         int bandCenterY = (scanMaximum + scanMinimum) / 2;
-
-        LevelChunkSection[] sections = chunk != null ? chunk.getSections() : null;
-        int minimumY = level.getMinBuildHeight();
-        int minSectionY = Math.floorDiv(minimumY, 16);
-
-        // LAYERED searches its 32-block band with fast section air-skipping.
-        for (int openY = scanMaximum; openY >= scanMinimum; openY--) {
-            if (sections != null) {
-                int sIdx = (openY - minimumY) >> 4;
-                if (sIdx >= 0 && sIdx < sections.length) {
-                    LevelChunkSection sec = sections[sIdx];
-                    if (sec != null && sec.hasOnlyAir()) {
-                        int secBottom = (minSectionY + sIdx) << 4;
-                        if (openY > secBottom) {
-                            openY = Math.max(secBottom, scanMinimum);
-                        }
-                    }
-                }
-            }
-            long pixel = getCaveSurface(level, chunk, openPos, colorPos, openY,
-                    bandCenterY, fullView);
-            if (pixel != CAVE_PIXEL_NOT_FOUND) return pixel;
-        }
-
-        return packCavePixel(0, CaveRegion.NO_SURFACE);
+        return scanCaveColumn(level, chunk, blockX, blockZ, scanMaximum, scanMinimum, bandCenterY, false);
     }
 
     /**
      * FULL cave begins only after the column has entered a real underground mass.
-     * This mirrors the underground transition state: surface vegetation and tree trunks
-     * are skipped before the first enclosed air/fluid run is allowed to become a
-     * cave floor.
+     * Uses the unified underair / shouldEnterGround state machine across the column.
      */
     private long getFullCavePixel(Level level, int blockX, int blockZ) {
         LevelChunk chunk = level.getChunk(blockX >> 4, blockZ >> 4);
@@ -1874,173 +1830,191 @@ public class ChunkScanner {
 
     private long getFullCavePixel(Level level, LevelChunk chunk, int blockX, int blockZ) {
         int minimumY = level.getMinBuildHeight();
-        int startY = findUndergroundSearchStart(level, chunk, blockX, blockZ);
-        if (startY <= minimumY) return packCavePixel(0, CaveRegion.NO_SURFACE);
-
-        int caveMidpoint = isCaveLikeDimension(level) ? 64 : 0;
-        ScanScratch scratch = scanScratch.get();
-        BlockPos.MutableBlockPos openPos = scratch.position(0, blockX, startY, blockZ);
-        BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, startY, blockZ);
-        LevelChunkSection[] sections = chunk != null ? chunk.getSections() : null;
-        int minSectionY = Math.floorDiv(minimumY, 16);
-
-        for (int openY = startY; openY >= minimumY; openY--) {
-            if (sections != null) {
-                int sIdx = (openY - minimumY) >> 4;
-                if (sIdx >= 0 && sIdx < sections.length) {
-                    LevelChunkSection sec = sections[sIdx];
-                    if (sec != null && sec.hasOnlyAir()) {
-                        int secBottom = (minSectionY + sIdx) << 4;
-                        if (openY > secBottom) {
-                            openY = secBottom;
-                        }
-                    }
-                }
-            }
-            long pixel = getCaveSurface(level, chunk, openPos, colorPos, openY,
-                    caveMidpoint, true);
-            if (pixel != CAVE_PIXEL_NOT_FOUND) return pixel;
-        }
-        return packCavePixel(0, CaveRegion.NO_SURFACE);
-    }
-
-    private int findUndergroundSearchStart(Level level, int blockX, int blockZ) {
-        LevelChunk chunk = level.getChunk(blockX >> 4, blockZ >> 4);
-        return findUndergroundSearchStart(level, chunk, blockX, blockZ);
-    }
-
-    private int findUndergroundSearchStart(Level level, LevelChunk chunk, int blockX, int blockZ) {
-        int minimumY = level.getMinBuildHeight();
         int ceilingCap = level.dimensionType().hasCeiling() ? 122 : (level.getMaxBuildHeight() - 1);
-        int maximumY = ceilingCap;
         int topY = isCaveLikeDimension(level)
-                ? maximumY
-                : Math.max(minimumY, Math.min(maximumY,
+                ? ceilingCap
+                : Math.max(minimumY, Math.min(ceilingCap,
                         chunk != null
                                 ? chunk.getHeight(Heightmap.Types.WORLD_SURFACE, blockX & 15, blockZ & 15)
                                 : level.getHeight(Heightmap.Types.WORLD_SURFACE, blockX, blockZ)));
-        if (chunk == null) return minimumY;
-        LevelChunkSection[] sections = chunk.getSections();
-        int minSectionY = Math.floorDiv(minimumY, 16);
-        int topSectionIdx = Math.min(sections.length - 1, (topY - minimumY) >> 4);
-        BlockPos.MutableBlockPos probe = scanScratch.get().position(2,
-                blockX, topY, blockZ);
-        for (int sIdx = topSectionIdx; sIdx >= 0; sIdx--) {
-            LevelChunkSection section = sections[sIdx];
-            if (section == null || section.hasOnlyAir()) continue;
-            int sectionBottom = (minSectionY + sIdx) << 4;
-            int startYInSection = Math.min(topY, sectionBottom + 15);
-            for (int y = startYInSection; y >= sectionBottom; y--) {
-                probe.setY(y);
-                BlockState state = section.getBlockState(blockX & 15, y & 15, blockZ & 15);
-                if (isUndergroundTerrainEntry(level, probe, state)) return y - 1;
-            }
-        }
-        return minimumY;
+        if (topY <= minimumY) return packCavePixel(0, CaveRegion.NO_SURFACE);
+        int caveMidpoint = isCaveLikeDimension(level) ? 64 : 0;
+        return scanCaveColumn(level, chunk, blockX, blockZ, topY, minimumY, caveMidpoint, true);
     }
 
     /**
-     * Same enter-ground predicate used by the decoded/archive cave pipeline and by
-     * The Full-Cave loadPixel state machine. A three-consecutive-solid heuristic
-     * skipped valid caves behind one- or two-block roofs and made live chunks disagree
-     * with the Anvil/archive version of the same X/Z column.
+     * Unified continuous column scanner for both Layered Cave and Full Cave.
+     * Uses a symmetric state machine ({@code shouldEnterGround} + {@code underair}) and preserves
+     * thin floor blocks (carpets, rails, redstone wire, glow lichen, repeaters, etc.)
+     * with short-block height adjustment (-1) for clean slope shading.
      */
-    private boolean isUndergroundTerrainEntry(Level level, BlockPos pos,
-            BlockState state) {
-        if (state == null || state.isAir() || !state.getFluidState().isEmpty()) {
-            return false;
-        }
-        MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
-        if (state.ignitedByLava() || state.canBeReplaced()
-                || state.getPistonPushReaction() == PushReaction.DESTROY) {
-            return false;
-        }
-        if (visual.role() != MapVisualClassifier.Role.OPAQUE_BASE) return false;
-        return state.blocksMotion()
-                || !caveStateClassifier.isCollisionEmpty(level, pos, state);
-    }
-
-    private long getCaveSurface(Level level, LevelChunk chunk, BlockPos.MutableBlockPos openPos,
-            BlockPos.MutableBlockPos colorPos, int openY, int bandCenterY,
-            boolean fullView) {
-        openPos.setY(openY);
-        BlockState openState = chunk != null ? chunk.getBlockState(openPos) : level.getBlockState(openPos);
-        BlockState colorState;
-        boolean emissiveFeature = isOpenEmissiveFeature(level, openPos, openState);
-        boolean visibleFlower = MapConfig.displayFlowers
-                && visualClassifier.info(openState).flower();
-        boolean waterCoveredFloor = false;
-        int waterDepth = 0;
-        int waterTintY = openY;
-        // Fluids are followed only through their own contiguous column. Their
-        // basin floor may lie below the selected band without exposing unrelated
-        // lower caves, so water resolution may safely continue to world bottom.
+    private long scanCaveColumn(Level level, LevelChunk chunk, int blockX, int blockZ,
+            int scanMaximum, int scanMinimum, int bandCenterY, boolean fullView) {
         int minimumY = level.getMinBuildHeight();
+        if (scanMaximum < scanMinimum) return packCavePixel(0, CaveRegion.NO_SURFACE);
 
-        if (emissiveFeature || visibleFlower
-                || (!openState.getFluidState().isEmpty()
-                        && !openState.getFluidState().is(net.minecraft.tags.FluidTags.WATER))) {
-            colorPos.setY(openY);
-            colorState = openState;
-        } else if (openState.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
-            // Water is transparent map geometry, not an opaque cave ceiling. Walk
-            // through the contiguous water column and color the actual basin/cave
-            // floor, then blend the water tint over it.
-            WaterFloor floor = resolveWaterFloor(level, chunk, colorPos, openY, minimumY);
-            if (floor == null) {
-                // The water continues below this layer or forms a waterfall. Keep a
-                // visible water pixel rather than converting the column into a hole.
-                colorPos.setY(openY);
-                colorState = openState;
-            } else {
-                colorPos.setY(floor.y());
-                colorState = floor.state();
-                waterDepth = floor.depth();
-                waterCoveredFloor = true;
+        ScanScratch scratch = scanScratch.get();
+        BlockPos.MutableBlockPos probePos = scratch.position(0, blockX, scanMaximum, blockZ);
+        BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, scanMaximum, blockZ);
+        BlockPos.MutableBlockPos lightPos = scratch.position(2, blockX, scanMaximum, blockZ);
+
+        LevelChunkSection[] sections = chunk != null ? chunk.getSections() : null;
+        int minSectionY = Math.floorDiv(minimumY, 16);
+        boolean hasSkyLight = level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling();
+        boolean showFlowers = MapConfig.displayFlowers;
+
+        boolean shouldEnterGround = fullView && !isCaveLikeDimension(level);
+        boolean underair = fullView;
+
+        for (int y = scanMaximum; y >= scanMinimum; y--) {
+            if (sections != null) {
+                int sIdx = (y - minimumY) >> 4;
+                if (sIdx >= 0 && sIdx < sections.length) {
+                    LevelChunkSection sec = sections[sIdx];
+                    if (sec == null || sec.hasOnlyAir()) {
+                        if (!shouldEnterGround) {
+                            underair = true;
+                        }
+                        int secBottom = (minSectionY + sIdx) << 4;
+                        if (y > secBottom) {
+                            y = Math.max(secBottom, scanMinimum);
+                        }
+                        continue;
+                    }
+                }
             }
-        } else {
-            boolean openSpace = openState.isAir() || caveStateClassifier.isCollisionEmpty(level, openPos, openState);
-            if (!openSpace || openY <= level.getMinBuildHeight()) return CAVE_PIXEL_NOT_FOUND;
-            colorPos.setY(openY - 1);
-            colorState = chunk != null ? chunk.getBlockState(colorPos) : level.getBlockState(colorPos);
 
-            // The first block below cave air is commonly the surface of an
-            // underground lake. Resolve through that water as well; otherwise the
-            // scanner colors the water block itself and hides the connected floor.
-            if (colorState.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
-                waterTintY = openY - 1;
-                WaterFloor floor = resolveWaterFloor(level, chunk, colorPos, waterTintY, minimumY);
+            probePos.setY(y);
+            BlockState state = chunk != null ? chunk.getBlockState(probePos) : level.getBlockState(probePos);
+            if (state == null || state.isAir()) {
+                if (!shouldEnterGround) {
+                    underair = true;
+                }
+                continue;
+            }
+
+            // 1. Full Cave surface-skip phase: ignore surface water, leaves, trees, glass roofs,
+            // giant mushrooms, and foliage until hitting the first real underground solid block.
+            if (shouldEnterGround) {
+                if ( isUndergroundTerrainEntry(level, probePos, state)) {
+                    shouldEnterGround = false;
+                    underair = false;
+                }
+                continue;
+            }
+
+            // 2. Ceiling-penetration phase (!underair): skip solid rock, surface oceans/lakes,
+            // and lava pockets embedded in ceiling rock until an open cave space is reached.
+            if (!underair) {
+                if (CaveMode.isCaveOpenOrInvisible(state, showFlowers)) {
+                    underair = true;
+                }
+                continue;
+            }
+
+            // 3. Inside cave open space (underair == true): pass through invisible/open decorations.
+            if (CaveMode.isCaveOpenOrInvisible(state, showFlowers)
+                    || (fullView && state.is( net.minecraft.tags.BlockTags.LEAVES))) {
+                continue;
+            }
+
+            // 4. Water column encountered below cave air: walk down to solid basin floor.
+            if (state.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
+                int waterSurfaceY = y;
+                WaterFloor floor = resolveWaterFloor(level, chunk, colorPos, waterSurfaceY, minimumY);
+                BlockState colorState;
+                int floorY;
+                int waterDepth;
+                boolean waterCoveredFloor;
                 if (floor == null) {
-                    colorPos.setY(waterTintY);
-                    colorState = chunk != null ? chunk.getBlockState(colorPos) : level.getBlockState(colorPos);
+                    colorPos.setY(waterSurfaceY);
+                    colorState = state;
+                    floorY = waterSurfaceY;
+                    waterDepth = 1;
+                    waterCoveredFloor = false;
                 } else {
-                    colorPos.setY(floor.y());
+                    floorY = floor.y();
+                    colorPos.setY(floorY);
                     colorState = floor.state();
                     waterDepth = floor.depth();
                     waterCoveredFloor = true;
                 }
-            } else {
-                boolean floorOpen = colorState.isAir()
-                        || (caveStateClassifier.isCollisionEmpty(level, colorPos, colorState)
-                                && colorState.getFluidState().isEmpty());
-                if (floorOpen) return CAVE_PIXEL_NOT_FOUND;
+                int baseColor = getCaveBlockColor(level, colorPos, colorState);
+                if (baseColor == 0) baseColor = 0xFF8A4A1C;
+                if (waterCoveredFloor) {
+                    BlockPos.MutableBlockPos waterPos = scratch.position(3, blockX, waterSurfaceY, blockZ);
+                    baseColor = applyCaveWaterOverlay(level, waterPos, baseColor, waterDepth);
+                }
+                lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, waterSurfaceY + 1), blockZ);
+                int blockLight = Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), colorState.getLightEmission());
+                int skyLight = hasSkyLight ? level.getBrightness(LightLayer.SKY, lightPos) : 0;
+                int shadeOffset = Math.round((floorY - bandCenterY) / 8.0f);
+                return packCavePixel(
+                        CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, false),
+                        floorY);
             }
+
+            // 5. Lava or other non-water fluid encountered below cave air:
+            if (!state.getFluidState().isEmpty()) {
+                colorPos.setY(y);
+                boolean isLava = state.is(Blocks.LAVA) || state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
+                int baseColor = getCaveBlockColor(level, colorPos, state);
+                if (baseColor == 0) continue;
+                lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, y + 1), blockZ);
+                int blockLight = isLava ? 15 : Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), state.getLightEmission());
+                int skyLight = (!isLava && hasSkyLight) ? level.getBrightness(LightLayer.SKY, lightPos) : 0;
+                int shadeOffset = Math.round((y - bandCenterY) / 8.0f);
+                return packCavePixel(
+                        CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isLava),
+                        y);
+            }
+
+            // 6. Solid or thin floor block (carpets, rails, redstone wire, glow lichen, mineshaft planks, stone, etc.):
+            boolean emissiveFeature = isOpenEmissiveFeature(level, probePos, state);
+            boolean shortBlock = CaveMode.isShortFloorBlock(level, probePos, state);
+            if (shortBlock && !emissiveFeature && !state.is(net.minecraft.tags.BlockTags.RAILS)) {
+                // Ensure ceiling-clinging blocks (like glow_lichen on a ceiling overhang) with air below are skipped
+                if (y - 1 >= minimumY) {
+                    colorPos.setY(y - 1);
+                    BlockState belowState = chunk != null ? chunk.getBlockState(colorPos) : level.getBlockState(colorPos);
+                    if (belowState.isAir() || CaveMode.isCaveOpenOrInvisible(belowState, showFlowers)) {
+                        continue;
+                    }
+                }
+            }
+
+            colorPos.setY(y);
+            int baseColor = emissiveFeature
+                    ? getEmissiveFeatureColor(level, colorPos, state)
+                    : getCaveBlockColor(level, colorPos, state);
+            if (baseColor == 0) continue;
+
+            boolean isLava = state.is(Blocks.LAVA) || state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
+            lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, y + 1), blockZ);
+            int blockLight = isLava
+                    ? 15
+                    : Math.max(
+                            Math.max(level.getBrightness(LightLayer.BLOCK, lightPos),
+                                    level.getBrightness(LightLayer.BLOCK, colorPos)),
+                            state.getLightEmission());
+            int skyLight = (!isLava && hasSkyLight)
+                    ? Math.max(level.getBrightness(LightLayer.SKY, lightPos),
+                            level.getBrightness(LightLayer.SKY, colorPos))
+                    : 0;
+            // Short blocks on a floor use y - 1 as their effective terrain height (isShort)
+            int effectiveY = (shortBlock && y > minimumY) ? (y - 1) : y;
+            int shadeOffset = Math.round((effectiveY - bandCenterY) / 8.0f);
+            return packCavePixel(
+                    CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isLava),
+                    effectiveY);
         }
 
-        int baseColor = emissiveFeature
-                ? getEmissiveFeatureColor(level, colorPos, colorState)
-                : getCaveBlockColor(level, colorPos, colorState);
-        if (baseColor == 0) return CAVE_PIXEL_NOT_FOUND;
-        if (waterCoveredFloor) {
-            BlockPos.MutableBlockPos waterPos = scanScratch.get().position(3,
-                    openPos.getX(), waterTintY, openPos.getZ());
-            baseColor = applyCaveWaterOverlay(level, waterPos, baseColor, waterDepth);
-        }
-        boolean isLava = colorState.is(Blocks.LAVA) || colorState.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
-        int blockLight = isLava ? 15 : Math.max(level.getBrightness(LightLayer.BLOCK, openPos), colorState.getLightEmission());
-        int shadeOffset = Math.round((colorPos.getY() - bandCenterY) / 8.0f);
-        return packCavePixel(CaveTextureManager.applyCaveLighting(baseColor, blockLight, shadeOffset, isLava),
-                colorPos.getY());
+        return packCavePixel(0, CaveRegion.NO_SURFACE);
+    }
+
+    private boolean isUndergroundTerrainEntry(Level level, BlockPos pos,
+            BlockState state) {
+        return CaveMode.isUndergroundSolidRoof(level, pos, state);
     }
 
     private WaterFloor resolveWaterFloor(Level level, LevelChunk chunk, BlockPos.MutableBlockPos probe,
@@ -2062,26 +2036,34 @@ public class ChunkScanner {
                 depth++;
                 continue;
             }
-            // A falling stream entering open air has no covered floor at this
-            // height. The outer downward scan will resolve the lower space itself.
             if (candidate.isAir()) return null;
-            boolean passThrough = caveStateClassifier.isCollisionEmpty(level, probe, candidate)
-                    && candidate.getFluidState().isEmpty();
-            if (passThrough) continue;
+            if (CaveMode.isCaveOpenOrInvisible(candidate, MapConfig.displayFlowers)) continue;
             return result.set(candidate, y, Math.max(1, depth));
         }
         return null;
     }
 
-    private float calculateFastCaveShade(short[] heights, int pixel, int centerY,
-            int layerY, boolean fullView) {
+    private float calculateFastCaveShade(short[] heights, int chunkX, int chunkZ,
+            int pixel, int centerY, int targetLayer) {
         if (MapConfig.terrainSlopes <= 0) return 1.0f;
         int ix = pixel & 15;
         int iz = pixel >>> 4;
-        int north = (iz > 0 && heights[pixel - 16] != CaveRegion.NO_SURFACE) ? heights[pixel - 16] : CaveRegion.NO_SURFACE;
-        int south = (iz < 15 && heights[pixel + 16] != CaveRegion.NO_SURFACE) ? heights[pixel + 16] : CaveRegion.NO_SURFACE;
-        int west = (ix > 0 && heights[pixel - 1] != CaveRegion.NO_SURFACE) ? heights[pixel - 1] : CaveRegion.NO_SURFACE;
-        int east = (ix < 15 && heights[pixel + 1] != CaveRegion.NO_SURFACE) ? heights[pixel + 1] : CaveRegion.NO_SURFACE;
+        int blockX = (chunkX << 4) + ix;
+        int blockZ = (chunkZ << 4) + iz;
+        CaveMapManager caveManager = CaveMapManager.getInstance();
+
+        int north = (iz > 0)
+                ? heights[pixel - 16]
+                : caveManager.getSurfaceY(targetLayer, blockX, blockZ - 1);
+        int south = (iz < 15)
+                ? heights[pixel + 16]
+                : caveManager.getSurfaceY(targetLayer, blockX, blockZ + 1);
+        int west = (ix > 0)
+                ? heights[pixel - 1]
+                : caveManager.getSurfaceY(targetLayer, blockX - 1, blockZ);
+        int east = (ix < 15)
+                ? heights[pixel + 1]
+                : caveManager.getSurfaceY(targetLayer, blockX + 1, blockZ);
 
         if (north == CaveRegion.NO_SURFACE) {
             north = (south != CaveRegion.NO_SURFACE) ? (2 * centerY - south) : centerY;
@@ -2185,47 +2167,16 @@ public class ChunkScanner {
 
     private int getCaveNeighbourY(Level level, int x, int z, int layerY,
             boolean fullView, int fallbackY) {
-        if (!level.hasChunk(x >> 4, z >> 4)) return fallbackY;
-        if (fullView) {
-            int cached = CaveMapManager.getInstance().getSurfaceY(x, z);
-            return cached == CaveRegion.NO_SURFACE ? fallbackY : cached;
+        int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
+        int cached = CaveMapManager.getInstance().getSurfaceY(targetLayer, x, z);
+        if (cached != CaveRegion.NO_SURFACE) {
+            return cached;
         }
+        if (!level.hasChunk(x >> 4, z >> 4)) return fallbackY;
         LevelChunk chunk = level.getChunk(x >> 4, z >> 4);
         if (chunk == null) return fallbackY;
-        int minimum = CaveMode.getScanMinimum(level, layerY);
-        int maximum = CaveMode.getScanMaximum(level, layerY);
-        ScanScratch scratch = scanScratch.get();
-        BlockPos.MutableBlockPos openPos = scratch.position(0, x, maximum, z);
-        BlockPos.MutableBlockPos floorPos = scratch.position(1, x, maximum, z);
-
-        for (int openY = maximum; openY >= minimum; openY--) {
-            openPos.setY(openY);
-            BlockState open = chunk.getBlockState(openPos);
-            if (isOpenEmissiveFeature(level, openPos, open)
-                    || (MapConfig.displayFlowers && visualClassifier.info(open).flower())) {
-                return openY;
-            }
-            if (open.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
-                WaterFloor waterFloor = resolveWaterFloor(level, chunk, floorPos, openY, minimum);
-                if (waterFloor != null) return waterFloor.y();
-                continue;
-            }
-            if (!open.getFluidState().isEmpty()) return openY;
-            boolean openSpace = open.isAir() || caveStateClassifier.isCollisionEmpty(level, openPos, open);
-            if (!openSpace || openY <= level.getMinBuildHeight()) continue;
-            floorPos.setY(openY - 1);
-            BlockState floor = chunk.getBlockState(floorPos);
-            if (floor.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
-                WaterFloor waterFloor = resolveWaterFloor(level, chunk, floorPos, openY - 1, minimum);
-                if (waterFloor != null) return waterFloor.y();
-                continue;
-            }
-            boolean floorOpen = floor.isAir()
-                    || (caveStateClassifier.isCollisionEmpty(level, floorPos, floor)
-                            && floor.getFluidState().isEmpty());
-            if (!floorOpen) return openY - 1;
-        }
-        return fallbackY;
+        int resolvedY = cavePixelY(getCavePixel(level, chunk, x, layerY, z, fullView));
+        return resolvedY == CaveRegion.NO_SURFACE ? fallbackY : resolvedY;
     }
 
     private int applyAbgrShade(int abgr, float shade) {

@@ -16,9 +16,15 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.TransparentBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -98,7 +104,7 @@ public final class CaveMode {
      * A one-second stable layer window prevents stair/elytra/player-Y jitter from
      * rebasing thousands of retained Layered projection products. */
     private static final int AUTO_LAYER_STABLE_TICKS = 20;
-    /** Prevent stair steps and small jumps from oscillating around a band edge. */
+    /** Prevent stair steps and small jumps from oscillating around the active layer Y. */
     private static final int AUTO_LAYER_BOUNDARY_HYSTERESIS = 3;
     private static final int AUTO_LAYER_FAST_SWITCH_DISTANCE = 32;
     private static final int LAYER_DEPTH = 32;
@@ -233,12 +239,7 @@ public final class CaveMode {
         int automaticY = clampY(mc.level,
                 CaveLayerBand.projectionTopY(CaveView.LAYERED, anchorY));
         if (dimension.equals(activeDimension) && activeLayerY != Integer.MIN_VALUE) {
-            int activeBand = CaveLayerBand.key(CaveView.LAYERED, activeLayerY);
-            int lowerSwitchY = CaveLayerBand.lowerY(activeBand)
-                    - AUTO_LAYER_BOUNDARY_HYSTERESIS;
-            int upperSwitchY = CaveLayerBand.upperY(activeBand)
-                    + AUTO_LAYER_BOUNDARY_HYSTERESIS;
-            if (anchorY >= lowerSwitchY && anchorY <= upperSwitchY) {
+            if (Math.abs(anchorY - activeLayerY) <= AUTO_LAYER_BOUNDARY_HYSTERESIS) {
                 automaticY = activeLayerY;
             }
         }
@@ -578,15 +579,8 @@ public final class CaveMode {
 
     private static boolean isSubstantialBarrier(Level level,
             BlockPos.MutableBlockPos pos, BlockState state) {
-        if (state == null || state.isAir() || state.is(BlockTags.LEAVES)
-                || !state.getFluidState().isEmpty() || state.canBeReplaced()
-                || state.getPistonPushReaction() == PushReaction.DESTROY) return false;
-        MapVisualClassifier.VisualInfo visual =
-                MapVisualClassifier.getInstance().info(state);
-        if (visual.leaves() || visual.flower()
-                || visual.role() != MapVisualClassifier.Role.OPAQUE_BASE) return false;
-        if (state.blocksMotion()) return true;
-        return !CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state);
+        return !isPassThrough(state)
+                && (state.blocksMotion() || !CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state));
     }
 
     private static LevelChunk fullChunk(Level level, int chunkX, int chunkZ) {
@@ -599,7 +593,7 @@ public final class CaveMode {
     }
 
     public static boolean shouldScanFromWorldTop(Level level) {
-        return false;
+        return level != null && (level.dimensionType().hasCeiling() || !level.dimensionType().hasSkyLight());
     }
 
     public static final int CAVE_NOT_ACTIVE = Integer.MAX_VALUE;
@@ -624,6 +618,8 @@ public final class CaveMode {
         int startZ = z - roofRadius;
 
         boolean ignoringHeightmaps = world.dimensionType().hasCeiling() || !world.dimensionType().hasSkyLight();
+        int bottom = y;
+        int top = Integer.MAX_VALUE;
         int potentialResult = defaultCaveStart;
         LevelChunk prevChunk = null;
         BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
@@ -640,9 +636,6 @@ public final class CaveMode {
                     return CAVE_NOT_ACTIVE;
                 }
 
-                int top;
-                int bottom = y;
-
                 if (!ignoringHeightmaps) {
                     int skyLight = world.getBrightness(LightLayer.SKY, mutablePos);
                     if (skyLight >= 15) {
@@ -650,27 +643,27 @@ public final class CaveMode {
                     }
                     int insideX = currentX & 15;
                     int insideZ = currentZ & 15;
+                    bottom = y;
                     top = bchunk.getHeight(Heightmap.Types.WORLD_SURFACE, insideX, insideZ);
-                } else {
-                    if (bchunk != prevChunk) {
-                        LevelChunkSection[] sections = bchunk.getSections();
-                        if (sections.length == 0) return CAVE_NOT_ACTIVE;
+                } else if (bchunk != prevChunk) {
+                    LevelChunkSection[] sections = bchunk.getSections();
+                    if (sections.length == 0) return CAVE_NOT_ACTIVE;
 
-                        int playerSection = (y - worldBottomY) >> 4;
-                        boolean foundSomething = false;
-                        for (int i = playerSection; i < sections.length; ++i) {
-                            LevelChunkSection sec = sections[i];
-                            if (sec == null || sec.hasOnlyAir()) continue;
-                            if (!foundSomething) {
-                                bottom = Math.max(bottom, worldBottomY + (i << 4));
-                                foundSomething = true;
-                            }
-                            top = worldBottomY + (i << 4) + 15;
+                    int playerSection = (y - worldBottomY) >> 4;
+                    if (playerSection < 0) playerSection = 0;
+                    boolean foundSomething = false;
+                    bottom = y;
+                    for (int i = playerSection; i < sections.length; ++i) {
+                        LevelChunkSection sec = sections[i];
+                        if (sec == null || sec.hasOnlyAir()) continue;
+                        if (!foundSomething) {
+                            bottom = Math.max(bottom, worldBottomY + (i << 4));
+                            foundSomething = true;
                         }
-                        if (!foundSomething) return CAVE_NOT_ACTIVE;
-                        prevChunk = bchunk;
+                        top = worldBottomY + (i << 4) + 15;
                     }
-                    top = worldTopY;
+                    if (!foundSomething) return CAVE_NOT_ACTIVE;
+                    prevChunk = bchunk;
                 }
 
                 if (top < worldBottomY) return CAVE_NOT_ACTIVE;
@@ -678,7 +671,7 @@ public final class CaveMode {
 
                 for (int currentY = bottom; currentY <= top; ++currentY) {
                     mutablePos.setY(currentY);
-                    BlockState state = world.getBlockState(mutablePos);
+                    BlockState state = bchunk.getBlockState(mutablePos);
                     if (isPassThrough(state)) continue;
 
                     if (o == roofRadius && p == roofRadius) {
@@ -694,15 +687,125 @@ public final class CaveMode {
         return potentialResult;
     }
 
-    private static boolean isPassThrough(BlockState state) {
+    /**
+     * Blocks that do NOT count as an opaque cave ceiling when detecting whether the
+     * player is inside a cave (transparentCache).
+     */
+    public static boolean isPassThrough(BlockState state) {
         if (state == null || state.isAir()) return true;
         if (state.getPistonPushReaction() == PushReaction.DESTROY) return true;
-        if (state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) return true;
+        if (!state.getFluidState().isEmpty() || state.getBlock() instanceof LiquidBlock) return true;
         if (state.is(BlockTags.LEAVES)) return true;
-        if (state.is(net.minecraft.world.level.block.Blocks.BARRIER)) return true;
+        if (state.is(Blocks.BARRIER) || state.is(Blocks.LIGHT)) return true;
+        if (state.canBeReplaced()) return true;
+        if (state.getBlock() instanceof TransparentBlock) return true;
 
         MapVisualClassifier.VisualInfo visual = MapVisualClassifier.getInstance().info(state);
-        return visual.leaves() || visual.flower();
+        if (visual.leaves() || visual.flower()) return true;
+        return visual.role() != MapVisualClassifier.Role.OPAQUE_BASE;
+    }
+
+    /**
+     * Unified predicate for whether a block counts as solid underground terrain
+     * that transitions Full Cave's {@code shouldEnterGround} from {@code true} to {@code false}.
+     * Used by both live chunk scanning ({@link ChunkScanner}) and Anvil {@code .mca}
+     * slicing ({@link CaveTextureManager}) so both pipelines produce identical results.
+     */
+    public static boolean isUndergroundSolidRoof(BlockGetter level, BlockPos pos, BlockState state) {
+        if (state == null || state.isAir() || !state.getFluidState().isEmpty()) {
+            return false;
+        }
+        if (state.ignitedByLava() || state.canBeReplaced()
+                || state.getPistonPushReaction() == PushReaction.DESTROY
+                || state.getBlock() instanceof TransparentBlock) {
+            return false;
+        }
+        if (state.is(BlockTags.LEAVES) || state.is(BlockTags.LOGS)
+                || state.is(BlockTags.PLANKS) || state.is(BlockTags.FENCES)
+                || state.is(BlockTags.FENCE_GATES) || state.is(BlockTags.RAILS)
+                || state.is(BlockTags.WOOL) || state.is(BlockTags.WOOL_CARPETS)
+                || state.is(BlockTags.BANNERS) || state.is(BlockTags.SIGNS)
+                || state.is(BlockTags.DOORS) || state.is(BlockTags.TRAPDOORS)
+                || state.is(BlockTags.WART_BLOCKS) || state.is(BlockTags.ICE)
+                || state.is(Blocks.BROWN_MUSHROOM_BLOCK)
+                || state.is(Blocks.RED_MUSHROOM_BLOCK)
+                || state.is(Blocks.MUSHROOM_STEM)
+                || state.is(Blocks.MANGROVE_ROOTS)
+                || state.is(Blocks.CACTUS)
+                || state.is(Blocks.SUGAR_CANE)
+                || state.is(Blocks.BAMBOO)
+                || state.is(Blocks.SHROOMLIGHT)
+                || state.is(Blocks.MELON)
+                || state.is(Blocks.PUMPKIN)
+                || state.is(Blocks.CARVED_PUMPKIN)
+                || state.is(Blocks.JACK_O_LANTERN)
+                || state.is(Blocks.HAY_BLOCK)
+                || state.is(Blocks.SNOW_BLOCK)
+                || state.is(Blocks.POWDER_SNOW)
+                || state.is(Blocks.COBWEB)
+                || state.is(Blocks.SCAFFOLDING)
+                || state.is(Blocks.BARRIER)
+                || state.is(Blocks.LIGHT)) {
+            return false;
+        }
+        MapVisualClassifier.VisualInfo visual = MapVisualClassifier.getInstance().info(state);
+        if (visual.leaves() || visual.flower()
+                || visual.role() != MapVisualClassifier.Role.OPAQUE_BASE) {
+            return false;
+        }
+        return state.blocksMotion()
+                || !CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state);
+    }
+
+    public static boolean isUndergroundSolidRoof(BlockState state) {
+        return isUndergroundSolidRoof(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, state);
+    }
+
+    /**
+     * Returns true if {@code state} should be treated as open air / invisible decoration
+     * during cave column traversal (setting {@code underair = true} and passing through
+     * to expose the floor beneath).
+     */
+    public static boolean isCaveOpenOrInvisible(BlockState state, boolean showFlowers) {
+        if (state == null || state.isAir()) return true;
+        if (!state.getFluidState().isEmpty()) return false;
+        if (state.is(Blocks.BARRIER) || state.is(Blocks.LIGHT)
+                || state.is(Blocks.STRUCTURE_VOID)) return true;
+
+        MapVisualClassifier.VisualInfo visual = MapVisualClassifier.getInstance().info(state);
+        if (visual.role() == MapVisualClassifier.Role.INVISIBLE
+                || visual.invisibleDecoration()) {
+            return true;
+        }
+        if (visual.flower()) {
+            return !showFlowers;
+        }
+
+        String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
+        if (path.equals("short_grass") || path.equals("grass")
+                || path.equals("tall_grass") || path.equals("fern")
+                || path.equals("large_fern") || path.equals("dead_bush")
+                || path.equals("vine") || path.endsWith("_vines")
+                || path.endsWith("_vines_plant") || path.equals("hanging_roots")
+                || path.equals("spore_blossom") || path.equals("cobweb")
+                || path.endsWith("_web") || path.equals("sugar_cane")
+                || path.equals("bamboo_sapling") || path.equals("kelp")
+                || path.equals("kelp_plant") || path.equals("seagrass")
+                || path.equals("tall_seagrass") || path.equals("tripwire")) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Returns true if {@code state} is a low-profile/thin floor block (carpet, rail,
+     * redstone wire, snow layer, pressure plate, repeater, glow lichen, etc.) whose
+     * effective height for slope shading should be adjusted by -1 (short-block logic).
+     */
+    public static boolean isShortFloorBlock(BlockGetter level, BlockPos pos, BlockState state) {
+        if (state == null || state.isAir() || !state.getFluidState().isEmpty()) return false;
+        if (CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state)) return true;
+        return CAVE_STATE_CLASSIFIER.collisionTop(level, pos, state) < 0.25f;
     }
 
     private record CaveContext(boolean covered, int suggestedTopY, int confidence) {
