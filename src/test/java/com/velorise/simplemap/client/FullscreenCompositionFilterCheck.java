@@ -1,4 +1,7 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.gpu.GpuPageTable.PageTableEntry;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.renderer.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,7 +18,7 @@ public final class FullscreenCompositionFilterCheck {
         String caveBranch = Files.readString(Path.of(
                 "src/main/java/com/velorise/simplemap/client/cave/CaveBranchAtlas.java"));
         String surfaceBranch = Files.readString(Path.of(
-                "src/main/java/com/velorise/simplemap/client/cave/SurfaceBranchAtlas.java"));
+                "src/main/java/com/velorise/simplemap/client/lod/SurfaceBranchAtlas.java"));
         String surfaceLod = Files.readString(Path.of(
                 "src/main/java/com/velorise/simplemap/client/RegionSurfaceLodService.java"));
 

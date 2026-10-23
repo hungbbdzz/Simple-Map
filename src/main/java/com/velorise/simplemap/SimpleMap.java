@@ -1,36 +1,28 @@
 package com.velorise.simplemap;
+import com.velorise.simplemap.client.RegionDataStore;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager.Waypoint;
+import com.velorise.simplemap.client.cave.*;
 
-import com.velorise.simplemap.client.AddWaypointScreen;
-import com.velorise.simplemap.client.BlockColorScreen;
-import com.velorise.simplemap.client.BlockColorManagerScreen;
 import com.velorise.simplemap.client.ChunkScanner;
-import com.velorise.simplemap.client.CaveMode;
-import com.velorise.simplemap.client.CaveTextureManager;
-import com.velorise.simplemap.client.DimensionTeleportTransition;
-import com.velorise.simplemap.client.FullCaveTextureManager;
-import com.velorise.simplemap.client.MapLightManager;
-import com.velorise.simplemap.client.MapArchitectureCoordinator;
+import com.velorise.simplemap.client.MapManager.MapTeleportController;
+import com.velorise.simplemap.client.MapManager.MapLightManager;
+import com.velorise.simplemap.client.MapManager.MapLightManager.LightRegion;
+import com.velorise.simplemap.client.MapManager.MapArchitectureCoordinator;
 import com.velorise.simplemap.client.MapActivityGate;
-import com.velorise.simplemap.client.MapKeybindActions;
-import com.velorise.simplemap.client.MapConfig;
-import com.velorise.simplemap.client.MapConfigScreen;
-import com.velorise.simplemap.client.MapDebugOverlay;
+import com.velorise.simplemap.client.SimpleMapClientMod.MapKeybindActions;
+import com.velorise.simplemap.client.MapManager.MapConfig;
 import com.velorise.simplemap.client.MapDebugRecorder;
-import com.velorise.simplemap.client.MapForegroundWriter;
 import com.velorise.simplemap.client.MapManager;
 import com.velorise.simplemap.client.MapMutationBus;
-import com.velorise.simplemap.client.MapObservationScheduler;
+import com.velorise.simplemap.client.MapWorkScheduler.MapObservationScheduler;
 import com.velorise.simplemap.client.MapOverviewTextureManager;
 import com.velorise.simplemap.client.MapPerformanceGovernor;
-import com.velorise.simplemap.client.MapPublicationCoordinator;
-import com.velorise.simplemap.client.MapScreen;
 import com.velorise.simplemap.client.MapViewportCoordinator;
 import com.velorise.simplemap.client.MinimapRenderer;
-import com.velorise.simplemap.client.PinNavigation;
 import com.velorise.simplemap.client.MapTextureManager;
-import com.velorise.simplemap.client.RegionDataStore;
-import com.velorise.simplemap.client.WaypointManager;
-import com.velorise.simplemap.client.cave.CavePipeline;
+import com.velorise.simplemap.client.gui.*;
+import com.velorise.simplemap.client.waypoint.*;
 import com.velorise.simplemap.network.ClientNetworkHandler;
 import com.velorise.simplemap.network.NetworkHandler;
 import com.velorise.simplemap.network.payload.SyncConfigPayload;
@@ -411,7 +403,7 @@ public class SimpleMap {
         public static void onClientTick(ClientTickEvent.Post event) {
             Minecraft mc = Minecraft.getInstance();
             if (mc.level == null || mc.player == null) return;
-            DimensionTeleportTransition.tick();
+            MapTeleportController.tickTransition();
             // Movement must be sampled before save, mutation, scan, cave and GPU
             // admission so every producer observes the same hard-gate epoch.
             MapActivityGate.getInstance().update(mc);
@@ -425,7 +417,7 @@ public class SimpleMap {
             // their maximum budgets independently in the same tick.
             MapObservationScheduler.getInstance().tick(mc,
                     SimpleMap.isMapUnlocked(mc.player),
-                    mc.screen instanceof com.velorise.simplemap.client.MapScreen);
+                    mc.screen instanceof MapScreen);
             MapDebugRecorder.getInstance().tick(mc);
 
             // 2.25. Create one bounded death waypoint on the transition into death.
@@ -548,16 +540,16 @@ public class SimpleMap {
              */
             if (mc.screen == null) {
                 MapPerformanceGovernor.getInstance().onFrame();
-                MapForegroundWriter.getInstance().onFrame(mc,
+                ChunkScanner.getInstance().onForegroundFrame(mc,
                         SimpleMap.isMapUnlocked(mc.player));
                 MinimapRenderer.getInstance().renderHUD(event.getGuiGraphics(), 1.0f);
-                DimensionTeleportTransition.render(event.getGuiGraphics());
+                MapTeleportController.renderTransition(event.getGuiGraphics());
                 if (mc.level != null && mc.player != null) {
                     long frameId = ++mapRenderFrameId;
-                    MapPublicationCoordinator.getInstance().drainFrame(frameId);
+                    MapViewportCoordinator.getInstance().drainPublicationFrame(frameId);
                     MapArchitectureCoordinator.getInstance().onFrameBoundary(frameId);
                 }
-                MapDebugOverlay.render(event.getGuiGraphics());
+                MapScreen.MapDebugOverlay.render(event.getGuiGraphics());
             }
         }
 
@@ -566,7 +558,7 @@ public class SimpleMap {
             MapPerformanceGovernor.getInstance().onFrame();
             Minecraft mc = Minecraft.getInstance();
             if (event.getScreen() instanceof MapScreen) {
-                MapForegroundWriter.getInstance().onFrame(mc,
+                ChunkScanner.getInstance().onForegroundFrame(mc,
                         SimpleMap.isMapUnlocked(mc.player));
             }
             if (MinimapRenderer.isAllowedScreenForMinimap(event.getScreen())) {
@@ -575,10 +567,10 @@ public class SimpleMap {
             }
             if (mc.level != null && mc.player != null) {
                 long frameId = ++mapRenderFrameId;
-                MapPublicationCoordinator.getInstance().drainFrame(frameId);
+                MapViewportCoordinator.getInstance().drainPublicationFrame(frameId);
                 MapArchitectureCoordinator.getInstance().onFrameBoundary(frameId);
             }
-            MapDebugOverlay.render(event.getGuiGraphics());
+            MapScreen.MapDebugOverlay.render(event.getGuiGraphics());
         }
 
         @SubscribeEvent
@@ -602,7 +594,7 @@ public class SimpleMap {
             // GPU resources during the same logout event.
             MapManager.getInstance().flushAndClear();
             MapObservationScheduler.getInstance().reset();
-            MapForegroundWriter.getInstance().reset();
+            ChunkScanner.getInstance().resetForegroundWriter();
             CaveMode.clearManualLayer();
             MapConfig.serverExtensionAvailable = false;
             MapConfig.serverCaveMapMode = 0;

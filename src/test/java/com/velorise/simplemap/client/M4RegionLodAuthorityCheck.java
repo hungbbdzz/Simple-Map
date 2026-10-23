@@ -1,9 +1,11 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.RegionSurfaceLodService.MapRegionLodPolicy;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapSurfaceDemandPolicy;
 
-import com.velorise.simplemap.client.lod.PreparedBranch;
-import com.velorise.simplemap.client.lod.RegionLodDeriver;
-import com.velorise.simplemap.client.lod.RegionLodGraph;
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph.PreparedBranch;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph.RegionLodDeriver;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
 
 import java.util.Arrays;
 import java.util.List;

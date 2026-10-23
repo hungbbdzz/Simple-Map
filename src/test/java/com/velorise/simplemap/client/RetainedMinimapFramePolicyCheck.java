@@ -1,4 +1,6 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.renderer.RetainedFullscreenFramePolicy.RetainedMinimapFramePolicy;
+import com.velorise.simplemap.client.renderer.*;
 
 /** Dependency-free invalidation/coalescing checks for retained minimap composition. */
 public final class RetainedMinimapFramePolicyCheck {

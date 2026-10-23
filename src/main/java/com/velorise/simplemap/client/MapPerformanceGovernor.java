@@ -217,15 +217,15 @@ public final class MapPerformanceGovernor {
         // does not wait seconds for the first 16x16 tiles.
         // Cave exact/branch projection and GPU publication already consume their
         // own bounded budgets. A 2 ms client-thread source slice on top of those
-        // stages caused a visible hitch every AUTO transition. Xaero advances its
+        // stages caused a visible hitch every AUTO transition. The governor advances its
         // persistent writer under a strict elapsed-time deadline; keep this source
-        // contribution sub-millisecond and let retained work continue next frame.
-        long base = cave ? 850_000L : 300_000L;
-        return Math.max(80_000L, (long) (base * headroomFactor()));
+        // contribution and let retained work continue next frame.
+        long base = cave ? 4_500_000L : 300_000L;
+        return Math.max(cave ? 1_500_000L : 80_000L, (long) (base * headroomFactor()));
     }
 
     /**
-     * Xaero-style travel writer slice: make bounded forward progress only while the
+     * Travel writer slice: make bounded forward progress only while the
      * current frame and integrated server have real headroom. When vanilla starts
      * generating/meshing chunks this returns zero immediately, retaining the last
      * map image rather than contributing to the hitch.
@@ -236,17 +236,17 @@ public final class MapPerformanceGovernor {
         double serverMspt = integratedServerMspt();
         boolean active = activity.isActivelyMoving();
         /*
-         * Xaero does not make map writing binary while the player travels. It
+         * The governor does not make map writing binary while the player travels. It
          * advances a persistent cursor under a hard elapsed-time deadline. Keep the
          * same invariant here: even when vanilla generation is busy, one very small
          * coherent pulse is retained so the route cannot become a chain of holes.
          * The pulse never expands mutation/saved-world/background lanes.
          */
         if (serverMspt >= 40.0D) {
-            return cave ? 250_000L : 180_000L;
+            return cave ? 1_500_000L : 180_000L;
         }
-        double serverFactor = serverMspt >= 30.0D ? 0.45D
-                : serverMspt >= 22.0D ? 0.70D : 1.0D;
+        double serverFactor = serverMspt >= 30.0D ? 0.60D
+                : serverMspt >= 22.0D ? 0.80D : 1.0D;
         long base;
         if (underPressure()) {
             // Hard per-tick ceilings: enough to finish useful chunks, too small to
@@ -259,8 +259,8 @@ public final class MapPerformanceGovernor {
                     ? (active ? 1_600_000L : 2_200_000L)
                     : (active ? 1_100_000L : 1_500_000L);
         }
-        double factor = Math.max(0.55D, headroomFactor()) * serverFactor;
-        long minimum = cave ? 250_000L : 180_000L;
+        double factor = Math.max(0.60D, headroomFactor()) * serverFactor;
+        long minimum = cave ? 1_500_000L : 180_000L;
         return Math.max(minimum, (long) (base * factor));
     }
 
@@ -279,10 +279,10 @@ public final class MapPerformanceGovernor {
         // resumable slice and let the saved-world decoder fill the broad viewport
         // asynchronously. A 5 ms scanner slice alone consumed most of the 8 ms
         // frame budget needed for 125 FPS.
-        if (scale < 0.20f) base = fastLoading ? 500_000L : 250_000L;
-        else if (scale < 0.55f) base = fastLoading ? 800_000L : 450_000L;
-        else base = fastLoading ? 1_100_000L : 650_000L;
-        return Math.max(150_000L, (long) (base * headroomFactor()));
+        if (scale < 0.20f) base = fastLoading ? 8_000_000L : 4_000_000L;
+        else if (scale < 0.55f) base = fastLoading ? 12_000_000L : 6_000_000L;
+        else base = fastLoading ? 16_000_000L : 8_000_000L;
+        return Math.max(1_000_000L, (long) (base * headroomFactor()));
     }
 
     public long fullscreenCaveBudgetNanos(float scale, boolean fastLoading) {
@@ -291,10 +291,10 @@ public final class MapPerformanceGovernor {
             return movementStreamingBudgetNanos(true);
         }
         long base;
-        if (scale < 0.20f) base = fastLoading ? 350_000L : 180_000L;
-        else if (scale < 0.55f) base = fastLoading ? 550_000L : 300_000L;
-        else base = fastLoading ? 800_000L : 450_000L;
-        return Math.max(120_000L, (long) (base * headroomFactor()));
+        if (scale < 0.20f) base = fastLoading ? 8_000_000L : 4_000_000L;
+        else if (scale < 0.55f) base = fastLoading ? 12_000_000L : 6_000_000L;
+        else base = fastLoading ? 16_000_000L : 8_000_000L;
+        return Math.max(1_000_000L, (long) (base * headroomFactor()));
     }
 
     public long textureUploadBudgetNanos(boolean focus) {
@@ -384,7 +384,7 @@ public final class MapPerformanceGovernor {
              * Travel keeps one small loaded-chunk writer and one-page publication
              * lane alive. Saved-world decode, mutation ingress, warmup and background
              * archive remain disabled. Under actual frame/server pressure even this
-             * foreground lane pauses, matching Xaero's elapsed-time writer behaviour.
+             * foreground lane pauses, matching elapsed-time writer behaviour.
              */
             long writerBudget = movementStreamingBudgetNanos(false);
             if (writerBudget <= 0L) {

@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.cave.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -11,7 +12,7 @@ public final class HoleRecoveryPolicyCheck {
         String plan = Files.readString(Path.of(root + "MapRenderPlan.java"));
         String renderer = Files.readString(Path.of(root + "MapRenderer.java"));
         String textures = Files.readString(Path.of(root + "MapTextureManager.java"));
-        String cave = Files.readString(Path.of(root + "CaveTextureManager.java"));
+        String cave = Files.readString(Path.of(root + "cave/CaveTextureManager.java"));
 
         require(plan.contains("PHASE_LEGACY_UNDERLAY = 2"),
                 "missing stable legacy underlay phase");

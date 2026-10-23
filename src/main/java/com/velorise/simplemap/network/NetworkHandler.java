@@ -1,7 +1,7 @@
 package com.velorise.simplemap.network;
+import com.velorise.simplemap.client.RegionDataStore;
 
 import com.velorise.simplemap.ModItems;
-import com.velorise.simplemap.client.RegionDataStore;
 import com.velorise.simplemap.network.payload.AckLearnRegionPayload;
 import com.velorise.simplemap.network.payload.InitSaveBookPayload;
 import com.velorise.simplemap.network.payload.LearnBookCompletePayload;

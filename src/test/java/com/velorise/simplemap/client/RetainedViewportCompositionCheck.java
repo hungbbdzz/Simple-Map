@@ -1,4 +1,6 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.renderer.RetainedFullscreenFramePolicy.RetainedViewportComposition;
+import com.velorise.simplemap.client.renderer.*;
 
 /** Dependency-free checks for retained fullscreen presentation transforms. */
 public final class RetainedViewportCompositionCheck {

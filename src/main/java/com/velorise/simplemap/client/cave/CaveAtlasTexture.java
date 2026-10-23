@@ -16,16 +16,16 @@ import java.nio.ByteBuffer;
  * reallocating the storage there keeps the atlas valid without retaining a second
  * CPU copy of every atlas level.
  */
-final class CaveAtlasTexture extends AbstractTexture {
+public final class CaveAtlasTexture extends AbstractTexture {
     private final int size;
     private final boolean linearMinification;
     private final Runnable storageAllocatedCallback;
 
-    CaveAtlasTexture(int size, Runnable storageAllocatedCallback) {
+    public CaveAtlasTexture(int size, Runnable storageAllocatedCallback) {
         this(size, false, storageAllocatedCallback);
     }
 
-    CaveAtlasTexture(int size, boolean linearMinification,
+    public CaveAtlasTexture(int size, boolean linearMinification,
             Runnable storageAllocatedCallback) {
         if (size <= 0) throw new IllegalArgumentException("Atlas size must be positive");
         this.size = size;
@@ -39,12 +39,12 @@ final class CaveAtlasTexture extends AbstractTexture {
         else RenderSystem.recordRenderCall(this::allocateStorage);
     }
 
-    void allocateStorage() {
+    public void allocateStorage() {
         RenderSystem.assertOnRenderThreadOrInit();
         GlStateManager._bindTexture(getId());
         // Cave hierarchy levels are already prefiltered/downsampled, so their
         // callers keep nearest minification. Surface exact leaves deliberately opt
-        // into linear minification (matching Xaero World Map RegionTexture) because
+        // into linear minification (matching linear minification) because
         // fractional ~1.0x zoom otherwise aliases block/chunk cadence into water
         // stripes. Magnification remains pixel-exact NEAREST for every atlas.
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER,

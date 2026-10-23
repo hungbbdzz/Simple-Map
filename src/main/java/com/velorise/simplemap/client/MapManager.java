@@ -1,15 +1,32 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
+import com.velorise.simplemap.client.color.SurfaceColorizer.MapVisualClassifier;
+import java.util.BitSet;
+import com.velorise.simplemap.client.renderer.*;
+import com.velorise.simplemap.client.color.SurfaceColorizer.MapColorProfile;
+import com.velorise.simplemap.client.RegionDataStore.SurfaceChunkCoverage;
+import com.velorise.simplemap.client.RegionDataStore.RegionContainerV2;
+import com.velorise.simplemap.client.MapWorkScheduler.MapProcessor;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager.Waypoint;
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapUploadEngine;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager.CaveStateClassifier;
+import com.velorise.simplemap.client.color.SurfaceColorizer.SurfaceTintData;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.color.*;
+import com.velorise.simplemap.client.gpu.*;
+import com.velorise.simplemap.client.MinimapRenderer.MinimapService;
 
-import com.velorise.simplemap.client.persistence.v2.MapPersistenceV2Service;
-import com.velorise.simplemap.client.cave.archive.CaveArchiveV2Service;
-import com.velorise.simplemap.client.cave.projection.CaveProjectionServiceV2;
+import com.velorise.simplemap.client.RegionDataStore.RegionContainerV2.MapPersistenceV2Service;
+import com.velorise.simplemap.client.gui.*;
+import com.velorise.simplemap.client.waypoint.*;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.velorise.simplemap.client.pipeline.MapWorkGraph;
-import com.velorise.simplemap.client.pipeline.MapWorkKey;
-import com.velorise.simplemap.client.pipeline.MapWorkStage;
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
-import com.velorise.simplemap.client.pipeline.RegionRecord;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.MapWorkKey;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.MapWorkStage;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RegionRecord;
 import com.velorise.simplemap.client.session.MapSessionManager;
 import it.unimi.dsi.fastutil.longs.Long2BooleanOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
@@ -17,6 +34,8 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -96,6 +115,19 @@ public class MapManager {
     private long lastSaveTime;
     private volatile boolean currentDimensionHasSavedData;
     private volatile long lastSavedDataProbeMs;
+
+    private static final long PERSIST_ACTIVE_RETRY_MS = 1_000L;
+    private static final long PERSIST_SURFACE_IDLE_INTERVAL_MS = 10_000L;
+    private static final long PERSIST_LIGHT_IDLE_INTERVAL_MS = 10_000L;
+    private static final long PERSIST_PLAYER_IDLE_BEFORE_SAVE_MS = 3_000L;
+    private static final double PERSIST_MOVEMENT_EPSILON_SQ = 0.0001D;
+
+    private long nextSurfacePumpMs;
+    private long nextLightPumpMs;
+    private long lastPlayerMovementMs;
+    private double lastPlayerX = Double.NaN;
+    private double lastPlayerZ = Double.NaN;
+    private int nextSubsystem;
     /** Immutable filesystem discovery snapshot. Never walk cache directories from
      * minimap/fullscreen rendering or waypoint lookup. */
     private volatile List<String> discoveredDimensionsSnapshot = List.of();
@@ -309,7 +341,7 @@ public class MapManager {
         // dimension-bound stores are in transition.
         MapSessionManager.getInstance().closeActive();
         saveDirtyRegionsAsync();
-        MapPersistenceCoordinator.getInstance().reset();
+        resetPersistence();
         worldGeneration.incrementAndGet();
         // Packet callbacks target the player's live ClientLevel, not the remote
         // dimension selected by the fullscreen map. Never carry their compact
@@ -319,11 +351,8 @@ public class MapManager {
         clearSurfaceDimensionData();
         MapLightManager.getInstance().flushAndClear();
         CaveMapManager.getInstance().flushDataForDimensionSwitch();
-        FullCaveMapManager.getInstance().flushDataForDimensionSwitch();
         CaveTextureManager.getInstance().suspendForDimensionSwitch();
-        VerticalCaveArchiveManager.getInstance().flushAndClear();
         ChunkScanner.getInstance().reset();
-        RegionProcessor.getInstance().stop();
         // Surface exact/legacy keys, overview keys and unified cave keys all include
         // the dimension cache identity. Keep their last-good immutable images so a
         // dimension cycle is a source-context handoff rather than a destructive GPU
@@ -355,25 +384,15 @@ public class MapManager {
         currentDimensionProfile = DimensionMapProfile.resolve(
                 currentDimensionDir.toPath(), resourceId);
 
-        // Dimension is an archive/projection ownership boundary. Activate it before
-        // CaveMapManager opens its repository because persistence replay can index
-        // compact tiles immediately from setBaseDirectory().
-        CaveArchiveV2Service.getInstance().activateDimension(resourceId);
-        CaveProjectionServiceV2.getInstance().activateDimension(resourceId);
-
         MapLightManager.getInstance().setCacheDirectory(
                 new File(currentWorldDir, "light_cache/" + storageId));
-        // Cave storage is dimension-scoped, but never dimension-disabled. Xaero
+        // Cave storage is dimension-scoped, but never dimension-disabled. The engine
         // keeps the same per-dimension index for Surface, Layered and Full modes;
         // the selected cave-start controls projection without destroying or
         // bypassing the archive. Open dimensions such as The End therefore retain
         // their index while AUTO normally resolves to the surface view.
         CaveMapManager.getInstance().setBaseDirectory(
                 new File(currentWorldDir, "caves/" + storageId), currentDimensionDir);
-        FullCaveMapManager.getInstance().setCacheDirectory(
-                new File(currentWorldDir, "caves/" + storageId + "/full_v3_underground_entry"));
-        VerticalCaveArchiveManager.getInstance().setCacheDirectory(
-                new File(currentWorldDir, "caves/" + storageId + "/vertical_v3_underground_entry"));
         scanRegionFiles(currentDimensionDir);
         currentDimensionHasSavedData = !regionFileExists.isEmpty()
                 || hasAnyMapFiles(currentDimensionDir)
@@ -867,15 +886,14 @@ public class MapManager {
         MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().clearDerivedColorCaches();
         MapVisualClassifier.getInstance().clear();
-        MapBlockEntityVisualResolver.getInstance().clear();
-        com.velorise.simplemap.client.cave.CaveStateClassifier.getInstance().clear();
+        MapVisualClassifier.MapBlockEntityVisualResolver.getInstance().clear();
+        com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager.CaveStateClassifier.getInstance().clear();
 
         // Do not increment worldGeneration and do not clear any texture/data store.
         // Generation changes are reserved for a real world/dimension replacement.
         MapTextureManager.getInstance().invalidateStyle();
         MapOverviewTextureManager.getInstance().invalidateStyle();
         CaveTextureManager.getInstance().invalidateStyle();
-        FullCaveTextureManager.getInstance().invalidateStyle();
 
         // Do not enqueue every .smdat file in filesystem order. That old path
         // saturated the worker queue and made Reload All reveal random distant
@@ -929,7 +947,7 @@ public class MapManager {
     private void loadRegionAsync(Region region, File directory, long generation) {
         if (!region.beginLoad()) return;
         // Keep the same Region object in the loaded map while IO is saturated.
-        // Xaero keeps requested regions in a pull queue; repeatedly removing and
+        // The system keeps requested regions in a pull queue; repeatedly removing and
         // recreating them wastes allocations and can leave visible holes near the
         // viewport centre.
         MapWorkScheduler.scheduleIo(0L, TimeUnit.MILLISECONDS,
@@ -991,7 +1009,63 @@ public class MapManager {
     }
 
     public void tickSave() {
-        MapPersistenceCoordinator.getInstance().tick(this);
+        if (MapActivityGate.getInstance().blocksMapWork()) return;
+        long now = System.currentTimeMillis();
+        var minecraft = net.minecraft.client.Minecraft.getInstance();
+        if (minecraft.player == null) return;
+
+        double playerX = minecraft.player.getX();
+        double playerZ = minecraft.player.getZ();
+        if (Double.isNaN(lastPlayerX)) {
+            lastPlayerX = playerX;
+            lastPlayerZ = playerZ;
+            lastPlayerMovementMs = now;
+            return;
+        }
+        double dx = playerX - lastPlayerX;
+        double dz = playerZ - lastPlayerZ;
+        lastPlayerX = playerX;
+        lastPlayerZ = playerZ;
+        if (dx * dx + dz * dz > PERSIST_MOVEMENT_EPSILON_SQ) {
+            lastPlayerMovementMs = now;
+            return;
+        }
+
+        if (now - lastPlayerMovementMs < PERSIST_PLAYER_IDLE_BEFORE_SAVE_MS
+                || MapMutationBus.getInstance().pendingColumns() != 0
+                || MapMutationBus.getInstance().pendingChunks() != 0
+                || MapMutationBus.getInstance().pendingRegions() != 0
+                || MapWorkScheduler.ioQueuedCount() != 0) {
+            return;
+        }
+
+        switch (nextSubsystem++ % 3) {
+            case 0 -> {
+                if (now >= nextSurfacePumpMs) {
+                    int remaining = pumpDirtyRegionSaves(1);
+                    nextSurfacePumpMs = now + (remaining > 0
+                            ? PERSIST_ACTIVE_RETRY_MS : PERSIST_SURFACE_IDLE_INTERVAL_MS);
+                }
+            }
+            case 1 -> {
+                if (now >= nextLightPumpMs) {
+                    int remaining = MapLightManager.getInstance()
+                            .pumpDirtyRegionSaves(1);
+                    nextLightPumpMs = now + (remaining > 0
+                            ? PERSIST_ACTIVE_RETRY_MS : PERSIST_LIGHT_IDLE_INTERVAL_MS);
+                }
+            }
+            default -> CaveMapManager.getInstance().tickSave();
+        }
+    }
+
+    public void resetPersistence() {
+        nextSurfacePumpMs = 0L;
+        nextLightPumpMs = 0L;
+        lastPlayerMovementMs = 0L;
+        lastPlayerX = Double.NaN;
+        lastPlayerZ = Double.NaN;
+        nextSubsystem = 0;
     }
 
     /** Pulls at most {@code maximum} dirty surface regions into persistence. */
@@ -1033,7 +1107,7 @@ public class MapManager {
     public synchronized void flushAndClear() {
         saveDirtyRegionsAsync();
         MapSessionManager.getInstance().closeActive();
-        MapPersistenceCoordinator.getInstance().reset();
+        resetPersistence();
         worldGeneration.incrementAndGet();
         MapProcessor.getInstance().clear();
         clearCache();
@@ -1041,16 +1115,8 @@ public class MapManager {
         MapOverviewTextureManager.getInstance().clearCache();
         MapLightManager.getInstance().flushAndClear();
         CaveMapManager.getInstance().flushAndClear();
-        FullCaveMapManager.getInstance().flushAndClear();
-        // True world/session reset. Dimension navigation intentionally does not
-        // clear these retained per-dimension archives/projections.
-        CaveProjectionServiceV2.getInstance().clear();
-        CaveArchiveV2Service.getInstance().clear();
         CaveTextureManager.getInstance().clearCache();
-        FullCaveTextureManager.getInstance().clearCache();
-        VerticalCaveArchiveManager.getInstance().flushAndClear();
         ChunkScanner.getInstance().reset();
-        RegionProcessor.getInstance().stop();
     }
 
     private void clearCache() {
@@ -1598,7 +1664,7 @@ public class MapManager {
          * <p>PASS120 returned the old positive chunk revision for every no-op scan.
          * MapManager interpreted that as a fresh publication and dirtied the exact
          * page plus its halo again, producing 4,084 atomic page refreshes in the
-         * supplied ~248 s run. Xaero only updates a MapTileChunk buffer when its tile
+         * supplied ~248 s run. The system only updates a MapTileChunk buffer when its tile
          * transaction actually changed; mirror that invariant here.</p>
          */
         public long finishSurfaceChunkTransaction(int localChunkX, int localChunkZ) {
@@ -1823,7 +1889,7 @@ public class MapManager {
             lock.lock();
             try {
                 int chunkIndex = localChunkZ * 32 + localChunkX;
-                // Xaero exposes a MapTile only after its complete 16x16 payload is
+                // The system exposes a MapTile only after its complete 16x16 payload is
                 // available. Completion is observation state, not a count of
                 // non-void blocks: a fully scanned End-island edge (or an entirely
                 // void chunk) is authoritative even though fewer than 256 columns
@@ -1855,7 +1921,7 @@ public class MapManager {
          * point sampling aliased ocean-floor detail into the regular dashed/grid
          * pattern visible at wide zoom. PASS118 samples every 4 blocks (128x128)
          * and the worker linearly reduces 2x2 styled samples into each 8x8 output
-         * texel, matching Xaero's filtered child-to-branch minification much more
+         * texel, matching filtered child-to-branch minification much more
          * closely without cloning the full 512x512 region.
          */
         public RegionLodSnapshot snapshotLodLevel0() {
@@ -2339,4 +2405,1443 @@ public class MapManager {
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
+
+    public record DimensionMapProfile(String resourceId, int minY, int maxY,
+            boolean hasSkyLight, boolean hasCeiling, boolean forceBrightLightmap,
+            float ambientLight, double coordinateScale, boolean known) {
+        private static final int VERSION = 2;
+        private static final String FILE_NAME = ".dimension_profile";
+
+        public DimensionMapProfile {
+            resourceId = normalize(resourceId);
+            if (maxY < minY) maxY = minY;
+            if (!Float.isFinite(ambientLight)) ambientLight = 0.0f;
+            ambientLight = Math.max(0.0f, Math.min(1.0f, ambientLight));
+            if (!Double.isFinite(coordinateScale) || coordinateScale <= 0.0) {
+                coordinateScale = 1.0;
+            }
+        }
+
+        public static DimensionMapProfile fromLevel(Level level, String resourceId) {
+            if (level == null) return fallback(resourceId);
+            boolean forceBright = queryForceBrightLightmap(level);
+            double scale = queryCoordinateScale(level);
+            float ambient = queryAmbientLight(level);
+            return new DimensionMapProfile(resourceId,
+                    level.getMinBuildHeight(), level.getMaxBuildHeight() - 1,
+                    level.dimensionType().hasSkyLight(),
+                    level.dimensionType().hasCeiling(), forceBright, ambient, scale, true);
+        }
+
+        public static DimensionMapProfile resolve(Path dimensionDirectory,
+                String resourceId) {
+            DimensionMapProfile saved = load(dimensionDirectory, resourceId);
+            if (saved.known()) return saved;
+            DimensionMapProfile integrated = fromIntegratedServer(resourceId);
+            if (integrated != null) {
+                integrated.save(dimensionDirectory);
+                return integrated;
+            }
+            return saved;
+        }
+
+        public static DimensionMapProfile load(Path dimensionDirectory,
+                String resourceId) {
+            Path file = dimensionDirectory == null ? null
+                    : dimensionDirectory.resolve(FILE_NAME);
+            if (file == null || !Files.isRegularFile(file)) return fallback(resourceId);
+            java.util.Properties values = new java.util.Properties();
+            try (java.io.InputStream input = Files.newInputStream(file)) {
+                values.load(input);
+                int version = parseInt(values.getProperty("version"), 0);
+                if (version < 1 || version > VERSION) return fallback(resourceId);
+                String id = normalize(values.getProperty("resource_id", resourceId));
+                DimensionMapProfile fallback = fallback(id);
+                return new DimensionMapProfile(id,
+                        parseInt(values.getProperty("min_y"), fallback.minY()),
+                        parseInt(values.getProperty("max_y"), fallback.maxY()),
+                        Boolean.parseBoolean(values.getProperty("has_skylight")),
+                        Boolean.parseBoolean(values.getProperty("has_ceiling")),
+                        Boolean.parseBoolean(values.getProperty("force_bright_lightmap")),
+                        version >= 2
+                                ? parseFloat(values.getProperty("ambient_light"), fallback.ambientLight())
+                                : fallback.ambientLight(),
+                        parseDouble(values.getProperty("coordinate_scale"), 1.0),
+                        true);
+            } catch (IOException | RuntimeException ignored) {
+                return fallback(resourceId);
+            }
+        }
+
+        public void save(Path dimensionDirectory) {
+            if (dimensionDirectory == null || !known) return;
+            try {
+                Files.createDirectories(dimensionDirectory);
+                Path file = dimensionDirectory.resolve(FILE_NAME);
+                Path temp = dimensionDirectory.resolve(FILE_NAME + ".tmp");
+                java.util.Properties values = new java.util.Properties();
+                values.setProperty("version", Integer.toString(VERSION));
+                values.setProperty("resource_id", resourceId);
+                values.setProperty("min_y", Integer.toString(minY));
+                values.setProperty("max_y", Integer.toString(maxY));
+                values.setProperty("has_skylight", Boolean.toString(hasSkyLight));
+                values.setProperty("has_ceiling", Boolean.toString(hasCeiling));
+                values.setProperty("force_bright_lightmap",
+                        Boolean.toString(forceBrightLightmap));
+                values.setProperty("ambient_light", Float.toString(ambientLight));
+                values.setProperty("coordinate_scale", Double.toString(coordinateScale));
+                try (java.io.OutputStream output = Files.newOutputStream(temp)) {
+                    values.store(output, "SimpleMap dimension profile v" + VERSION);
+                }
+                try {
+                    Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException ignored) {
+                    Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
+                }
+            } catch (IOException ignored) {
+            }
+        }
+
+        public int clampY(int y) {
+            return Math.max(minY, Math.min(maxY, y));
+        }
+
+        public static DimensionMapProfile fallback(String resourceId) {
+            String id = normalize(resourceId);
+            return switch (id) {
+                case "minecraft:overworld" -> new DimensionMapProfile(id,
+                        -64, 319, true, false, false, 0.0f, 1.0, true);
+                case "minecraft:the_nether" -> new DimensionMapProfile(id,
+                        0, 255, false, true, false, 0.1f, 8.0, true);
+                case "minecraft:the_end" -> new DimensionMapProfile(id,
+                        0, 255, false, false, true, 0.0f, 1.0, true);
+                default -> new DimensionMapProfile(id,
+                        -64, 319, false, false, false, 0.0f, 1.0, false);
+            };
+        }
+
+        private static DimensionMapProfile fromIntegratedServer(String resourceId) {
+            String target = normalize(resourceId);
+            try {
+                Object server = Minecraft.getInstance().getSingleplayerServer();
+                if (server == null) return null;
+                Object levels = server.getClass().getMethod("getAllLevels").invoke(server);
+                if (!(levels instanceof Iterable<?> iterable)) return null;
+                for (Object candidate : iterable) {
+                    if (!(candidate instanceof Level level)) continue;
+                    if (!target.equals(normalize(level.dimension().location().toString()))) continue;
+                    return fromLevel(level, target);
+                }
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+            }
+            return null;
+        }
+
+        private static float queryAmbientLight(Level level) {
+            try {
+                return level.dimensionType().ambientLight();
+            } catch (Throwable ignored) {
+                return 0.0f;
+            }
+        }
+
+        private static double queryCoordinateScale(Level level) {
+            try {
+                return level.dimensionType().coordinateScale();
+            } catch (Throwable ignored) {
+                return 1.0;
+            }
+        }
+
+        private static boolean queryForceBrightLightmap(Level level) {
+            try {
+                Object effects = level.getClass().getMethod("effects").invoke(level);
+                if (effects == null) return false;
+                Object result = effects.getClass().getMethod("forceBrightLightmap").invoke(effects);
+                return result instanceof Boolean value && value;
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                return false;
+            }
+        }
+
+        private static int parseInt(String value, int fallback) {
+            try { return Integer.parseInt(value); }
+            catch (RuntimeException ignored) { return fallback; }
+        }
+
+        private static float parseFloat(String value, float fallback) {
+            try { return Float.parseFloat(value); }
+            catch (RuntimeException ignored) { return fallback; }
+        }
+
+        private static double parseDouble(String value, double fallback) {
+            try { return Double.parseDouble(value); }
+            catch (RuntimeException ignored) { return fallback; }
+        }
+
+        private static String normalize(String id) {
+            if (id == null || id.isBlank()) return "minecraft:overworld";
+            return id.trim().toLowerCase(java.util.Locale.ROOT);
+        }
+    }
+
+    /**
+     * Server-authoritative map teleport helper.
+     */
+    public static final class MapTeleportController {
+        private MapTeleportController() {
+        }
+
+        public static boolean canTeleport(Minecraft minecraft) {
+            return minecraft != null && minecraft.player != null
+                    && (minecraft.player.isCreative()
+                            || minecraft.player.isSpectator()
+                            || minecraft.player.hasPermissions(2));
+        }
+
+        public static int defaultTargetY(String dimension) {
+            String normalized = MapManager.normalizeDimensionResourceId(dimension)
+                    .toLowerCase(java.util.Locale.ROOT);
+            if (normalized.equals("minecraft:the_nether") || normalized.endsWith(":the_nether")
+                    || normalized.endsWith(":nether")) {
+                return 65;
+            }
+            if (normalized.equals("minecraft:the_end") || normalized.endsWith(":the_end")
+                    || normalized.endsWith(":end")) {
+                return 80;
+            }
+            return 100;
+        }
+
+        public static boolean teleport(Minecraft minecraft, String dimension,
+                int x, int y, int z) {
+            if (minecraft == null || minecraft.player == null
+                    || minecraft.player.connection == null) {
+                return false;
+            }
+            if (!canTeleport(minecraft)) {
+                minecraft.player.sendSystemMessage(Component.literal(
+                        "Teleport requires Creative, Spectator, or permission level 2."));
+                return false;
+            }
+
+            MapManager manager = MapManager.getInstance();
+            String targetDimension = manager.resolveDimensionResourceId(dimension);
+            net.minecraft.resources.ResourceLocation targetId = net.minecraft.resources.ResourceLocation.tryParse(targetDimension);
+            if (targetId == null) {
+                minecraft.player.sendSystemMessage(Component.literal(
+                        "Invalid target dimension: " + targetDimension));
+                return false;
+            }
+
+            String liveDimension = MapManager.normalizeDimensionResourceId(
+                    manager.getLiveDimensionResourceId());
+            boolean crossDimension = !targetId.toString().equals(liveDimension);
+            String command;
+            if (crossDimension) {
+                command = String.format(java.util.Locale.ROOT,
+                        "execute in %s run teleport @s %d %d %d",
+                        targetId, x, y, z);
+                startTransition(targetId.toString(), command);
+                return true;
+            } else {
+                command = String.format(java.util.Locale.ROOT,
+                        "teleport %d %d %d", x, y, z);
+            }
+
+            minecraft.player.connection.sendCommand(command);
+            return true;
+        }
+
+        private static final long COMMAND_DELAY_NANOS = 220_000_000L;
+        private static final long DURATION_NANOS = 900_000_000L;
+        private static volatile long startedAtNanos;
+        private static volatile int tintRgb = 0x6D3AA8;
+        private static volatile String pendingCommand;
+
+        public static void startTransition(String targetDimension, String command) {
+            String id = targetDimension == null ? "" : targetDimension.toLowerCase(java.util.Locale.ROOT);
+            if (id.contains("nether")) tintRgb = 0x7B245E;
+            else if (id.contains("end")) tintRgb = 0xD8D29B;
+            else tintRgb = 0x397A9A;
+            pendingCommand = command;
+            startedAtNanos = System.nanoTime();
+        }
+
+        public static void tickTransition() {
+            String command = pendingCommand;
+            long start = startedAtNanos;
+            if (command == null || start == 0L
+                    || System.nanoTime() - start < COMMAND_DELAY_NANOS) {
+                return;
+            }
+            pendingCommand = null;
+            Minecraft minecraft = Minecraft.getInstance();
+            if (minecraft.player != null && minecraft.player.connection != null) {
+                minecraft.player.connection.sendCommand(command);
+            }
+        }
+
+        public static void renderTransition(GuiGraphics graphics) {
+            long start = startedAtNanos;
+            if (start == 0L || graphics == null) return;
+            long elapsed = System.nanoTime() - start;
+            if (elapsed < 0L || elapsed >= DURATION_NANOS) {
+                startedAtNanos = 0L;
+                pendingCommand = null;
+                return;
+            }
+
+            Minecraft minecraft = Minecraft.getInstance();
+            int width = minecraft.getWindow().getGuiScaledWidth();
+            int height = minecraft.getWindow().getGuiScaledHeight();
+            float progress = elapsed / (float) DURATION_NANOS;
+            float pulse = progress < 0.45f
+                    ? progress / 0.45f
+                    : Math.max(0.0f, 1.0f - (progress - 0.45f) / 0.55f);
+            int overlayAlpha = Math.min(150, Math.max(0, Math.round(112.0f * pulse)));
+            graphics.fill(0, 0, width, height, (overlayAlpha << 24) | tintRgb);
+
+            int centerX = width / 2;
+            int centerY = height / 2;
+            int maximumRadius = Math.max(20, Math.min(width, height) / 3);
+            int radius = Math.max(10, Math.round(maximumRadius * (0.25f + progress * 0.75f)));
+            int phase = (int) ((elapsed / 70_000_000L) & 15L);
+            int dotSize = Math.max(2, Math.min(6, Math.round(Math.min(width, height) / 180.0f)));
+
+            for (int i = 0; i < 16; i++) {
+                double angle = ((i + phase) & 15) * (Math.PI * 2.0 / 16.0);
+                int x = centerX + (int) Math.round(Math.cos(angle) * radius);
+                int y = centerY + (int) Math.round(Math.sin(angle) * radius * 0.62);
+                int trail = (i - phase + 16) & 15;
+                int alpha = trail == 0 ? 0xFF : trail <= 3 ? 0xB0 : 0x50;
+                int color = (alpha << 24) | 0x00F2F2F2;
+                graphics.fill(x - dotSize, y - dotSize,
+                        x + dotSize, y + dotSize, color);
+            }
+        }
+    }
+
+    /**
+     * Cross-milestone lifecycle boundary for the architecture stack.
+     * Subsystems remain independently testable and never infer session ownership
+     * from a late callback.
+     */
+    public static final class MapArchitectureCoordinator {
+        public record Summary(GpuPageTable.MapGpuPageTableService.Summary pageTable,
+                MapUploadEngine.Summary uploads,
+                MinimapService.Summary minimap,
+                SurfaceRegionSourceDatabase.Snapshot surfaceSource,
+                com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph.Summary surfaceProjection,
+                long surfaceRequests,
+                MapPersistenceV2Service.Summary persistence) { }
+
+        private static final MapArchitectureCoordinator INSTANCE =
+                new MapArchitectureCoordinator();
+        private long lastFrameId = Long.MIN_VALUE;
+
+        private MapArchitectureCoordinator() { }
+        public static MapArchitectureCoordinator getInstance() { return INSTANCE; }
+
+        public void onWorldJoin() {
+            lastFrameId = Long.MIN_VALUE;
+        }
+
+        public void onFrameBoundary(long frameId) {
+            if (frameId == lastFrameId) return;
+            lastFrameId = frameId;
+            MapUploadEngine.getInstance().drain(
+                    System.nanoTime() + 1_000_000L, 2 * 1024 * 1024);
+            GpuPageTable.MapGpuPageTableService.getInstance().swapAtFrameBoundary();
+            MapTextureManager.getInstance().onPageTableFrameBoundary();
+            MapOverviewTextureManager.getInstance().onPageTableFrameBoundary();
+            CaveTextureManager.getInstance().endRenderBatch();
+        }
+
+        public void onWorldLeave() {
+            MinimapService.getInstance().clear();
+            RegionSurfaceLodService.getInstance().clear();
+            SurfaceRegionSourceDatabase.getInstance().clear();
+            MapUploadEngine.getInstance().clear();
+            GpuPageTable.MapGpuPageTableService.getInstance().clear();
+            lastFrameId = Long.MIN_VALUE;
+        }
+
+        public Summary summary() {
+            return new Summary(
+                    GpuPageTable.MapGpuPageTableService.getInstance().summary(),
+                    MapUploadEngine.getInstance().summary(),
+                    MinimapService.getInstance().summary(),
+                    SurfaceRegionSourceDatabase.getInstance().snapshot(),
+                    RegionSurfaceLodService.getInstance().summary(),
+                    MapViewportCoordinator.getInstance().getSubmittedSurfaceRequests(),
+                    MapPersistenceV2Service.getInstance().summary());
+        }
+    }
+
+
+    public static class MapConfig {
+    /** Temporary common zoom-out floor for fullscreen and minimap views. */
+    public static final float MINIMUM_ZOOM_SCALE = 0.1f;
+
+    private static final Logger LOGGER = LogManager.getLogger();
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final int CURRENT_PERFORMANCE_DEFAULTS_VERSION = 1;
+    private static File configFile;
+
+    // Config values
+    public static boolean minimapEnabled = true;
+    public static float minimapXPercent = 0.82f; // Default Top-Right
+    public static float minimapYPercent = 0.05f;
+    public static String minimapAnchor = "TOP_RIGHT";
+    public static int minimapOffsetX = -8;
+    public static int minimapOffsetY = 8;
+    public static boolean legacyMinimapPositionPending = false;
+    public static int minimapSize = 64; // Square size (px) - smaller default for better UX
+    public static float minimapZoom = 1.0f; // Zoom level inside (changed from 0.25f to 1.0f)
+    public static int scanPointsPerTick = 100000; // Internal column budget; UI presents this as chunks/tick or AUTO
+    public static int mapRevealMode = 1; // Legacy field; chunk-stream is now the only reveal pipeline
+    public static int scanEngineVersion = 2;
+    public static boolean alwaysRescanExplored = false; // Whether to continuously scan already explored blocks
+    public static int blockColourMode = 0; // 0 = ACCURATE, 1 = VANILLA
+    public static boolean displayFlowers = false;
+    public static int terrainSlopes = 2; // 0 = OFF, 1 = 2D, 2 = 3D
+    public static boolean cursorBiomeEnabled = true;
+    public static boolean cursorBlockEnabled = true;
+
+    // Player marker display config
+    public static float playerMarkerScale = 0.5f; // Scale multiplier (0.1x to 1.0x)
+    public static int playerMarkerMode = 1; // 0 = SKIN (player head only), 1 = ARROW_ONLY
+    public static int playerPointerColor = 0xFFFF0000; // Default Red
+    public static final int[] POINTER_COLORS = {
+            0xFF00C8FF, // Cyan
+            0xFF00FF00, // Green
+            0xFFFF0000, // Red
+            0xFFFFCC00, // Yellow
+            0xFFC800FF, // Purple
+            0xFFFF8800, // Orange
+            0xFFFFFFFF, // White
+            0xFF000001 // Rainbow
+    };
+    public static final String[] POINTER_COLOR_NAMES = {
+            "Cyan",
+            "Green",
+            "Red",
+            "Yellow",
+            "Purple",
+            "Orange",
+            "White",
+            "Rainbow"
+    };
+
+    // Coords config (-1.0f represents automatic snapping underneath the minimap)
+    public static boolean coordsEnabled = true;
+    public static float coordsXPercent = -1.0f;
+    public static float coordsYPercent = -1.0f;
+    public static float coordsScale = 0.64f;
+    public static int coordsTextColor = 0xFFFFFFFF; // Default White
+
+    // Waypoint scale & visibility configs
+    public static float waypointScale = 5.0f; // Global waypoint scale (1.0x to 10.0x)
+    public static boolean waypointsVisible = true; // Toggle visibility of waypoints
+    public static boolean createDeathWaypoint = true;
+    public static int maxDeathWaypoints = 3;
+
+    // Pin scale (0.1x to 1.0x, defaults to 0.5x)
+    public static float pinScale = 0.5f;
+    public static boolean autoClearPin = true;
+
+    // Pin navigation marker. The route origin is captured once when the pin is
+    // created, then retained with the per-dimension pin so guide dots remain fixed
+    // to world blocks instead of following the player or viewport.
+    public static boolean pinActive = false;
+    public static double pinWorldX = 0;
+    public static double pinWorldZ = 0;
+    public static boolean pinRouteStartValid = false;
+    public static double pinRouteStartWorldX = 0;
+    public static double pinRouteStartWorldZ = 0;
+
+    // Minimap rotation config
+    public static boolean minimapRotate = true; // Toggle whether minimap rotates with player
+    public static boolean minimapCircle = false; // Toggle whether minimap is circular
+    public static boolean showMinimapInScreens = true;
+    public static int minimapNightMode = 1; // 0 = OFF, 1 = AUTO, 2 = ON
+    public static int minimapRingColor = 0xFF2D3033;
+    public static int mapColorProfile = 0;
+    public static List<Integer> savedColors = new ArrayList<>();
+    public static Map<String, Integer> blockColorOverrides = new LinkedHashMap<>();
+    /** Uses a larger bounded scan/upload budget only while the full map is open. */
+    public static boolean fastFullscreenLoading = false;
+    /** Local cave policy used when the connected server has no Simple Map extension. */
+    public static int localCaveMapMode = 2; // 0 = OFF, 1 = AUTO, 2 = ON
+    /** Explicit OFF/LAYERED/FULL selection persisted independently for each dimension. */
+    public static Map<String, String> caveDimensionModes = new LinkedHashMap<>();
+
+    // Compass letter (N/E/S/W) display config
+    public static boolean compassLettersVisible = true;
+    public static int compassLetterColor = 0xFFFFFFFF; // Default White
+
+    public static boolean isStencilEnabled(Object renderTarget) {
+        if (renderTarget == null)
+            return false;
+        try {
+            java.lang.reflect.Field f = renderTarget.getClass().getDeclaredField("useStencil");
+            f.setAccessible(true);
+            return f.getBoolean(renderTarget);
+        } catch (Exception e1) {
+            try {
+                java.lang.reflect.Method m = renderTarget.getClass().getDeclaredMethod("useStencil");
+                m.setAccessible(true);
+                return (Boolean) m.invoke(renderTarget);
+            } catch (Exception e2) {
+                try {
+                    java.lang.reflect.Method m = renderTarget.getClass().getDeclaredMethod("isStencilEnabled");
+                    m.setAccessible(true);
+                    return (Boolean) m.invoke(renderTarget);
+                } catch (Exception e3) {
+                    for (java.lang.reflect.Field field : renderTarget.getClass().getDeclaredFields()) {
+                        if (field.getType() == boolean.class) {
+                            String name = field.getName();
+                            if (name.toLowerCase().contains("stencil")) {
+                                try {
+                                    field.setAccessible(true);
+                                    return field.getBoolean(renderTarget);
+                                } catch (Exception ignored) {
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Book map config
+    public static boolean serverExtensionAvailable = false; // Ephemeral, never persisted
+    public static boolean serverRequireMapBook = false; // Synced from server to client
+    public static int serverCaveMapMode = 0; // Synced: 0 = OFF, 1 = AUTO, 2 = ON
+
+    public static void init() {
+        configFile = new File(Minecraft.getInstance().gameDirectory, "simplemap/config.json");
+        if (!configFile.getParentFile().exists()) {
+            configFile.getParentFile().mkdirs();
+        }
+
+        // New installs use the time-budgeted chunk-stream engine at full speed.
+        if (!configFile.exists()) scanPointsPerTick = calculateDefaultScanPoints();
+
+        load();
+    }
+
+    public static void load() {
+        boolean rewriteMigratedConfig = false;
+        if (!configFile.exists()) {
+            save(); // Write defaults
+            return;
+        }
+
+        try (var reader = Files.newBufferedReader(configFile.toPath(), StandardCharsets.UTF_8)) {
+            ConfigData data = GSON.fromJson(reader, ConfigData.class);
+            if (data == null) throw new IOException("Empty SimpleMap config");
+            minimapEnabled = data.minimapEnabled;
+            minimapXPercent = Math.max(0.0f, Math.min(1.0f, data.minimapXPercent));
+            minimapYPercent = Math.max(0.0f, Math.min(1.0f, data.minimapYPercent));
+            if (data.minimapAnchor == null) {
+                legacyMinimapPositionPending = true;
+            } else {
+                minimapAnchor = MinimapRenderer.MinimapPosition.sanitizeAnchor(data.minimapAnchor);
+                minimapOffsetX = data.minimapOffsetX;
+                minimapOffsetY = data.minimapOffsetY;
+            }
+            minimapSize = Math.max(16, Math.min(150, data.minimapSize));
+            minimapZoom = Math.max(MINIMUM_ZOOM_SCALE, Math.min(2.0f, data.minimapZoom));
+            if (data.scanEngineVersion < 2) {
+                // One-time migration: old configs often carried 500/1000 DOTS,
+                // which made already-loaded chunks look missing.
+                scanPointsPerTick = 100000;
+                mapRevealMode = 1;
+                scanEngineVersion = 2;
+                rewriteMigratedConfig = true;
+            } else {
+                scanPointsPerTick = Math.max(1000, Math.min(100000, data.scanPointsPerTick));
+                mapRevealMode = 1;
+                scanEngineVersion = data.scanEngineVersion;
+            }
+            blockColourMode = Math.max(0, Math.min(1, data.blockColourMode));
+            displayFlowers = data.displayFlowers;
+            terrainSlopes = Math.max(0, Math.min(2, data.terrainSlopes));
+            cursorBiomeEnabled = data.cursorBiomeEnabled == null || data.cursorBiomeEnabled;
+            cursorBlockEnabled = data.cursorBlockEnabled == null || data.cursorBlockEnabled;
+
+            playerMarkerScale = Math.max(0.1f,
+                    Math.min(1.0f, data.playerMarkerScale == 0.0f ? 0.5f : data.playerMarkerScale));
+            playerMarkerMode = data.playerMarkerMode;
+            playerPointerColor = data.playerPointerColor == null ? 0xFFFF0000 : data.playerPointerColor;
+
+            coordsEnabled = data.coordsEnabled;
+            coordsXPercent = data.coordsXPercent == -1.0f ? -1.0f
+                    : Math.max(0.0f, Math.min(1.0f, data.coordsXPercent));
+            coordsYPercent = data.coordsYPercent == -1.0f ? -1.0f
+                    : Math.max(0.0f, Math.min(1.0f, data.coordsYPercent));
+            coordsScale = Math.max(0.1f, Math.min(2.0f, data.coordsScale));
+            coordsTextColor = data.coordsTextColor == null ? 0xFFFFFFFF : data.coordsTextColor;
+
+            waypointScale = Math.max(1.0f, Math.min(10.0f, data.waypointScale == 0.0f ? 5.0f : data.waypointScale));
+            pinScale = Math.max(0.1f, Math.min(1.0f, data.pinScale == 0.0f ? 0.5f : data.pinScale));
+            waypointsVisible = data.waypointsVisible;
+            createDeathWaypoint = data.createDeathWaypoint == null || data.createDeathWaypoint;
+            maxDeathWaypoints = data.maxDeathWaypoints == null
+                    ? 3
+                    : Math.max(0, Math.min(20, data.maxDeathWaypoints));
+
+            minimapRotate = data.minimapRotate;
+            minimapCircle = data.minimapCircle;
+            showMinimapInScreens = data.showMinimapInScreens == null || data.showMinimapInScreens;
+            minimapNightMode = data.minimapNightMode == null
+                    ? 1
+                    : Math.max(0, Math.min(2, data.minimapNightMode));
+            minimapRingColor = data.minimapRingColor == null ? 0xFF2D3033 : data.minimapRingColor;
+            mapColorProfile = Math.max(0, Math.min(MapColorProfile.NAMES.length - 1, data.mapColorProfile));
+            savedColors = new ArrayList<>();
+            if (data.savedColors != null) {
+                for (Integer color : data.savedColors) {
+                    if (color != null && !savedColors.contains(color)) savedColors.add(color);
+                    if (savedColors.size() == 8) break;
+                }
+            }
+            blockColorOverrides = new LinkedHashMap<>();
+            if (data.blockColorOverrides != null) {
+                for (Map.Entry<String, Integer> entry : data.blockColorOverrides.entrySet()) {
+                    if (entry.getKey() != null && entry.getValue() != null
+                            && entry.getKey().length() <= 256
+                            && entry.getKey().matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
+                        blockColorOverrides.put(entry.getKey(), entry.getValue());
+                    }
+                    if (blockColorOverrides.size() == 1024) break;
+                }
+            }
+            autoClearPin = data.autoClearPin;
+
+            compassLettersVisible = data.compassLettersVisible;
+            compassLetterColor = data.compassLetterColor == null ? 0xFFFFFFFF : data.compassLetterColor;
+
+            alwaysRescanExplored = data.alwaysRescanExplored;
+            if (data.performanceDefaultsVersion == null
+                    || data.performanceDefaultsVersion < CURRENT_PERFORMANCE_DEFAULTS_VERSION) {
+                // Beta migration: BALANCED is now the safe default. This runs once;
+                // a later explicit FAST choice is preserved after the migrated config is saved.
+                fastFullscreenLoading = false;
+                rewriteMigratedConfig = true;
+            } else {
+                fastFullscreenLoading = Boolean.TRUE.equals(data.fastFullscreenLoading);
+            }
+            localCaveMapMode = data.localCaveMapMode == null
+                ? 2
+                : Math.max(0, Math.min(2, data.localCaveMapMode));
+            caveDimensionModes = new LinkedHashMap<>();
+            if (data.caveDimensionModes != null) {
+                for (Map.Entry<String, String> entry : data.caveDimensionModes.entrySet()) {
+                    String dimension = entry.getKey();
+                    String mode = entry.getValue();
+                    if (dimension == null || mode == null
+                            || !dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) continue;
+                    String normalized = mode.toUpperCase(java.util.Locale.ROOT);
+                    if (normalized.equals("OFF") || normalized.equals("LAYERED")
+                            || normalized.equals("FULL")) {
+                        caveDimensionModes.put(dimension, normalized);
+                    }
+                    if (caveDimensionModes.size() == 256) break;
+                }
+            }
+        } catch (Exception exception) {
+            LOGGER.error("Failed to load map config; preserving the unreadable file and restoring defaults", exception);
+            quarantineCorruptConfig();
+            restoreDefaults();
+            save();
+            return;
+        }
+        if (rewriteMigratedConfig) save();
+    }
+
+    public static synchronized void save() {
+        if (configFile == null) return;
+        Path target = configFile.toPath();
+        Path temporary = target.resolveSibling(target.getFileName() + ".tmp");
+        try {
+            Files.createDirectories(target.getParent());
+            try (Writer writer = Files.newBufferedWriter(temporary, StandardCharsets.UTF_8)) {
+                ConfigData data = new ConfigData();
+                data.minimapEnabled = minimapEnabled;
+                data.minimapXPercent = minimapXPercent;
+                data.minimapYPercent = minimapYPercent;
+                data.minimapAnchor = minimapAnchor;
+                data.minimapOffsetX = minimapOffsetX;
+                data.minimapOffsetY = minimapOffsetY;
+                data.minimapSize = minimapSize;
+                data.minimapZoom = minimapZoom;
+                data.scanPointsPerTick = scanPointsPerTick;
+                data.mapRevealMode = 1;
+                data.scanEngineVersion = scanEngineVersion;
+                data.blockColourMode = blockColourMode;
+                data.displayFlowers = displayFlowers;
+                data.terrainSlopes = terrainSlopes;
+                data.cursorBiomeEnabled = cursorBiomeEnabled;
+                data.cursorBlockEnabled = cursorBlockEnabled;
+
+                data.playerMarkerScale = playerMarkerScale;
+                data.playerMarkerMode = playerMarkerMode;
+                data.playerPointerColor = playerPointerColor;
+
+                data.coordsEnabled = coordsEnabled;
+                data.coordsXPercent = coordsXPercent;
+                data.coordsYPercent = coordsYPercent;
+                data.coordsScale = coordsScale;
+                data.coordsTextColor = coordsTextColor;
+
+                data.waypointScale = waypointScale;
+                data.pinScale = pinScale;
+                data.autoClearPin = autoClearPin;
+                data.waypointsVisible = waypointsVisible;
+                data.createDeathWaypoint = createDeathWaypoint;
+                data.maxDeathWaypoints = maxDeathWaypoints;
+
+                data.minimapRotate = minimapRotate;
+                data.minimapCircle = minimapCircle;
+                data.showMinimapInScreens = showMinimapInScreens;
+                data.minimapNightMode = minimapNightMode;
+                data.minimapRingColor = minimapRingColor;
+                data.mapColorProfile = mapColorProfile;
+                data.savedColors = new ArrayList<>(savedColors);
+                data.blockColorOverrides = new LinkedHashMap<>(blockColorOverrides);
+
+                data.compassLettersVisible = compassLettersVisible;
+                data.compassLetterColor = compassLetterColor;
+
+                data.alwaysRescanExplored = alwaysRescanExplored;
+                data.fastFullscreenLoading = fastFullscreenLoading;
+                data.performanceDefaultsVersion = CURRENT_PERFORMANCE_DEFAULTS_VERSION;
+                data.localCaveMapMode = localCaveMapMode;
+                data.caveDimensionModes = new LinkedHashMap<>(caveDimensionModes);
+                GSON.toJson(data, writer);
+            }
+            moveReplacing(temporary, target);
+        } catch (IOException exception) {
+            LOGGER.error("Failed to save map config atomically", exception);
+            try {
+                Files.deleteIfExists(temporary);
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static void moveReplacing(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static void quarantineCorruptConfig() {
+        if (configFile == null || !configFile.isFile()) return;
+        Path source = configFile.toPath();
+        Path quarantine = source.resolveSibling(configFile.getName() + ".corrupt." + System.currentTimeMillis());
+        try {
+            moveReplacing(source, quarantine);
+        } catch (IOException moveFailure) {
+            LOGGER.warn("Could not quarantine unreadable SimpleMap config {}", source, moveFailure);
+        }
+    }
+
+    /**
+     * Restores configurable preferences while preserving user-authored data such as
+     * saved palette colors and per-block overrides. Waypoints and explored map files
+     * live outside this config and are never touched here.
+     */
+    public static void resetPreferencesToDefaults() {
+        List<Integer> retainedSavedColors = new ArrayList<>(savedColors);
+        Map<String, Integer> retainedBlockOverrides = new LinkedHashMap<>(blockColorOverrides);
+        restoreDefaults();
+        savedColors = retainedSavedColors;
+        blockColorOverrides = retainedBlockOverrides;
+        save();
+    }
+
+    private static void restoreDefaults() {
+        minimapEnabled = true;
+        minimapXPercent = 0.82f;
+        minimapYPercent = 0.05f;
+        minimapAnchor = "TOP_RIGHT";
+        minimapOffsetX = -8;
+        minimapOffsetY = 8;
+        legacyMinimapPositionPending = false;
+        minimapSize = 64;
+        minimapZoom = 1.0f;
+        scanPointsPerTick = calculateDefaultScanPoints();
+        mapRevealMode = 1;
+        scanEngineVersion = 2;
+        alwaysRescanExplored = false;
+        blockColourMode = 0;
+        displayFlowers = false;
+        terrainSlopes = 2;
+        cursorBiomeEnabled = true;
+        cursorBlockEnabled = true;
+        playerMarkerScale = 0.5f;
+        playerMarkerMode = 1;
+        playerPointerColor = 0xFFFF0000;
+        coordsEnabled = true;
+        coordsXPercent = -1.0f;
+        coordsYPercent = -1.0f;
+        coordsScale = 0.64f;
+        coordsTextColor = 0xFFFFFFFF;
+        waypointScale = 5.0f;
+        waypointsVisible = true;
+        createDeathWaypoint = true;
+        maxDeathWaypoints = 3;
+        pinScale = 0.5f;
+        autoClearPin = true;
+        minimapRotate = true;
+        minimapCircle = false;
+        showMinimapInScreens = true;
+        minimapNightMode = 1;
+        minimapRingColor = 0xFF2D3033;
+        mapColorProfile = 0;
+        savedColors = new ArrayList<>();
+        blockColorOverrides = new LinkedHashMap<>();
+        fastFullscreenLoading = false;
+        localCaveMapMode = 2;
+        caveDimensionModes = new LinkedHashMap<>();
+        compassLettersVisible = true;
+        compassLetterColor = 0xFFFFFFFF;
+    }
+
+    private static class ConfigData {
+        boolean minimapEnabled = true;
+        float minimapXPercent = 0.82f;
+        float minimapYPercent = 0.05f;
+        String minimapAnchor;
+        int minimapOffsetX = -8;
+        int minimapOffsetY = 8;
+        int minimapSize = 64;
+        float minimapZoom = 1.0f;
+        int scanPointsPerTick = 100000;
+        int mapRevealMode = 1;
+        int scanEngineVersion = 2;
+        int blockColourMode = 0;
+        boolean displayFlowers = false;
+        int terrainSlopes = 2;
+        Boolean cursorBiomeEnabled = true;
+        Boolean cursorBlockEnabled = true;
+
+        float playerMarkerScale = 0.5f;
+        int playerMarkerMode = 1;
+        Integer playerPointerColor = 0xFFFF0000;
+
+        boolean coordsEnabled = true;
+        float coordsXPercent = -1.0f;
+        float coordsYPercent = -1.0f;
+        float coordsScale = 0.64f;
+        Integer coordsTextColor = 0xFFFFFFFF;
+
+        float waypointScale = 5.0f;
+        float pinScale = 0.5f;
+        boolean waypointsVisible = true;
+        Boolean createDeathWaypoint = true;
+        Integer maxDeathWaypoints = 3;
+        boolean autoClearPin = true;
+
+        boolean minimapRotate = true;
+        boolean minimapCircle = false;
+        Boolean showMinimapInScreens = true;
+        Integer minimapNightMode = 1;
+        Integer minimapRingColor = 0xFF2D3033;
+        int mapColorProfile = 0;
+        List<Integer> savedColors = new ArrayList<>();
+        Map<String, Integer> blockColorOverrides = new LinkedHashMap<>();
+
+        boolean compassLettersVisible = true;
+        Integer compassLetterColor = 0xFFFFFFFF;
+
+        boolean alwaysRescanExplored = false;
+        Boolean fastFullscreenLoading = false;
+        Integer performanceDefaultsVersion;
+        Integer localCaveMapMode = 2;
+        Map<String, String> caveDimensionModes = new LinkedHashMap<>();
+    }
+
+    /**
+     * Returns the server policy when the optional server extension is present,
+     * otherwise the user's local cave policy. This keeps the client-only map fully
+     * usable on ordinary public servers without pretending those servers control it.
+     */
+    public static int getEffectiveCaveMapMode() {
+        return serverExtensionAvailable
+                ? Math.max(0, Math.min(2, serverCaveMapMode))
+                : Math.max(0, Math.min(2, localCaveMapMode));
+    }
+
+    public static int calculateDefaultScanPoints() {
+        // The scanner is now bounded by a nano-time deadline and chunk priority,
+        // so a high logical cap is safe. Users with weak systems can still lower
+        // the setting manually to reduce background mapping work.
+        return 100000;
+    }
+
+}
+
+
+
+    /**
+ * Local surface block-light cache. Disk work is asynchronous and every result
+ * is guarded by a world-generation token so old dimensions cannot publish into
+ * the newly active map.
+ */
+public static final class MapLightManager {
+    private static final Logger LOGGER = LogManager.getLogger();
+    private static final MapLightManager INSTANCE = new MapLightManager();
+    private static final int PIXEL_COUNT = 512 * 512;
+    private static final int MAX_REGIONS = 96;
+    private static final int MAX_PENDING_SAVES = 12;
+    private static final long SAVE_RETRY_DELAY_MS = 500L;
+
+    private final Map<String, LightRegion> regions = new LinkedHashMap<>(16, 0.75f, true);
+    private final Set<String> dirtyRegions = new HashSet<>();
+    private final Map<String, Boolean> fileExists = new ConcurrentHashMap<>();
+    private final AtomicLong generation = new AtomicLong();
+    private final Map<String, LightSaveRequest> pendingSaves = new ConcurrentHashMap<>();
+    private final Map<String, LightSaveRequest> inFlightSaves = new ConcurrentHashMap<>();
+    private final AtomicBoolean saveDrainScheduled = new AtomicBoolean();
+    private volatile File cacheDirectory;
+    private long lastSaveTime;
+
+    public static MapLightManager getInstance() {
+        return INSTANCE;
+    }
+
+    private MapLightManager() {
+    }
+
+    public void setLight(int blockX, int blockZ, int light) {
+        int rx = blockX >> 9;
+        int rz = blockZ >> 9;
+        LightRegion region = getRegion(rx, rz, true);
+        if (region == null) return;
+        int px = blockX & 511;
+        int pz = blockZ & 511;
+        if (region.setLight(px, pz, light)) {
+            synchronized (dirtyRegions) {
+                dirtyRegions.add(key(rx, rz));
+            }
+            MapTextureManager.getInstance().markPageDirtyForBlock(blockX, blockZ);
+            int localChunkIndex = ((blockZ & 511) >>> 4) * 32
+                    + ((blockX & 511) >>> 4);
+            SurfaceRegionSourceDatabase.getInstance().markChunkDirty(
+                    rx, rz, localChunkIndex);
+        }
+    }
+
+    /**
+     * Commits one contiguous row-major slice of a 16x16 chunk under a single
+     * region lock. Light packets used to call {@link #setLight} for every column,
+     * causing up to 256 lock/unlock and dirty-notification cycles per chunk.
+     */
+    public void setChunkLightSlice(int chunkX, int chunkZ, int startColumn,
+            byte[] source, int sourceOffset, int count) {
+        setChunkLightSlice(chunkX, chunkZ, startColumn,
+                source, sourceOffset, count, true);
+    }
+
+    /**
+     * Batched light commit with optional downstream invalidation. Geometry chunk
+     * transactions pass {@code false} and publish Surface/source dirtiness once at
+     * cursor 256; light-only packets retain the immediate default path.
+     */
+    public boolean setChunkLightSlice(int chunkX, int chunkZ, int startColumn,
+            byte[] source, int sourceOffset, int count, boolean publishDirty) {
+        if (source == null || startColumn < 0 || startColumn >= 256
+                || sourceOffset < 0 || count <= 0
+                || sourceOffset + count > source.length) return false;
+        int safeCount = Math.min(count, 256 - startColumn);
+        int blockX = chunkX << 4;
+        int blockZ = chunkZ << 4;
+        int rx = blockX >> 9;
+        int rz = blockZ >> 9;
+        LightRegion region = getRegion(rx, rz, true);
+        if (region == null) return false;
+        int localChunkX = (blockX & 511) >>> 4;
+        int localChunkZ = (blockZ & 511) >>> 4;
+        if (!region.setChunkSlice(localChunkX, localChunkZ, startColumn,
+                source, sourceOffset, safeCount)) return false;
+        synchronized (dirtyRegions) {
+            dirtyRegions.add(key(rx, rz));
+        }
+        if (publishDirty) {
+            MapTextureManager.getInstance().markPageDirtyForChunk(chunkX, chunkZ);
+            int localChunkIndex = localChunkZ * 32 + localChunkX;
+            SurfaceRegionSourceDatabase.getInstance().markChunkDirty(
+                    rx, rz, localChunkIndex);
+        }
+        return true;
+    }
+
+    public LightRegion getRegion(int rx, int rz, boolean create) {
+        String key = key(rx, rz);
+        synchronized (regions) {
+            LightRegion existing = regions.get(key);
+            if (existing != null || !create || cacheDirectory == null) return existing;
+
+            long token = generation.get();
+            LightRegion created = new LightRegion(rx, rz, token);
+            regions.put(key, created);
+            File directory = cacheDirectory;
+            File file = new File(directory, fileName(rx, rz));
+            LightSaveRequest pending = latestSave(directory, rx, rz);
+            boolean exists = pending != null || fileExists.computeIfAbsent(key, ignored -> file.isFile());
+            if (pending != null) {
+                created.applyLoaded(pending.levels());
+                created.markLoaded();
+            } else if (exists) loadRegionAsync(created, directory, token);
+            else created.markLoaded();
+            evictOldRegions(directory);
+            return created;
+        }
+    }
+
+    public synchronized void setCacheDirectory(File directory) {
+        File normalized = directory == null ? null : directory.getAbsoluteFile();
+        if (sameFile(cacheDirectory, normalized)) return;
+        flushCurrentDirectory();
+        generation.incrementAndGet();
+        closeAndClearRegions();
+        fileExists.clear();
+        cacheDirectory = normalized;
+        if (normalized != null) {
+            try {
+                Files.createDirectories(normalized.toPath());
+            } catch (IOException exception) {
+                LOGGER.warn("Could not create SimpleMap light-cache directory {}", normalized, exception);
+            }
+        }
+    }
+
+    public void tickSave() {
+        long now = System.currentTimeMillis();
+        if (now - lastSaveTime < 10_000L) return;
+        lastSaveTime = now;
+        pumpDirtyRegionSaves(2);
+    }
+
+    /** Pulls only a small number of dirty light regions into the IO queue. */
+    int pumpDirtyRegionSaves(int maximum) {
+        File directory = cacheDirectory;
+        if (directory == null || maximum <= 0) return dirtyRegionCount();
+        int admitted = 0;
+        while (admitted < maximum) {
+            String selected;
+            synchronized (dirtyRegions) {
+                Iterator<String> iterator = dirtyRegions.iterator();
+                if (!iterator.hasNext()) break;
+                selected = iterator.next();
+                iterator.remove();
+            }
+            LightRegion region;
+            synchronized (regions) {
+                region = regions.get(selected);
+            }
+            if (region == null || region.closed) continue;
+            if (!saveRegionAsync(region, directory, false)) {
+                synchronized (dirtyRegions) {
+                    dirtyRegions.add(selected);
+                }
+                break;
+            }
+            admitted++;
+        }
+        return dirtyRegionCount();
+    }
+
+    int dirtyRegionCount() {
+        synchronized (dirtyRegions) {
+            return dirtyRegions.size();
+        }
+    }
+
+    int pendingSaveCount() {
+        return pendingSaves.size();
+    }
+
+    int inFlightSaveCount() {
+        return inFlightSaves.size();
+    }
+
+    public synchronized void flushAndClear() {
+        flushCurrentDirectory();
+        generation.incrementAndGet();
+        closeAndClearRegions();
+        fileExists.clear();
+        cacheDirectory = null;
+    }
+
+    private void loadRegionAsync(LightRegion region, File directory, long token) {
+        if (!region.beginLoad()) return;
+        File file = new File(directory, fileName(region.rx, region.rz));
+        MapWorkScheduler.scheduleIo(0L, TimeUnit.MILLISECONDS,
+                MapRequestLane.FULLSCREEN, MapWorkScheduler.WorkType.DISK_READ,
+                MapRequestLane.FULLSCREEN.priorityBase(), 10,
+                () -> isCurrent(region, directory, token), () -> {
+            try {
+                byte[] bytes = null;
+                LightSaveRequest pending = latestSave(directory, region.rx, region.rz);
+                if (pending != null) {
+                    bytes = Arrays.copyOf(pending.levels(), pending.levels().length);
+                } else {
+                    try {
+                        long length = Files.size(file.toPath());
+                        if (length == PIXEL_COUNT) {
+                            bytes = Files.readAllBytes(file.toPath());
+                        } else {
+                            throw new IOException("Invalid light-cache size " + length);
+                        }
+                    } catch (IOException exception) {
+                        LOGGER.warn("Failed to read light cache {}", file.getName(), exception);
+                        quarantineCorruptFile(file);
+                        if (token == generation.get() && sameFile(cacheDirectory, directory)) {
+                            fileExists.remove(key(region.rx, region.rz));
+                        }
+                    }
+                }
+                if (!isCurrent(region, directory, token)) return;
+                if (bytes != null) region.applyLoaded(bytes);
+                region.markLoaded();
+                MapTextureManager.getInstance()
+                        .markRegionSourceAvailable(region.rx, region.rz);
+            } finally {
+                region.finishLoad();
+            }
+        });
+    }
+
+    private boolean isCurrent(LightRegion region, File directory, long token) {
+        if (token != generation.get() || !sameFile(cacheDirectory, directory) || region.closed) return false;
+        synchronized (regions) {
+            return regions.get(key(region.rx, region.rz)) == region;
+        }
+    }
+
+    private void flushCurrentDirectory() {
+        File directory = cacheDirectory;
+        if (directory == null) return;
+        Set<String> keys;
+        synchronized (dirtyRegions) {
+            keys = new HashSet<>(dirtyRegions);
+            dirtyRegions.clear();
+        }
+        synchronized (regions) {
+            for (String key : keys) {
+                LightRegion region = regions.get(key);
+                if (region != null && !region.closed) saveRegionAsync(region, directory, true);
+            }
+        }
+    }
+
+    private boolean saveRegionAsync(LightRegion region, File directory, boolean force) {
+        if (directory == null || region == null || region.closed) return false;
+        String saveKey = saveKey(directory, region.rx, region.rz);
+        if (!force && !pendingSaves.containsKey(saveKey)
+                && !inFlightSaves.containsKey(saveKey)
+                && pendingSaves.size() >= MAX_PENDING_SAVES) return false;
+        LightSaveRequest request = new LightSaveRequest(directory, region.rx, region.rz,
+                region.getGeneration(), region.snapshot());
+        pendingSaves.put(request.key(), request);
+        scheduleSaveDrain(0L);
+        return true;
+    }
+
+    private void scheduleSaveDrain(long delayMs) {
+        if (!saveDrainScheduled.compareAndSet(false, true)) return;
+        MapWorkScheduler.scheduleIo(Math.max(0L, delayMs), TimeUnit.MILLISECONDS,
+                MapRequestLane.BACKGROUND, MapWorkScheduler.WorkType.DISK_WRITE,
+                0, 12, () -> true, () -> {
+            boolean failed = false;
+            LightSaveRequest request = null;
+            try {
+                Iterator<LightSaveRequest> iterator = pendingSaves.values().iterator();
+                if (iterator.hasNext()) request = iterator.next();
+                if (request == null || !pendingSaves.remove(request.key(), request)) return;
+                inFlightSaves.put(request.key(), request);
+                try {
+                    if (!writeSaveRequest(request)) {
+                        failed = true;
+                        pendingSaves.putIfAbsent(request.key(), request);
+                    }
+                } finally {
+                    inFlightSaves.remove(request.key(), request);
+                }
+            } finally {
+                saveDrainScheduled.set(false);
+                if (!pendingSaves.isEmpty()) {
+                    scheduleSaveDrain(failed ? SAVE_RETRY_DELAY_MS : 2L);
+                }
+            }
+        });
+    }
+
+    private boolean writeSaveRequest(LightSaveRequest request) {
+        File directory = request.directory();
+        File file = new File(directory, fileName(request.rx(), request.rz()));
+        File temporary = null;
+        try {
+            Files.createDirectories(directory.toPath());
+            temporary = Files.createTempFile(directory.toPath(), file.getName() + ".", ".tmp").toFile();
+            Files.write(temporary.toPath(), request.levels());
+            atomicReplace(temporary, file);
+            if (request.generation() == generation.get() && sameFile(cacheDirectory, directory)) {
+                fileExists.put(key(request.rx(), request.rz()), true);
+            }
+            return true;
+        } catch (IOException exception) {
+            LOGGER.warn("Failed to write light cache {}", file.getName(), exception);
+            return false;
+        } finally {
+            if (temporary != null) {
+                try {
+                    Files.deleteIfExists(temporary.toPath());
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    private LightSaveRequest latestSave(File directory, int rx, int rz) {
+        String saveKey = saveKey(directory, rx, rz);
+        LightSaveRequest request = pendingSaves.get(saveKey);
+        return request != null ? request : inFlightSaves.get(saveKey);
+    }
+
+    private void evictOldRegions(File directory) {
+        while (regions.size() > MAX_REGIONS) {
+            Iterator<Map.Entry<String, LightRegion>> iterator = regions.entrySet().iterator();
+            if (!iterator.hasNext()) return;
+            Map.Entry<String, LightRegion> eldest = iterator.next();
+            iterator.remove();
+            boolean dirty;
+            synchronized (dirtyRegions) {
+                dirty = dirtyRegions.remove(eldest.getKey());
+            }
+            if (dirty && directory != null
+                    && !saveRegionAsync(eldest.getValue(), directory, false)) {
+                // Do not evict the only authoritative dirty copy merely because
+                // the bounded save queue is full. It will be reconsidered later.
+                regions.put(eldest.getKey(), eldest.getValue());
+                synchronized (dirtyRegions) {
+                    dirtyRegions.add(eldest.getKey());
+                }
+                return;
+            }
+            eldest.getValue().close();
+        }
+    }
+
+    private void closeAndClearRegions() {
+        synchronized (regions) {
+            for (LightRegion region : regions.values()) region.close();
+            regions.clear();
+        }
+        synchronized (dirtyRegions) {
+            dirtyRegions.clear();
+        }
+    }
+
+
+
+    private static void quarantineCorruptFile(File file) {
+        if (file == null || !file.isFile()) return;
+        File quarantine = new File(file.getParentFile(),
+                file.getName() + ".corrupt." + System.currentTimeMillis());
+        try {
+            Files.move(file.toPath(), quarantine.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            LOGGER.warn("Moved unreadable light cache to {}", quarantine.getName());
+        } catch (IOException exception) {
+            LOGGER.warn("Could not quarantine unreadable light cache {}", file, exception);
+        }
+    }
+
+    private static void atomicReplace(File source, File target) throws IOException {
+        try {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static boolean sameFile(File first, File second) {
+        if (first == second) return true;
+        if (first == null || second == null) return false;
+        return first.toPath().toAbsolutePath().normalize()
+                .equals(second.toPath().toAbsolutePath().normalize());
+    }
+
+    private static String key(int rx, int rz) {
+        return rx + "," + rz;
+    }
+
+    private static String fileName(int rx, int rz) {
+        return "l." + rx + "." + rz + ".bin";
+    }
+
+    private static String saveKey(File directory, int rx, int rz) {
+        return new File(directory, fileName(rx, rz)).toPath().toAbsolutePath().normalize().toString();
+    }
+
+    private record LightSaveRequest(File directory, int rx, int rz, long generation, byte[] levels) {
+        private LightSaveRequest {
+            levels = Arrays.copyOf(levels, levels.length);
+        }
+
+        private String key() {
+            return saveKey(directory, rx, rz);
+        }
+    }
+
+    public static final class LightRegion {
+        private final int rx;
+        private final int rz;
+        private final long generation;
+        private final byte[] levels = new byte[PIXEL_COUNT];
+        private final BitSet modifiedBeforeLoad = new BitSet(PIXEL_COUNT);
+        private final ReentrantLock lock = new ReentrantLock();
+        private volatile boolean loaded;
+        private volatile boolean closed;
+        private final AtomicBoolean loadScheduled = new AtomicBoolean();
+
+        private LightRegion(int rx, int rz, long generation) {
+            this.rx = rx;
+            this.rz = rz;
+            this.generation = generation;
+        }
+
+        public void lock() {
+            lock.lock();
+        }
+
+        public void unlock() {
+            lock.unlock();
+        }
+
+        public byte[] getLevelsDirect() {
+            return levels;
+        }
+
+        /** Copies a small immutable light rectangle for a page + halo job. */
+        public byte[] snapshotWindow(int minX, int minZ, int width, int height) {
+            if (minX < 0 || minZ < 0 || width <= 0 || height <= 0
+                    || minX + width > MapPageLayout.REGION_SIZE
+                    || minZ + height > MapPageLayout.REGION_SIZE) {
+                throw new IllegalArgumentException("Invalid light window "
+                        + minX + "," + minZ + " " + width + "x" + height);
+            }
+            lock.lock();
+            try {
+                byte[] result = new byte[width * height];
+                for (int z = 0; z < height; z++) {
+                    System.arraycopy(levels,
+                            (minZ + z) * MapPageLayout.REGION_SIZE + minX,
+                            result, z * width, width);
+                }
+                return result;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public boolean isLoaded() {
+            return loaded && !closed;
+        }
+
+        public long getGeneration() {
+            return generation;
+        }
+
+        private boolean beginLoad() {
+            return !closed && loadScheduled.compareAndSet(false, true);
+        }
+
+        private void finishLoad() {
+            loadScheduled.set(false);
+        }
+
+        private void markLoaded() {
+            if (!closed) loaded = true;
+        }
+
+        private void close() {
+            closed = true;
+        }
+
+        private void applyLoaded(byte[] source) {
+            lock.lock();
+            try {
+                if (closed) return;
+                for (int i = 0; i < levels.length; i++) {
+                    if (!modifiedBeforeLoad.get(i)) levels[i] = source[i];
+                }
+                modifiedBeforeLoad.clear();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private byte[] snapshot() {
+            lock.lock();
+            try {
+                return Arrays.copyOf(levels, levels.length);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private boolean setLight(int px, int pz, int light) {
+            int clamped = Math.max(0, Math.min(15, light));
+            int index = pz * 512 + px;
+            lock.lock();
+            try {
+                if (closed || (levels[index] & 0xFF) == clamped) return false;
+                levels[index] = (byte) clamped;
+                if (!loaded) modifiedBeforeLoad.set(index);
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private boolean setChunkSlice(int localChunkX, int localChunkZ,
+                int startColumn, byte[] source, int sourceOffset, int count) {
+            lock.lock();
+            try {
+                if (closed) return false;
+                boolean changed = false;
+                for (int index = 0; index < count; index++) {
+                    int column = startColumn + index;
+                    int localX = column & 15;
+                    int localZ = column >>> 4;
+                    int destination = (localChunkZ * 16 + localZ) * 512
+                            + localChunkX * 16 + localX;
+                    int light = source[sourceOffset + index] & 0xFF;
+                    int clamped = Math.max(0, Math.min(15, light));
+                    if ((levels[destination] & 0xFF) == clamped) continue;
+                    levels[destination] = (byte) clamped;
+                    if (!loaded) modifiedBeforeLoad.set(destination);
+                    changed = true;
+                }
+                return changed;
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+}
+
 }

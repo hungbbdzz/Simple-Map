@@ -1,17 +1,25 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapWorkScheduler.MapTextureBuildWorker;
 
-import com.velorise.simplemap.client.surface.SurfacePublicationService;
-import com.velorise.simplemap.client.surface.SurfaceResidencyService;
-import com.velorise.simplemap.client.cave.CaveAtlasRegion;
-import com.velorise.simplemap.client.cave.SurfaceRegionLodAtlas;
-import com.velorise.simplemap.client.lod.PreparedBranch;
-import com.velorise.simplemap.client.lod.RegionLodDeriver;
-import com.velorise.simplemap.client.lod.RegionLodGraph;
-import com.velorise.simplemap.client.gpu.MapGpuPageTableService;
-import com.velorise.simplemap.client.gpu.PageTableEntry;
-import com.velorise.simplemap.client.gpu.TileKey;
-import com.velorise.simplemap.client.gpu.UploadCommand;
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import java.util.Arrays;
+import java.util.function.BooleanSupplier;
+import com.velorise.simplemap.client.MapWorkScheduler.MapProcessor;
+import com.velorise.simplemap.client.gpu.GpuPageTable.TileKey;
+import com.velorise.simplemap.client.gpu.GpuPageTable.PageTableEntry;
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapUploadEngine.UploadCommand;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapGpuBudgetController;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapResidencyManager;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.cave.CaveTextureAtlas.AtlasGutter;
+import com.velorise.simplemap.client.MapWorkScheduler.MapTextureBuildWorker.MapStyleSnapshot;
+
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapUploadEngine;
+import com.velorise.simplemap.client.cave.CaveTextureAtlas.CaveAtlasRegion;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph.PreparedBranch;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph.RegionLodDeriver;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph;
+import com.velorise.simplemap.client.gpu.GpuPageTable;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
 import com.velorise.simplemap.client.session.MapSessionManager;
 import net.minecraft.client.Minecraft;
 
@@ -166,7 +174,7 @@ public final class RegionSurfaceLodService {
         /*
          * Both visible Surface owners feed this service. Keep one
          * cheap M4 level-0/root authority for every visible region at every zoom.
-         * Xaero never allows a finer child to become the sole representation:
+         * The LOD system never allows a finer child to become the sole representation:
          * when a child is cold, the retained root sub-rectangle remains visible.
          * The old density gate disabled exactly that invariant at close zoom and
          * left teleport/atlas-eviction holes with no renderable underlay.
@@ -236,8 +244,8 @@ public final class RegionSurfaceLodService {
                     || record.uploadedKnownMask == 0L) return null;
             MapResidencyManager.getInstance().touch(residencyKey(key));
             TileKey tileKey = tileKey(key);
-            MapGpuPageTableService.Resolved resolved =
-                    SurfaceResidencyService.getInstance().resolve(tileKey);
+            GpuPageTable.MapGpuPageTableService.Resolved resolved =
+                    GpuPageTable.MapGpuPageTableService.getInstance().resolve(tileKey);
             if (resolved != null) {
                 PageTableEntry entry = resolved.entry();
                 return new CaveAtlasRegion(resolved.texture(), entry.sourceX(),
@@ -594,7 +602,7 @@ public final class RegionSurfaceLodService {
                 : PARENT_SCHEDULE_BACKGROUND;
         int scheduled = 0;
 
-        // Build the density-selected visible parent first. This mirrors Xaero's
+        // Build the density-selected visible parent first. This mirrors the
         // selected-level update slice and avoids a full graph snapshot + stream +
         // sort on every far-zoom frame.
         int targetLevel = MapRegionLodPolicy.targetLevel(view.scale);
@@ -798,7 +806,7 @@ public final class RegionSurfaceLodService {
                             prepared.dirtyMinX(), prepared.dirtyMinY(),
                             prepared.dirtyMaxX(), prepared.dirtyMaxY()),
                     null, null);
-            SurfacePublicationService.getInstance().executeInline(upload);
+            MapUploadEngine.getInstance().executeInline(upload);
             long uploadNanos = System.nanoTime() - uploadStart;
             MapGpuBudgetController.getInstance().record(
                     MapGpuBudgetController.UploadKind.BRANCH, uploadNanos);
@@ -824,7 +832,7 @@ public final class RegionSurfaceLodService {
                                 prepared.key().level())) {
                     flags |= PageTableEntry.FLAG_COMPLETE;
                 }
-                SurfacePublicationService.getInstance().stage(tileKey(record.key),
+                GpuPageTable.MapGpuPageTableService.getInstance().stage(tileKey(record.key),
                         publishedRegion.texture(), record.slot,
                         atlases[record.key.level()].storageGeneration(),
                         prepared.revision(), flags,
@@ -896,7 +904,7 @@ public final class RegionSurfaceLodService {
                     for (NodeRecord record : records.values()) {
                         if (record.key.level() != level) continue;
                         record.initialized = false;
-                        SurfacePublicationService.getInstance().remove(
+                        GpuPageTable.MapGpuPageTableService.getInstance().remove(
                                 tileKey(record.key));
                         record.slot = -1;
                         graph.markBranchEvicted(record.key,
@@ -916,7 +924,7 @@ public final class RegionSurfaceLodService {
                 return false;
             }
             atlases[key.level()].releaseSlot(record.slot);
-            SurfacePublicationService.getInstance().remove(tileKey(key));
+            GpuPageTable.MapGpuPageTableService.getInstance().remove(tileKey(key));
             record.slot = -1;
             record.initialized = false;
             graph.markBranchEvicted(key, record.uploadedRevision);
@@ -948,7 +956,7 @@ public final class RegionSurfaceLodService {
         boolean retiredGpuSlot = record.slot >= 0;
         if (retiredGpuSlot) {
             atlases[record.key.level()].releaseSlot(record.slot);
-            SurfacePublicationService.getInstance().remove(tileKey(record.key));
+            GpuPageTable.MapGpuPageTableService.getInstance().remove(tileKey(record.key));
             record.slot = -1;
         }
         MapResidencyManager.getInstance().remove(residencyKey(record.key));
@@ -1195,4 +1203,1316 @@ public final class RegionSurfaceLodService {
                     && minRegionX <= maxRegionX && minRegionZ <= maxRegionZ;
         }
     }
+
+    public static final class SurfaceRegionLodAtlas {
+        public static final int SIZE = 64;
+        private static final int PITCH = AtlasGutter.pitch(SIZE);
+
+        private final int level;
+        private final int slotColumns;
+        private final int slotCount;
+        private final boolean[] allocated;
+        private final java.util.ArrayDeque<Integer> free;
+        private final java.util.ArrayDeque<Integer> quarantined = new java.util.ArrayDeque<>();
+        private final com.velorise.simplemap.client.gpu.CaveAtlasPboUploader uploader = new com.velorise.simplemap.client.gpu.CaveAtlasPboUploader();
+        private final int[] gutteredUpload = new int[PITCH * PITCH];
+
+        private CaveAtlasTexture texture;
+        private net.minecraft.resources.ResourceLocation location;
+        private int textureId;
+        private boolean initialized;
+        private long storageGeneration;
+
+        public SurfaceRegionLodAtlas(int level) {
+            if (level < 0) throw new IllegalArgumentException("level");
+            this.level = level;
+            this.slotColumns = level == 0
+                    ? MapMemoryBudgetPolicy.branchLowColumns()
+                    : level == 1
+                    ? Math.max(16, MapMemoryBudgetPolicy.branchHighColumns())
+                    : MapMemoryBudgetPolicy.branchHighColumns();
+            this.slotCount = slotColumns * slotColumns;
+            this.allocated = new boolean[slotCount];
+            this.free = new java.util.ArrayDeque<>(slotCount);
+            refill();
+        }
+
+        public int level() { return level; }
+        public int slotCount() { return slotCount; }
+
+        public void ensureInitialized() {
+            initialize();
+        }
+
+        public long storageGeneration() {
+            return storageGeneration;
+        }
+
+        public boolean hasQuarantinedSlots() {
+            return !quarantined.isEmpty();
+        }
+
+        public int acquireSlot() {
+            com.mojang.blaze3d.systems.RenderSystem.assertOnRenderThreadOrInit();
+            initialize();
+            Integer slot = free.pollFirst();
+            if (slot == null) return -1;
+            allocated[slot] = true;
+            return slot;
+        }
+
+        public void releaseSlot(int slot) {
+            if (slot < 0 || slot >= slotCount || !allocated[slot]) return;
+            if (!quarantined.contains(slot)) quarantined.addLast(slot);
+        }
+
+        public void onPageTableFrameBoundary() {
+            com.mojang.blaze3d.systems.RenderSystem.assertOnRenderThreadOrInit();
+            while (!quarantined.isEmpty()) {
+                int slot = quarantined.removeFirst();
+                if (slot < 0 || slot >= slotCount || !allocated[slot]) continue;
+                allocated[slot] = false;
+                free.addLast(slot);
+            }
+        }
+
+        public void resetSlots() {
+            com.mojang.blaze3d.systems.RenderSystem.assertOnRenderThreadOrInit();
+            java.util.Arrays.fill(allocated, false);
+            quarantined.clear();
+            refill();
+        }
+
+        public CaveAtlasRegion region(int slot, long knownMask, long completeMask) {
+            if (!initialized || slot < 0 || slot >= slotCount || !allocated[slot]) {
+                return null;
+            }
+            int atlasSize = PITCH * slotColumns;
+            int sourceX = (slot % slotColumns) * PITCH + AtlasGutter.SIZE;
+            int sourceY = (slot / slotColumns) * PITCH + AtlasGutter.SIZE;
+            int worldSize = MapRegionLodPolicy.worldSize(level);
+            return new CaveAtlasRegion(location, sourceX, sourceY, SIZE, atlasSize,
+                    level, worldSize, knownMask, completeMask);
+        }
+
+        public void upload(int slot, int[] pixels,
+                int dirtyMinX, int dirtyMinY, int dirtyMaxX, int dirtyMaxY) {
+            com.mojang.blaze3d.systems.RenderSystem.assertOnRenderThreadOrInit();
+            initialize();
+            if (slot < 0 || slot >= slotCount || !allocated[slot]
+                    || pixels == null || pixels.length < SIZE * SIZE) return;
+            int minX = Math.max(0, Math.min(SIZE - 1, dirtyMinX));
+            int minY = Math.max(0, Math.min(SIZE - 1, dirtyMinY));
+            int maxX = Math.max(minX, Math.min(SIZE - 1, dirtyMaxX));
+            int maxY = Math.max(minY, Math.min(SIZE - 1, dirtyMaxY));
+
+            AtlasGutter.copyOnePixelBorder(pixels, SIZE, gutteredUpload);
+            int atlasX = (slot % slotColumns) * PITCH;
+            int atlasY = (slot / slotColumns) * PITCH;
+            uploader.upload(textureId, atlasX, atlasY, PITCH, PITCH,
+                    gutteredUpload, PITCH, 0, 0);
+        }
+
+        private void initialize() {
+            if (initialized) return;
+            com.mojang.blaze3d.systems.RenderSystem.assertOnRenderThreadOrInit();
+            int atlasSize = PITCH * slotColumns;
+            location = net.minecraft.resources.ResourceLocation.fromNamespaceAndPath(
+                    "simplemap", "surface_atlas/region_l" + level + "_64");
+            texture = new CaveAtlasTexture(atlasSize, true,
+                    () -> storageGeneration++);
+            net.minecraft.client.Minecraft.getInstance().getTextureManager().register(location, texture);
+            texture.allocateStorage();
+            MapMemoryBudgetPolicy.registerAtlasAllocation(
+                    "surface_region_lod_l" + level,
+                    (long) atlasSize * atlasSize * Integer.BYTES);
+            textureId = texture.getId();
+            initialized = true;
+        }
+
+        private void refill() {
+            free.clear();
+            for (int slot = 0; slot < slotCount; slot++) free.addLast(slot);
+        }
+    }
+
+    /**
+     * Shared density policy for the M4 region hierarchy.
+     *
+     * <p>Level 0 is one 512x512 source region represented by a 64x64 fallback
+     * texture (8 blocks/texel). Higher levels follow the same factor-2 hierarchy as
+     * The {@code textureLevel}: every level groups 2x2 children and doubles the
+     * blocks represented by one texel. The exact path remains chunk-progressive;
+     * this hierarchy is only stable coverage while sharper children arrive.</p>
+     */
+    public static final class MapRegionLodPolicy {
+        public static final int MAX_LEVEL = 3;
+        public static final float DIRECT_PROJECTION_THRESHOLD = 0.50f;
+        /** At this density the level-3 region texel (64 blocks) is screen-correct. */
+        public static final float REGION_ONLY_THRESHOLD = 0.015625f;
+
+        private MapRegionLodPolicy() { }
+
+        public static boolean directProjectionEnabled(float logicalScale) {
+            return Float.isFinite(logicalScale)
+                    && logicalScale > 0.0f
+                    && logicalScale < DIRECT_PROJECTION_THRESHOLD;
+        }
+
+        /**
+         * Coarse region coverage is also required when the visible exact-leaf set is
+         * larger than the safe Surface atlas working set. This can happen at a scale
+         * slightly above 0.50x on a large fullscreen window: density alone suggests
+         * exact L0, but hundreds of leaves cannot remain resident simultaneously.
+         * Building a stable 512x512 underlay is cheaper than cycling exact pages.
+         */
+        public static boolean directProjectionEnabled(float logicalScale,
+                int minPageX, int maxPageX, int minPageZ, int maxPageZ) {
+            if (directProjectionEnabled(logicalScale)) return true;
+            long pagesWide = Math.max(1L, (long) maxPageX - minPageX + 1L);
+            long pagesHigh = Math.max(1L, (long) maxPageZ - minPageZ + 1L);
+            long exactCapacity = (long) MapMemoryBudgetPolicy.surfaceLeafColumns()
+                    * MapMemoryBudgetPolicy.surfaceLeafColumns();
+            long safeWorkingSet = Math.max(64L, exactCapacity * 3L / 4L);
+            return pagesWide * pagesHigh > safeWorkingSet;
+        }
+
+
+        /**
+         * Extreme far zoom uses the level-3 region hierarchy as visual authority.
+         * Exact chunk work may still progress in the background; this predicate only
+         * prevents invisible fine quads from bloating the render plan.
+         */
+        public static boolean regionAuthorityOnly(float logicalScale) {
+            return Float.isFinite(logicalScale)
+                    && logicalScale > 0.0f
+                    && logicalScale < REGION_ONLY_THRESHOLD;
+        }
+
+        public static int targetLevel(float logicalScale) {
+            if (logicalScale >= 0.125f) return 0;
+            if (logicalScale >= 0.0625f) return 1;
+            if (logicalScale >= 0.03125f) return 2;
+            return MAX_LEVEL;
+        }
+
+        public static int regionSpan(int level) {
+            int clamped = Math.max(0, Math.min(MAX_LEVEL, level));
+            return 1 << clamped;
+        }
+
+        public static int worldSize(int level) {
+            long size = 512L * regionSpan(level);
+            return size > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) size;
+        }
+    }
+
+
+    /**
+ * Durable region-centric LOD authority introduced for M4.
+ *
+ * <p>Level 0 represents one 512x512 surface region and owns 64 exact-leaf
+ * versions. Every higher level groups 2x2 direct children, matching the
+ * screen-space texture-level hierarchy. Queue entries are
+ * disposable hints: dirty child masks, version sums and publication state remain
+ * in this graph and can reconstruct work after queue reset or admission denial.</p>
+ */
+public static final class RegionLodGraph {
+    /** Exact 64x64 leaves contained by one 512x512 level-0 source region. */
+    public static final int LEAF_CHILDREN_PER_AXIS = 8;
+    /** Retained array width; parent levels use only their first four entries. */
+    public static final int CHILD_COUNT = LEAF_CHILDREN_PER_AXIS
+            * LEAF_CHILDREN_PER_AXIS;
+    public static final int PARENT_CHILDREN_PER_AXIS = 2;
+    public static final int PARENT_CHILD_COUNT = 4;
+    public static final long ALL_LEAF_CHILDREN = -1L;
+    public static final long ALL_PARENT_CHILDREN = 0xFL;
+    /** Compatibility alias for level-0 callers. */
+    public static final long ALL_CHILDREN = ALL_LEAF_CHILDREN;
+    public static final int DEFAULT_MAX_LEVEL = 3;
+
+    public enum State {
+        CLEAN,
+        DIRTY,
+        RUNNING,
+        PREPARED,
+        PUBLISHED,
+        CANCELLED
+    }
+
+    public record NodeKey(long sessionId, int projectionId, int level,
+            int nodeX, int nodeZ) {
+        public NodeKey {
+            if (sessionId <= 0L) throw new IllegalArgumentException("sessionId");
+            if (level < 0) throw new IllegalArgumentException("level");
+        }
+    }
+
+    public record Lease(NodeKey key, RevisionStamp stamp, long revision,
+            long dirtyChildMask, long knownMask, long completeMask,
+            long[] childVersionSums) {
+        public Lease {
+            childVersionSums = Arrays.copyOf(childVersionSums,
+                    childVersionSums.length);
+        }
+        @Override public long[] childVersionSums() {
+            return Arrays.copyOf(childVersionSums, childVersionSums.length);
+        }
+    }
+
+    public record NodeSnapshot(NodeKey key, RevisionStamp stamp,
+            long targetRevision, long runningRevision,
+            long preparedRevision, long publishedRevision,
+            long aggregateVersionSum, long dirtyChildMask,
+            long knownMask, long completeMask, boolean gpuResident,
+            State state, long[] childVersionSums) {
+        public NodeSnapshot {
+            childVersionSums = Arrays.copyOf(childVersionSums,
+                    childVersionSums.length);
+        }
+        @Override public long[] childVersionSums() {
+            return Arrays.copyOf(childVersionSums, childVersionSums.length);
+        }
+    }
+
+
+    public record Summary(int nodes, int dirty, int running, int prepared,
+            int published, int resident, int level0Nodes, int coarseNodes) {
+        public static Summary empty() {
+            return new Summary(0, 0, 0, 0, 0, 0, 0, 0);
+        }
+    }
+
+    private final int maxLevel;
+    private final Map<NodeKey, NodeRecord> nodes = new HashMap<>();
+
+    public RegionLodGraph() {
+        this(DEFAULT_MAX_LEVEL);
+    }
+
+    public RegionLodGraph(int maxLevel) {
+        this.maxLevel = Math.max(0, maxLevel);
+    }
+
+    public synchronized void updateLeaf(RevisionStamp stamp,
+            int projectionId, int regionX, int regionZ, int leafIndex,
+            long leafVersion, boolean known, boolean complete,
+            boolean gpuResident) {
+        if (stamp == null || leafIndex < 0 || leafIndex >= CHILD_COUNT) return;
+        NodeKey key = new NodeKey(stamp.sessionId(), projectionId, 0,
+                regionX, regionZ);
+        NodeRecord node = node(key, stamp);
+        long normalized = Math.max(1L, leafVersion);
+        long bit = 1L << leafIndex;
+        long previous = node.childVersionSums[leafIndex];
+        boolean unpublishedDirectSeed = (node.directSeedMask & bit) != 0L
+                && node.publishedRevision == 0L
+                && node.preparedRevision == 0L;
+        // A direct 512x512 source probe seeds every child with one region-wide
+        // watermark before exact 64x64 leaves exist. That watermark and a leaf
+        // revision are different authorities, so an exact leaf may replace an
+        // unpublished seed even when its local revision number is lower. Once a
+        // coarse branch has been prepared/published, the old monotonic fence is
+        // retained and a late exact callback cannot roll durable coverage back.
+        if (normalized < previous && !unpublishedDirectSeed) return;
+        node.directSeedMask &= ~bit;
+        node.childVersionSums[leafIndex] = normalized;
+        node.aggregateVersionSum = safeAdd(node.aggregateVersionSum,
+                normalized - previous);
+        node.knownMask = setBit(node.knownMask, bit, known);
+        node.completeMask = setBit(node.completeMask, bit, complete);
+        node.gpuChildMask = setBit(node.gpuChildMask, bit, gpuResident);
+        node.dirtyChildMask |= bit;
+        node.targetRevision = revisionFor(node);
+        markDirty(node);
+        propagate(node);
+    }
+
+
+    /**
+     * Seeds or refreshes one level-0 region directly from the source database.
+     * All 64 leaf slots share the region source watermark until exact leaf
+     * revisions arrive and refine them independently. This allows coarse-first
+     * work to exist before any exact texture has been built.
+     */
+    public synchronized NodeKey requestRegion(RevisionStamp stamp,
+            int projectionId, int regionX, int regionZ,
+            long sourceWatermark) {
+        if (stamp == null) return null;
+        NodeKey key = new NodeKey(stamp.sessionId(), projectionId, 0,
+                regionX, regionZ);
+        NodeRecord node = node(key, stamp);
+        long normalized = Math.max(1L, sourceWatermark);
+        boolean changed = false;
+        for (int child = 0; child < CHILD_COUNT; child++) {
+            long bit = 1L << child;
+            // Exact-leaf authority must not be overwritten by an unrelated
+            // region-wide source watermark. Direct seeding owns only empty or
+            // already-direct-seeded child slots; exact publication refines them
+            // independently and can then drive the level-0 compositor.
+            boolean directOwned = (node.directSeedMask & bit) != 0L;
+            if (!directOwned && node.childVersionSums[child] > 0L) continue;
+            if (node.childVersionSums[child] >= normalized) {
+                node.directSeedMask |= bit;
+                continue;
+            }
+            node.childVersionSums[child] = normalized;
+            node.directSeedMask |= bit;
+            node.dirtyChildMask |= bit;
+            changed = true;
+        }
+        if (changed || node.publishedRevision == 0L) {
+            recomputeAggregate(node);
+            if (node.dirtyChildMask == 0L) {
+                node.dirtyChildMask = completeMaskForLevel(0);
+            }
+            node.targetRevision = revisionFor(node);
+            markDirty(node);
+            propagate(node);
+        }
+        return key;
+    }
+
+    /** Returns a running lease to durable DIRTY state after admission/source wait. */
+    public synchronized void defer(Lease lease) {
+        if (lease == null) return;
+        NodeRecord node = nodes.get(lease.key());
+        if (node == null || node.cancelled) return;
+        if (node.runningRevision == lease.revision()) node.runningRevision = 0L;
+        node.dirtyChildMask |= lease.dirtyChildMask();
+        node.state = State.DIRTY;
+    }
+
+    public int maxLevel() {
+        return maxLevel;
+    }
+
+    public synchronized void markLeafDirty(RevisionStamp stamp,
+            int projectionId, int regionX, int regionZ, int leafIndex,
+            long targetVersion) {
+        if (stamp == null || leafIndex < 0 || leafIndex >= CHILD_COUNT) return;
+        NodeRecord node = node(new NodeKey(stamp.sessionId(), projectionId, 0,
+                regionX, regionZ), stamp);
+        long bit = 1L << leafIndex;
+        node.childVersionSums[leafIndex] = Math.max(
+                node.childVersionSums[leafIndex], Math.max(1L, targetVersion));
+        recomputeAggregate(node);
+        node.dirtyChildMask |= bit;
+        node.targetRevision = revisionFor(node);
+        markDirty(node);
+        propagate(node);
+    }
+
+    public synchronized void markExactLeafEvicted(long sessionId,
+            int projectionId, int regionX, int regionZ, int leafIndex) {
+        NodeRecord node = nodes.get(new NodeKey(sessionId, projectionId, 0,
+                regionX, regionZ));
+        if (node == null || leafIndex < 0 || leafIndex >= CHILD_COUNT) return;
+        node.gpuChildMask &= ~(1L << leafIndex);
+    }
+
+    public synchronized Lease tryBegin(NodeKey key) {
+        NodeRecord node = nodes.get(key);
+        if (node == null || node.cancelled || node.state != State.DIRTY
+                || node.dirtyChildMask == 0L) return null;
+        node.state = State.RUNNING;
+        node.runningRevision = node.targetRevision;
+        return new Lease(key, node.stamp, node.runningRevision,
+                node.dirtyChildMask, node.knownMask, node.completeMask,
+                node.childVersionSums);
+    }
+
+    /**
+     * Claims visible level-0 regions in deterministic top-to-bottom order without
+     * materializing a snapshot and sorting every graph node on each render frame.
+     */
+    public synchronized List<Lease> claimLevel0RowMajor(long sessionId,
+            int projectionId, int minNodeX, int maxNodeX,
+            int minNodeZ, int maxNodeZ, int limit) {
+        return claimLevelRowMajor(sessionId, projectionId, 0,
+                minNodeX, maxNodeX, minNodeZ, maxNodeZ, limit);
+    }
+
+    /**
+     * Claims one visible hierarchy level in deterministic screen order. Far zoom
+     * uses this for the target region level instead of copying every graph node,
+     * sorting snapshots and then discarding almost all of them each frame.
+     */
+    public synchronized List<Lease> claimLevelRowMajor(long sessionId,
+            int projectionId, int level, int minNodeX, int maxNodeX,
+            int minNodeZ, int maxNodeZ, int limit) {
+        if (level < 0 || level > maxLevel || limit <= 0
+                || minNodeX > maxNodeX || minNodeZ > maxNodeZ) {
+            return List.of();
+        }
+        List<Lease> leases = new ArrayList<>(Math.min(limit, 8));
+        for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ
+                && leases.size() < limit; nodeZ++) {
+            for (int nodeX = minNodeX; nodeX <= maxNodeX
+                    && leases.size() < limit; nodeX++) {
+                NodeKey key = new NodeKey(sessionId, projectionId, level,
+                        nodeX, nodeZ);
+                NodeRecord node = nodes.get(key);
+                if (node == null || node.cancelled
+                        || node.state != State.DIRTY
+                        || node.dirtyChildMask == 0L
+                        || node.knownMask == 0L) continue;
+                Lease lease = tryBegin(key);
+                if (lease != null) leases.add(lease);
+            }
+        }
+        return List.copyOf(leases);
+    }
+
+    public synchronized List<Lease> claimCoarseFirst(long sessionId,
+            int projectionId, int limit) {
+        if (limit <= 0) return List.of();
+        List<NodeRecord> candidates = new ArrayList<>();
+        for (NodeRecord node : nodes.values()) {
+            if (node.key.sessionId() != sessionId
+                    || node.key.projectionId() != projectionId
+                    || node.cancelled || node.state != State.DIRTY
+                    || node.dirtyChildMask == 0L) continue;
+            candidates.add(node);
+        }
+        candidates.sort(Comparator
+                .comparing((NodeRecord node) -> node.gpuResident)
+                .thenComparing((NodeRecord node) -> -node.key.level())
+                .thenComparingLong(node -> node.publishedRevision)
+                .thenComparingInt(node -> node.key.nodeZ())
+                .thenComparingInt(node -> node.key.nodeX()));
+        List<Lease> leases = new ArrayList<>(Math.min(limit, candidates.size()));
+        for (NodeRecord node : candidates) {
+            if (leases.size() >= limit) break;
+            Lease lease = tryBegin(node.key);
+            if (lease != null) leases.add(lease);
+        }
+        return List.copyOf(leases);
+    }
+
+    public synchronized boolean markPrepared(Lease lease,
+            PreparedBranch prepared) {
+        if (!matches(lease, prepared)) return false;
+        NodeRecord node = nodes.get(lease.key());
+        if (node == null || node.cancelled) return false;
+        node.runningRevision = 0L;
+        node.preparedRevision = Math.max(node.preparedRevision,
+                prepared.revision());
+        boolean current = lease.revision() == node.targetRevision
+                && Arrays.equals(lease.childVersionSums(),
+                        node.childVersionSums);
+        if (current) {
+            node.knownMask = prepared.knownMask();
+            node.completeMask = prepared.completeMask();
+            node.dirtyChildMask &= ~lease.dirtyChildMask();
+        }
+        node.state = node.dirtyChildMask == 0L
+                && node.preparedRevision >= node.targetRevision
+                ? State.PREPARED : State.DIRTY;
+        if (current) propagate(node);
+        return true;
+    }
+
+    public synchronized boolean markPublished(PreparedBranch prepared) {
+        if (prepared == null) return false;
+        NodeRecord node = nodes.get(prepared.key());
+        if (node == null || node.cancelled
+                || !sameStamp(node.stamp, prepared.stamp())) return false;
+        if (prepared.revision() < node.targetRevision
+                || !Arrays.equals(prepared.childVersionSums(),
+                        node.childVersionSums)) return false;
+        node.preparedRevision = Math.max(node.preparedRevision,
+                prepared.revision());
+        node.publishedRevision = Math.max(node.publishedRevision,
+                prepared.revision());
+        node.knownMask = prepared.knownMask();
+        node.completeMask = prepared.completeMask();
+        node.gpuResident = prepared.knownMask() != 0L;
+        node.dirtyChildMask = 0L;
+        node.state = State.PUBLISHED;
+        propagate(node);
+        return true;
+    }
+
+    public synchronized void markBranchEvicted(NodeKey key, long revision) {
+        NodeRecord node = nodes.get(key);
+        if (node == null || node.cancelled) return;
+        if (revision >= node.publishedRevision) node.gpuResident = false;
+        node.state = node.preparedRevision >= node.targetRevision
+                ? State.PREPARED : State.DIRTY;
+    }
+
+    public synchronized boolean hasPublishedReplacement(long sessionId,
+            int projectionId, int regionX, int regionZ, long minimumRevision) {
+        int childX = regionX;
+        int childZ = regionZ;
+        for (int level = 0; level <= maxLevel; level++) {
+            NodeKey key = new NodeKey(sessionId, projectionId, level,
+                    childX, childZ);
+            NodeRecord node = nodes.get(key);
+            if (node != null && node.gpuResident
+                    && node.publishedRevision >= minimumRevision
+                    && node.knownMask != 0L) return true;
+            childX = Math.floorDiv(childX, PARENT_CHILDREN_PER_AXIS);
+            childZ = Math.floorDiv(childZ, PARENT_CHILDREN_PER_AXIS);
+        }
+        return false;
+    }
+
+    public synchronized Summary summary(long sessionId, int projectionId) {
+        int dirty = 0;
+        int running = 0;
+        int prepared = 0;
+        int published = 0;
+        int resident = 0;
+        int level0 = 0;
+        int coarse = 0;
+        int count = 0;
+        for (NodeRecord node : nodes.values()) {
+            if (node.key.sessionId() != sessionId
+                    || node.key.projectionId() != projectionId) continue;
+            count++;
+            if (node.key.level() == 0) level0++;
+            else coarse++;
+            if (node.state == State.DIRTY) dirty++;
+            else if (node.state == State.RUNNING) running++;
+            else if (node.state == State.PREPARED) prepared++;
+            else if (node.state == State.PUBLISHED) published++;
+            if (node.gpuResident) resident++;
+        }
+        return new Summary(count, dirty, running, prepared, published,
+                resident, level0, coarse);
+    }
+
+    public synchronized void clear() {
+        nodes.clear();
+    }
+
+    public synchronized NodeSnapshot snapshot(NodeKey key) {
+        NodeRecord node = nodes.get(key);
+        return node == null ? null : snapshot(node);
+    }
+
+    public synchronized List<NodeSnapshot> snapshots(long sessionId,
+            int projectionId) {
+        List<NodeSnapshot> result = new ArrayList<>();
+        for (NodeRecord node : nodes.values()) {
+            if (node.key.sessionId() == sessionId
+                    && node.key.projectionId() == projectionId) {
+                result.add(snapshot(node));
+            }
+        }
+        result.sort(Comparator.comparingInt((NodeSnapshot node) -> node.key().level())
+                .thenComparingInt(node -> node.key().nodeZ())
+                .thenComparingInt(node -> node.key().nodeX()));
+        return List.copyOf(result);
+    }
+
+    /** Marks every resident node for a newer style/projection tuple dirty. */
+    public synchronized int invalidate(RevisionStamp stamp, int projectionId) {
+        if (stamp == null) return 0;
+        int invalidated = 0;
+        for (NodeRecord node : nodes.values()) {
+            if (node.key.sessionId() != stamp.sessionId()
+                    || node.key.projectionId() != projectionId
+                    || node.cancelled || !isNewer(stamp, node.stamp)) continue;
+            node.stamp = stamp;
+            long affected = node.knownMask != 0L
+                    ? node.knownMask : node.dirtyChildMask;
+            if (affected == 0L) continue;
+            node.dirtyChildMask |= affected;
+            node.targetRevision = revisionFor(node);
+            markDirty(node);
+            invalidated++;
+        }
+        return invalidated;
+    }
+
+    public synchronized void cancelSession(long sessionId) {
+        var iterator = nodes.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<NodeKey, NodeRecord> entry = iterator.next();
+            if (entry.getKey().sessionId() != sessionId) continue;
+            entry.getValue().cancelled = true;
+            entry.getValue().state = State.CANCELLED;
+            iterator.remove();
+        }
+    }
+
+    private NodeRecord node(NodeKey key, RevisionStamp stamp) {
+        NodeRecord existing = nodes.get(key);
+        if (existing != null) {
+            if (isNewer(stamp, existing.stamp)) existing.stamp = stamp;
+            return existing;
+        }
+        NodeRecord created = new NodeRecord(key, stamp);
+        nodes.put(key, created);
+        return created;
+    }
+
+    private void propagate(NodeRecord child) {
+        NodeRecord current = child;
+        for (int parentLevel = child.key.level() + 1;
+                parentLevel <= maxLevel; parentLevel++) {
+            int parentX = Math.floorDiv(current.key.nodeX(),
+                    PARENT_CHILDREN_PER_AXIS);
+            int parentZ = Math.floorDiv(current.key.nodeZ(),
+                    PARENT_CHILDREN_PER_AXIS);
+            int childIndex = Math.floorMod(current.key.nodeZ(),
+                    PARENT_CHILDREN_PER_AXIS) * PARENT_CHILDREN_PER_AXIS
+                    + Math.floorMod(current.key.nodeX(),
+                            PARENT_CHILDREN_PER_AXIS);
+            NodeRecord parent = node(new NodeKey(current.key.sessionId(),
+                    current.key.projectionId(), parentLevel, parentX, parentZ),
+                    current.stamp);
+            long previous = parent.childVersionSums[childIndex];
+            long aggregate = current.aggregateVersionSum;
+            parent.childVersionSums[childIndex] = aggregate;
+            parent.aggregateVersionSum = safeAdd(parent.aggregateVersionSum,
+                    aggregate - previous);
+            long bit = 1L << childIndex;
+            parent.knownMask = setBit(parent.knownMask, bit,
+                    current.knownMask != 0L);
+            parent.completeMask = setBit(parent.completeMask, bit,
+                    current.completeMask == completeMaskForLevel(
+                            current.key.level()));
+            parent.dirtyChildMask |= bit;
+            parent.targetRevision = revisionFor(parent);
+            markDirty(parent);
+            current = parent;
+        }
+    }
+
+    /** Number of direct child slots that are meaningful for this node level. */
+    public static int childCountForLevel(int level) {
+        return level <= 0 ? CHILD_COUNT : PARENT_CHILD_COUNT;
+    }
+
+    /** Full coverage mask for this node level. */
+    public static long completeMaskForLevel(int level) {
+        return level <= 0 ? ALL_LEAF_CHILDREN : ALL_PARENT_CHILDREN;
+    }
+
+    private static boolean matches(Lease lease, PreparedBranch prepared) {
+        return lease != null && prepared != null
+                && lease.key().equals(prepared.key())
+                && sameStamp(lease.stamp(), prepared.stamp())
+                && lease.revision() == prepared.revision()
+                && Arrays.equals(lease.childVersionSums(),
+                        prepared.childVersionSums());
+    }
+
+    private static boolean sameStamp(RevisionStamp left, RevisionStamp right) {
+        return left != null && left.equals(right);
+    }
+
+    private static boolean isNewer(RevisionStamp candidate,
+            RevisionStamp current) {
+        if (current == null) return true;
+        boolean nonDecreasing = candidate.sourceGeneration()
+                        >= current.sourceGeneration()
+                && candidate.styleGeneration() >= current.styleGeneration()
+                && candidate.projectionGeneration()
+                        >= current.projectionGeneration();
+        boolean changed = candidate.sourceGeneration() != current.sourceGeneration()
+                || candidate.styleGeneration() != current.styleGeneration()
+                || candidate.projectionGeneration()
+                        != current.projectionGeneration();
+        return nonDecreasing && changed;
+    }
+
+    private static long setBit(long mask, long bit, boolean value) {
+        return value ? mask | bit : mask & ~bit;
+    }
+
+    private static long revisionFor(NodeRecord node) {
+        long generation = safeAdd(node.stamp.sourceGeneration(),
+                node.stamp.styleGeneration());
+        generation = safeAdd(generation,
+                node.stamp.projectionGeneration());
+        return Math.max(1L, safeAdd(node.aggregateVersionSum, generation));
+    }
+
+    private static long safeAdd(long left, long right) {
+        if (right > 0L && left > Long.MAX_VALUE - right) return Long.MAX_VALUE;
+        if (right < 0L && left < Long.MIN_VALUE - right) return Long.MIN_VALUE;
+        return left + right;
+    }
+
+    private static void recomputeAggregate(NodeRecord node) {
+        long sum = 0L;
+        for (long version : node.childVersionSums) sum = safeAdd(sum, version);
+        node.aggregateVersionSum = sum;
+    }
+
+    private static void markDirty(NodeRecord node) {
+        if (node.state != State.RUNNING) node.state = State.DIRTY;
+    }
+
+    private static NodeSnapshot snapshot(NodeRecord node) {
+        return new NodeSnapshot(node.key, node.stamp, node.targetRevision,
+                node.runningRevision, node.preparedRevision,
+                node.publishedRevision, node.aggregateVersionSum,
+                node.dirtyChildMask, node.knownMask, node.completeMask,
+                node.gpuResident, node.state, node.childVersionSums);
+    }
+
+    private static final class NodeRecord {
+        private final NodeKey key;
+        private RevisionStamp stamp;
+        private final long[] childVersionSums = new long[CHILD_COUNT];
+        private long targetRevision = 1L;
+        private long runningRevision;
+        private long preparedRevision;
+        private long publishedRevision;
+        private long aggregateVersionSum;
+        private long dirtyChildMask;
+        private long knownMask;
+        private long completeMask;
+        private long gpuChildMask;
+        /** Child versions currently owned by a region-wide direct-source seed. */
+        private long directSeedMask;
+        private boolean gpuResident;
+        private boolean cancelled;
+        private State state = State.CLEAN;
+
+        private NodeRecord(NodeKey key, RevisionStamp stamp) {
+            this.key = key;
+            this.stamp = stamp;
+        }
+    }
+
+    /**
+     * Immutable worker output for one region-centric LOD node. It contains no GPU
+     * handle and no mutable source object, so render-thread publication can validate
+     * the complete revision tuple before uploading.
+     */
+    public static final class PreparedBranch {
+        private final RegionLodGraph.NodeKey key;
+        private final RevisionStamp stamp;
+        private final long revision;
+        private final int width;
+        private final int height;
+        private final int[] pixels;
+        private final long knownMask;
+        private final long completeMask;
+        private final long[] knownRows;
+        private final long[] completeRows;
+        private final long[] childVersionSums;
+        private final int dirtyMinX;
+        private final int dirtyMinY;
+        private final int dirtyMaxX;
+        private final int dirtyMaxY;
+
+        public PreparedBranch(RegionLodGraph.NodeKey key, RevisionStamp stamp,
+                long revision, int width, int height, int[] pixels,
+                long knownMask, long completeMask, long[] childVersionSums,
+                int dirtyMinX, int dirtyMinY, int dirtyMaxX, int dirtyMaxY) {
+            this(key, stamp, revision, width, height, pixels, knownMask,
+                    completeMask, rowsFromMask(knownMask),
+                    rowsFromMask(completeMask), childVersionSums,
+                    dirtyMinX, dirtyMinY, dirtyMaxX, dirtyMaxY);
+        }
+
+        public PreparedBranch(RegionLodGraph.NodeKey key, RevisionStamp stamp,
+                long revision, int width, int height, int[] pixels,
+                long knownMask, long completeMask, long[] knownRows,
+                long[] completeRows, long[] childVersionSums,
+                int dirtyMinX, int dirtyMinY, int dirtyMaxX, int dirtyMaxY) {
+            if (key == null || stamp == null) {
+                throw new IllegalArgumentException("Branch key and stamp are required");
+            }
+            if (width <= 0 || height <= 0 || pixels == null
+                    || pixels.length != width * height) {
+                throw new IllegalArgumentException("Invalid branch pixel payload");
+            }
+            if (childVersionSums == null
+                    || childVersionSums.length != RegionLodGraph.CHILD_COUNT) {
+                throw new IllegalArgumentException("Branch requires 64 child versions");
+            }
+            if (knownRows == null || knownRows.length != height
+                    || completeRows == null || completeRows.length != height) {
+                throw new IllegalArgumentException("Branch requires coverage rows");
+            }
+            this.key = key;
+            this.stamp = stamp;
+            this.revision = Math.max(1L, revision);
+            this.width = width;
+            this.height = height;
+            this.pixels = Arrays.copyOf(pixels, pixels.length);
+            this.knownMask = knownMask;
+            this.completeMask = completeMask;
+            this.knownRows = Arrays.copyOf(knownRows, knownRows.length);
+            this.completeRows = Arrays.copyOf(completeRows, completeRows.length);
+            this.childVersionSums = Arrays.copyOf(childVersionSums,
+                    childVersionSums.length);
+            this.dirtyMinX = Math.max(0, Math.min(width - 1, dirtyMinX));
+            this.dirtyMinY = Math.max(0, Math.min(height - 1, dirtyMinY));
+            this.dirtyMaxX = Math.max(this.dirtyMinX,
+                    Math.min(width - 1, dirtyMaxX));
+            this.dirtyMaxY = Math.max(this.dirtyMinY,
+                    Math.min(height - 1, dirtyMaxY));
+        }
+
+        public RegionLodGraph.NodeKey key() { return key; }
+        public RevisionStamp stamp() { return stamp; }
+        public long revision() { return revision; }
+        public int width() { return width; }
+        public int height() { return height; }
+        public int[] pixels() { return Arrays.copyOf(pixels, pixels.length); }
+        public long knownMask() { return knownMask; }
+        public long completeMask() { return completeMask; }
+        public long[] knownRows() { return Arrays.copyOf(knownRows, knownRows.length); }
+        public long[] completeRows() {
+            return Arrays.copyOf(completeRows, completeRows.length);
+        }
+        public long[] childVersionSums() {
+            return Arrays.copyOf(childVersionSums, childVersionSums.length);
+        }
+        public int dirtyMinX() { return dirtyMinX; }
+        public int dirtyMinY() { return dirtyMinY; }
+        public int dirtyMaxX() { return dirtyMaxX; }
+        public int dirtyMaxY() { return dirtyMaxY; }
+
+        private static long[] rowsFromMask(long childMask) {
+            long[] rows = new long[64];
+            for (int child = 0; child < 64; child++) {
+                if ((childMask & (1L << child)) == 0L) continue;
+                int childX = child & 7;
+                int childY = child >>> 3;
+                long bits = 0xFFL << (childX * 8);
+                int startY = childY * 8;
+                for (int y = startY; y < startY + 8; y++) rows[y] |= bits;
+            }
+            return rows;
+        }
+    }
+
+    /**
+     * Worker-only compositor for the region-centric LOD hierarchy.
+     */
+    public static final class RegionLodDeriver {
+        public static final int TEXTURE_SIZE = 64;
+        private static final int LEAF_CHILD_OUTPUT_SIZE = 8;
+        private static final int LEAF_SAMPLE_SPAN =
+                TEXTURE_SIZE / LEAF_CHILD_OUTPUT_SIZE;
+
+        private RegionLodDeriver() { }
+
+        public static final class ChildSnapshot {
+            private final int childIndex;
+            private final long revision;
+            private final int[] pixels;
+            private final long[] knownRows;
+            private final long[] completeRows;
+
+            public ChildSnapshot(int childIndex, long revision, int[] pixels,
+                    long[] knownRows, long[] completeRows) {
+                if (childIndex < 0 || childIndex >= RegionLodGraph.CHILD_COUNT) {
+                    throw new IllegalArgumentException("childIndex");
+                }
+                if (pixels == null || pixels.length != TEXTURE_SIZE * TEXTURE_SIZE
+                        || knownRows == null || knownRows.length != TEXTURE_SIZE
+                        || completeRows == null
+                        || completeRows.length != TEXTURE_SIZE) {
+                    throw new IllegalArgumentException(
+                            "LOD child requires 64x64 pixels and coverage rows");
+                }
+                this.childIndex = childIndex;
+                this.revision = Math.max(1L, revision);
+                this.pixels = Arrays.copyOf(pixels, pixels.length);
+                this.knownRows = Arrays.copyOf(knownRows, knownRows.length);
+                this.completeRows = Arrays.copyOf(completeRows,
+                        completeRows.length);
+            }
+
+            public int childIndex() { return childIndex; }
+            public long revision() { return revision; }
+            public int[] pixels() { return Arrays.copyOf(pixels, pixels.length); }
+            public long[] knownRows() {
+                return Arrays.copyOf(knownRows, knownRows.length);
+            }
+            public long[] completeRows() {
+                return Arrays.copyOf(completeRows, completeRows.length);
+            }
+        }
+
+        public static final class ReducedChildSnapshot {
+            private final int childIndex;
+            private final long revision;
+            private final int[] pixels;
+            private final long[] knownRows;
+            private final long[] completeRows;
+
+            public ReducedChildSnapshot(int childIndex, long revision,
+                    int[] pixels, long[] knownRows, long[] completeRows) {
+                if (childIndex < 0 || childIndex >= RegionLodGraph.CHILD_COUNT) {
+                    throw new IllegalArgumentException("childIndex");
+                }
+                if (pixels == null || pixels.length
+                        != LEAF_CHILD_OUTPUT_SIZE * LEAF_CHILD_OUTPUT_SIZE
+                        || knownRows == null
+                        || knownRows.length != LEAF_CHILD_OUTPUT_SIZE
+                        || completeRows == null
+                        || completeRows.length != LEAF_CHILD_OUTPUT_SIZE) {
+                    throw new IllegalArgumentException(
+                            "Reduced LOD child requires 8x8 pixels and coverage rows");
+                }
+                this.childIndex = childIndex;
+                this.revision = Math.max(1L, revision);
+                this.pixels = Arrays.copyOf(pixels, pixels.length);
+                this.knownRows = Arrays.copyOf(knownRows, knownRows.length);
+                this.completeRows = Arrays.copyOf(completeRows,
+                        completeRows.length);
+            }
+
+            public int childIndex() { return childIndex; }
+            public long revision() { return revision; }
+            public int[] pixels() { return Arrays.copyOf(pixels, pixels.length); }
+            public long[] knownRows() {
+                return Arrays.copyOf(knownRows, knownRows.length);
+            }
+            public long[] completeRows() {
+                return Arrays.copyOf(completeRows, completeRows.length);
+            }
+        }
+
+        public static ReducedChildSnapshot reduceExactLeaf(int childIndex,
+                long revision, int[] pixels, long[] knownRows) {
+            if (pixels == null || pixels.length != TEXTURE_SIZE * TEXTURE_SIZE
+                    || knownRows == null || knownRows.length != TEXTURE_SIZE) {
+                return null;
+            }
+            int[] reducedPixels = new int[LEAF_CHILD_OUTPUT_SIZE
+                    * LEAF_CHILD_OUTPUT_SIZE];
+            long[] reducedKnownRows = new long[LEAF_CHILD_OUTPUT_SIZE];
+            long[] reducedCompleteRows = new long[LEAF_CHILD_OUTPUT_SIZE];
+            for (int outputY = 0; outputY < LEAF_CHILD_OUTPUT_SIZE; outputY++) {
+                int sourceStartY = outputY * LEAF_SAMPLE_SPAN;
+                for (int outputX = 0; outputX < LEAF_CHILD_OUTPUT_SIZE; outputX++) {
+                    int sourceStartX = outputX * LEAF_SAMPLE_SPAN;
+                    ReducedColor reduced = reduceBlock(pixels, knownRows,
+                            sourceStartX, sourceStartY, LEAF_SAMPLE_SPAN);
+                    if (reduced.known) {
+                        reducedPixels[outputY * LEAF_CHILD_OUTPUT_SIZE + outputX] =
+                                reduced.abgr;
+                        reducedKnownRows[outputY] |= 1L << outputX;
+                    }
+                    if (blockComplete(knownRows, sourceStartX, sourceStartY,
+                            LEAF_SAMPLE_SPAN)) {
+                        reducedCompleteRows[outputY] |= 1L << outputX;
+                    }
+                }
+            }
+            return new ReducedChildSnapshot(childIndex, revision,
+                    reducedPixels, reducedKnownRows, reducedCompleteRows);
+        }
+
+        public static PreparedBranch deriveLevel0(RegionLodGraph.Lease lease,
+                Collection<ReducedChildSnapshot> children,
+                BooleanSupplier stillValid) {
+            if (lease == null || lease.key().level() != 0) {
+                throw new IllegalArgumentException("level-0 lease required");
+            }
+            BooleanSupplier valid = stillValid == null ? () -> true : stillValid;
+            ReducedChildSnapshot[] indexed =
+                    new ReducedChildSnapshot[RegionLodGraph.CHILD_COUNT];
+            if (children != null) {
+                for (ReducedChildSnapshot child : children) {
+                    if (child == null) continue;
+                    if (indexed[child.childIndex] != null) {
+                        throw new IllegalArgumentException(
+                                "Duplicate reduced LOD child " + child.childIndex);
+                    }
+                    indexed[child.childIndex] = child;
+                }
+            }
+
+            long[] expectedVersions = lease.childVersionSums();
+            int[] output = new int[TEXTURE_SIZE * TEXTURE_SIZE];
+            long[] outputKnownRows = new long[TEXTURE_SIZE];
+            long[] outputCompleteRows = new long[TEXTURE_SIZE];
+            long outputKnownMask = 0L;
+            long outputCompleteMask = 0L;
+            for (int childIndex = 0;
+                    childIndex < RegionLodGraph.CHILD_COUNT; childIndex++) {
+                check(valid);
+                long bit = 1L << childIndex;
+                boolean expectedKnown = (lease.knownMask() & bit) != 0L;
+                ReducedChildSnapshot child = indexed[childIndex];
+                if (child == null) {
+                    if (expectedKnown) {
+                        throw new IllegalArgumentException(
+                                "Missing authoritative reduced child " + childIndex);
+                    }
+                    continue;
+                }
+                if (expectedVersions[childIndex] > 0L
+                        && child.revision != expectedVersions[childIndex]) {
+                    throw new IllegalArgumentException(
+                            "Stale reduced child " + childIndex + ": expected "
+                                    + expectedVersions[childIndex] + ", got "
+                                    + child.revision);
+                }
+                int childX = childIndex & 7;
+                int childZ = childIndex >>> 3;
+                int destinationStartX = childX * LEAF_CHILD_OUTPUT_SIZE;
+                int destinationStartY = childZ * LEAF_CHILD_OUTPUT_SIZE;
+                boolean anyKnown = false;
+                boolean allComplete = true;
+                for (int row = 0; row < LEAF_CHILD_OUTPUT_SIZE; row++) {
+                    long known = child.knownRows[row] & 0xFFL;
+                    long complete = child.completeRows[row] & 0xFFL;
+                    anyKnown |= known != 0L;
+                    allComplete &= complete == 0xFFL;
+                    int destinationY = destinationStartY + row;
+                    int destinationOffset = destinationY * TEXTURE_SIZE
+                            + destinationStartX;
+                    System.arraycopy(child.pixels, row * LEAF_CHILD_OUTPUT_SIZE,
+                            output, destinationOffset, LEAF_CHILD_OUTPUT_SIZE);
+                    outputKnownRows[destinationY] |= known << destinationStartX;
+                    outputCompleteRows[destinationY] |=
+                            complete << destinationStartX;
+                }
+                if (anyKnown) outputKnownMask |= bit;
+                if (allComplete) outputCompleteMask |= bit;
+            }
+            int[] dirtyRect = dirtyRect(lease.key().level(),
+                    lease.dirtyChildMask());
+            return new PreparedBranch(lease.key(), lease.stamp(), lease.revision(),
+                    TEXTURE_SIZE, TEXTURE_SIZE, output, outputKnownMask,
+                    outputCompleteMask, outputKnownRows, outputCompleteRows,
+                    expectedVersions, dirtyRect[0], dirtyRect[1],
+                    dirtyRect[2], dirtyRect[3]);
+        }
+
+        public static PreparedBranch derive(RegionLodGraph.Lease lease,
+                Collection<ChildSnapshot> children, BooleanSupplier stillValid) {
+            if (lease == null) throw new IllegalArgumentException("lease");
+            BooleanSupplier valid = stillValid == null ? () -> true : stillValid;
+            ChildSnapshot[] indexed = new ChildSnapshot[RegionLodGraph.CHILD_COUNT];
+            if (children != null) {
+                for (ChildSnapshot child : children) {
+                    if (child == null) continue;
+                    if (indexed[child.childIndex] != null) {
+                        throw new IllegalArgumentException(
+                                "Duplicate LOD child " + child.childIndex);
+                    }
+                    indexed[child.childIndex] = child;
+                }
+            }
+
+            long[] expectedVersions = lease.childVersionSums();
+            int[] output = new int[TEXTURE_SIZE * TEXTURE_SIZE];
+            long[] outputKnownRows = new long[TEXTURE_SIZE];
+            long[] outputCompleteRows = new long[TEXTURE_SIZE];
+            long outputKnownMask = 0L;
+            long outputCompleteMask = 0L;
+
+            int childCount = RegionLodGraph.childCountForLevel(lease.key().level());
+            for (int childIndex = 0; childIndex < childCount; childIndex++) {
+                check(valid);
+                long bit = 1L << childIndex;
+                ChildSnapshot child = indexed[childIndex];
+                boolean expectedKnown = (lease.knownMask() & bit) != 0L;
+                if (child == null) {
+                    if (expectedKnown) {
+                        throw new IllegalArgumentException(
+                                "Missing authoritative LOD child " + childIndex);
+                    }
+                    continue;
+                }
+                long expectedRevision = expectedVersions[childIndex];
+                if (expectedRevision > 0L && child.revision != expectedRevision) {
+                    throw new IllegalArgumentException(
+                            "Stale LOD child " + childIndex + ": expected "
+                                    + expectedRevision + ", got " + child.revision);
+                }
+
+                ChildReduction reduction = reduceChild(child, output,
+                        outputKnownRows, outputCompleteRows, valid,
+                        lease.key().level());
+                if (reduction.anyKnown()) outputKnownMask |= bit;
+                if (reduction.allComplete()) outputCompleteMask |= bit;
+            }
+
+            int[] dirtyRect = dirtyRect(lease.key().level(),
+                    lease.dirtyChildMask());
+            return new PreparedBranch(lease.key(), lease.stamp(), lease.revision(),
+                    TEXTURE_SIZE, TEXTURE_SIZE, output, outputKnownMask,
+                    outputCompleteMask, outputKnownRows, outputCompleteRows,
+                    expectedVersions, dirtyRect[0], dirtyRect[1],
+                    dirtyRect[2], dirtyRect[3]);
+        }
+
+        private static ChildReduction reduceChild(ChildSnapshot child,
+                int[] output, long[] outputKnownRows, long[] outputCompleteRows,
+                BooleanSupplier valid, int level) {
+            int childrenPerAxis = level <= 0
+                    ? RegionLodGraph.LEAF_CHILDREN_PER_AXIS
+                    : RegionLodGraph.PARENT_CHILDREN_PER_AXIS;
+            int childOutputSize = TEXTURE_SIZE / childrenPerAxis;
+            int sampleSpan = TEXTURE_SIZE / childOutputSize;
+            int childX = child.childIndex % childrenPerAxis;
+            int childZ = child.childIndex / childrenPerAxis;
+            int destinationStartX = childX * childOutputSize;
+            int destinationStartY = childZ * childOutputSize;
+            boolean anyKnown = false;
+            boolean allComplete = true;
+
+            for (int outputY = 0; outputY < childOutputSize; outputY++) {
+                check(valid);
+                int sourceStartY = outputY * sampleSpan;
+                int destinationY = destinationStartY + outputY;
+                int destinationRow = destinationY * TEXTURE_SIZE;
+                for (int outputX = 0; outputX < childOutputSize; outputX++) {
+                    int sourceStartX = outputX * sampleSpan;
+                    int destinationX = destinationStartX + outputX;
+                    ReducedColor reduced = reduceBlock(child, sourceStartX,
+                            sourceStartY, sampleSpan);
+                    boolean complete = blockComplete(child, sourceStartX,
+                            sourceStartY, sampleSpan);
+                    if (reduced.known) {
+                        anyKnown = true;
+                        output[destinationRow + destinationX] = reduced.abgr;
+                        outputKnownRows[destinationY] |= 1L << destinationX;
+                    }
+                    if (complete) {
+                        outputCompleteRows[destinationY] |= 1L << destinationX;
+                    } else {
+                        allComplete = false;
+                    }
+                }
+            }
+            return new ChildReduction(anyKnown, allComplete);
+        }
+
+        private static boolean blockComplete(ChildSnapshot child,
+                int sourceStartX, int sourceStartY, int sampleSpan) {
+            long mask = ((1L << sampleSpan) - 1L) << sourceStartX;
+            for (int y = 0; y < sampleSpan; y++) {
+                if ((child.completeRows[sourceStartY + y] & mask) != mask) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static boolean blockComplete(long[] knownRows,
+                int sourceStartX, int sourceStartY, int sampleSpan) {
+            long mask = ((1L << sampleSpan) - 1L) << sourceStartX;
+            for (int y = 0; y < sampleSpan; y++) {
+                if ((knownRows[sourceStartY + y] & mask) != mask) return false;
+            }
+            return true;
+        }
+
+        private static ReducedColor reduceBlock(ChildSnapshot child,
+                int sourceStartX, int sourceStartY, int sampleSpan) {
+            int knownCount = 0;
+            int coloredCount = 0;
+            long redTotal = 0L;
+            long greenTotal = 0L;
+            long blueTotal = 0L;
+            for (int y = 0; y < sampleSpan; y++) {
+                int sourceY = sourceStartY + y;
+                long knownRow = child.knownRows[sourceY];
+                int sourceRow = sourceY * TEXTURE_SIZE;
+                for (int x = 0; x < sampleSpan; x++) {
+                    int sourceX = sourceStartX + x;
+                    if ((knownRow & (1L << sourceX)) == 0L) continue;
+                    knownCount++;
+                    int color = child.pixels[sourceRow + sourceX];
+                    int a = color >>> 24;
+                    if (a == 0) continue;
+                    coloredCount++;
+                    redTotal += color & 0xFF;
+                    greenTotal += (color >>> 8) & 0xFF;
+                    blueTotal += (color >>> 16) & 0xFF;
+                }
+            }
+            if (knownCount == 0) return ReducedColor.UNKNOWN;
+            if (coloredCount == 0) return new ReducedColor(true, 0);
+            return new ReducedColor(true, packMeanColor(
+                    (int) (redTotal / coloredCount),
+                    (int) (greenTotal / coloredCount),
+                    (int) (blueTotal / coloredCount)));
+        }
+
+        private static ReducedColor reduceBlock(int[] pixels, long[] knownRows,
+                int sourceStartX, int sourceStartY, int sampleSpan) {
+            int knownCount = 0;
+            int coloredCount = 0;
+            long redTotal = 0L;
+            long greenTotal = 0L;
+            long blueTotal = 0L;
+            for (int y = 0; y < sampleSpan; y++) {
+                int sourceY = sourceStartY + y;
+                long knownRow = knownRows[sourceY];
+                int sourceRow = sourceY * TEXTURE_SIZE;
+                for (int x = 0; x < sampleSpan; x++) {
+                    int sourceX = sourceStartX + x;
+                    if ((knownRow & (1L << sourceX)) == 0L) continue;
+                    knownCount++;
+                    int color = pixels[sourceRow + sourceX];
+                    int a = color >>> 24;
+                    if (a == 0) continue;
+                    coloredCount++;
+                    redTotal += color & 0xFF;
+                    greenTotal += (color >>> 8) & 0xFF;
+                    blueTotal += (color >>> 16) & 0xFF;
+                }
+            }
+            if (knownCount == 0) return ReducedColor.UNKNOWN;
+            if (coloredCount == 0) return new ReducedColor(true, 0);
+            return new ReducedColor(true, packMeanColor(
+                    (int) (redTotal / coloredCount),
+                    (int) (greenTotal / coloredCount),
+                    (int) (blueTotal / coloredCount)));
+        }
+
+        private static int packMeanColor(int red, int green, int blue) {
+            return 0xFF000000 | (Math.max(0, Math.min(255, blue)) << 16)
+                    | (Math.max(0, Math.min(255, green)) << 8)
+                    | Math.max(0, Math.min(255, red));
+        }
+
+        private static int[] dirtyRect(int level, long dirtyChildMask) {
+            if (dirtyChildMask == 0L) return new int[] { 0, 0, 63, 63 };
+            int minX = TEXTURE_SIZE;
+            int minY = TEXTURE_SIZE;
+            int maxX = -1;
+            int maxY = -1;
+            int childrenPerAxis = level <= 0
+                    ? RegionLodGraph.LEAF_CHILDREN_PER_AXIS
+                    : RegionLodGraph.PARENT_CHILDREN_PER_AXIS;
+            int childCount = RegionLodGraph.childCountForLevel(level);
+            int childOutputSize = TEXTURE_SIZE / childrenPerAxis;
+            for (int child = 0; child < childCount; child++) {
+                if ((dirtyChildMask & (1L << child)) == 0L) continue;
+                int x = (child % childrenPerAxis) * childOutputSize;
+                int y = (child / childrenPerAxis) * childOutputSize;
+                minX = Math.min(minX, x);
+                minY = Math.min(minY, y);
+                maxX = Math.max(maxX, x + childOutputSize - 1);
+                maxY = Math.max(maxY, y + childOutputSize - 1);
+            }
+            return new int[] { minX, minY, maxX, maxY };
+        }
+
+        private static void check(BooleanSupplier valid) {
+            if (!valid.getAsBoolean()) {
+                throw new java.util.concurrent.CancellationException(
+                        "LOD derivation cancelled");
+            }
+        }
+
+        private record ChildReduction(boolean anyKnown, boolean allComplete) { }
+
+        private record ReducedColor(boolean known, int abgr) {
+            private static final ReducedColor UNKNOWN = new ReducedColor(false, 0);
+        }
+    }
+}
+
 }

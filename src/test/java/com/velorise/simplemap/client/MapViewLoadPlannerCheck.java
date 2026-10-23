@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapViewLoadPlanner;
 
 import java.util.HashSet;
 import java.util.Set;

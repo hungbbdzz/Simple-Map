@@ -2,13 +2,6 @@
 
 Simple Map focuses on readable terrain, fast client-side exploration, practical navigation tools, and an optional Map Book system for sharing explored regions without turning the interface into a separate game.
 
-> [!WARNING]
-> **Development Paused** — This project is currently on hold. The cave mapping system proved more complex than anticipated, and further development has been postponed indefinitely. The mod is stable, fully functional for surface mapping, and remains available under the **MIT License** — forks and contributions are welcome.
-
-> **Architecture checkpoint:** V17.8 / M4 Region LOD authority. Surface far-zoom coverage can now be projected directly from region source data, published through a durable 8×8 hierarchy, and rendered as a coarse underlay before exact pages finish. The older factor-2 LOD tree remains temporarily as a quality/refinement adapter until the M5 page-table renderer replaces both paths.
-
-> **PASS99 loaded/loading checkpoint:** minimap Surface/Cave now keep retained root coverage behind refinement and gate front/back FBO handoff like Xaero's loaded/loading grids. Cave branch work uses foreground/background dirty lanes rather than viewport queue sorting, and projection/page styling removes several high-rate transient allocations.
-
 ---
 
 ## Highlights
@@ -62,7 +55,7 @@ The minimap is rendered from the same explored region data as the full-screen ma
 - Rotating-map or rotating-player-pointer modes.
 - Configurable size from 16 to 150 GUI pixels.
 - Independent minimap zoom.
-- Draggable, anchor-based placement that remains stable across resolution and GUI-scale changes.
+- Draggable, anchor-based placement that remains stable across resolution and GUI-scale changes.ư
 - Optional coordinates with independent scale and position.
 - Arrow-only or skin-plus-arrow player marker.
 - Configurable player pointer, pin, coordinate text, compass letters, and minimap ring colours.

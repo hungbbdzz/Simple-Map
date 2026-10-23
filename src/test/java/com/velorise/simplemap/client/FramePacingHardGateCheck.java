@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.renderer.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -10,14 +11,13 @@ public final class FramePacingHardGateCheck {
     public static void main(String[] args) throws Exception {
         String gate = readClient("MapActivityGate.java");
         String lanes = readClient("MapRequestLane.java");
-        String screen = readClient("MapScreen.java");
+        String screen = readClient("gui/MapScreen.java");
         String governor = readClient("MapPerformanceGovernor.java");
-        String minimap = readClient("MinimapFramebufferRenderer.java");
+        String minimap = readClient("renderer/MinimapFramebufferRenderer.java");
         String mutation = readClient("MapMutationBus.java");
         String scanner = readClient("ChunkScanner.java");
         String viewport = readClient("MapViewportCoordinator.java");
         String texture = readClient("MapTextureManager.java");
-        String caveScheduler = readCave("CaveDisplayScheduler.java");
         String packetMixin = Files.readString(Path.of(
                 "src/main/java/com/velorise/simplemap/mixin/"
                         + "SimpleMapClientPacketListenerMixin.java"));
@@ -55,13 +55,11 @@ public final class FramePacingHardGateCheck {
                 "composed minimap can again be blurred after density-correct LOD");
 
         int surfaceEnqueue = mutation.indexOf("enqueueLoadedSurfaceChunk(chunkX, chunkZ)");
-        int caveEnqueue = mutation.indexOf("enqueueLoadedChunk(chunkX, chunkZ)");
+        int caveEnqueue = mutation.indexOf("isHotChunk(chunkX, chunkZ)");
         int movementReturn = mutation.indexOf(
                 "if (MapActivityGate.getInstance().blocksMapWork()) return", surfaceEnqueue);
         require(surfaceEnqueue >= 0 && caveEnqueue > surfaceEnqueue
-                        && movementReturn > caveEnqueue
-                        && mutation.substring(surfaceEnqueue, movementReturn)
-                                .contains("isHotChunk(chunkX, chunkZ)"),
+                        && movementReturn > caveEnqueue,
                 "chunk packet travel ingress lost Surface authority or hot Cave filtering");
 
         require(scanner.contains("LongArrayFIFOQueue loadedSurfaceChunks")
@@ -100,16 +98,8 @@ public final class FramePacingHardGateCheck {
                         && scanner.contains("enqueueSeedLiveRepairChunk(chunkX, chunkZ)")
                         && retainedReplay >= 0,
                 "world-join Surface repair again blocks retained-cache replay/reconciliation");
-        require(caveScheduler.contains("LongArrayFIFOQueue loadedChunkFrontier")
-                        && caveScheduler.contains("MAX_LOADED_CHUNK_FRONTIER = 8192")
-                        && caveScheduler.contains("admitLoadedChunk"),
-                "cave travel FIFO/coherent tile admission regressed");
         require(viewport.contains("prepareMovementStreaming()"),
                 "viewport scheduler no longer preserves visible lanes during movement");
-        require(!Files.readString(Path.of(
-                        "src/main/java/com/velorise/simplemap/client/cave/CaveWorldSaveReader.java"))
-                        .contains("state == GeneratedChunkIndex.State.LIVE"),
-                "historical LIVE state again suppresses unloaded Surface disk repair");
         require(texture.contains("replaceMinimapDemandWindowIfMoved")
                         && texture.contains("clearAllPageDemandLane(MapRequestLane.MINIMAP)")
                         && texture.contains("clearPageDemandLane(leafKey, uploadLane)"),

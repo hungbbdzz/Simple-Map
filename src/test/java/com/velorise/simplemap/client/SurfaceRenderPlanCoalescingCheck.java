@@ -1,9 +1,10 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.cave.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-/** PASS95 guard for Xaero-style coarse Surface publication coalescing. */
+/** PASS95 guard for coarse Surface publication coalescing. */
 public final class SurfaceRenderPlanCoalescingCheck {
     private SurfaceRenderPlanCoalescingCheck() { }
 

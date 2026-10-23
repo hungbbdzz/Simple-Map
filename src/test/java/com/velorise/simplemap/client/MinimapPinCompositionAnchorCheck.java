@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.renderer.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -10,9 +11,9 @@ public final class MinimapPinCompositionAnchorCheck {
     public static void main(String[] args) throws Exception {
         Path root = Path.of("src/main/java/com/velorise/simplemap/client");
         String framebuffer = Files.readString(
-                root.resolve("MinimapFramebufferRenderer.java"));
+                root.resolve("renderer/MinimapFramebufferRenderer.java"));
         String renderer = Files.readString(root.resolve("MinimapRenderer.java"));
-        String navigation = Files.readString(root.resolve("PinNavigation.java"));
+        String navigation = Files.readString(root.resolve("waypoint/PinNavigation.java"));
         String mapRenderer = Files.readString(root.resolve("MapRenderer.java"));
 
         require(framebuffer.contains("HudPoint projectWorldToHud")

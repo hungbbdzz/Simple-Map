@@ -1,4 +1,7 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.color.SurfaceColorizer.BlockTintPolicy;
+import com.velorise.simplemap.client.color.SurfaceColorizer.SurfaceTintData;
+import com.velorise.simplemap.client.color.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,7 +25,7 @@ public final class SurfaceBiomeTintSeamCheck {
                         && scanner.contains("return SurfaceTintData.NONE;"),
                 "scanner still persists transient standard biome tint");
         String cache = Files.readString(Path.of(
-                "src/main/java/com/velorise/simplemap/client/cave/LodBranchDiskCache.java"));
+                "src/main/java/com/velorise/simplemap/client/lod/LodBranchDiskCache.java"));
         require(cache.contains("private static final int VERSION = 11;"),
                 "old seam-bearing derived branch cache is still reusable");
         System.out.println("SURFACE_BIOME_TINT_SEAM_PASS");

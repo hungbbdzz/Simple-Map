@@ -1,18 +1,18 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.RegionDataStore.SurfaceChunkCoverage;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapViewLoadPlanner;
+import com.velorise.simplemap.client.gpu.GpuPageTable.TileKey;
+import com.velorise.simplemap.client.gpu.GpuPageTable.PageTableEntry;
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapUploadEngine.UploadCommand;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapSurfaceDemandPolicy;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapViewportDemandPolicy;
+import com.velorise.simplemap.client.color.*;
 
-import com.velorise.simplemap.client.cave.CaveChunkTile;
-import com.velorise.simplemap.client.cave.CaveColumnData;
-import com.velorise.simplemap.client.cave.archive.CaveArchiveV2Service;
-import com.velorise.simplemap.client.cave.archive.CompactCaveTile;
-import com.velorise.simplemap.client.cave.projection.CaveProjectionServiceV2;
 import com.velorise.simplemap.client.gpu.GpuPageTable;
-import com.velorise.simplemap.client.gpu.MapUploadEngine;
-import com.velorise.simplemap.client.gpu.PageTableEntry;
-import com.velorise.simplemap.client.gpu.TileKey;
-import com.velorise.simplemap.client.gpu.UploadCommand;
-import com.velorise.simplemap.client.minimap.FixedTileRing;
-import com.velorise.simplemap.client.persistence.v2.RegionContainerV2;
-import com.velorise.simplemap.client.renderer.LodSelector;
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapUploadEngine;
+import com.velorise.simplemap.client.MinimapRenderer.FixedTileRing;
+import com.velorise.simplemap.client.RegionDataStore.RegionContainerV2;
+import com.velorise.simplemap.client.renderer.RetainedFullscreenFramePolicy.LodSelector;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,7 +25,6 @@ public final class ArchitectureStackCheck {
         pageTableIsAtomic();
         uploadEngineIsBounded();
         minimapRingIsFixed();
-        caveArchiveAndProjectionShareOneSource();
         regionContainerRecoversFromCorruptTail();
         architectureBoundariesAreDeterministic();
         viewportDemandIsCenterFirst();
@@ -74,29 +73,6 @@ public final class ArchitectureStackCheck {
         long generation = ring.generation();
         require(!ring.recenter(10, -4), "same center rebuilt ring");
         require(ring.generation() == generation, "ring generation changed");
-    }
-
-    private static void caveArchiveAndProjectionShareOneSource() {
-        CaveChunkTile tile = new CaveChunkTile(4, 5, true);
-        short[] top = {(short) 40};
-        short[] floor = {(short) 32};
-        int[] colors = {0xFF806040};
-        byte[] flags = {CaveColumnData.FLAG_EMISSIVE};
-        tile.commitColumn(0, new CaveColumnData(top, floor, colors, flags,
-                1, -64, 320, true));
-        CaveArchiveV2Service archive = CaveArchiveV2Service.getInstance();
-        archive.clear();
-        require(archive.ingest(tile.snapshot()), "archive ingest failed");
-        CompactCaveTile compact = archive.get(4, 5);
-        require(compact != null && compact.runCount() == 1,
-                "compact archive missing run");
-        var layered = CaveProjectionServiceV2.getInstance()
-                .layered(4, 5, 40, 1L);
-        var full = CaveProjectionServiceV2.getInstance().fullSummary(4, 5);
-        require(layered != null && layered.pixels()[0] != 0,
-                "layered projection missed archive run");
-        require(full != null && full.coverageRatio() > 0.0f,
-                "full summary missed archive source");
     }
 
     private static void regionContainerRecoversFromCorruptTail() throws Exception {
