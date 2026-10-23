@@ -580,20 +580,15 @@ public class ChunkScanner {
         if (caveActive) {
             int layerY = CaveMode.getLayerY(mc);
             boolean fullCave = CaveMode.isFullView(mc);
-            if (!fullCave) CaveMapManager.getInstance().setActiveLayer(layerY);
+            CaveMapManager.getInstance().setActiveLayer(fullCave ? Integer.MIN_VALUE : layerY);
 
-            int centerBlockX = (int) Math.floor(mc.player.getX());
-            int centerBlockZ = (int) Math.floor(mc.player.getZ());
             int effectiveRadius = getAdaptiveRadius(mc, maxRadius, viewKey(mc, true, fullCave, layerY));
             long caveStarted = System.nanoTime();
             long caveBudget = scanBudget(mc, true);
             long caveDeadline = caveStarted + caveBudget;
             long caveUrgentDeadline = caveStarted + foregroundUrgentSlice(caveBudget);
 
-            // 1. Scan immediate small circular region around player
-            scanImmediate(mc, centerBlockX, centerBlockZ, IMMEDIATE_RADIUS,
-                    layerY, true, fullCave, caveDeadline);
-            // 2. Scan urgent chunks (player chunk + direction)
+            // 1. Scan urgent 16x16 chunks (player chunk + movement direction)
             scanUrgentLoadedChunks(mc, layerY, true, fullCave, caveUrgentDeadline);
             // 3. Scan nearest chunks
             int samplesTarget = resolveSampleTarget(true);
@@ -792,15 +787,16 @@ public class ChunkScanner {
                 || observedCaveView != nextView
                 || observedCaveProjectionTopY != nextTopY;
 
-        if (active && nextView == CaveView.LAYERED) {
-            CaveMapManager.getInstance().setActiveLayer(nextTopY);
+        if (active) {
+            CaveMapManager.getInstance().setActiveLayer(
+                    nextView == CaveView.FULL ? Integer.MIN_VALUE : nextTopY);
         }
         observedCaveView = nextView;
         observedCaveBandY = nextBand;
         observedCaveProjectionTopY = nextTopY;
 
         if (bandOrLayerChanged && active && minecraft.player != null) {
-            scanCaveAroundPlayerUniform(minecraft, 64);
+            scanCaveAroundPlayerUniform(minecraft, 32);
         }
     }
 
@@ -826,14 +822,9 @@ public class ChunkScanner {
     private void scanCaveAroundPlayerUniform(Minecraft mc, int maxRadius) {
         int layerY = CaveMode.getLayerY(mc);
         boolean fullView = CaveMode.isFullView(mc);
-        if (!fullView) CaveMapManager.getInstance().setActiveLayer(layerY);
+        CaveMapManager.getInstance().setActiveLayer(fullView ? Integer.MIN_VALUE : layerY);
         int effectiveRadius = getAdaptiveRadius(mc, maxRadius, viewKey(mc, true, fullView, layerY));
-        int centerBlockX = (int) Math.floor(mc.player.getX());
-        int centerBlockZ = (int) Math.floor(mc.player.getZ());
-        int innerRadius = fullView ? FULL_CAVE_IMMEDIATE_RADIUS : IMMEDIATE_RADIUS;
         long deadline = System.nanoTime() + scanBudget(mc, true);
-        scanImmediate(mc, centerBlockX, centerBlockZ, innerRadius,
-                layerY, true, fullView, deadline);
         scanUrgentLoadedChunks(mc, layerY, true, fullView, deadline);
 
         // Downward projections can inspect many blocks per pixel. Keep their total
@@ -1128,7 +1119,7 @@ public class ChunkScanner {
                 caveManager.setPixel(targetLayer, blockX, blockZ, 0, CaveRegion.NO_SURFACE, false);
                 continue;
             }
-            float shade = calculateFastCaveShade(caveHeights, chunkX, chunkZ, p, surfaceY, targetLayer);
+            float shade = calculateFastCaveShade(mc.level, caveHeights, chunkX, chunkZ, p, surfaceY, layerY, fullView);
             int displayedColor = applyAbgrShade(rawColor, shade);
             caveManager.setPixel(targetLayer, blockX, blockZ, displayedColor, surfaceY, true);
         }
@@ -1162,10 +1153,9 @@ public class ChunkScanner {
         synchronizeCaveModeRevision();
         int layerY = CaveMode.getLayerY(mc);
         boolean fullView = CaveMode.isFullView(mc);
-        if (!fullView) {
-            CaveMapManager.getInstance().setActiveLayer(layerY);
-        }
-        CaveTextureManager.getInstance().requestVisiblePages(layerY, minX, maxX, minZ, maxZ,
+        int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
+        CaveMapManager.getInstance().setActiveLayer(targetLayer);
+        CaveTextureManager.getInstance().requestVisiblePages(targetLayer, minX, maxX, minZ, maxZ,
                 scale, focusX, focusZ, lane);
         long budget = scanBudget(mc, true);
         if (budget > 0L) {
@@ -1234,7 +1224,7 @@ public class ChunkScanner {
         synchronizeCaveModeRevision();
         boolean fullView = cave && CaveMode.isFullView(mc);
         int layerY = cave ? CaveMode.getLayerY(mc) : 0;
-        if (cave && !fullView) CaveMapManager.getInstance().setActiveLayer(layerY);
+        if (cave) CaveMapManager.getInstance().setActiveLayer(fullView ? Integer.MIN_VALUE : layerY);
         if (cave) {
             scanVisibleCaveArea(mc, minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
             // MapScreen suppresses the normal LIVE_CRITICAL lane. Keep a tiny
@@ -1294,23 +1284,20 @@ public class ChunkScanner {
             requestRefresh(mc);
             return;
         }
-        if (!CaveMode.isFullView(mc)) {
-            CaveMapManager.getInstance().setActiveLayer(CaveMode.getLayerY(mc));
-        }
-        observedCaveModeRevision = CaveMode.getRevision();
+        boolean fullView = CaveMode.isFullView(mc);
         int topY = CaveMode.getLayerY(mc);
-        CaveView view = CaveMode.isFullView(mc) ? CaveView.FULL : CaveView.LAYERED;
+        CaveMapManager.getInstance().setActiveLayer(fullView ? Integer.MIN_VALUE : topY);
+        observedCaveModeRevision = CaveMode.getRevision();
+        CaveView view = fullView ? CaveView.FULL : CaveView.LAYERED;
         int bandY = CaveLayerBand.key(view, topY);
         observedCaveView = view;
         observedCaveBandY = bandY;
         observedCaveProjectionTopY = topY;
         MapViewportCoordinator.getInstance().onLayerChanged();
         if (mc.level != null && mc.player != null) {
-            // Immediate priority 1: concentric inner 4-chunk (64-block) radius burst around player
-            scanCaveAroundPlayerUniform(mc, 64);
-            int renderDistance = mc.options.renderDistance().get();
-            int radius = Math.max(16, renderDistance * 16);
-            scanCaveAroundPlayerUniform(mc, radius);
+            // Prime immediate player neighborhood without stalling the UI frame;
+            // remaining chunks stream progressively via scanVisibleCaveArea.
+            scanCaveAroundPlayerUniform(mc, 48);
         }
     }
 
@@ -1326,6 +1313,14 @@ public class ChunkScanner {
         liveSurfacePublishedChunks.clear();
         foregroundSeedCursor = 0;
         foregroundSeedNanos = 0L;
+        if (mc != null && CaveMode.isActive(mc)) {
+            CaveMapManager.getInstance().clearCache();
+            CaveTextureManager.getInstance().clearCache();
+            boolean fullView = CaveMode.isFullView(mc);
+            CaveMapManager.getInstance().setActiveLayer(
+                    fullView ? Integer.MIN_VALUE : CaveMode.getLayerY(mc));
+            MapViewportCoordinator.getInstance().onLayerChanged();
+        }
         if (mc != null && mc.level != null && mc.player != null) {
             int renderDistance = mc.options.renderDistance().get();
             int radius = Math.max(16, renderDistance * 16);
@@ -1844,7 +1839,8 @@ public class ChunkScanner {
 
     /**
      * Unified continuous column scanner for both Layered Cave and Full Cave.
-     * Uses a symmetric state machine ({@code shouldEnterGround} + {@code underair}) and preserves
+     * Continuous column scan maintaining ground and air transitions across sections.
+     * state machine ({@code shouldEnterGround} + {@code underair}) and preserves
      * thin floor blocks (carpets, rails, redstone wire, glow lichen, repeaters, etc.)
      * with short-block height adjustment (-1) for clean slope shading.
      */
@@ -1948,7 +1944,7 @@ public class ChunkScanner {
                 lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, waterSurfaceY + 1), blockZ);
                 int blockLight = Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), colorState.getLightEmission());
                 int skyLight = hasSkyLight ? level.getBrightness(LightLayer.SKY, lightPos) : 0;
-                int shadeOffset = Math.round((floorY - bandCenterY) / 8.0f);
+                int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(floorY);
                 return packCavePixel(
                         CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, false),
                         floorY);
@@ -1963,7 +1959,7 @@ public class ChunkScanner {
                 lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, y + 1), blockZ);
                 int blockLight = isLava ? 15 : Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), state.getLightEmission());
                 int skyLight = (!isLava && hasSkyLight) ? level.getBrightness(LightLayer.SKY, lightPos) : 0;
-                int shadeOffset = Math.round((y - bandCenterY) / 8.0f);
+                int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(y);
                 return packCavePixel(
                         CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isLava),
                         y);
@@ -2001,9 +1997,9 @@ public class ChunkScanner {
                     ? Math.max(level.getBrightness(LightLayer.SKY, lightPos),
                             level.getBrightness(LightLayer.SKY, colorPos))
                     : 0;
-            // Short blocks on a floor use y - 1 as their effective terrain height (isShort)
+            // Short blocks on a floor use y - 1 as their effective terrain height
             int effectiveY = (shortBlock && y > minimumY) ? (y - 1) : y;
-            int shadeOffset = Math.round((effectiveY - bandCenterY) / 8.0f);
+            int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(effectiveY);
             return packCavePixel(
                     CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isLava),
                     effectiveY);
@@ -2043,27 +2039,26 @@ public class ChunkScanner {
         return null;
     }
 
-    private float calculateFastCaveShade(short[] heights, int chunkX, int chunkZ,
-            int pixel, int centerY, int targetLayer) {
+    private float calculateFastCaveShade(Level level, short[] heights, int chunkX, int chunkZ,
+            int pixel, int centerY, int layerY, boolean fullView) {
         if (MapConfig.terrainSlopes <= 0) return 1.0f;
         int ix = pixel & 15;
         int iz = pixel >>> 4;
         int blockX = (chunkX << 4) + ix;
         int blockZ = (chunkZ << 4) + iz;
-        CaveMapManager caveManager = CaveMapManager.getInstance();
 
         int north = (iz > 0)
                 ? heights[pixel - 16]
-                : caveManager.getSurfaceY(targetLayer, blockX, blockZ - 1);
+                : getCaveNeighbourY(level, blockX, blockZ - 1, layerY, fullView, CaveRegion.NO_SURFACE);
         int south = (iz < 15)
                 ? heights[pixel + 16]
-                : caveManager.getSurfaceY(targetLayer, blockX, blockZ + 1);
+                : getCaveNeighbourY(level, blockX, blockZ + 1, layerY, fullView, CaveRegion.NO_SURFACE);
         int west = (ix > 0)
                 ? heights[pixel - 1]
-                : caveManager.getSurfaceY(targetLayer, blockX - 1, blockZ);
+                : getCaveNeighbourY(level, blockX - 1, blockZ, layerY, fullView, CaveRegion.NO_SURFACE);
         int east = (ix < 15)
                 ? heights[pixel + 1]
-                : caveManager.getSurfaceY(targetLayer, blockX + 1, blockZ);
+                : getCaveNeighbourY(level, blockX + 1, blockZ, layerY, fullView, CaveRegion.NO_SURFACE);
 
         if (north == CaveRegion.NO_SURFACE) {
             north = (south != CaveRegion.NO_SURFACE) ? (2 * centerY - south) : centerY;
@@ -2188,63 +2183,12 @@ public class ChunkScanner {
     }
 
     private int getCaveBlockColor(Level level, BlockPos pos, BlockState state) {
-        String blockId = visualClassifier.info(state).blockId();
-        Integer override = MapConfig.blockColorOverrides.get(blockId);
-        if (override != null) return argbToAbgr(override);
-        boolean isLava = state.is(Blocks.LAVA) || state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
-        if (!isLava && state.getLightEmission() > 0) return getEmissiveFeatureColor(level, pos, state);
-
-        MapColor mapColor = state.getMapColor(level, pos);
-        int rgb;
-        if (isLava) {
-            rgb = MapTextureManager.getInstance()
-                    .resolveBlockColor(blockId, MapConfig.blockColourMode);
-            if (rgb == 0 || rgb == 0xFFFFFFFF) rgb = 0xD46414;
-            else rgb &= 0x00FFFFFF;
-        } else if (mapColor == MapColor.NONE) {
-            // Many modded, glass-like and decorative solid blocks deliberately use
-            // MapColor.NONE even though their model has a valid texture. Falling back
-            // to the texture sampler prevents those floors from becoming cave holes.
-            int sampled = MapTextureManager.getInstance()
-                    .resolveBlockColor(blockId, MapConfig.blockColourMode);
-            rgb = sampled == 0 || sampled == 0xFFFFFFFF
-                    ? 0x7F8588 : sampled & 0x00FFFFFF;
-        } else {
-            rgb = resolveBlockRgb(level, pos, state, mapColor);
-        }
-        MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
-        if (!isLava && MapConfig.blockColourMode == 0) {
-            rgb = makeColorRich(rgb, visual.leaves(), visual.fixedTextureColor(),
-                    visual.grass(), visual.wood() || mapColor == MapColor.WOOD);
-        }
-        int red = (rgb >>> 16) & 0xFF;
-        int green = (rgb >>> 8) & 0xFF;
-        int blue = rgb & 0xFF;
-        return 0xFF000000 | (blue << 16) | (green << 8) | red;
+        return CaveTextureManager.resolveCaveBlockBaseColor(state);
     }
 
     private int applyCaveWaterOverlay(Level level, BlockPos waterPos,
             int floorAbgr, int depth) {
-        BlockState waterState = level.getBlockState(waterPos);
-        int waterRgb = Minecraft.getInstance().getBlockColors()
-                .getColor(waterState, level, waterPos, 0);
-        if (waterRgb == -1) waterRgb = MapColor.WATER.col;
-
-        float amount = Math.min(0.82f, 0.34f + Math.max(1, depth) * 0.055f);
-        float attenuation = Math.max(0.72f,
-                (float) Math.pow(0.982f, Math.max(0, depth - 2)));
-        int floorRed = floorAbgr & 0xFF;
-        int floorGreen = (floorAbgr >>> 8) & 0xFF;
-        int floorBlue = (floorAbgr >>> 16) & 0xFF;
-        int waterRed = (waterRgb >>> 16) & 0xFF;
-        int waterGreen = (waterRgb >>> 8) & 0xFF;
-        int waterBlue = waterRgb & 0xFF;
-
-        int red = Math.round((floorRed + (waterRed - floorRed) * amount) * attenuation);
-        int green = Math.round((floorGreen + (waterGreen - floorGreen) * amount) * attenuation);
-        int blue = Math.round((floorBlue + (waterBlue - floorBlue) * amount) * attenuation);
-        return 0xFF000000 | (Math.min(255, blue) << 16)
-                | (Math.min(255, green) << 8) | Math.min(255, red);
+        return CaveTextureManager.blendCaveWater(floorAbgr, depth);
     }
 
     private boolean isOpenEmissiveFeature(Level level, BlockPos pos, BlockState state) {
@@ -2257,23 +2201,7 @@ public class ChunkScanner {
 
     /** Gives flames and non-solid light sources a visible map core, not only a halo. */
     private int getEmissiveFeatureColor(Level level, BlockPos pos, BlockState state) {
-        String blockId = visualClassifier.info(state).blockId();
-        Integer override = MapConfig.blockColorOverrides.get(blockId);
-        if (override != null) return argbToAbgr(override);
-        int rgb = MapTextureManager.getInstance().resolveBlockColor(blockId, MapConfig.blockColourMode);
-        if (rgb != 0 && rgb != 0xFFFFFFFF) rgb &= 0x00FFFFFF;
-        else rgb = Minecraft.getInstance().getBlockColors().getColor(state, level, pos, 0);
-        if (rgb == -1) {
-            MapColor mapColor = state.getMapColor(level, pos);
-            rgb = mapColor == MapColor.NONE ? 0xFFB13B : mapColor.col;
-        }
-
-        boolean isLava = state.is(Blocks.LAVA) || state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
-        float boost = isLava ? 1.0f : (1.0f + 0.15f * state.getLightEmission() / 15.0f);
-        int red = Math.min(255, Math.round(((rgb >>> 16) & 0xFF) * boost));
-        int green = Math.min(255, Math.round(((rgb >>> 8) & 0xFF) * boost));
-        int blue = Math.min(255, Math.round((rgb & 0xFF) * boost));
-        return 0xFF000000 | (blue << 16) | (green << 8) | red;
+        return CaveTextureManager.resolveCaveBlockBaseColor(state);
     }
 
     private int applyCaveLighting(int abgr, int light, int verticalOffset) {
@@ -2506,9 +2434,7 @@ public class ChunkScanner {
         if (CaveMode.isActive(mc)) {
             boolean fullView = CaveMode.isFullView(mc);
             int layerY = CaveMode.getLayerY(mc);
-            if (!fullView) {
-                CaveMapManager.getInstance().setActiveLayer(layerY);
-            }
+            CaveMapManager.getInstance().setActiveLayer(fullView ? Integer.MIN_VALUE : layerY);
             scanCavePixelIfLoaded(mc.level, blockX, layerY, blockZ, fullView);
         } else {
             scanBlockColumn(mc.level, blockX, blockZ, true);

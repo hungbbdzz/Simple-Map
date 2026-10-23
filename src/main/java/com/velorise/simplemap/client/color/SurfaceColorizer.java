@@ -1519,7 +1519,7 @@ public static final class MapVisualClassifier {
             return sample != null && sample.usesTintIndex();
         }
 
-        public static Sample sample(ResourceLocation blockId) {
+        public static synchronized Sample sample(ResourceLocation blockId) {
             Sample cached = CACHE.get(blockId);
             if (cached != null) return cached;
             if (FAILED.contains(blockId)) return null;

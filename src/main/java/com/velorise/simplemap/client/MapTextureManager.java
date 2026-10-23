@@ -4169,7 +4169,7 @@ public class MapTextureManager {
             if (sampled != null) return sampled;
 
             int rgb = -1;
-            if (level != null && !BlockTextureColorSampler.isBrokenTint(blockIdText)) {
+            if (level != null && minecraft.isSameThread() && !BlockTextureColorSampler.isBrokenTint(blockIdText)) {
                 try {
                     rgb = minecraft.getBlockColors().getColor(state, level, position, 0);
                 } catch (Throwable throwable) {
