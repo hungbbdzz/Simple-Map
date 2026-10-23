@@ -1635,9 +1635,15 @@ public class MapScreen extends Screen {
 
         @Override
         protected void updateMessage() {
+            boolean fullCave = CaveMode.getCaveType(Minecraft.getInstance()) == CaveMode.CaveType.FULL;
             String label;
-            if (isAutoSelection()) label = dragging ? "Preview: AUTO" : "Top Y: AUTO";
-            else label = (dragging ? "Preview Y: " : "Top Y: ") + selectedY();
+            if (fullCave) {
+                if (isAutoSelection()) label = dragging ? "Full Cave (AUTO)" : "Full Cave: AUTO";
+                else label = (dragging ? "Full Cave (Y: " : "Full Cave (Top Y: ") + selectedY() + ")";
+            } else {
+                if (isAutoSelection()) label = dragging ? "Preview: AUTO" : "Top Y: AUTO";
+                else label = (dragging ? "Preview Y: " : "Top Y: ") + selectedY();
+            }
             setMessage(Component.literal(label));
         }
 

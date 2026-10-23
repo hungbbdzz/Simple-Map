@@ -297,8 +297,6 @@ public class MapTextureManager {
     public BlockTintPolicy resolveTintPolicy(String blockIdText) {
         BlockTintPolicy cached = tintPolicyCache.get(blockIdText);
         if (cached != null) return cached;
-        Minecraft minecraft = Minecraft.getInstance();
-        if (!minecraft.isSameThread()) return BlockTintPolicy.NONE;
         BlockTintPolicy resolved = BlockTintPolicy.NONE;
         try {
             ResourceLocation blockId = ResourceLocation.parse(blockIdText);

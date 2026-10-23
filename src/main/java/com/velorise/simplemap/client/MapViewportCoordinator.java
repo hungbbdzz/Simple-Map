@@ -771,11 +771,11 @@ public final class MapViewportCoordinator {
             processed++;
 
             layers.requestVisibleRegion(layerY, rx, rz);
-            boolean warmExactTexture = layers.hasRegionFile(layerY, rx, rz)
-                    && textures.peekRegionTexture(layerY, rx, rz) != null;
-            // A warm exact-layer GPU texture is already the requested result. Keep it
-            // visible without reloading/reprojecting the same file after every Top-Y
-            // switch. Missing regions still stream in square region rings.
+            boolean alreadySliced = layers.isRegionAnvilSlicedAtLayer(layerY, rx, rz);
+            boolean warmExactTexture = alreadySliced
+                    || (layers.hasRegionFile(layerY, rx, rz)
+                            && textures.peekRegionTexture(layerY, rx, rz) != null);
+            // A warm exact-layer GPU texture or already-sliced region is already the requested result.
             if (!warmExactTexture && (layers.hasRegionFile(layerY, rx, rz)
                     || layers.isRegionLoaded(layerY, rx, rz))) {
                 int dx = rx - layerStream.centerRx;
