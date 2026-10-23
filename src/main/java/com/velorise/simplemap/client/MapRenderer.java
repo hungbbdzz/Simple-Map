@@ -1203,8 +1203,7 @@ public class MapRenderer {
                 for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
                     for (int rx = minRegionX; rx <= maxRegionX; rx++) {
                         if (!drawnRegions.contains(packRegion(rx, rz))
-                                && (manager.hasRegionFile(targetLayer, rx, rz)
-                                        || manager.isRegionLoaded(targetLayer, rx, rz))) {
+                                && manager.isRegionPending(targetLayer, rx, rz)) {
                             builder.pending(rx, rz);
                         }
                     }
