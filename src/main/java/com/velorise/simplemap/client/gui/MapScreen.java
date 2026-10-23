@@ -983,11 +983,12 @@ public class MapScreen extends Screen {
         net.minecraft.world.level.Level level = this.minecraft.level;
 
         if (CaveMode.isActive(this.minecraft)) {
-            if (CaveMode.isFullView(this.minecraft)) {
-                int fullY = CaveMapManager.getInstance().getSurfaceY(bx, bz);
-                if (fullY != CaveMapManager.NO_SURFACE) {
-                    return new BlockInfo("", "", fullY, Integer.MIN_VALUE, true);
-                }
+            int targetLayer = CaveMode.isFullView(this.minecraft)
+                    ? Integer.MIN_VALUE
+                    : CaveMode.getLayerY(this.minecraft);
+            int cachedY = CaveMapManager.getInstance().getSurfaceY(targetLayer, bx, bz);
+            if (cachedY != CaveMapManager.NO_SURFACE) {
+                return new BlockInfo("", "", cachedY, Integer.MIN_VALUE, true);
             }
             return null;
         }
@@ -1015,35 +1016,46 @@ public class MapScreen extends Screen {
         net.minecraft.core.BlockPos.MutableBlockPos pos = new net.minecraft.core.BlockPos.MutableBlockPos(bx, 0, bz);
 
         if (CaveMode.isActive(this.minecraft)) {
-            if (CaveMode.isFullView(this.minecraft)) {
-                int surfaceY = CaveMapManager.getInstance().getSurfaceY(bx, bz);
-                if (surfaceY != CaveMapManager.NO_SURFACE) {
-                    pos.setY(surfaceY);
-                    net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
-                    if (!state.isAir()) {
-                        String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
-                                .getKey(state.getBlock()).toString();
-                        return createBlockInfo(level, pos, surfaceY);
+            boolean fullView = CaveMode.isFullView(this.minecraft);
+            int layerY = fullView ? Integer.MIN_VALUE : CaveMode.getLayerY(this.minecraft);
+            int surfaceY = CaveMapManager.getInstance().getSurfaceY(layerY, bx, bz);
+            if (surfaceY != CaveMapManager.NO_SURFACE) {
+                // Check surfaceY + 1 first in case a thin floor block (carpet/rail) adjusted height by -1
+                if (surfaceY + 1 < level.getMaxBuildHeight()) {
+                    pos.setY(surfaceY + 1);
+                    net.minecraft.world.level.block.state.BlockState aboveState = level.getBlockState(pos);
+                    if (!aboveState.isAir()
+                            && !CaveMode.isCaveOpenOrInvisible(aboveState, MapConfig.displayFlowers)
+                            && CaveMode.isShortFloorBlock(level, pos, aboveState)) {
+                        return createBlockInfo(level, pos, surfaceY + 1);
                     }
                 }
+                pos.setY(surfaceY);
+                net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+                if (!state.isAir()) {
+                    return createBlockInfo(level, pos, surfaceY);
+                }
+                return new BlockInfo("", "", surfaceY, Integer.MIN_VALUE, true);
+            }
+            if (fullView) {
                 return new BlockInfo("", "", minBuildHeight);
             }
-            int layerY = CaveMode.getLayerY(this.minecraft);
             int scanMinimum = CaveMode.getScanMinimum(level, layerY);
             int scanMaximum = CaveMode.getScanMaximum(level, layerY);
-
-
-            // Match the renderer: exact material at Top-Y first, then search only
-            // downward through the bounded band. Alternating above/below caused the
-            // cursor Y to jump between unrelated cave floors every frame.
-            pos.setY(scanMaximum);
-            net.minecraft.world.level.block.state.BlockState selected = level.getBlockState(pos);
-            if (isRenderableSliceState(level, pos, selected)) {
-                return createBlockInfo(level, pos, scanMaximum);
-            }
+            boolean underair = false;
             for (int y = scanMaximum; y >= scanMinimum; y--) {
-                BlockInfo info = getCaveBlockInfoAtY(level, pos, y);
-                if (info != null) return info;
+                pos.setY(y);
+                net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+                if (!underair) {
+                    if (CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
+                        underair = true;
+                    }
+                    continue;
+                }
+                if (CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
+                    continue;
+                }
+                return createBlockInfo(level, pos, y);
             }
             return null;
         }
