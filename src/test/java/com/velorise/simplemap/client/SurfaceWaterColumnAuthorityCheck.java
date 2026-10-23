@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.color.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,7 +24,7 @@ public final class SurfaceWaterColumnAuthorityCheck {
                 "live Surface water geometry/single authority path is missing");
 
         String colorizer = Files.readString(Path.of(
-                "src/main/java/com/velorise/simplemap/client/SurfaceColorizer.java"));
+                "src/main/java/com/velorise/simplemap/client/color/SurfaceColorizer.java"));
         require(colorizer.contains("String floorId = blockId(packed, blockPalette)")
                         && colorizer.contains("MapBlockData.waterDepth(packed)")
                         && colorizer.contains("0.25f + depth * 0.045f")

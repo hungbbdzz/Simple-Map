@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.session;
 
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
+import com.velorise.simplemap.client.session.MapSessionManager.MapSession;
 
 public final class MapSessionStampCheck {
     private MapSessionStampCheck() { }

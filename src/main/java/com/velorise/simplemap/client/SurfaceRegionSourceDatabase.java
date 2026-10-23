@@ -1,7 +1,15 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapManager.MapLightManager;
+import com.velorise.simplemap.client.MapManager.MapLightManager.LightRegion;
+import com.velorise.simplemap.client.color.SurfaceColorizer.SurfaceTintData;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapMemoryLeaseManager;
+import com.velorise.simplemap.client.color.*;
+import com.velorise.simplemap.client.MapDebugRecorder.MapPipelineTelemetry;
+import com.velorise.simplemap.client.MapDebugRecorder.MapPipelineTelemetry.MapPipelineStage;
+import com.velorise.simplemap.client.cave.*;
 
-import com.velorise.simplemap.client.pipeline.MapWorkGraph;
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
 import com.velorise.simplemap.client.session.MapSessionManager;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import net.minecraft.client.Minecraft;
@@ -309,7 +317,7 @@ public final class SurfaceRegionSourceDatabase {
      *
      * Renderer demand is page-scoped. Scanning all 32x32 chunks of a loaded
      * MapManager.Region for every unresolved exact page made the writer do up to
-     * 1024 revision checks when Xaero's MapTileChunk transaction needs only 16.
+     * 1024 revision checks when a tile chunk transaction needs only 16.
      * Region-wide warming remains available for coarse/LOD reconstruction.
      */
     public boolean warmLoadedPage(RevisionStamp stamp, int regionX, int regionZ,
@@ -352,7 +360,7 @@ public final class SurfaceRegionSourceDatabase {
                         RegionSurfaceLodService.getInstance()
                                 .onRegionSourceWarmed(regionX, regionZ));
             } else if (failure == null && stamp.isCurrent()) {
-                // Xaero advances a persistent writer cursor instead of rescanning an
+                // The database advances a persistent writer cursor instead of rescanning an
                 // unavailable tile every render frame. Retain the same event-driven
                 // behaviour here: chunk publication clears this fence immediately.
                 pageWarmRetryAfterNanos.put(warmKey, System.nanoTime()
@@ -809,7 +817,7 @@ public final class SurfaceRegionSourceDatabase {
         SourceKey key = new SourceKey(stamp.sessionId(), regionX, regionZ);
 
         /*
-         * PASS109 / Xaero single retained authority:
+         * PASS109 single retained authority:
          *
          * No renderer lane is allowed to rebuild source state while capturing a
          * batch plan. PASS108 kept MINIMAP probe-only but FULLSCREEN/BACKGROUND
@@ -1531,7 +1539,7 @@ public final class SurfaceRegionSourceDatabase {
                 int windowStartZ = worldPageStartZ - halo;
                 /*
                  * The overwhelmingly common 1x1 page transaction stays inside one
-                 * 512x512 retained source region. Xaero keeps that tile's retained
+                 * 512x512 retained source region. The database keeps that tile's retained
                  * palette identity; rebuilding a HashMap union and two remap arrays
                  * for such a local transaction is pure allocation churn. Only
                  * cross-region batches need palette union/remapping.
@@ -1663,5 +1671,58 @@ public final class SurfaceRegionSourceDatabase {
         int[] tintsUnsafe() { return tints; }
         byte[] lightUnsafe() { return light; }
         byte[] knownUnsafe() { return known; }
+    }
+}
+
+
+/**
+ * Allocation-free source-capture allowance keyed to a physical render frame.
+ *
+ * <p>A wall-clock budget can refill several times while one already-slow frame
+ * is still running. This helper admits a fixed number of source chunks exactly
+ * once per frame id. Compatibility callers without a frame id use a conservative
+ * 50 ms fallback window.</p>
+ */
+final class SurfaceCaptureFrameAllowance {
+    private static final long FALLBACK_WINDOW_NANOS = 50_000_000L;
+
+    private long frameId = Long.MIN_VALUE;
+    private long allowanceFrameId = Long.MAX_VALUE;
+    private long fallbackWindowStartedNanos;
+    private int remaining;
+
+    synchronized void beginFrame(long frameId) {
+        this.frameId = frameId;
+    }
+
+    synchronized int claim(boolean minimapLane, boolean pressured, long nowNanos) {
+        boolean resetAllowance;
+        if (frameId != Long.MIN_VALUE) {
+            resetAllowance = allowanceFrameId != frameId;
+            if (resetAllowance) allowanceFrameId = frameId;
+        } else {
+            long elapsed = nowNanos - fallbackWindowStartedNanos;
+            resetAllowance = fallbackWindowStartedNanos == 0L
+                    || elapsed < 0L || elapsed >= FALLBACK_WINDOW_NANOS;
+            if (resetAllowance) fallbackWindowStartedNanos = nowNanos;
+        }
+        if (resetAllowance) {
+            remaining = pressured
+                    ? (minimapLane ? 16 : 8)
+                    : (minimapLane ? 64 : 48);
+        }
+        int requested = pressured
+                ? (minimapLane ? 8 : 4)
+                : (minimapLane ? 32 : 24);
+        int granted = Math.min(requested, remaining);
+        remaining -= granted;
+        return granted;
+    }
+
+    synchronized void reset() {
+        frameId = Long.MIN_VALUE;
+        allowanceFrameId = Long.MAX_VALUE;
+        fallbackWindowStartedNanos = 0L;
+        remaining = 0;
     }
 }

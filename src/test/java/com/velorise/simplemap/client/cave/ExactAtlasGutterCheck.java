@@ -9,7 +9,7 @@ public final class ExactAtlasGutterCheck {
 
     public static void main(String[] args) throws Exception {
         Path root = Path.of("src/main/java/com/velorise/simplemap/client");
-        String surface = Files.readString(root.resolve("cave/SurfaceLeafAtlas.java"));
+        String surface = Files.readString(root.resolve("lod/SurfaceLeafAtlas.java"));
         String cave = Files.readString(root.resolve("cave/CaveTextureAtlas.java"));
         String memory = Files.readString(root.resolve("MapMemoryBudgetPolicy.java"));
         require(surface.contains("PITCH = SIZE + 2")

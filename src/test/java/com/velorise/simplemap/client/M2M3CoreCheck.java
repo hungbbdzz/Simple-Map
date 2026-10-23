@@ -1,14 +1,20 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapManager.MapConfig;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy.MapRenderScalePolicy;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapSurfaceDemandPolicy;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapMemoryLeaseManager;
+import com.velorise.simplemap.client.color.*;
 
-import com.velorise.simplemap.client.pipeline.MapWorkGraph;
-import com.velorise.simplemap.client.pipeline.MapWorkKey;
-import com.velorise.simplemap.client.pipeline.MapWorkStage;
-import com.velorise.simplemap.client.pipeline.RegionRecord;
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
-import com.velorise.simplemap.client.lod.PreparedBranch;
-import com.velorise.simplemap.client.lod.RegionLodDeriver;
-import com.velorise.simplemap.client.lod.RegionLodGraph;
-import com.velorise.simplemap.client.session.MapSession;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.MapWorkKey;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.MapWorkStage;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RegionRecord;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph.PreparedBranch;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph.RegionLodDeriver;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph;
+import com.velorise.simplemap.client.session.MapSessionManager.MapSession;
 import com.velorise.simplemap.client.session.MapSessionManager;
 
 import java.util.Arrays;
@@ -182,7 +188,7 @@ public final class M2M3CoreCheck {
         require(MapLodPolicy.branchLevel(0.06f, 3) == 3,
                 "far surface view exceeded the L3 quality floor");
         require(MapLodPolicy.branchLevel(MapConfig.MINIMUM_ZOOM_SCALE, 3) == 3,
-                "minimum supported cave zoom did not retain the Xaero L3 floor");
+                "minimum supported cave zoom did not retain the L3 floor");
         require(MapMemoryBudgetPolicy.caveBranchColumns(3) >= 24,
                 "detail cave branch atlas cannot retain a useful 16:9 working set");
         require(MapMemoryBudgetPolicy.caveBranchColumns(4)

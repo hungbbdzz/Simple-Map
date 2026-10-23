@@ -1,6 +1,17 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapManager.MapConfig;
+import com.velorise.simplemap.client.gui.MapScreen.MapConfigScreen;
+import com.velorise.simplemap.client.gui.MapScreen.MapConfigScreen.WaypointListScreen;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager.Waypoint;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.renderer.*;
 
 import com.velorise.simplemap.SimpleMap;
+import com.velorise.simplemap.client.waypoint.*;
+import com.velorise.simplemap.client.gui.*;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
+import com.velorise.simplemap.client.session.MapSessionManager;
+import java.util.Arrays;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.world.entity.player.Player;
@@ -63,8 +74,8 @@ public class MinimapRenderer {
         if (screen == null) return false;
         // Hide minimap on the mod's own full-screen views
         if (screen instanceof MapScreen || screen instanceof MapConfigScreen
-                || screen instanceof AddWaypointScreen || screen instanceof BlockColorScreen
-                || screen instanceof BlockColorManagerScreen) {
+                || screen instanceof WaypointListScreen.AddWaypointScreen || screen instanceof MapConfigScreen.BlockColorManagerScreen.BlockColorScreen
+                || screen instanceof MapConfigScreen.BlockColorManagerScreen) {
             return false;
         }
         // Hide minimap on Minecraft system screens (loading, saving, title, connecting...)
@@ -150,7 +161,7 @@ public class MinimapRenderer {
         int tHalf = Math.max(1, borderThickness / 2);
         double interpX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX());
         double interpZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
-        com.velorise.simplemap.client.minimap.MinimapService.getInstance()
+        MinimapService.getInstance()
                 .update(interpX, interpZ, effectiveZoom);
         // Retained rendering can reuse the same texture for many visual frames,
         // but tick-side visible demand expires after 500 ms. Refresh only the
@@ -655,4 +666,253 @@ public class MinimapRenderer {
             consumer.addVertex(matrix, cx + r2 * cos1, cy + r2 * sin1, 0.0f).setColor(r, g, b, a);
         }
     }
+
+    public static final class MinimapService {
+        public record Summary(long ringGeneration, int diameter,
+                long requests, long skipped, long lastGoodRevision,
+                boolean lastGoodAvailable) { }
+
+        private static final MinimapService INSTANCE = new MinimapService();
+        private static final int RING_DIAMETER = 13;
+
+        private final FixedTileRing ring = new FixedTileRing(RING_DIAMETER);
+        private final ColumnSignatureStore signatures =
+                new ColumnSignatureStore(RING_DIAMETER * 16 * RING_DIAMETER * 16);
+        private long requests;
+        private long skipped;
+        private long lastGoodRevision;
+        private boolean lastGoodAvailable;
+        private long lastRequestNanos;
+        private long sessionId;
+
+        private MinimapService() { }
+
+        public static MinimapService getInstance() { return INSTANCE; }
+
+        public void update(double centerX, double centerZ, float zoom) {
+            RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+            if (stamp == null || !stamp.isCurrent()) return;
+            if (sessionId != stamp.sessionId()) resetForSession(stamp.sessionId());
+            int chunkX = ((int) Math.floor(centerX)) >> 4;
+            int chunkZ = ((int) Math.floor(centerZ)) >> 4;
+            boolean moved = ring.recenter(chunkX, chunkZ);
+            long now = System.nanoTime();
+            if (!moved && now - lastRequestNanos < 50_000_000L) {
+                skipped++;
+                return;
+            }
+            lastRequestNanos = now;
+            requests++;
+        }
+
+        public synchronized void markLastGood(long revision) {
+            lastGoodRevision = Math.max(lastGoodRevision, Math.max(1L, revision));
+            lastGoodAvailable = true;
+        }
+
+        public synchronized boolean hasLastGood() { return lastGoodAvailable; }
+
+        public synchronized Summary summary() {
+            return new Summary(ring.generation(), ring.diameter(), requests,
+                    skipped, lastGoodRevision, lastGoodAvailable);
+        }
+
+        public synchronized void clear() {
+            sessionId = 0L;
+            signatures.clear();
+            lastGoodRevision = 0L;
+            lastGoodAvailable = false;
+            lastRequestNanos = 0L;
+        }
+
+        private synchronized void resetForSession(long newSessionId) {
+            sessionId = newSessionId;
+            signatures.clear();
+            lastGoodRevision = 0L;
+            lastGoodAvailable = false;
+        }
+
+        public static final class ColumnSignatureStore {
+            private final long[] signatures;
+            private final int[] colors;
+            private long revision;
+
+            public ColumnSignatureStore(int pixels) {
+                signatures = new long[Math.max(1, pixels)];
+                colors = new int[signatures.length];
+                Arrays.fill(signatures, Long.MIN_VALUE);
+            }
+
+            public synchronized boolean update(int index, long signature, int color) {
+                if (index < 0 || index >= signatures.length) return false;
+                if (signatures[index] == signature && colors[index] == color) return false;
+                signatures[index] = signature;
+                colors[index] = color;
+                revision++;
+                return true;
+            }
+
+            public synchronized int color(int index) {
+                return index < 0 || index >= colors.length ? 0 : colors[index];
+            }
+
+            public synchronized long signature(int index) {
+                return index < 0 || index >= signatures.length
+                        ? Long.MIN_VALUE : signatures[index];
+            }
+
+            public synchronized long revision() { return revision; }
+            public synchronized int[] snapshotColors() {
+                return Arrays.copyOf(colors, colors.length);
+            }
+
+            public synchronized void clear() {
+                Arrays.fill(signatures, Long.MIN_VALUE);
+                Arrays.fill(colors, 0);
+                revision++;
+            }
+
+            public static long signature(int materialId, int biomeId, int topY,
+                    int light, int slope, int flags, long styleRevision) {
+                long value = materialId & 0xFFFFFL;
+                value = value * 0x9E3779B97F4A7C15L + (biomeId & 0xFFFFL);
+                value = value * 0x9E3779B97F4A7C15L + (topY & 0xFFFFL);
+                value = value * 0x9E3779B97F4A7C15L + (light & 0xFFL);
+                value = value * 0x9E3779B97F4A7C15L + (slope & 0xFFL);
+                value = value * 0x9E3779B97F4A7C15L + (flags & 0xFFL);
+                return value ^ Long.rotateLeft(styleRevision, 17);
+            }
+        }
+    }
+
+    /** Resolves a minimap position relative to a stable screen anchor. */
+    public static final class MinimapPosition {
+        private static final int EDGE_MARGIN = 2;
+
+        private MinimapPosition() {
+        }
+
+        public static int[] resolve(int screenWidth, int screenHeight, int size) {
+            if (MapConfig.legacyMinimapPositionPending) {
+                int oldX = clamp((int) (screenWidth * MapConfig.minimapXPercent), EDGE_MARGIN,
+                        screenWidth - size - EDGE_MARGIN);
+                int oldY = clamp((int) (screenHeight * MapConfig.minimapYPercent), EDGE_MARGIN,
+                        screenHeight - size - EDGE_MARGIN);
+                setFromTopLeft(oldX, oldY, screenWidth, screenHeight, size);
+                MapConfig.legacyMinimapPositionPending = false;
+                MapConfig.save();
+            }
+
+            String anchor = sanitizeAnchor(MapConfig.minimapAnchor);
+            int x = baseX(anchor, screenWidth, size) + MapConfig.minimapOffsetX;
+            int y = baseY(anchor, screenHeight, size) + MapConfig.minimapOffsetY;
+            return new int[] {
+                    clamp(x, EDGE_MARGIN, screenWidth - size - EDGE_MARGIN),
+                    clamp(y, EDGE_MARGIN, screenHeight - size - EDGE_MARGIN)
+            };
+        }
+
+        public static void setFromTopLeft(int x, int y, int screenWidth, int screenHeight, int size) {
+            String horizontal = nearestAxis(x,
+                    EDGE_MARGIN,
+                    (screenWidth - size) / 2,
+                    screenWidth - size - EDGE_MARGIN,
+                    "LEFT", "CENTER", "RIGHT");
+            String vertical = nearestAxis(y,
+                    EDGE_MARGIN,
+                    (screenHeight - size) / 2,
+                    screenHeight - size - EDGE_MARGIN,
+                    "TOP", "MIDDLE", "BOTTOM");
+
+            MapConfig.minimapAnchor = vertical + "_" + horizontal;
+            MapConfig.minimapOffsetX = x - baseX(MapConfig.minimapAnchor, screenWidth, size);
+            MapConfig.minimapOffsetY = y - baseY(MapConfig.minimapAnchor, screenHeight, size);
+        }
+
+        public static String sanitizeAnchor(String anchor) {
+            if (anchor == null) return "TOP_RIGHT";
+            return switch (anchor) {
+                case "TOP_LEFT", "TOP_CENTER", "TOP_RIGHT",
+                        "MIDDLE_LEFT", "MIDDLE_CENTER", "MIDDLE_RIGHT",
+                        "BOTTOM_LEFT", "BOTTOM_CENTER", "BOTTOM_RIGHT" -> anchor;
+                default -> "TOP_RIGHT";
+            };
+        }
+
+        private static int baseX(String anchor, int screenWidth, int size) {
+            if (anchor.endsWith("_LEFT")) return EDGE_MARGIN;
+            if (anchor.endsWith("_CENTER")) return (screenWidth - size) / 2;
+            return screenWidth - size - EDGE_MARGIN;
+        }
+
+        private static int baseY(String anchor, int screenHeight, int size) {
+            if (anchor.startsWith("TOP_")) return EDGE_MARGIN;
+            if (anchor.startsWith("MIDDLE_")) return (screenHeight - size) / 2;
+            return screenHeight - size - EDGE_MARGIN;
+        }
+
+        private static String nearestAxis(int value, int first, int middle, int last,
+                String firstName, String middleName, String lastName) {
+            int firstDistance = Math.abs(value - first);
+            int middleDistance = Math.abs(value - middle);
+            int lastDistance = Math.abs(value - last);
+            if (firstDistance <= middleDistance && firstDistance <= lastDistance) return firstName;
+            if (middleDistance <= lastDistance) return middleName;
+            return lastName;
+        }
+
+        private static int clamp(int value, int min, int max) {
+            if (max < min) return min;
+            return Math.max(min, Math.min(value, max));
+        }
+    }
+
+
+    public static final class FixedTileRing {
+    private final int diameter;
+    private final long[] chunkKeys;
+    private int centerChunkX = Integer.MIN_VALUE;
+    private int centerChunkZ = Integer.MIN_VALUE;
+    private long generation;
+
+    public FixedTileRing(int diameter) {
+        if (diameter < 3 || (diameter & 1) == 0) {
+            throw new IllegalArgumentException("diameter must be odd and >= 3");
+        }
+        this.diameter = diameter;
+        this.chunkKeys = new long[diameter * diameter];
+        Arrays.fill(chunkKeys, Long.MIN_VALUE);
+    }
+
+    public synchronized boolean recenter(int chunkX, int chunkZ) {
+        if (chunkX == centerChunkX && chunkZ == centerChunkZ) return false;
+        centerChunkX = chunkX;
+        centerChunkZ = chunkZ;
+        int radius = diameter / 2;
+        int index = 0;
+        for (int z = -radius; z <= radius; z++) {
+            for (int x = -radius; x <= radius; x++) {
+                chunkKeys[index++] = pack(chunkX + x, chunkZ + z);
+            }
+        }
+        generation++;
+        return true;
+    }
+
+    public synchronized long generation() { return generation; }
+    public int diameter() { return diameter; }
+    public synchronized int centerChunkX() { return centerChunkX; }
+    public synchronized int centerChunkZ() { return centerChunkZ; }
+    public synchronized long[] snapshotKeys() {
+        return Arrays.copyOf(chunkKeys, chunkKeys.length);
+    }
+
+    public static long pack(int x, int z) {
+        return ((long) x << 32) ^ (z & 0xFFFFFFFFL);
+    }
+
+    public static int unpackX(long key) { return (int) (key >> 32); }
+    public static int unpackZ(long key) { return (int) key; }
+}
+
 }

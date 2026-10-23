@@ -1,11 +1,15 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
+import com.velorise.simplemap.client.MapManager.MapConfig;
+import com.velorise.simplemap.client.MapDebugRecorder.MapPipelineTelemetry;
+import com.velorise.simplemap.client.MapWorkScheduler.MapProcessor;
+import com.velorise.simplemap.client.cave.CaveMode.CaveLayerBand;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapGpuBudgetController;
+import com.velorise.simplemap.client.cave.CaveTextureManager;
+import com.velorise.simplemap.client.cave.*;
 
-import com.velorise.simplemap.client.surface.SurfaceDemandController;
-import com.velorise.simplemap.client.cave.v2.CaveProjectionController;
-import com.velorise.simplemap.client.cave.CaveWorldSaveReader;
-import com.velorise.simplemap.client.cave.CaveView;
-import com.velorise.simplemap.client.cave.CaveScreenSpacePolicy;
-import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
+import com.velorise.simplemap.client.gui.MapScreen;
+import com.velorise.simplemap.client.cave.CaveMode.CaveLayerBand.CaveView;
 import net.minecraft.client.Minecraft;
 
 import java.util.ArrayList;
@@ -53,13 +57,50 @@ public final class MapViewportCoordinator {
     private static final long LOADED_SURFACE_HALO_INTERVAL_NANOS = 50_000_000L;
     private static final long HIDDEN_CAVE_HALO_INTERVAL_NANOS = 150_000_000L;
     private static final long CAVE_ADJACENT_WARMUP_INTERVAL_NANOS = 2_000_000_000L;
-    private static final long CAVE_FULLSCREEN_SOURCE_IDLE_INTERVAL_NANOS = 100_000_000L;
-    private static final long CAVE_FULLSCREEN_SOURCE_INTERACT_INTERVAL_NANOS = 250_000_000L;
+    private static final long CAVE_FULLSCREEN_SOURCE_IDLE_INTERVAL_NANOS = 8_000_000L;
+    private static final long CAVE_FULLSCREEN_SOURCE_INTERACT_INTERVAL_NANOS = 16_000_000L;
     private static final long LOADED_SURFACE_HALO_GAME_BUDGET_NANOS = 6_000_000L;
     private static final long LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS = 5_000_000L;
     private LayerStreamState layerStream = new LayerStreamState();
 
     private MapViewportCoordinator() {
+    }
+
+    private long submittedSurfaceRequests;
+
+    public synchronized long getSubmittedSurfaceRequests() {
+        return submittedSurfaceRequests;
+    }
+
+    public void drainPublicationFrame(long frameId) {
+        MapPublicationCoordinator.getInstance().drainFrame(frameId);
+    }
+
+    private void submitSurfaceDemand(double minX, double maxX, double minZ, double maxZ,
+            double focusX, double focusZ, float logicalScale,
+            MapRequestLane lane, boolean trimFarFullscreen) {
+        if (lane == null) return;
+        if (trimFarFullscreen && lane == MapRequestLane.FULLSCREEN) {
+            MapSurfaceDemandPolicy.Bounds trimmed = MapSurfaceDemandPolicy.trim(
+                    minX, maxX, minZ, maxZ, logicalScale);
+            minX = trimmed.minX();
+            maxX = trimmed.maxX();
+            minZ = trimmed.minZ();
+            maxZ = trimmed.maxZ();
+        }
+        MapViewportDemandPolicy.Bounds admitted =
+                MapViewportDemandPolicy.trimEdgeSlivers(
+                        minX, maxX, minZ, maxZ, lane);
+        minX = admitted.minX();
+        maxX = admitted.maxX();
+        minZ = admitted.minZ();
+        maxZ = admitted.maxZ();
+        MapOverviewTextureManager.getInstance().setPreferredSurfaceScale(logicalScale);
+        MapTextureManager.getInstance().requestVisiblePages(
+                minX, maxX, minZ, maxZ,
+                focusX, focusZ,
+                Math.max(0.01f, logicalScale), lane);
+        synchronized (this) { submittedSurfaceRequests++; }
     }
 
     public static MapViewportCoordinator getInstance() {
@@ -124,7 +165,7 @@ public final class MapViewportCoordinator {
         governor.setFocus(clampedFocusX, clampedFocusZ);
         if (openingFullscreen) {
             /*
-             * Do not revoke the player-local writer when MapScreen opens. Xaero
+             * Do not revoke the player-local writer when MapScreen opens. The engine
              * keeps its minimap loading set alive behind the fullscreen map; only
              * the visible renderer changes. Revoking MINIMAP ownership here caused
              * loaded chunks and completed cave pages to accumulate until the screen
@@ -188,10 +229,6 @@ public final class MapViewportCoordinator {
     public void prepareMovementStreaming() {
         MapWorkScheduler.bumpViewport(MapRequestLane.BACKGROUND);
         MapWorkScheduler.bumpViewport(MapRequestLane.PREFETCH);
-        UnifiedCaveTextureManager.getInstance().suspendLane(MapRequestLane.BACKGROUND);
-        UnifiedCaveTextureManager.getInstance().suspendLane(MapRequestLane.PREFETCH);
-        CaveWorldSaveReader.getInstance().suspendLane(MapRequestLane.BACKGROUND);
-        CaveWorldSaveReader.getInstance().suspendLane(MapRequestLane.PREFETCH);
         MapPublicationCoordinator.getInstance().beginTick();
         lastMinimapRun = 0L;
         lastFullscreenRun = 0L;
@@ -213,8 +250,6 @@ public final class MapViewportCoordinator {
      */
     public void suspendForMovement() {
         MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
-        UnifiedCaveTextureManager.getInstance().suspendLane(MapRequestLane.MINIMAP);
-        CaveWorldSaveReader.getInstance().suspendLane(MapRequestLane.MINIMAP);
         MapPublicationCoordinator.getInstance().beginTick();
         MapPublicationCoordinator.getInstance().setPublicationAllowed(false);
         lastMinimapRun = 0L;
@@ -226,10 +261,6 @@ public final class MapViewportCoordinator {
         fullscreenRequest = null;
         fullscreenGeneration++;
         MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
-        UnifiedCaveTextureManager.getInstance().suspendLane(
-                MapRequestLane.FULLSCREEN);
-        CaveWorldSaveReader.getInstance().suspendLane(
-                MapRequestLane.FULLSCREEN);
         lastFullscreenCaveSourceRun = 0L;
         layerStream = new LayerStreamState();
         MapPerformanceGovernor.getInstance().setFullscreenState(false, false);
@@ -243,6 +274,11 @@ public final class MapViewportCoordinator {
         MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
         lastFullscreenCaveSourceRun = 0L;
         lastLayerUploadRun = 0L;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && CaveMode.isActive(mc) && !CaveMode.isFullView(mc)) {
+            com.velorise.simplemap.client.cave.CaveTextureManager.getInstance()
+                    .onLayerActivated(CaveMode.getLayerY(mc));
+        }
     }
 
     public void reset() {
@@ -298,7 +334,7 @@ public final class MapViewportCoordinator {
                 && fullscreen.generation == fullscreenGeneration
                 && now - fullscreen.submittedNanos < 10_000_000_000L;
         // The minimap renderer is hidden while MapScreen owns the screen, but its
-        // bounded Cave presentation subscriber is retained below. Xaero consumes the
+        // bounded Cave presentation subscriber is retained below. The coordinator consumes the
         // World Map MapProcessor product directly for minimap cave chunks; Simple Map
         // mirrors that with one UnifiedCaveTextureManager product rather than letting
         // the two views diverge until MapScreen closes.
@@ -312,13 +348,7 @@ public final class MapViewportCoordinator {
             if (MapManager.getInstance().isViewingLiveDimension()) {
                 boolean caveVisibleNow = CaveMode.isActive(minecraft);
                 if (caveVisibleNow) {
-                    if (profile.allowSavedVisible()) {
-                        // PASS148: Cave source acquisition is saved-world work, not
-                        // Surface capture. PASS147 skipped this whole call to remove
-                        // hidden Surface churn and accidentally disabled the active
-                        // CaveWorldSaveReader path. Tie it to allowSavedVisible so
-                        // movement profiles that intentionally disable Anvil IO stay
-                        // loaded-source-only.
+                    if (profile.allowVisibleScan()) {
                         ChunkScanner.getInstance().scanVisibleCaveArea(minecraft,
                                 minimap.minX, minimap.maxX,
                                 minimap.minZ, minimap.maxZ, minimap.scale,
@@ -370,7 +400,7 @@ public final class MapViewportCoordinator {
          * effect of a renderer/publication pass. PASS159 could request the first
          * 32-page Cave window, fill the first rows, then stop permanently because
          * the next source window was only selected when this coordinator entered
-         * the non-interacting fullscreen publication branch again. Xaero's
+         * the non-interacting fullscreen publication branch again. the 
          * MinimapWriter/MapWriter advances its cursor independently under a hard
          * time/cadence budget. Do the same here: the retained fullscreen request is
          * enough to advance the Cave source cursor even while composition is being
@@ -380,7 +410,7 @@ public final class MapViewportCoordinator {
                 && CaveMode.isActive(minecraft);
 
         /*
-         * PASS168 / Xaero parity: while the world-map Cave view is visible there is
+         * PASS168 parity: while the world-map Cave view is visible there is
          * exactly one foreground presentation owner. PASS164 kept a hidden MINIMAP
          * subscriber alive here, which started a second presentation generation and
          * repeatedly reclassified the same retained region products between MINIMAP
@@ -394,10 +424,6 @@ public final class MapViewportCoordinator {
                 && now - lastHiddenCaveHaloRun
                         >= HIDDEN_CAVE_HALO_INTERVAL_NANOS) {
             lastHiddenCaveHaloRun = now;
-            UnifiedCaveTextureManager.getInstance().suspendLane(
-                    MapRequestLane.MINIMAP);
-            CaveWorldSaveReader.getInstance().suspendLane(
-                    MapRequestLane.MINIMAP);
             MapDebugRecorder recorder = MapDebugRecorder.getInstance();
             if (recorder.shouldEmitEvent(
                     "CAVE_FULLSCREEN_HIDDEN_MINIMAP_SUPPRESSED", 1000L)) {
@@ -413,7 +439,7 @@ public final class MapViewportCoordinator {
          * background work. Do not let ObservationProfile.allowSavedVisible() park it.
          * The 12:06 trace changed Layered Top-Y with 228 visible pages, advanced only
          * 26-48 source pages, then emitted no writer pulses while CPU/IO were idle.
-         * Xaero's MapWriter/MinimapWriter keeps its cursor alive every update and
+         * The persistent writer keeps its cursor alive every update and
          * merely shrinks work to the elapsed-time budget. Our source window is already
          * pressure-bounded (32/16/8 and halved under pressure), so keep pulsing until
          * the visible cursor closes. Teleport/world handoff quarantine remains the
@@ -442,7 +468,7 @@ public final class MapViewportCoordinator {
                                     + " profile_saved_visible=" + profile.allowSavedVisible()
                                     + " foreground_liveness=true"
                                     + " predecessor_policy=retained_cursor_not_render_request"
-                                    + " policy=xaero_persistent_visible_writer"
+                                    + " policy=persistent_visible_writer"
                                     + " pass=PASS167");
                 }
             }
@@ -526,7 +552,7 @@ public final class MapViewportCoordinator {
          * PASS157 still refreshed and published the hidden Surface halo every
          * 50 ms while the Cave minimap was visible. The latest capture shows
          * thousands of Surface batches/exact refreshes and 0.7-1.2 GiB/s
-         * allocation during GAME/Cave even when Cave source wait is zero. Xaero
+         * allocation during GAME/Cave even when Cave source wait is zero. The engine
          * keeps one bounded map writer for the selected projection instead of
          * rebuilding an invisible alternative map in parallel. Surface catches
          * up from loaded chunks after Cave is disabled.
@@ -542,13 +568,11 @@ public final class MapViewportCoordinator {
                     minecraft, radius, budget);
             double centerX = minecraft.player.getX();
             double centerZ = minecraft.player.getZ();
-            SurfaceDemandController.getInstance().submit(
-                    new SurfaceDemandController.Request(
-                            centerX - radius, centerX + radius,
-                            centerZ - radius, centerZ + radius,
-                            centerX, centerZ, 1.0f,
-                            MapRequestLane.MINIMAP,
-                            false));
+            submitSurfaceDemand(
+                    centerX - radius, centerX + radius,
+                    centerZ - radius, centerZ + radius,
+                    centerX, centerZ, 1.0f,
+                    MapRequestLane.MINIMAP, false);
             publication.requestSurface(MapRequestLane.MINIMAP, false);
         }
 
@@ -581,8 +605,8 @@ public final class MapViewportCoordinator {
                 ? Integer.MIN_VALUE : CaveMode.getLayerY(minecraft);
         double centerX = minecraft.player.getX();
         double centerZ = minecraft.player.getZ();
-        CaveProjectionController.getInstance().request(
-                view, topY,
+        CaveTextureManager.getInstance().requestVisiblePages(
+                topY,
                 centerX - radius, centerX + radius,
                 centerZ - radius, centerZ + radius,
                 1.0f, centerX, centerZ, MapRequestLane.BACKGROUND);
@@ -618,10 +642,9 @@ public final class MapViewportCoordinator {
         double minZ = centerZ - radius;
         double maxZ = centerZ + radius;
 
-        SurfaceDemandController.getInstance().submit(
-                new SurfaceDemandController.Request(minX, maxX, minZ, maxZ,
-                        centerX, centerZ, 1.0f,
-                        MapRequestLane.BACKGROUND, false));
+        submitSurfaceDemand(minX, maxX, minZ, maxZ,
+                centerX, centerZ, 1.0f,
+                MapRequestLane.BACKGROUND, false);
         MapPublicationCoordinator.getInstance().requestSurface(MapRequestLane.BACKGROUND, false);
 
         // Do not decode cave Anvil sources while Surface is the active projection.
@@ -656,48 +679,10 @@ public final class MapViewportCoordinator {
                 : Math.min(256.0, Math.max(96.0,
                         Math.max(source.maxX - source.minX,
                                 source.maxZ - source.minZ) * 0.25));
-        int activeTopY = CaveMode.getLayerY(minecraft);
-        int bandY = com.velorise.simplemap.client.cave.DenseCaveTile.normalizeLayer(
-                com.velorise.simplemap.client.cave.CaveView.LAYERED, activeTopY);
-        com.velorise.simplemap.client.cave.CavePipeline pipeline =
-                com.velorise.simplemap.client.cave.CavePipeline.getInstance();
-        long warmupStarted = System.nanoTime();
-        pipeline.warmLayerBand(bandY - 8,
-                centerX - radius, centerX + radius,
-                centerZ - radius, centerZ + radius, 0.25f);
-        pipeline.warmLayerBand(bandY + 24,
-                centerX - radius, centerX + radius,
-                centerZ - radius, centerZ + radius, 0.25f);
-        MapObservationTelemetry.getInstance().record(
-                MapObservationTelemetry.Lane.LAYER_WARMUP,
-                System.nanoTime() - warmupStarted, 2);
     }
 
     private void requestTextures(Minecraft minecraft, Request request) {
-        if (requestLiveTextures(minecraft, request)) return;
-
-        // The loaded-source demand above is always cheap and remains active while
-        // travelling. Only this second half may touch world-save/Anvil data.
-        // Exact leaves are the sole surface authority. Repair incomplete/legacy
-        // Surface chunks from the same decoded Anvil source used by cave
-        // projections. The reader owns a small rolling page budget and skips
-        // complete/known-absent chunks.
-        int minimumChunkX = ((int) Math.floor(Math.min(
-                request.minX, request.maxX))) >> 4;
-        int maximumChunkX = ((int) Math.floor(Math.nextDown(Math.max(
-                request.minX, request.maxX)))) >> 4;
-        int minimumChunkZ = ((int) Math.floor(Math.min(
-                request.minZ, request.maxZ))) >> 4;
-        int maximumChunkZ = ((int) Math.floor(Math.nextDown(Math.max(
-                request.minZ, request.maxZ)))) >> 4;
-        if (minimumChunkX <= maximumChunkX && minimumChunkZ <= maximumChunkZ) {
-            CaveWorldSaveReader.getInstance().prefetchVisibleSources(
-                    minecraft, minimumChunkX, maximumChunkX,
-                    minimumChunkZ, maximumChunkZ,
-                    ((request.minX + request.maxX) * 0.5) / 16.0,
-                    ((request.minZ + request.maxZ) * 0.5) / 16.0,
-                    request.scale, request.lane);
-        }
+        requestLiveTextures(minecraft, request);
     }
 
     /**
@@ -714,7 +699,7 @@ public final class MapViewportCoordinator {
         int layerY = cave ? CaveMode.getLayerY(minecraft) : Integer.MIN_VALUE;
 
         if (cave) {
-            // Cave page projection is much heavier than Xaero's cached leaf load.
+            // Cave page projection is much heavier than a cached leaf load.
             // Far zoom remains branch-rendered, but the screen-space policy admits
             // one slow coherent leaf seed so a cold viewport can build LOD instead
             // of staying black forever.
@@ -722,11 +707,11 @@ public final class MapViewportCoordinator {
             // viewport-owned traversal; cursor movement never changes admission.
             double schedulingFocusX = (request.minX + request.maxX) * 0.5;
             double schedulingFocusZ = (request.minZ + request.maxZ) * 0.5;
+            int targetLayer = full ? Integer.MIN_VALUE : layerY;
             if (!full) CaveMapManager.getInstance().setActiveLayer(layerY);
-            CaveProjectionController.getInstance().request(
-                    full ? com.velorise.simplemap.client.cave.CaveView.FULL
-                            : com.velorise.simplemap.client.cave.CaveView.LAYERED,
-                    full ? Integer.MIN_VALUE : layerY,
+            requestLayerRegions(request, targetLayer);
+            CaveTextureManager.getInstance().requestVisiblePages(
+                    targetLayer,
                     request.minX, request.maxX, request.minZ, request.maxZ,
                     request.scale, schedulingFocusX, schedulingFocusZ,
                     request.lane);
@@ -736,14 +721,13 @@ public final class MapViewportCoordinator {
         // Exact leaves are the sole surface authority. At far zoom the manager
         // admits only a bounded attention hot set; recursive branches cover the
         // remainder without constructing legacy 512x512 overview textures.
-        SurfaceDemandController.getInstance().submit(
-                new SurfaceDemandController.Request(
-                        request.minX, request.maxX,
-                        request.minZ, request.maxZ,
-                        (request.minX + request.maxX) * 0.5,
-                        (request.minZ + request.maxZ) * 0.5,
-                        request.scale, request.lane,
-                        request.lane == MapRequestLane.FULLSCREEN));
+        submitSurfaceDemand(
+                request.minX, request.maxX,
+                request.minZ, request.maxZ,
+                (request.minX + request.maxX) * 0.5,
+                (request.minZ + request.maxZ) * 0.5,
+                request.scale, request.lane,
+                request.lane == MapRequestLane.FULLSCREEN);
         return false;
     }
 
@@ -777,7 +761,6 @@ public final class MapViewportCoordinator {
 
         int budget = layerRegionBudget(request.scale);
         CaveMapManager layers = CaveMapManager.getInstance();
-        VerticalCaveArchiveManager archive = VerticalCaveArchiveManager.getInstance();
         CaveTextureManager textures = CaveTextureManager.getInstance();
         int processed = 0;
         while (processed < budget && layerStream.cursor < layerStream.regions.size()) {
@@ -786,14 +769,14 @@ public final class MapViewportCoordinator {
             int rz = region[1];
             processed++;
 
-            textures.requestVisibleRegion(layerY, rx, rz);
-            boolean warmExactTexture = layers.hasRegionFile(rx, rz)
+            layers.requestVisibleRegion(layerY, rx, rz);
+            boolean warmExactTexture = layers.hasRegionFile(layerY, rx, rz)
                     && textures.peekRegionTexture(layerY, rx, rz) != null;
             // A warm exact-layer GPU texture is already the requested result. Keep it
             // visible without reloading/reprojecting the same file after every Top-Y
             // switch. Missing regions still stream in square region rings.
-            if (!warmExactTexture && (layers.hasRegionFile(rx, rz)
-                    || layers.isRegionLoaded(rx, rz) || archive.hasRegionData(rx, rz))) {
+            if (!warmExactTexture && (layers.hasRegionFile(layerY, rx, rz)
+                    || layers.isRegionLoaded(layerY, rx, rz))) {
                 int dx = rx - layerStream.centerRx;
                 int dz = rz - layerStream.centerRz;
                 int priority = 250_000 - (dx * dx + dz * dz) * 100;
@@ -807,12 +790,6 @@ public final class MapViewportCoordinator {
     }
 
     private static int layerRegionBudget(float scale) {
-        // Each exact layer region may project 262,144 columns/pixels and upload a
-        // 512x512 texture. Keep far zoom intentionally conservative.
-        if (scale < 0.12f) return 1;
-        if (scale < 0.20f) return 1;
-        if (scale < 0.35f) return 2;
-        if (scale < 0.55f) return 4;
         return 8;
     }
 
@@ -964,8 +941,734 @@ public final class MapViewportCoordinator {
                 int focusRx, int focusRz) {
             return this.dimension.equals(dimension) && this.layerY == layerY
                     && this.minRx == minRx && this.maxRx == maxRx
-                    && this.minRz == minRz && this.maxRz == maxRz
-                    && this.centerRx == focusRx && this.centerRz == focusRz;
+                    && this.minRz == minRz && this.maxRz == maxRz;
         }
     }
+
+
+public static final class MapViewportDemandPolicy {
+    private MapViewportDemandPolicy() {
+    }
+
+    public static Bounds trimEdgeSlivers(double minX, double maxX,
+            double minZ, double maxZ, MapRequestLane lane) {
+        double safeMinX = Math.min(minX, maxX);
+        double safeMaxX = Math.max(minX, maxX);
+        double safeMinZ = Math.min(minZ, maxZ);
+        double safeMaxZ = Math.max(minZ, maxZ);
+        return new Bounds(safeMinX, safeMaxX, safeMinZ, safeMaxZ);
+    }
+
+    public record Bounds(double minX, double maxX, double minZ, double maxZ) {
+    }
+}
+
+/**
+ * Defines the rolling exact-surface working set for a zoom-selected viewport.
+ *
+ * <p>The whole viewport remains eligible. Work volume is controlled by the
+ * bounded centre-out frontier and the selected LOD, not by cutting arbitrary
+ * strips from the screen.</p>
+ */
+public static final class MapSurfaceDemandPolicy {
+    private static volatile Snapshot latest = Snapshot.identity();
+
+    private MapSurfaceDemandPolicy() {
+    }
+
+    public static Bounds trim(double minX, double maxX,
+            double minZ, double maxZ, float scale) {
+        double safeMinX = Math.min(minX, maxX);
+        double safeMaxX = Math.max(minX, maxX);
+        double safeMinZ = Math.min(minZ, maxZ);
+        double safeMaxZ = Math.max(minZ, maxZ);
+        latest = new Snapshot(false, 1.0, 0.0, 0.0, 0.0,
+                exactActiveWindow(scale, false));
+        return new Bounds(safeMinX, safeMaxX, safeMinZ, safeMaxZ);
+    }
+
+    /**
+     * Maximum number of concurrent fullscreen exact leaves. Branch publication
+     * remains independent and therefore continues to fill the complete viewport.
+     */
+    public static int exactActiveWindow(float scale, boolean pressure) {
+        return exactActiveWindow(scale, pressure, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Capacity-aware exact working set. At density-correct L1 far zoom, the
+     * 512x512 Region LOD is authoritative full-viewport coverage and exact leaves
+     * are refinement only. Keep that hot set small so exact work cannot starve the
+     * coarse disk/Region-LOD frontier. Close zoom may use a larger exact window.
+     */
+    public static int exactActiveWindow(float scale, boolean pressure,
+            int visiblePageCount) {
+        int visible = Math.max(1, visiblePageCount);
+        float safeScale = Float.isFinite(scale) && scale > 0.0f ? scale : 1.0f;
+        float projectedChunkPixels = safeScale * MapPageLayout.SUBTILE_SIZE;
+        int cap = projectedChunkPixels >= 16.0f ? 48
+                : projectedChunkPixels >= 8.0f ? 32
+                : projectedChunkPixels >= 4.0f ? 16
+                : projectedChunkPixels >= 2.0f ? 8 : 4;
+        if (pressure) cap = Math.max(2, cap / 2);
+        return Math.min(visible, cap);
+    }
+
+    public static Snapshot snapshot() {
+        return latest;
+    }
+
+    public record Bounds(double minX, double maxX, double minZ, double maxZ) {
+    }
+
+    public record Snapshot(boolean trimmed, double areaRatio,
+            double leftFraction, double rightFraction, double verticalFraction,
+            int exactActiveWindow) {
+        private static Snapshot identity() {
+            return new Snapshot(false, 1.0, 0.0, 0.0, 0.0, 12);
+        }
+    }
+
+}
+
+/**
+ * Single render-thread publication runner for all visible map projections.
+ *
+ * <p>Viewport/tick code publishes intent and performs no GPU work. Render events
+ * drain the same intent against one shared frame ledger. This mirrors the
+ * central render-process pattern: completed CPU work can advance every rendered
+ * frame, while a slow frame automatically receives a smaller upload slice.
+ * The visible projection exclusively owns that frame's GPU publication slice;
+ * inactive projection payloads stay retained until they become primary.</p>
+ */
+public static final class MapPublicationCoordinator {
+    private static final MapPublicationCoordinator INSTANCE =
+            new MapPublicationCoordinator();
+
+    private boolean surfaceRequested;
+    private boolean surfaceFocus;
+    private MapRequestLane surfaceLane;
+    private boolean layeredCaveRequested;
+    private boolean layeredCaveFocus;
+    private boolean fullCaveRequested;
+    private boolean fullCaveFocus;
+    private boolean publicationAllowed;
+    private long lastFrameId = Long.MIN_VALUE;
+    private long drainCount;
+    private long coalescedRequests;
+
+    private MapPublicationCoordinator() {
+    }
+
+    public static MapPublicationCoordinator getInstance() {
+        return INSTANCE;
+    }
+
+    /** Starts a fresh viewport-intent epoch. GPU publication remains frame-owned. */
+    public void beginTick() {
+        surfaceRequested = false;
+        surfaceFocus = false;
+        surfaceLane = null;
+        layeredCaveRequested = false;
+        layeredCaveFocus = false;
+        fullCaveRequested = false;
+        fullCaveFocus = false;
+        coalescedRequests = 0L;
+    }
+
+    public void setPublicationAllowed(boolean allowed) {
+        publicationAllowed = allowed;
+    }
+
+    public void requestSurface(boolean focus) {
+        requestSurface(MapRequestLane.BACKGROUND, focus);
+    }
+
+    public void requestSurface(MapRequestLane lane, boolean focus) {
+        if (surfaceRequested) coalescedRequests++;
+        surfaceRequested = true;
+        surfaceFocus |= focus;
+        MapRequestLane effective = lane == null
+                ? MapRequestLane.BACKGROUND : lane;
+        if (effective.strongerThan(surfaceLane)) surfaceLane = effective;
+    }
+
+    public void requestLayeredCave() {
+        requestLayeredCave(false);
+    }
+
+    public void requestLayeredCave(boolean focus) {
+        if (layeredCaveRequested) coalescedRequests++;
+        layeredCaveRequested = true;
+        layeredCaveFocus |= focus;
+    }
+
+    public void requestFullCave(boolean focus) {
+        if (fullCaveRequested) coalescedRequests++;
+        fullCaveRequested = true;
+        fullCaveFocus |= focus;
+    }
+
+    /**
+     * Drains one primary projection family for one actual rendered frame. The
+     * viewport intent deliberately remains live until the next client tick, so a
+     * 120/144 Hz client can consume completed work in small slices instead of one
+     * 20 TPS burst.
+     */
+    public void drainFrame(long frameId) {
+        if (MapActivityGate.getInstance().blocksForegroundStreaming()) return;
+        if (!publicationAllowed) return;
+        if (frameId == lastFrameId) return;
+        if (!surfaceRequested && !layeredCaveRequested && !fullCaveRequested) return;
+        lastFrameId = frameId;
+
+        boolean focused = fullCaveRequested ? fullCaveFocus
+                : layeredCaveRequested ? layeredCaveFocus : surfaceFocus;
+        // Source capture and GPU upload must share the same physical-frame
+        // boundary. A time-window budget can otherwise refill repeatedly inside
+        // one already-slow frame and deepen the movement hitch.
+        SurfaceRegionSourceDatabase.getInstance().beginPublicationFrame(frameId);
+        MapGpuBudgetController.getInstance().beginFrame(focused);
+        long started = System.nanoTime();
+        if (fullCaveRequested || layeredCaveRequested) {
+            CaveTextureManager.getInstance().uploadDirtyTextures(focused);
+        } else if (surfaceRequested) {
+            /*
+             * Publish prepared coarse branches before exact leaves consume the
+             * shared frame ledger. This gives far-zoom L1 coverage a deterministic
+             * path to the screen instead of letting exact uploads starve it forever.
+             * Exact pages published below feed the branch source for the next frame;
+             * avoiding a second same-frame drain keeps denial counters and render
+             * thread planning work bounded.
+             */
+            MapOverviewTextureManager.getInstance().publishBranches(surfaceFocus);
+            MapTextureManager.getInstance().uploadExactTextures(
+                    surfaceLane, surfaceFocus);
+        }
+        /*
+         * The visible projection receives exclusive ownership of the current
+         * upload slice. There is intentionally no secondary Surface GPU drain while
+         * Cave/Full Cave is visible. CPU-complete Surface payloads remain retained
+         * and resume when Surface becomes primary again.
+         */
+        drainCount++;
+        MapObservationTelemetry.getInstance().record(
+                MapObservationTelemetry.Lane.PUBLICATION,
+                System.nanoTime() - started, 1);
+    }
+
+    /** Compatibility entry point for manual/debug paths. */
+    public void drainFrame() {
+        // Non-render callers cannot identify a physical frame. They receive a
+        // unique ledger only for this compatibility path; normal rendering must
+        // call the overload with the real client-owned frame id.
+        drainFrame(lastFrameId == Long.MAX_VALUE ? Long.MIN_VALUE : lastFrameId + 1L);
+    }
+
+    /** Compatibility entry point for manual/debug paths. */
+    public void drain(boolean allowed) {
+        setPublicationAllowed(allowed);
+        drainFrame();
+    }
+
+    public Snapshot snapshot() {
+        return new Snapshot(drainCount, coalescedRequests,
+                surfaceRequested, surfaceLane,
+                layeredCaveRequested, fullCaveRequested,
+                publicationAllowed);
+    }
+
+    public record Snapshot(long drainCount, long coalescedRequests,
+            boolean surfaceRequested, MapRequestLane surfaceLane,
+            boolean layeredCaveRequested, boolean fullCaveRequested,
+            boolean publicationAllowed) {
+    }
+}
+
+
+
+    public static final class MapLodPolicy {
+    public static final int LEAF_WORLD_SIZE = 64;
+    public static final int MAX_BRANCH_LEVEL = 7;
+
+    private MapLodPolicy() {
+    }
+
+    public static int branchLevel(float pixelsPerBlock) {
+        return branchLevel(pixelsPerBlock, MAX_BRANCH_LEVEL);
+    }
+
+    public static int branchLevel(float pixelsPerBlock, int maximumLevel) {
+        double footprint = blocksPerScreenPixel(pixelsPerBlock);
+        if (footprint < 2.0) return 0;
+        int level = (int) Math.floor(Math.log(footprint) / Math.log(2.0));
+        return Math.max(0, Math.min(maximumLevel, level));
+    }
+
+
+    /**
+     * Selects the finest density-correct level that also fits the retained-node
+     * budget for the current viewport. This prevents atlas thrashing on extremely
+     * wide fullscreen views while keeping minimap views on a finer level.
+     */
+    public static int branchLevel(float pixelsPerBlock, int viewportWidth,
+            int viewportHeight, double searchFactor, int targetVisibleNodes) {
+        int level = branchLevel(pixelsPerBlock);
+        double worldWidth = Math.max(1.0, viewportWidth * searchFactor
+                * blocksPerScreenPixel(pixelsPerBlock));
+        double worldHeight = Math.max(1.0, viewportHeight * searchFactor
+                * blocksPerScreenPixel(pixelsPerBlock));
+        // Exact leaves share one atlas binding and can therefore tolerate a much
+        // larger quad count than independent branch nodes. The threshold follows
+        // the selected memory profile instead of assuming the old 1024-slot atlas.
+        if (level == 0) {
+            long exactX = Math.max(1L, (long) Math.ceil(worldWidth / LEAF_WORLD_SIZE) + 1L);
+            long exactZ = Math.max(1L, (long) Math.ceil(worldHeight / LEAF_WORLD_SIZE) + 1L);
+            long exactSlots = (long) MapMemoryBudgetPolicy.surfaceLeafColumns()
+                    * MapMemoryBudgetPolicy.surfaceLeafColumns();
+            long safeExactSlots = Math.max(64L, exactSlots * 7L / 8L);
+            if (exactX * exactZ <= safeExactSlots) return 0;
+            level = 1;
+        }
+        while (level < MAX_BRANCH_LEVEL) {
+            int columns = level <= 2
+                    ? MapMemoryBudgetPolicy.branchLowColumns()
+                    : MapMemoryBudgetPolicy.branchHighColumns();
+            int atlasCapacity = columns * columns;
+            int safeCapacity = Math.max(16, atlasCapacity * 3 / 4);
+            int budget = Math.max(16, Math.min(targetVisibleNodes, safeCapacity));
+            int nodeWorldSize = worldSizeForBranch(level);
+            long nodesX = Math.max(1L, (long) Math.ceil(worldWidth / nodeWorldSize) + 1L);
+            long nodesZ = Math.max(1L, (long) Math.ceil(worldHeight / nodeWorldSize) + 1L);
+            if (nodesX * nodesZ <= budget) break;
+            level++;
+        }
+        return level;
+    }
+
+
+    /**
+     * Adds a small density hysteresis around adjacent LOD boundaries.
+     *
+     * <p>Without this guard a tiny wheel/viewport rounding change can alternate
+     * between two branch levels every frame, making the renderer swap between
+     * independently resident snapshots. Budget-forced coarser levels are never
+     * delayed, because protecting frame time is more important than hysteresis.</p>
+     */
+    public static int stabilizeBranchLevel(int candidateLevel, int previousLevel,
+            float pixelsPerBlock) {
+        if (previousLevel < 0 || candidateLevel == previousLevel) return candidateLevel;
+        if (Math.abs(candidateLevel - previousLevel) > 1) return candidateLevel;
+
+        int densityLevel = branchLevel(pixelsPerBlock);
+        // The viewport-node budget may require a coarser level than density alone.
+        if (candidateLevel > previousLevel && candidateLevel > densityLevel) {
+            return candidateLevel;
+        }
+        // When a previous budget-forced level is no longer necessary, return to the
+        // density-correct level immediately rather than retaining excessive blur.
+        if (candidateLevel < previousLevel && previousLevel > densityLevel) {
+            return candidateLevel;
+        }
+
+        double footprint = blocksPerScreenPixel(pixelsPerBlock);
+        if (candidateLevel > previousLevel) {
+            double enterCoarser = (1 << candidateLevel) * 1.12;
+            return footprint >= enterCoarser ? candidateLevel : previousLevel;
+        }
+        double leaveCoarser = (1 << previousLevel) * 0.88;
+        return footprint <= leaveCoarser ? candidateLevel : previousLevel;
+    }
+
+    /**
+     * Cave-specific LOD stabilization around user-scale boundaries.
+     *
+     * <p>Cave hierarchy selection is driven by logical map zoom, not GUI-scaled
+     * framebuffer density. A narrow two-percent guard removes wheel jitter without
+     * retaining exact L0 deep into the range where an L1 root should already be the
+     * visible authority.</p>
+     */
+    public static int stabilizeCaveBranchLevel(int candidateLevel, int previousLevel,
+            float logicalPixelsPerBlock) {
+        if (previousLevel < 0 || candidateLevel == previousLevel) return candidateLevel;
+        if (Math.abs(candidateLevel - previousLevel) > 1) return candidateLevel;
+
+        double footprint = blocksPerScreenPixel(logicalPixelsPerBlock);
+        if (candidateLevel > previousLevel) {
+            double enterCoarser = (1 << candidateLevel) * 1.02;
+            return footprint >= enterCoarser ? candidateLevel : previousLevel;
+        }
+        double leaveCoarser = (1 << previousLevel) * 0.98;
+        return footprint <= leaveCoarser ? candidateLevel : previousLevel;
+    }
+
+    public static int leafMipLevel(float pixelsPerBlock, int maximumMip) {
+        double footprint = blocksPerScreenPixel(pixelsPerBlock);
+        int level = footprint < 2.0 ? 0
+                : (int) Math.floor(Math.log(footprint) / Math.log(2.0));
+        return Math.max(0, Math.min(maximumMip, level));
+    }
+
+    public static double blocksPerScreenPixel(float pixelsPerBlock) {
+        return 1.0 / Math.max(0.0001, pixelsPerBlock);
+    }
+
+    public static int worldSizeForBranch(int level) {
+        if (level <= 0) return LEAF_WORLD_SIZE;
+        return LEAF_WORLD_SIZE << level;
+    }
+
+    public static int pageSpanForBranch(int level) {
+        return level <= 0 ? 1 : 1 << level;
+    }
+
+
+public static final class MapRenderScalePolicy {
+    private MapRenderScalePolicy() {
+    }
+
+    public static float physicalPixelsPerBlock(float logicalPixelsPerBlock,
+            double guiScale) {
+        float logical = Math.max(0.0001f, logicalPixelsPerBlock);
+        return (float) (logical * Math.max(1.0, guiScale));
+    }
+
+    public static int physicalPixels(int logicalPixels, double guiScale) {
+        return Math.max(1, (int) Math.ceil(Math.max(1, logicalPixels)
+                * Math.max(1.0, guiScale)));
+    }
+
+    public static Scales fullscreenFbo(float logicalPixelsPerBlock,
+            double guiScale) {
+        float physical = physicalPixelsPerBlock(logicalPixelsPerBlock, guiScale);
+        // The off-screen target and the final framebuffer have the same physical
+        // texel density. LOD policy therefore uses physical density too.
+        return new Scales(physical, physical);
+    }
+
+    public record Scales(float renderPixelsPerBlock, float policyPixelsPerBlock) {
+    }
+}
+
+}
+
+
+    public static final class MapViewLoadPlanner {
+    public static final int FULLSCREEN_SLICE_SIZE = 100;
+    public static final int FULLSCREEN_SHORTLIST_SIZE = 10;
+    public static final int MINIMAP_HALO_PAGES = 1;
+    /**
+     * Maximum exact working radius needed by Minecraft's supported client render
+     * distances. A standalone 9x9 chunk writer is not the policy used when
+     * its world-map integration is active: that path renders the actual minimap
+     * bounds from the shared region cache. The old radius of two pages confused
+     * those two paths and permanently limited Simple Map to a 320x320-block island.
+     */
+    public static final int MINIMAP_MAX_RADIUS_PAGES = 10;
+
+    /** Cave gameplay writer: centre +/-2 64x64 map pages. */
+    public static final int CAVE_MINIMAP_MAX_RADIUS_PAGES = 2;
+    private MapViewLoadPlanner() {
+    }
+
+    /** Persistent traversal state. Focus is deliberately not part of the key. */
+    public static final class State {
+        private String dimension = "";
+        private int minX;
+        private int maxX;
+        private int minZ;
+        private int maxZ;
+        private int sliceIndex;
+        private int sliceCount;
+        private boolean configured;
+        private boolean retainedOverlap;
+        private long completedCycles;
+        private long[] pagePlan = new long[0];
+
+        public boolean configure(String dimension, int minX, int maxX,
+                int minZ, int maxZ) {
+            String safeDimension = dimension == null ? "" : dimension;
+            int safeMinX = Math.min(minX, maxX);
+            int safeMaxX = Math.max(minX, maxX);
+            int safeMinZ = Math.min(minZ, maxZ);
+            int safeMaxZ = Math.max(minZ, maxZ);
+            if (configured && this.dimension.equals(safeDimension)
+                    && this.minX == safeMinX && this.maxX == safeMaxX
+                    && this.minZ == safeMinZ && this.maxZ == safeMaxZ) return false;
+
+            int previousMinX = this.minX;
+            int previousMaxX = this.maxX;
+            int previousMinZ = this.minZ;
+            int previousMaxZ = this.maxZ;
+            boolean sameDimension = configured && this.dimension.equals(safeDimension);
+            retainedOverlap = sameDimension && rectanglesOverlap(
+                    previousMinX, previousMaxX, previousMinZ, previousMaxZ,
+                    safeMinX, safeMaxX, safeMinZ, safeMaxZ);
+
+            this.dimension = safeDimension;
+            this.minX = safeMinX;
+            this.maxX = safeMaxX;
+            this.minZ = safeMinZ;
+            this.maxZ = safeMaxZ;
+            this.pagePlan = buildPlan(safeMinX, safeMaxX, safeMinZ, safeMaxZ);
+            this.sliceCount = Math.max(1, (pagePlan.length
+                    + FULLSCREEN_SLICE_SIZE - 1) / FULLSCREEN_SLICE_SIZE);
+            this.sliceIndex = 0;
+            this.completedCycles = 0L;
+            this.configured = true;
+            return true;
+        }
+
+        /**
+         * Fills the current fullscreen update slice without advancing it.
+         * The immutable plan is centre-out, so zooming never restarts at a remote
+         * top-left edge and strands the inspected page behind hundreds of leaves.
+         */
+        public int fillCurrentFullscreenSlice(long[] output) {
+            if (!configured || output == null || output.length == 0) return 0;
+            int start = sliceIndex * FULLSCREEN_SLICE_SIZE;
+            int count = Math.min(output.length,
+                    Math.max(0, Math.min(pagePlan.length,
+                            start + FULLSCREEN_SLICE_SIZE) - start));
+            if (count > 0) System.arraycopy(pagePlan, start, output, 0, count);
+            return count;
+        }
+
+        /** Compatibility view for dependency-light tools; production uses longs. */
+        public int fillCurrentFullscreenSlice(Page[] output) {
+            if (!configured || output == null || output.length == 0) return 0;
+            int start = sliceIndex * FULLSCREEN_SLICE_SIZE;
+            int end = Math.min(pagePlan.length, start + FULLSCREEN_SLICE_SIZE);
+            int count = 0;
+            for (int index = start; index < end && count < output.length; index++) {
+                long packed = pagePlan[index];
+                output[count++] = new Page(packedX(packed), packedZ(packed), index);
+            }
+            return count;
+        }
+
+        /** Advances only after the current slice has no missing or in-flight page. */
+        public void advanceFullscreenSlice() {
+            if (!configured) return;
+            sliceIndex++;
+            if (sliceIndex >= sliceCount) {
+                sliceIndex = 0;
+                completedCycles++;
+            }
+        }
+
+        /** Compatibility helper for tests/tools that intentionally consume a slice. */
+        public int fillNextFullscreenSlice(long[] output) {
+            int count = fillCurrentFullscreenSlice(output);
+            advanceFullscreenSlice();
+            return count;
+        }
+
+        public int fillNextFullscreenSlice(Page[] output) {
+            int count = fillCurrentFullscreenSlice(output);
+            advanceFullscreenSlice();
+            return count;
+        }
+
+        public int currentSliceStartOrdinal() {
+            return sliceIndex * FULLSCREEN_SLICE_SIZE;
+        }
+
+        public boolean retainedOverlap() {
+            return retainedOverlap;
+        }
+
+        public long completedCycles() {
+            return completedCycles;
+        }
+
+        public int currentSliceIndex() {
+            return sliceIndex;
+        }
+
+        public int sliceCount() {
+            return sliceCount;
+        }
+
+        public void clear() {
+            dimension = "";
+            minX = maxX = minZ = maxZ = 0;
+            sliceIndex = 0;
+            sliceCount = 0;
+            completedCycles = 0L;
+            configured = false;
+            retainedOverlap = false;
+            pagePlan = new long[0];
+        }
+
+        private static long[] buildPlan(int minX, int maxX,
+                int minZ, int maxZ) {
+            int width = Math.max(0, maxX - minX + 1);
+            int height = Math.max(0, maxZ - minZ + 1);
+            int total = width * height;
+            if (total == 0) return new long[0];
+
+            /*
+             * The coordinator shortlists the closest viewed regions rather than walking a
+             * screen edge. Generate the same deterministic centre-out authority
+             * without sorting or temporary distance arrays. Retained overlap is
+             * still preserved by the caller for source ownership; satisfied centre
+             * pages are skipped cheaply and newly exposed nearby pages are then
+             * admitted before distant edges.
+             */
+            long[] result = new long[total];
+            int centerX = minX + (maxX - minX) / 2;
+            int centerZ = minZ + (maxZ - minZ) / 2;
+            int maximumRadius = Math.max(
+                    Math.max(centerX - minX, maxX - centerX),
+                    Math.max(centerZ - minZ, maxZ - centerZ));
+            int ordinal = 0;
+            for (int radius = 0; radius <= maximumRadius; radius++) {
+                int left = centerX - radius;
+                int right = centerX + radius;
+                int top = centerZ - radius;
+                int bottom = centerZ + radius;
+                if (top >= minZ && top <= maxZ) {
+                    for (int x = Math.max(minX, left);
+                            x <= Math.min(maxX, right); x++) {
+                        result[ordinal] = pack(x, top);
+                        ordinal++;
+                    }
+                }
+                if (radius == 0) continue;
+                for (int z = Math.max(minZ, top + 1);
+                        z <= Math.min(maxZ, bottom - 1); z++) {
+                    if (left >= minX && left <= maxX) {
+                        result[ordinal] = pack(left, z);
+                        ordinal++;
+                    }
+                    if (right != left && right >= minX && right <= maxX) {
+                        result[ordinal] = pack(right, z);
+                        ordinal++;
+                    }
+                }
+                if (bottom >= minZ && bottom <= maxZ) {
+                    for (int x = Math.max(minX, left);
+                            x <= Math.min(maxX, right); x++) {
+                        result[ordinal] = pack(x, bottom);
+                        ordinal++;
+                    }
+                }
+            }
+            return result;
+        }
+
+        private static boolean rectanglesOverlap(int firstMinX, int firstMaxX,
+                int firstMinZ, int firstMaxZ, int secondMinX, int secondMaxX,
+                int secondMinZ, int secondMaxZ) {
+            return firstMinX <= secondMaxX && firstMaxX >= secondMinX
+                    && firstMinZ <= secondMaxZ && firstMaxZ >= secondMinZ;
+        }
+    }
+
+    /** Covers the loaded chunk radius, page-alignment slack and one repair halo. */
+    public static int minimapWorkingRadiusPages(int renderDistanceChunks) {
+        int loadedRadiusChunks = Math.max(2, renderDistanceChunks + 3);
+        int alignedPages = (loadedRadiusChunks + 3) / 4;
+        return Math.max(2, Math.min(MINIMAP_MAX_RADIUS_PAGES,
+                alignedPages + MINIMAP_HALO_PAGES));
+    }
+
+    /**
+     * Fills a bounded minimap exact-leaf halo in deterministic centre-out order.
+     * The visible rectangle is expanded by one page, then capped to the caller's
+     * loaded-world working radius so extreme zoom cannot flood the exact pipeline.
+     */
+    public static int fillMinimapHalo(int visibleMinX, int visibleMaxX,
+            int visibleMinZ, int visibleMaxZ, int centerX, int centerZ,
+            long[] output) {
+        return fillMinimapHalo(visibleMinX, visibleMaxX,
+                visibleMinZ, visibleMaxZ, centerX, centerZ,
+                MINIMAP_MAX_RADIUS_PAGES, output);
+    }
+
+    public static int fillMinimapHalo(int visibleMinX, int visibleMaxX,
+            int visibleMinZ, int visibleMaxZ, int centerX, int centerZ,
+            int maximumRadiusPages, long[] output) {
+        if (output == null || output.length == 0) return 0;
+        int safeRadius = Math.max(1,
+                Math.min(MINIMAP_MAX_RADIUS_PAGES, maximumRadiusPages));
+        int minX = Math.max(Math.min(visibleMinX, visibleMaxX) - MINIMAP_HALO_PAGES,
+                centerX - safeRadius);
+        int maxX = Math.min(Math.max(visibleMinX, visibleMaxX) + MINIMAP_HALO_PAGES,
+                centerX + safeRadius);
+        int minZ = Math.max(Math.min(visibleMinZ, visibleMaxZ) - MINIMAP_HALO_PAGES,
+                centerZ - safeRadius);
+        int maxZ = Math.min(Math.max(visibleMinZ, visibleMaxZ) + MINIMAP_HALO_PAGES,
+                centerZ + safeRadius);
+        int maximumRadius = Math.max(
+                Math.max(Math.abs(centerX - minX), Math.abs(maxX - centerX)),
+                Math.max(Math.abs(centerZ - minZ), Math.abs(maxZ - centerZ)));
+        int count = 0;
+        for (int radius = 0; radius <= maximumRadius && count < output.length;
+                radius++) {
+            int left = centerX - radius;
+            int right = centerX + radius;
+            int top = centerZ - radius;
+            int bottom = centerZ + radius;
+            if (top >= minZ && top <= maxZ) {
+                for (int x = Math.max(minX, left);
+                        x <= Math.min(maxX, right) && count < output.length; x++) {
+                    output[count++] = pack(x, top);
+                }
+            }
+            if (radius == 0) continue;
+            for (int z = Math.max(minZ, top + 1);
+                    z <= Math.min(maxZ, bottom - 1) && count < output.length; z++) {
+                if (left >= minX && left <= maxX) output[count++] = pack(left, z);
+                if (count >= output.length) break;
+                if (right != left && right >= minX && right <= maxX) {
+                    output[count++] = pack(right, z);
+                }
+            }
+            if (bottom >= minZ && bottom <= maxZ) {
+                for (int x = Math.max(minX, left);
+                        x <= Math.min(maxX, right) && count < output.length; x++) {
+                    output[count++] = pack(x, bottom);
+                }
+            }
+        }
+        return count;
+    }
+
+    /** Compatibility overload; production uses the allocation-free long buffer. */
+    public static int fillMinimapHalo(int visibleMinX, int visibleMaxX,
+            int visibleMinZ, int visibleMaxZ, int centerX, int centerZ,
+            Page[] output) {
+        if (output == null || output.length == 0) return 0;
+        long[] packed = new long[output.length];
+        int count = fillMinimapHalo(visibleMinX, visibleMaxX,
+                visibleMinZ, visibleMaxZ, centerX, centerZ, packed);
+        for (int index = 0; index < count; index++) {
+            output[index] = new Page(packedX(packed[index]), packedZ(packed[index]), index);
+        }
+        return count;
+    }
+
+    static long pack(int x, int z) {
+        return ((long) x << 32) ^ (z & 0xffffffffL);
+    }
+
+    static int packedX(long packed) {
+        return (int) (packed >> 32);
+    }
+
+    static int packedZ(long packed) {
+        return (int) packed;
+    }
+
+    public record Page(int x, int z, int ordinal) {
+        public int distanceSquaredTo(int focusX, int focusZ) {
+            int dx = x - focusX;
+            int dz = z - focusZ;
+            return dx * dx + dz * dz;
+        }
+    }
+}
+
 }

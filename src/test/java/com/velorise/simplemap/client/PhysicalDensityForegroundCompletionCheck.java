@@ -1,4 +1,7 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy.MapRenderScalePolicy;
+import com.velorise.simplemap.client.renderer.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;

@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client.gpu;
+import com.velorise.simplemap.client.gpu.GpuPageTable.PageTableEntry;
 
 /** PASS93 guard for dynamic exact-surface subtile visibility. */
 public final class PageTableCoverageMaskCheck {

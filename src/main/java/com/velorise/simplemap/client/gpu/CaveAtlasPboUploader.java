@@ -1,8 +1,8 @@
 package com.velorise.simplemap.client.gpu;
+import com.velorise.simplemap.client.cave.*;
 
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.velorise.simplemap.client.cave.CaveTelemetry;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.lwjgl.opengl.GL;
@@ -25,18 +25,10 @@ import java.nio.ByteBuffer;
 public final class CaveAtlasPboUploader implements AutoCloseable {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final int PBO_RING_SIZE = 3;
-    /*
-     * PASS140: every exact Cave rectangle is at most 66x66 RGBA (~17 KiB).
-     * Orphaning/buffering a PBO for transfers this small adds more driver state
-     * transitions than payload and the latest run still recorded a 342 ms exact
-     * upload outlier. Keep the PBO implementation for future larger transfers, but
-     * use the direct pooled native buffer path for these tiny exact-page updates.
-     */
     private static final int PBO_MIN_UPLOAD_BYTES = 64 * 1024;
     private static final boolean VALIDATE_GL =
             Boolean.getBoolean("simplemap.validateCaveGl");
 
-    private final CaveTelemetry telemetry = CaveTelemetry.getInstance();
     private final CaveDirectBufferPool buffers = new CaveDirectBufferPool(PBO_RING_SIZE + 1);
     private final int[] unpackPbos = new int[PBO_RING_SIZE];
 
@@ -65,7 +57,6 @@ public final class CaveAtlasPboUploader implements AutoCloseable {
                 uploadDirect(textureId, destinationX, destinationY,
                         width, height, staging);
             }
-            telemetry.recordGpuSubUpload(pbo, width * height);
         } finally {
             buffers.release(staging);
         }

@@ -1,8 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.velorise.simplemap.client.MapLodPolicy;
-import com.velorise.simplemap.client.MapAtlasMemoryTracker;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy;
 import com.velorise.simplemap.client.MapMemoryBudgetPolicy;
 import com.velorise.simplemap.client.gpu.CaveAtlasPboUploader;
 import net.minecraft.client.Minecraft;
@@ -17,11 +16,11 @@ import java.util.ArrayDeque;
  * GPU-only AbstractTexture, so resource reloads recreate storage without retaining
  * an atlas-sized NativeImage on the Java/native heap.
  */
-final class CaveTextureAtlas {
-    static final int PAGE_SIZE = 64;
-    static final int SLOT_COLUMNS = MapMemoryBudgetPolicy.caveExactColumns();
-    static final int SLOT_COUNT = SLOT_COLUMNS * SLOT_COLUMNS;
-    static final int LOD_COUNT = 4;
+public final class CaveTextureAtlas {
+    public static final int PAGE_SIZE = 64;
+    public static final int SLOT_COLUMNS = MapMemoryBudgetPolicy.caveExactColumns();
+    public static final int SLOT_COUNT = SLOT_COLUMNS * SLOT_COLUMNS;
+    public static final int LOD_COUNT = 4;
 
     private static final int[] LOD_SIZES = { 64, 32, 16, 8 };
 
@@ -38,7 +37,7 @@ final class CaveTextureAtlas {
     private boolean initialized;
     private long storageGeneration;
 
-    CaveTextureAtlas() {
+    public CaveTextureAtlas() {
         for (int lod = 0; lod < LOD_COUNT; lod++) {
             int pitch = LOD_SIZES[lod] + 2;
             gutteredUploads[lod] = new int[pitch * pitch];
@@ -46,23 +45,23 @@ final class CaveTextureAtlas {
         refillFreeSlots();
     }
 
-    void ensureInitialized() {
+    public void ensureInitialized() {
         initialize();
     }
 
-    long storageGeneration() {
+    public long storageGeneration() {
         return storageGeneration;
     }
 
-    boolean hasQuarantinedSlots() {
+    public boolean hasQuarantinedSlots() {
         return !quarantinedSlots.isEmpty();
     }
 
-    int availableSlotCount() {
+    public int availableSlotCount() {
         return freeSlots.size();
     }
 
-    int acquireSlot() {
+    public int acquireSlot() {
         RenderSystem.assertOnRenderThreadOrInit();
         initialize();
         Integer slot = freeSlots.pollFirst();
@@ -71,19 +70,19 @@ final class CaveTextureAtlas {
         return slot;
     }
 
-    void releaseSlot(int slot) {
+    public void releaseSlot(int slot) {
         if (slot < 0 || slot >= SLOT_COUNT || !allocatedSlots[slot]) return;
         allocatedSlots[slot] = false;
         freeSlots.addLast(slot);
     }
 
     /** Release a slot that was visible through the front page table. */
-    void releasePublishedSlot(int slot) {
+    public void releasePublishedSlot(int slot) {
         if (slot < 0 || slot >= SLOT_COUNT || !allocatedSlots[slot]) return;
         if (!quarantinedSlots.contains(slot)) quarantinedSlots.addLast(slot);
     }
 
-    void onPageTableFrameBoundary() {
+    public void onPageTableFrameBoundary() {
         RenderSystem.assertOnRenderThreadOrInit();
         while (!quarantinedSlots.isEmpty()) {
             int slot = quarantinedSlots.removeFirst();
@@ -93,7 +92,7 @@ final class CaveTextureAtlas {
         }
     }
 
-    void resetSlots() {
+    public void resetSlots() {
         RenderSystem.assertOnRenderThreadOrInit();
         for (int slot = 0; slot < allocatedSlots.length; slot++) {
             allocatedSlots[slot] = false;
@@ -102,11 +101,11 @@ final class CaveTextureAtlas {
         refillFreeSlots();
     }
 
-    CaveAtlasRegion region(int slot, float scale) {
+    public CaveAtlasRegion region(int slot, float scale) {
         return regionForLod(slot, lodForScale(scale));
     }
 
-    CaveAtlasRegion regionForLod(int slot, int lod) {
+    public CaveAtlasRegion regionForLod(int slot, int lod) {
         if (!initialized || slot < 0 || slot >= SLOT_COUNT
                 || !allocatedSlots[slot] || lod < 0 || lod >= LOD_COUNT) return null;
         int pageSize = LOD_SIZES[lod];
@@ -118,7 +117,7 @@ final class CaveTextureAtlas {
                 pageSize, atlasSize);
     }
 
-    void upload(int slot, int lod, int[] pixels, DirtyRect dirty) {
+    public void upload(int slot, int lod, int[] pixels, DirtyRect dirty) {
         RenderSystem.assertOnRenderThreadOrInit();
         initialize();
         if (slot < 0 || slot >= SLOT_COUNT || !allocatedSlots[slot]) {
@@ -178,11 +177,11 @@ final class CaveTextureAtlas {
                 dirty.minX(), dirty.minY());
     }
 
-    static int lodSize(int lod) {
+    public static int lodSize(int lod) {
         return LOD_SIZES[lod];
     }
 
-    static int lodForScale(float scale) {
+    public static int lodForScale(float scale) {
         return MapLodPolicy.leafMipLevel(scale, LOD_COUNT - 1);
     }
 
@@ -195,10 +194,10 @@ final class CaveTextureAtlas {
             int atlasSize = (pageSize + 2) * SLOT_COLUMNS;
             ResourceLocation location = ResourceLocation.fromNamespaceAndPath(
                     "simplemap", "cave_atlas/lod_" + pageSize);
-            CaveAtlasTexture texture = new CaveAtlasTexture(atlasSize, this::markStorageAllocated);
+            CaveAtlasTexture texture = new CaveAtlasTexture(atlasSize, true, this::markStorageAllocated);
             minecraft.getTextureManager().register(location, texture);
             texture.allocateStorage();
-            MapAtlasMemoryTracker.getInstance().register(
+            MapMemoryBudgetPolicy.registerAtlasAllocation(
                     "cave_exact_lod_" + pageSize,
                     (long) atlasSize * atlasSize * Integer.BYTES);
 
@@ -219,21 +218,96 @@ final class CaveTextureAtlas {
         for (int slot = 0; slot < SLOT_COUNT; slot++) freeSlots.addLast(slot);
     }
 
-    record DirtyRect(int minX, int minY, int maxX, int maxY) {
-        static DirtyRect full(int size) {
+    public record DirtyRect(int minX, int minY, int maxX, int maxY) {
+        public static DirtyRect full(int size) {
             return new DirtyRect(0, 0, size - 1, size - 1);
         }
 
-        boolean isEmpty() {
+        public boolean isEmpty() {
             return maxX < minX || maxY < minY;
         }
 
-        int width() {
+        public int width() {
             return isEmpty() ? 0 : maxX - minX + 1;
         }
 
-        int height() {
+        public int height() {
             return isEmpty() ? 0 : maxY - minY + 1;
+        }
+    }
+
+    /**
+     * Builds a one-texel replicated border around an atlas slot.
+     */
+    public static final class AtlasGutter {
+        public static final int SIZE = 1;
+
+        private AtlasGutter() {
+        }
+
+        public static int pitch(int contentSize) {
+            return contentSize + SIZE * 2;
+        }
+
+        public static void copyOnePixelBorder(int[] source, int contentSize, int[] destination) {
+            int pitch = pitch(contentSize);
+            if (source == null || source.length < contentSize * contentSize) {
+                throw new IllegalArgumentException("Atlas gutter source is too small");
+            }
+            if (destination == null || destination.length < pitch * pitch) {
+                throw new IllegalArgumentException("Atlas gutter destination is too small");
+            }
+
+            for (int y = 0; y < contentSize; y++) {
+                int sourceRow = y * contentSize;
+                int destinationRow = (y + SIZE) * pitch + SIZE;
+                System.arraycopy(source, sourceRow, destination, destinationRow, contentSize);
+                destination[destinationRow - 1] = source[sourceRow];
+                destination[destinationRow + contentSize] = source[sourceRow + contentSize - 1];
+            }
+
+            int firstInteriorRow = SIZE * pitch;
+            int lastInteriorRow = (SIZE + contentSize - 1) * pitch;
+            System.arraycopy(destination, firstInteriorRow, destination, 0, pitch);
+            System.arraycopy(destination, lastInteriorRow, destination,
+                    (pitch - 1) * pitch, pitch);
+        }
+    }
+
+    /**
+     * Immutable draw handle for one cave texture inside a shared GPU atlas.
+     */
+    public static record CaveAtlasRegion(
+            ResourceLocation texture,
+            float sourceX,
+            float sourceY,
+            int sourceSize,
+            int atlasSize,
+            int level,
+            int worldSize,
+            long knownMask,
+            long completeMask) {
+
+        /** Compatibility constructor for exact 64x64 leaf pages. */
+        public CaveAtlasRegion(ResourceLocation texture, float sourceX, float sourceY,
+                int sourceSize, int atlasSize) {
+            this(texture, sourceX, sourceY, sourceSize, atlasSize,
+                    0, CaveTextureAtlas.PAGE_SIZE, -1L, -1L);
+        }
+
+        public boolean childKnown(int childIndex) {
+            return childIndex >= 0 && childIndex < 64
+                    && (knownMask & (1L << childIndex)) != 0L;
+        }
+
+        public boolean childComplete(int childIndex) {
+            return childIndex >= 0 && childIndex < 64
+                    && (completeMask & (1L << childIndex)) != 0L;
+        }
+
+        public boolean fullyComplete() {
+            long full = level <= 0 ? -1L : 0xFL;
+            return completeMask == full;
         }
     }
 }

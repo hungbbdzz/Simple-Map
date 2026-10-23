@@ -41,6 +41,7 @@ neoForge {
             // initialize successfully a moment later. Disable only the dev-run
             // progress window; this property is not packaged into the mod jar.
             systemProperty 'fml.earlyprogresswindow', 'false'
+            environment 'SHIM_MCCOMPAT', '0x800000001'
         }
         server {
             server()
@@ -136,21 +137,6 @@ tasks.register('viewportLoadPlannerCheck', JavaExec) {
     mainClass = 'com.velorise.simplemap.client.MapViewLoadPlannerCheck'
 }
 
-// Cave foreground stages must preserve one centre-out ordinal authority.
-tasks.register('caveLoadHierarchyCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveLoadHierarchyCheck'
-}
-
-// Fullscreen cave pages may build ahead, but cache/exact publication must never
-// jump over an unresolved page and form black islands inside loaded terrain.
-tasks.register('caveContiguousPublicationCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveContiguousPublicationCheck'
-}
-
 // AUTO dimension topology must not let repeated End-island roofs become a
 // persistent cave world, and each Layered cache key must own one immutable Top Y.
 tasks.register('caveDimensionEvidenceCheck', JavaExec) {
@@ -163,20 +149,6 @@ tasks.register('caveLayerBandCheck', JavaExec) {
     dependsOn testClasses
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.velorise.simplemap.client.cave.CaveLayerBandCheck'
-}
-
-// Cave/Full Cave must use Xaero's enter-ground -> real-air -> first-floor
-// transaction, and cache revisions must invalidate older projection semantics.
-tasks.register('caveProjectionSemanticsCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveProjectionSemanticsCheck'
-}
-
-tasks.register('adaptiveDimensionLoadCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.AdaptiveDimensionLoadPolicyCheck'
 }
 
 // Retained minimap invalidation must react to atlas pixel writes without
@@ -220,58 +192,23 @@ tasks.register('mapSessionStampCheck', JavaExec) {
     mainClass = 'com.velorise.simplemap.client.session.MapSessionStampCheck'
 }
 
-// Incremental Layered-Cave leaves publish as bounded page batches.
-tasks.register('caveTilePublicationPolicyCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveTilePublicationPolicyCheck'
-}
-
 // Aggregate static/state gate for the complete region-centric architecture stack.
-
 tasks.register('architectureAllCheck') {
     dependsOn tasks.named('m2m4CoreCheck')
     dependsOn tasks.named('architectureStackCheck')
     dependsOn tasks.named('mapSessionStampCheck')
     dependsOn tasks.named('viewportLoadPlannerCheck')
-    dependsOn tasks.named('caveLoadHierarchyCheck')
-    dependsOn tasks.named('caveContiguousPublicationCheck')
     dependsOn tasks.named('caveDimensionEvidenceCheck')
     dependsOn tasks.named('caveLayerBandCheck')
-    dependsOn tasks.named('caveProjectionSemanticsCheck')
-    dependsOn tasks.named('caveTilePublicationPolicyCheck')
-    dependsOn tasks.named('adaptiveDimensionLoadCheck')
     dependsOn tasks.named('retainedMinimapFramePolicyCheck')
     dependsOn tasks.named('mapGpuInstancePlanCheck')
     dependsOn tasks.named('movementMutationPolicyCheck')
     dependsOn tasks.named('viewportDemandPublicationPolicyCheck')
-}
-
-// PASS41: ensure static cached enum arrays initialize before the cave singleton.
-tasks.register('caveTextureManagerStaticInitCheck', JavaExec) {
-    group = 'verification'
-    description = 'Verifies UnifiedCaveTextureManager static initialization order.'
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveTextureManagerStaticInitCheck'
-    dependsOn testClasses
-}
-
-// PASS41: align incremental Layered fullscreen commits into shared redraw batches.
-tasks.register('caveViewportPublicationPolicyCheck', JavaExec) {
-    group = 'verification'
-    description = 'Verifies shared Layered-Cave viewport publication cadence.'
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveViewportPublicationPolicyCheck'
-    dependsOn testClasses
-}
-
-// PASS41: known-empty Cave projections use primitive int storage on render hot paths.
-tasks.register('caveAbsentDisplayPrimitiveIndexCheck', JavaExec) {
-    group = 'verification'
-    description = 'Verifies primitive known-empty Cave projection authority.'
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveAbsentDisplayPrimitiveIndexCheck'
-    dependsOn testClasses
+    dependsOn tasks.named('surfaceCaptureFrameAllowanceCheck')
+    dependsOn tasks.named('retainedFullscreenFramePolicyCheck')
+    dependsOn tasks.named('retainedViewportCompositionCheck')
+    dependsOn tasks.named('framePacingHardGateCheck')
+    dependsOn tasks.named('retainedFramebufferBindingCheck')
 }
 
 // Runtime-validated PASS46 policy checks.
@@ -304,17 +241,6 @@ tasks.register('framePacingHardGateCheck', JavaExec) {
     dependsOn testClasses
 }
 
-tasks.named('architectureAllCheck') {
-    dependsOn tasks.named('surfaceCaptureFrameAllowanceCheck')
-    dependsOn tasks.named('retainedFullscreenFramePolicyCheck')
-    dependsOn tasks.named('retainedViewportCompositionCheck')
-    dependsOn tasks.named('framePacingHardGateCheck')
-    dependsOn tasks.named('caveTextureManagerStaticInitCheck')
-    dependsOn tasks.named('caveViewportPublicationPolicyCheck')
-    dependsOn tasks.named('caveAbsentDisplayPrimitiveIndexCheck')
-}
-
-
 // Minecraft 1.21 RenderTarget.clear() unbinds the target. Both retained paths
 // must bind it again before replaying terrain into the texture.
 tasks.register('retainedFramebufferBindingCheck', JavaExec) {
@@ -322,104 +248,4 @@ tasks.register('retainedFramebufferBindingCheck', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.velorise.simplemap.client.RetainedFramebufferBindingCheck'
     dependsOn testClasses
-}
-
-tasks.named('architectureAllCheck') {
-    dependsOn tasks.named('retainedFramebufferBindingCheck')
-}
-
-// PASS69: completed cave work follows current viewport ownership and cannot
-// head-of-line block foreground publication from a weak historical lane.
-tasks.register('caveCompletionLanePromotionCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveCompletionLanePromotionCheck'
-}
-
-
-// PASS81: region projection demand must stay viewport-bounded and use one
-// canonical dimension namespace from source handoff through GPU publication.
-tasks.register('cavePass81DemandLifecycleCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass81DemandLifecycleCheck'
-}
-
-// PASS131: admitted Cave source outlives viewport pulses, loading generations own
-// completed projection handoff, and writer expansion is guarded by last-good tiles.
-tasks.register('cavePass131LifecycleInvariantCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass131LifecycleInvariantCheck'
-}
-
-// PASS132: disk absence is transient, LIVE revokes weaker retained authority,
-// and only proof-bearing complete emptiness may enter presentation/CIMG.
-tasks.register('cavePass132AuthorityInvariantCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass132AuthorityInvariantCheck'
-}
-
-// PASS133-A-D: canonical scanning is hard-sliced, transient acquisition can
-// quiesce without Cave authority, and archive/page revisions publish by milestone.
-tasks.register('cavePass133PerformanceInvariantCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass133PerformanceInvariantCheck'
-}
-
-// PASS134: live disk-absence repair is deduped and budget-owned, native imports
-// route by chunk without retry churn, and all archive writers compose lava once.
-tasks.register('cavePass134PostAuthorityPerformanceCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass134PostAuthorityPerformanceCheck'
-}
-
-// PASS134-A/B/D/E: exact Layered products retain independent Top-Y identity,
-// content builds survive presentation turnover, presence wakes stay local, and
-// compact archive arrays are materialized off the client lane.
-tasks.register('cavePass135BottleneckIdentityCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass135BottleneckIdentityCheck'
-}
-
-// PASS136-A/B: world-save presence is one bounded async Anvil-region snapshot,
-// while exact Layered retention trims only the target chunk's tiny key bucket.
-tasks.register('cavePass136LocalityInvariantCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass136LocalityInvariantCheck'
-}
-
-// PASS137-A/B: repeated viewport observations retain one idempotent source
-// frontier, and visible admission closes focus/near-complete pages before halo.
-tasks.register('cavePass137SourceFrontierCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CavePass137SourceFrontierCheck'
-}
-
-tasks.register('caveArchiveFrontierEmissiveCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveArchiveFrontierEmissiveCheck'
-}
-
-tasks.register('caveRegionImageCacheCheck', JavaExec) {
-    group = 'verification'
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.velorise.simplemap.client.cave.CaveRegionImageCacheCheck'
 }

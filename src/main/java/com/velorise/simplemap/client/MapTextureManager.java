@@ -1,21 +1,45 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapManager.MapLightManager;
+import com.velorise.simplemap.client.MapManager.MapLightManager.LightRegion;
+import com.velorise.simplemap.client.MapManager.MapConfig;
+import com.velorise.simplemap.client.MapWorkScheduler.MapTextureBuildWorker;
+import com.velorise.simplemap.client.RegionSurfaceLodService.MapRegionLodPolicy;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapSurfaceDemandPolicy;
+import com.velorise.simplemap.client.color.SurfaceColorizer.MapVisualClassifier.BlockTextureColorSampler;
+import com.velorise.simplemap.client.color.SurfaceColorizer.SurfaceTintData;
+import com.velorise.simplemap.client.color.SurfaceColorizer.BlockTintPolicy;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy;
+import com.velorise.simplemap.client.MapWorkScheduler.MapProcessor;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapViewLoadPlanner;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapMemoryLeaseManager;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapResidencyManager;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapGpuBudgetController;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.color.*;
 
-import com.velorise.simplemap.client.surface.SurfacePublicationService;
-import com.velorise.simplemap.client.surface.SurfaceResidencyService;
-import com.velorise.simplemap.client.gpu.MapGpuPageTableService;
-import com.velorise.simplemap.client.gpu.PageTableEntry;
-import com.velorise.simplemap.client.gpu.TileKey;
-import com.velorise.simplemap.client.gpu.UploadCommand;
+import com.velorise.simplemap.client.MapWorkScheduler.MapTextureBuildWorker.PreparedSurfaceRegionBatch;
+import com.velorise.simplemap.client.MapWorkScheduler.MapTextureBuildWorker.MapStyleSnapshot;
+import com.velorise.simplemap.client.MapDebugRecorder.MapPipelineTelemetry;
+import com.velorise.simplemap.client.MapDebugRecorder.MapPipelineTelemetry.MapPipelineStage;
+
+import com.velorise.simplemap.client.MapDebugRecorder.ExactPageState;
+import com.velorise.simplemap.client.MapDebugRecorder.ExactPageStateTracker;
+import com.velorise.simplemap.client.MapDebugRecorder.MapPipelineTelemetry.MapPipelineStage;
+import com.velorise.simplemap.client.MapWorkScheduler.MapTextureBuildWorker.MapStyleSnapshot;
+import com.velorise.simplemap.client.gpu.GpuPageTable;
+import com.velorise.simplemap.client.gpu.GpuPageTable.PageTableEntry;
+import com.velorise.simplemap.client.gpu.GpuPageTable.TileKey;
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapUploadEngine.UploadCommand;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.velorise.simplemap.client.cave.CaveAtlasRegion;
-import com.velorise.simplemap.client.cave.SurfaceLeafAtlas;
-import com.velorise.simplemap.client.cave.SurfaceLodTree;
-import com.velorise.simplemap.client.pipeline.MapWorkGraph;
-import com.velorise.simplemap.client.pipeline.MapWorkKey;
-import com.velorise.simplemap.client.pipeline.MapWorkStage;
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.cave.CaveTextureAtlas.CaveAtlasRegion;
+import com.velorise.simplemap.client.lod.SurfaceLeafAtlas;
+import com.velorise.simplemap.client.lod.SurfaceLodTree;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.MapWorkKey;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.MapWorkStage;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
 import com.velorise.simplemap.client.session.MapSessionManager;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
@@ -91,7 +115,7 @@ public class MapTextureManager {
     private final Map<String, Long> pageRevisions = new HashMap<>();
     /** 16x16 exact-leaf parts which actually need restyling/publication. */
     private final Map<String, Integer> dirtyPageSubtileMasks = new HashMap<>();
-    private final Map<String, CompletableFuture<PreparedSurfaceRegionBatch>>
+    private final Map<String, CompletableFuture<MapTextureBuildWorker.PreparedSurfaceRegionBatch>>
             pendingSurfaceBatches = new HashMap<>();
     /**
      * CPU-ready exact leaves waiting only for render-thread publication. Cave can
@@ -309,10 +333,10 @@ public class MapTextureManager {
         }
         Integer cached = cache.get(blockId);
         if (cached != null) return cached;
-        Minecraft minecraft = Minecraft.getInstance();
-        if (!minecraft.isSameThread()) return 0xFFFFFFFF;
         int resolved = resolveDefaultBlockColor(blockId, colourMode);
-        cache.put(blockId, resolved);
+        if (resolved != 0xFFFFFFFF) {
+            cache.put(blockId, resolved);
+        }
         return resolved;
     }
 
@@ -634,7 +658,7 @@ public class MapTextureManager {
     /**
      * Requests visible exact leaves around the user's attention point. Fullscreen
      * focus is the block under the mouse; minimap focus is the player. This mirrors
-     * Xaero's distance comparator while keeping the branch hierarchy as fallback.
+     * A distance comparator while keeping the branch hierarchy as fallback.
      */
     public void requestVisiblePages(double minX, double maxX, double minZ, double maxZ,
             double focusX, double focusZ, MapRequestLane lane) {
@@ -685,7 +709,7 @@ public class MapTextureManager {
             replaceMinimapDemandWindowIfMoved(
                     MapManager.getInstance().getDimensionCacheKey(),
                     focusPageX, focusPageZ);
-            // Xaero's minimap is a separate demand producer: complete a compact
+            // the  minimap is a separate demand producer: complete a compact
             // player/camera-centred exact halo before spending work elsewhere.
             // Size it from Minecraft's loaded radius instead of a fixed 5x5-page
             // island, so rotated corners and newly loaded edge chunks are included.
@@ -735,14 +759,14 @@ public class MapTextureManager {
             if (viewportChanged) {
                 clearAllPageDemandLane(MapRequestLane.FULLSCREEN);
                 /*
-                 * PASS100 / Xaero retained-residency rule:
+                 * PASS100 retained-residency rule:
                  * a viewport rebase changes ownership, not cache residency.
                  * Eagerly releasing every exact page outside the new rectangle
                  * caused hundreds of avoidable GPU evictions/restores and made
                  * revisiting a location black until exact leaves were uploaded
                  * again. Keep old exact slots resident and let the atlas/residency
                  * LRU choose victims only when a new allocation actually needs
-                 * space. This mirrors Xaero's loaded/cache separation.
+                 * space. This mirrors loaded/cache separation.
                  */
                 if (planner.retainedOverlap()) {
                     MapProcessor.getInstance().retainSurfaceLoadsInRegions(
@@ -853,7 +877,7 @@ public class MapTextureManager {
     /**
      * Renderer demand never snapshots MapManager.Region directly. It only asks the
      * writer side to populate the immutable retained source and waits for the
-     * publication wake-up. This is the Surface equivalent of Xaero's writer-owned
+     * publication wake-up. This is the Surface equivalent of the writer-owned
      * loadingBlocks/MapTileChunk buffers.
      */
     private void ensureRetainedSurfaceSource(int regionX, int regionZ,
@@ -896,7 +920,7 @@ public class MapTextureManager {
         int required = retainedLeafSourceMask(regionX, regionZ, pageX, pageZ);
         /* PASS110: a 64x64 exact texture is the atomic GPU transaction, but its
          * coverage mask does not need to pretend that source outside the currently
-         * available 4x4 chunk sweep exists. Xaero updates one MapTileChunk buffer
+         * available 4x4 chunk sweep exists. The manager updates one MapTileChunk buffer
          * after visiting all sixteen child positions; skipped edge chunks remain
          * unloaded while the available MapTiles are coherent. Treat the current
          * retained-source mask as the authority and repair/expand this page when a
@@ -1321,8 +1345,8 @@ public class MapTextureManager {
                 int globalPageZ = regionZ * MapPageLayout.PAGES_PER_REGION + pageZ;
                 int variant = glow ? TileKey.VARIANT_SURFACE_GLOW
                         : TileKey.VARIANT_SURFACE_EXACT;
-                MapGpuPageTableService.Resolved resolved =
-                        SurfaceResidencyService.getInstance().resolve(
+                GpuPageTable.MapGpuPageTableService.Resolved resolved =
+                        GpuPageTable.MapGpuPageTableService.getInstance().resolve(
                                 new TileKey(info.publishedStamp.sessionId(), 0, 0,
                                         globalPageX, globalPageZ, variant));
                 if (resolved != null) {
@@ -1564,7 +1588,7 @@ public class MapTextureManager {
                     && page.gpuRetryAfterNanos > System.nanoTime()) {
                 /*
                  * The shared ledger is exhausted for this upload kind in the
-                 * current physical frame. Xaero stops the upload slice here rather
+                 * current physical frame. The upload slice stops here rather
                  * than probing dozens of other retained textures against the same
                  * limit. The completed payload remains queued by
                  * schedulePagePreparation(), so the next frame resumes without a
@@ -1702,7 +1726,7 @@ public class MapTextureManager {
     /**
      * Compatibility entry point retained for manual refresh/debug paths. Normal
      * gameplay calls {@link #uploadExactTextures(boolean)} through
-     * {@link MapPublicationCoordinator} and therefore never builds legacy region
+     * {@link MapViewportCoordinator} and therefore never builds legacy region
      * textures in the foreground.
      */
     public void uploadDirtyTextures(boolean force) {
@@ -1828,7 +1852,7 @@ public class MapTextureManager {
              * dirty leaves but only ~25 current demands; a changed visible leaf
              * buried hundreds of entries deep then looked permanently stuck.
              * pageDemands is small and bounded by viewport leases, so ranking it
-             * first is cheap and mirrors Xaero's viewer-centric writer priority.
+             * first is cheap and mirrors viewer-centric writer priority.
              */
             List<String> demanded = new ArrayList<>();
             for (Map.Entry<String, SurfacePageDemand> entry : pageDemands.entrySet()) {
@@ -2164,7 +2188,7 @@ public class MapTextureManager {
          * Request lanes are viewport ownership, not a permanent property of a
          * completed payload. PASS99 kept the lane captured when the CPU job was
          * scheduled, so an offscreen result from an old fullscreen viewport could
-         * continue reserving foreground GPU budget for seconds. Xaero re-prioritizes
+         * continue reserving foreground GPU budget for seconds. The manager re-prioritizes
          * retained textures from the current loaded/loading view. Do the same:
          * current demand owns the lane; no current demand means background.
          */
@@ -2505,10 +2529,10 @@ public class MapTextureManager {
         int knownColumns = countKnownColumns(mergedRows);
 
         /*
-         * PASS109 / Xaero loaded-loading parity:
+         * PASS109 loaded-loading parity:
          *
-         * Xaero Minimap writes into loadingBlocks and swaps the completed grid into
-         * loadedBlocks. Xaero World Map visits all 4x4 MapTiles of a MapTileChunk
+         * The minimap writes into loadingBlocks and swaps the completed grid into
+         * loadedBlocks. The world map visits all 4x4 tiles of a chunk block
          * before updateBuffers(). SimpleMap previously made each complete 16x16
          * child visible immediately. In the PASS108 log, 674/679 first Surface GPU
          * publications were incomplete pages (279 had only one 16x16 chunk), which
@@ -2576,7 +2600,7 @@ public class MapTextureManager {
                 prepared.revision(), null,
                 () -> leafAtlas.upload(page.atlasSlot, mergedColor, mergedGlow),
                 null, null);
-        SurfacePublicationService.getInstance().executeInline(upload);
+        com.velorise.simplemap.client.gpu.GpuPageTable.MapUploadEngine.getInstance().executeInline(upload);
         long exactUploadNanos = System.nanoTime() - exactUploadStart;
         MapPipelineTelemetry.getInstance().recordStageNanos(
                 MapPipelineStage.EXACT_UPLOAD, exactUploadNanos);
@@ -2665,7 +2689,7 @@ public class MapTextureManager {
          * The live minimap is latency-sensitive and its source arrives one complete
          * 16x16 chunk transaction at a time. PASS100 still grouped a single dirty
          * minimap leaf into 2x2 batches (100 halo chunks) even when only 1/4 pages
-         * were attached; the log shows those bursts beside the 27.6 ms frame. Xaero
+         * were attached; the log shows those bursts beside the 27.6 ms frame. The engine
          * advances individual MinimapChunk/tile state and never widens one fresh
          * chunk into a multi-page capture transaction. Fullscreen retains batching
          * because throughput, not per-frame latency, is its primary concern.
@@ -2719,7 +2743,7 @@ public class MapTextureManager {
          * geometry. PASS101 chose 2x2 using a historical FULLSCREEN/BACKGROUND lane,
          * then discovered a live MINIMAP demand while attaching leaves and promoted
          * the already-sized batch. That is how two lane=MINIMAP pages=2/4 batches
-         * still escaped the nominal MINIMAP=1x1 rule. Xaero does not merge its
+         * still escaped the nominal MINIMAP=1x1 rule. The manager does not merge its
          * latency-sensitive MinimapChunk writer into a wider world-map transaction.
          */
         long demandNowMs = System.currentTimeMillis();
@@ -2983,7 +3007,7 @@ public class MapTextureManager {
                 requested.regionZ(), MapWorkStage.GPU_PREPARE, Integer.MIN_VALUE);
         MapWorkGraph graph = MapWorkGraph.getInstance();
         graph.request(graphKey, batchRevision, batchMask);
-        CompletableFuture<PreparedSurfaceRegionBatch> batchFuture =
+        CompletableFuture<MapTextureBuildWorker.PreparedSurfaceRegionBatch> batchFuture =
                 MapTextureBuildWorker.tryBuildSurfaceBatch(source, style,
                         pageRevisionSnapshot, attachPage,
                         requestedSubtileMasks,
@@ -3721,7 +3745,7 @@ public class MapTextureManager {
         enqueueLeafPublication(regionX, regionZ, info.generation, prepared);
     }
 
-    /** Xaero RegionTexture semantics: LINEAR minification, NEAREST magnification. */
+    /** RegionTexture semantics: LINEAR minification, NEAREST magnification. */
     private static void configureExactSurfaceSampling(DynamicTexture texture) {
         if (texture == null) return;
         if (!RenderSystem.isOnRenderThreadOrInit()) {
@@ -3819,7 +3843,7 @@ public class MapTextureManager {
                 ? pending.knownPages[pageIndex] : inferKnownRows(leafPixels);
         int completeSubtiles = MapPageLayout.completeSubtileMask(knownRows);
         if (completeSubtiles != MapPageLayout.FULL_SUBTILE_MASK) {
-            // Xaero World Map updates a MapTileChunk buffer only after its complete
+            // The world map updates a chunk buffer only after its complete
             // 4x4 chunk transaction has been visited. Keep sparse/edge data in the
             // 512x512 retained underlay instead of promoting disconnected 16x16
             // children into the exact atlas. The exact page is admitted once all
@@ -4145,11 +4169,11 @@ public class MapTextureManager {
             if (sampled != null) return sampled;
 
             int rgb = -1;
-            if (level != null && !BrokenBlockTintCache.getInstance().isBroken(blockIdText)) {
+            if (level != null && !BlockTextureColorSampler.isBrokenTint(blockIdText)) {
                 try {
                     rgb = minecraft.getBlockColors().getColor(state, level, position, 0);
                 } catch (Throwable throwable) {
-                    BrokenBlockTintCache.getInstance().markBroken(blockIdText);
+                    BlockTextureColorSampler.markBrokenTint(blockIdText);
                 }
             }
             if (rgb == -1) {
@@ -4256,7 +4280,7 @@ public class MapTextureManager {
          * and caused the logout ConcurrentModificationException. Detach first, then
          * cancel the stable snapshot outside the monitor.
          */
-        List<CompletableFuture<PreparedSurfaceRegionBatch>> cancelBatches;
+        List<CompletableFuture<MapTextureBuildWorker.PreparedSurfaceRegionBatch>> cancelBatches;
         synchronized (pendingSurfaceBatches) {
             cancelBatches = new ArrayList<>(pendingSurfaceBatches.values());
             pendingSurfaceBatches.clear();
@@ -4265,7 +4289,7 @@ public class MapTextureManager {
             captureClusterAttemptNanos.clear();
             captureClusterDeferrals.clear();
         }
-        for (CompletableFuture<PreparedSurfaceRegionBatch> future : cancelBatches) {
+        for (CompletableFuture<MapTextureBuildWorker.PreparedSurfaceRegionBatch> future : cancelBatches) {
             future.cancel(false);
         }
         SurfaceRegionSourceDatabase.getInstance().clear();
@@ -4669,7 +4693,7 @@ public class MapTextureManager {
             flags |= PageTableEntry.FLAG_COMPLETE;
         }
         if (color != null) {
-            SurfacePublicationService.getInstance().stage(
+            GpuPageTable.MapGpuPageTableService.getInstance().stage(
                     new TileKey(page.publishedStamp.sessionId(), 0, 0,
                             globalPageX, globalPageZ,
                             TileKey.VARIANT_SURFACE_EXACT),
@@ -4679,7 +4703,7 @@ public class MapTextureManager {
                     color.atlasSize());
         }
         if (glow != null && page.glowPixels != null) {
-            SurfacePublicationService.getInstance().stage(
+            GpuPageTable.MapGpuPageTableService.getInstance().stage(
                     new TileKey(page.publishedStamp.sessionId(), 0, 0,
                             globalPageX, globalPageZ,
                             TileKey.VARIANT_SURFACE_GLOW),
@@ -4698,7 +4722,7 @@ public class MapTextureManager {
                 + address.pageX();
         int globalPageZ = address.regionZ() * MapPageLayout.PAGES_PER_REGION
                 + address.pageZ();
-        SurfacePublicationService table = SurfacePublicationService.getInstance();
+        GpuPageTable.MapGpuPageTableService table = GpuPageTable.MapGpuPageTableService.getInstance();
         table.remove(new TileKey(page.publishedStamp.sessionId(), 0, 0,
                 globalPageX, globalPageZ, TileKey.VARIANT_SURFACE_EXACT));
         table.remove(new TileKey(page.publishedStamp.sessionId(), 0, 0,
@@ -4967,4 +4991,142 @@ public class MapTextureManager {
             this.generation = generation;
         }
     }
+
+    static final class SurfacePageBufferPool {
+        private static final SurfacePageBufferPool INSTANCE = new SurfacePageBufferPool();
+        private static final int MAX_RETAINED = 48;
+
+        private final java.util.concurrent.ConcurrentLinkedQueue<Buffer> available =
+                new java.util.concurrent.ConcurrentLinkedQueue<>();
+        private final java.util.concurrent.atomic.AtomicInteger retained =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        private SurfacePageBufferPool() {
+        }
+
+        static SurfacePageBufferPool getInstance() {
+            return INSTANCE;
+        }
+
+        Buffer acquire(int length) {
+            int required = Math.max(1, length);
+            Buffer buffer;
+            while ((buffer = available.poll()) != null) {
+                retained.decrementAndGet();
+                if (buffer.length() == required) {
+                    buffer.prepare();
+                    return buffer;
+                }
+            }
+            buffer = new Buffer(new long[required], new int[required], new byte[required]);
+            buffer.prepare();
+            return buffer;
+        }
+
+        void release(Buffer buffer) {
+            if (buffer == null || !buffer.markReleased()) return;
+            while (true) {
+                int current = retained.get();
+                if (current >= MAX_RETAINED) return;
+                if (retained.compareAndSet(current, current + 1)) {
+                    available.offer(buffer);
+                    return;
+                }
+            }
+        }
+
+        static final class Buffer {
+            private final long[] pixels;
+            private final int[] tints;
+            private final byte[] light;
+            private boolean released;
+
+            private Buffer(long[] pixels, int[] tints, byte[] light) {
+                this.pixels = pixels;
+                this.tints = tints;
+                this.light = light;
+            }
+
+            long[] pixels() {
+                return pixels;
+            }
+
+            int[] tints() {
+                return tints;
+            }
+
+            byte[] light() {
+                return light;
+            }
+
+            int length() {
+                return pixels.length;
+            }
+
+            private synchronized void prepare() {
+                released = false;
+                java.util.Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
+                java.util.Arrays.fill(tints, SurfaceTintData.UNKNOWN);
+                java.util.Arrays.fill(light, (byte) 0);
+            }
+
+            private synchronized boolean markReleased() {
+                if (released) return false;
+                released = true;
+                return true;
+            }
+        }
+    }
+}
+
+
+/**
+ * Dependency-light admission policy for region-centric surface transactions.
+ *
+ * <p>Cold foreground requests intentionally start as a single-leaf transaction.
+ * Larger supertiles are admitted only after the focused leaf has source coverage
+ * and nearby leaf demand proves that the extra capture/assembly work will be used.</p>
+ */
+class SurfaceBatchPolicy {
+    private SurfaceBatchPolicy() {
+    }
+
+    public static int chooseBatchSize(MapRequestLane lane, boolean initialized,
+            boolean sourceReady, int demandedInFourByFour) {
+        MapRequestLane effective = lane == null
+                ? MapRequestLane.BACKGROUND : lane;
+        if (effective == MapRequestLane.BACKGROUND
+                || effective == MapRequestLane.PREFETCH) {
+            // Archive reconstruction used to capture the complete 8x8 page
+            // region on every retry. A cold region therefore walked 34x34
+            // chunks (including the capture halo) even when none of them were
+            // resident. Keep reconstruction cooperative on the live path and
+            // widen it only after persisted source coverage is available.
+            if (!sourceReady) return 1;
+            int demand = Math.max(0, demandedInFourByFour);
+            if (demand >= 6) return 4;
+            return demand >= 2 ? 2 : 1;
+        }
+        int demand = Math.max(0, demandedInFourByFour);
+        // A foreground super-batch is profitable only after its focused leaf has
+        // coherent source coverage. Before that, 2x2/4x4 capture repeatedly
+        // materialised mostly-empty neighbours and amplified partial publications.
+        if (!sourceReady) return 1;
+        if (effective == MapRequestLane.MINIMAP) return demand >= 2 ? 2 : 1;
+        if (demand >= 8) return 4;
+        return demand >= 2 ? 2 : 1;
+    }
+
+    public static boolean shouldBuildPage(boolean requestedPage,
+            boolean sourceReady, boolean hasDemand, MapRequestLane lane) {
+        if (requestedPage) return true;
+        MapRequestLane effective = lane == null
+                ? MapRequestLane.BACKGROUND : lane;
+        boolean reconstructionLane = effective == MapRequestLane.BACKGROUND
+                || effective == MapRequestLane.PREFETCH;
+        if (reconstructionLane) return sourceReady;
+        return hasDemand;
+    }
+
+
 }

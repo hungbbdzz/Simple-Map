@@ -1,4 +1,6 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager.Waypoint;
+import com.velorise.simplemap.client.renderer.*;
 
 /** Dependency-free checks for fullscreen retained terrain composition. */
 public final class RetainedFullscreenFramePolicyCheck {

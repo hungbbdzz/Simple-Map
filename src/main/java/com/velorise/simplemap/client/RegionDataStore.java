@@ -1,5 +1,17 @@
 package com.velorise.simplemap.client;
 
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.LinkedHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.CRC32;
+import com.velorise.simplemap.client.color.SurfaceColorizer.SurfaceTintData;
+import com.velorise.simplemap.client.color.*;
+import com.velorise.simplemap.client.cave.*;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -791,4 +803,428 @@ public final class RegionDataStore {
             LOGGER.warn("SimpleMap save completion callback failed", callbackFailure);
         }
     }
+
+
+
+/**
+ * Chunk-granular Surface observation state. Material payload and observation are
+ * deliberately independent: a fully scanned void chunk is complete map data.
+ */
+public static final class SurfaceChunkCoverage {
+    public static final int CHUNKS_PER_AXIS = 32;
+    public static final int CHUNK_COUNT = CHUNKS_PER_AXIS * CHUNKS_PER_AXIS;
+    public static final int WORDS = CHUNK_COUNT / Long.SIZE;
+
+    private SurfaceChunkCoverage() {
+    }
+
+    public static boolean isComplete(long[] mask, int chunkIndex) {
+        return mask != null && mask.length == WORDS
+                && chunkIndex >= 0 && chunkIndex < CHUNK_COUNT
+                && (mask[chunkIndex >>> 6] & (1L << (chunkIndex & 63))) != 0L;
+    }
+
+    public static boolean markComplete(long[] mask, int chunkIndex) {
+        if (mask == null || mask.length != WORDS
+                || chunkIndex < 0 || chunkIndex >= CHUNK_COUNT) return false;
+        int word = chunkIndex >>> 6;
+        long bit = 1L << (chunkIndex & 63);
+        boolean changed = (mask[word] & bit) == 0L;
+        mask[word] |= bit;
+        return changed;
+    }
+
+
+    public static boolean clearComplete(long[] mask, int chunkIndex) {
+        if (mask == null || mask.length != WORDS
+                || chunkIndex < 0 || chunkIndex >= CHUNK_COUNT) return false;
+        int word = chunkIndex >>> 6;
+        long bit = 1L << (chunkIndex & 63);
+        boolean changed = (mask[word] & bit) != 0L;
+        mask[word] &= ~bit;
+        return changed;
+    }
+
+    /** Legacy v1-v3 files had no explicit coverage; only all-solid chunks qualify. */
+    public static long[] inferLegacy(long[] pixels, int regionSize,
+            long emptyPacked) {
+        long[] mask = new long[WORDS];
+        if (pixels == null || regionSize != CHUNKS_PER_AXIS * 16
+                || pixels.length != regionSize * regionSize) return mask;
+        for (int chunkZ = 0; chunkZ < CHUNKS_PER_AXIS; chunkZ++) {
+            for (int chunkX = 0; chunkX < CHUNKS_PER_AXIS; chunkX++) {
+                boolean complete = true;
+                for (int z = 0; z < 16 && complete; z++) {
+                    int row = (chunkZ * 16 + z) * regionSize + chunkX * 16;
+                    for (int x = 0; x < 16; x++) {
+                        if (pixels[row + x] == emptyPacked) {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if (complete) markComplete(mask, chunkZ * CHUNKS_PER_AXIS + chunkX);
+            }
+        }
+        return mask;
+    }
+}
+
+
+    /**
+ * Append-journal region container with CRC recovery and atomic compaction.
+ * A truncated or corrupt tail is ignored; earlier committed records remain
+ * readable. Source records have higher authority than disposable derived data.
+ */
+public static final class RegionContainerV2 {
+    public static final int MAGIC = 0x534D5232; // SMR2
+    private static final int RECORD_MAGIC = 0x52454332; // REC2
+    private static final int VERSION = 2;
+    private static final int MAX_RECORD_BYTES = 64 * 1024 * 1024;
+    /** Single-writer append state; avoids rescanning a multi-MiB container before
+     * every record while still detecting external replacement/truncation. */
+    private static final Map<Path, AppendState> APPEND_STATES = new HashMap<>();
+
+    public enum RecordType {
+        SURFACE_SOURCE(1, true),
+        CAVE_ARCHIVE(2, true),
+        SURFACE_EXACT(16, false),
+        SURFACE_LOD(17, false),
+        CAVE_BAND(18, false),
+        CAVE_LOD(19, false),
+        MIGRATION_MARKER(31, true);
+
+        private final int id;
+        private final boolean source;
+        RecordType(int id, boolean source) { this.id = id; this.source = source; }
+        public int id() { return id; }
+        public boolean source() { return source; }
+        public static RecordType byId(int id) {
+            for (RecordType type : values()) if (type.id == id) return type;
+            return null;
+        }
+    }
+
+    public record Header(long worldIdentity, int regionX, int regionZ,
+            int dataVersion) { }
+    public record RecordKey(RecordType type, int localKey) { }
+    public record Record(RecordKey key, long sourceRevision,
+            long styleRevision, byte[] payload) { }
+    public record ReadResult(Header header, Map<RecordKey, Record> latest,
+            long validBytes, boolean truncatedOrCorruptTail) { }
+
+    private RegionContainerV2() { }
+
+    public static synchronized boolean append(Path path, Header header,
+            Record record) throws IOException {
+        if (path == null || header == null || record == null
+                || record.key() == null || record.key().type() == null
+                || record.payload() == null
+                || record.payload().length > MAX_RECORD_BYTES) {
+            throw new IllegalArgumentException("invalid region container append");
+        }
+        Path identity = path.toAbsolutePath().normalize();
+        Files.createDirectories(identity.getParent());
+        long size = Files.exists(identity) ? Files.size(identity) : 0L;
+        boolean create = size == 0L;
+        boolean recovered = false;
+        AppendState state = APPEND_STATES.get(identity);
+        if (!create && (state == null || state.fileSize() != size
+                || !sameHeader(state.header(), header))) {
+            ReadResult existing = read(identity);
+            if (existing.header() == null || !sameHeader(existing.header(), header)) {
+                throw new IOException("SMR2 header identity mismatch");
+            }
+            if (existing.truncatedOrCorruptTail()) {
+                try (FileChannel channel = FileChannel.open(identity,
+                        StandardOpenOption.WRITE)) {
+                    channel.truncate(existing.validBytes());
+                    channel.force(true);
+                }
+                size = existing.validBytes();
+                recovered = true;
+            }
+            state = new AppendState(existing.header(), size);
+            APPEND_STATES.put(identity, state);
+        }
+        try (DataOutputStream output = new DataOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(identity,
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND)))) {
+            if (create) writeHeader(output, header);
+            CRC32 crc = new CRC32();
+            crc.update(record.payload());
+            output.writeInt(RECORD_MAGIC);
+            output.writeByte(record.key().type().id());
+            output.writeInt(record.key().localKey());
+            output.writeLong(record.sourceRevision());
+            output.writeLong(record.styleRevision());
+            output.writeInt(record.payload().length);
+            output.writeInt((int) crc.getValue());
+            output.write(record.payload());
+            output.flush();
+        }
+        APPEND_STATES.put(identity, new AppendState(header, Files.size(identity)));
+        return recovered;
+    }
+
+    public static ReadResult read(Path path) throws IOException {
+        if (path == null || !Files.exists(path) || Files.size(path) == 0L) {
+            return new ReadResult(null, Map.of(), 0L, false);
+        }
+        LinkedHashMap<RecordKey, Record> latest = new LinkedHashMap<>();
+        long validBytes = 0L;
+        boolean damaged = false;
+        Header header;
+        try (CountingInputStream counting = new CountingInputStream(
+                new BufferedInputStream(Files.newInputStream(path)));
+             DataInputStream input = new DataInputStream(counting)) {
+            header = readHeader(input);
+            validBytes = counting.count();
+            while (true) {
+                long recordStart = counting.count();
+                try {
+                    int magic = input.readInt();
+                    if (magic != RECORD_MAGIC) {
+                        damaged = true;
+                        break;
+                    }
+                    RecordType type = RecordType.byId(input.readUnsignedByte());
+                    int localKey = input.readInt();
+                    long sourceRevision = input.readLong();
+                    long styleRevision = input.readLong();
+                    int length = input.readInt();
+                    int expectedCrc = input.readInt();
+                    if (type == null || length < 0 || length > MAX_RECORD_BYTES) {
+                        damaged = true;
+                        break;
+                    }
+                    byte[] payload = input.readNBytes(length);
+                    if (payload.length != length) {
+                        damaged = true;
+                        break;
+                    }
+                    CRC32 crc = new CRC32();
+                    crc.update(payload);
+                    if ((int) crc.getValue() != expectedCrc) {
+                        damaged = true;
+                        break;
+                    }
+                    RecordKey key = new RecordKey(type, localKey);
+                    Record candidate = new Record(key, sourceRevision,
+                            styleRevision, payload);
+                    Record previous = latest.get(key);
+                    if (previous == null
+                            || previous.sourceRevision() < sourceRevision
+                            || (previous.sourceRevision() == sourceRevision
+                            && previous.styleRevision() <= styleRevision)) {
+                        latest.put(key, candidate);
+                    }
+                    validBytes = counting.count();
+                } catch (EOFException end) {
+                    if (counting.count() != recordStart) damaged = true;
+                    break;
+                }
+            }
+        }
+        return new ReadResult(header, Map.copyOf(latest), validBytes, damaged);
+    }
+
+    public static synchronized void compact(Path path) throws IOException {
+        Path identity = path.toAbsolutePath().normalize();
+        APPEND_STATES.remove(identity);
+        ReadResult result = read(identity);
+        if (result.header() == null) return;
+        Path temporary = identity.resolveSibling(identity.getFileName() + ".compact.tmp");
+        Files.deleteIfExists(temporary);
+        boolean first = true;
+        for (Record record : result.latest().values()) {
+            if (first) {
+                Files.createDirectories(temporary.toAbsolutePath().getParent());
+                try (DataOutputStream output = new DataOutputStream(
+                        new BufferedOutputStream(Files.newOutputStream(temporary)))) {
+                    writeHeader(output, result.header());
+                }
+                first = false;
+            }
+            append(temporary, result.header(), record);
+        }
+        if (first) {
+            try (DataOutputStream output = new DataOutputStream(
+                    new BufferedOutputStream(Files.newOutputStream(temporary)))) {
+                writeHeader(output, result.header());
+            }
+        }
+        try {
+            Files.move(temporary, identity, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException unsupported) {
+            Files.move(temporary, identity, StandardCopyOption.REPLACE_EXISTING);
+        }
+        APPEND_STATES.remove(temporary.toAbsolutePath().normalize());
+        APPEND_STATES.remove(identity);
+    }
+
+
+    private static boolean sameHeader(Header left, Header right) {
+        return left.worldIdentity() == right.worldIdentity()
+                && left.regionX() == right.regionX()
+                && left.regionZ() == right.regionZ()
+                && left.dataVersion() == right.dataVersion();
+    }
+
+    private static void writeHeader(DataOutputStream output, Header header)
+            throws IOException {
+        output.writeInt(MAGIC);
+        output.writeInt(VERSION);
+        output.writeLong(header.worldIdentity());
+        output.writeInt(header.regionX());
+        output.writeInt(header.regionZ());
+        output.writeInt(header.dataVersion());
+    }
+
+    private static Header readHeader(DataInputStream input) throws IOException {
+        if (input.readInt() != MAGIC) throw new IOException("Invalid SMR2 magic");
+        int version = input.readInt();
+        if (version != VERSION) throw new IOException("Unsupported SMR2 version " + version);
+        return new Header(input.readLong(), input.readInt(), input.readInt(),
+                input.readInt());
+    }
+
+    private record AppendState(Header header, long fileSize) { }
+
+    private static final class CountingInputStream extends java.io.FilterInputStream {
+        private long count;
+        private CountingInputStream(java.io.InputStream input) { super(input); }
+        long count() { return count; }
+        @Override public int read() throws IOException {
+            int value = super.read();
+            if (value >= 0) count++;
+            return value;
+        }
+        @Override public int read(byte[] buffer, int offset, int length)
+                throws IOException {
+            int read = super.read(buffer, offset, length);
+            if (read > 0) count += read;
+            return read;
+        }
+    }
+
+    public static final class MapPersistenceV2Service {
+        public record Summary(int queued, long surfaceCommitted,
+                long caveCommitted, long failures, long recoveries) { }
+
+        private static final MapPersistenceV2Service INSTANCE =
+                new MapPersistenceV2Service();
+        private final ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "SimpleMap-PersistenceV2");
+            thread.setDaemon(true);
+            return thread;
+        });
+        private final ExecutorService loader = Executors.newFixedThreadPool(2, r -> {
+            Thread thread = new Thread(r, "SimpleMap-PersistenceV2-Read");
+            thread.setDaemon(true);
+            return thread;
+        });
+        private final AtomicInteger queued = new AtomicInteger();
+        private long surfaceCommitted;
+        private long caveCommitted;
+        private long failures;
+        private long recoveries;
+
+        private MapPersistenceV2Service() { }
+        public static MapPersistenceV2Service getInstance() { return INSTANCE; }
+
+        public boolean caveArchiveRegionExists(File dimensionDirectory,
+                int regionX, int regionZ) {
+            return dimensionDirectory != null
+                    && Files.isRegularFile(containerPath(dimensionDirectory, regionX, regionZ));
+        }
+
+        public CompletableFuture<Boolean> appendSurface(File dimensionDirectory,
+                long worldIdentity, int regionX, int regionZ, long sourceRevision,
+                long styleRevision, RegionDataStore.StoredRegion region) {
+            if (dimensionDirectory == null || region == null) {
+                return CompletableFuture.completedFuture(false);
+            }
+            byte[] payload;
+            try {
+                payload = encodeSurface(region);
+            } catch (IOException exception) {
+                return CompletableFuture.failedFuture(exception);
+            }
+            return append(dimensionDirectory, worldIdentity, regionX, regionZ,
+                    new RegionContainerV2.Record(
+                            new RegionContainerV2.RecordKey(
+                                    RegionContainerV2.RecordType.SURFACE_SOURCE, 0),
+                            sourceRevision, styleRevision, payload), true);
+        }
+
+        public synchronized Summary summary() {
+            return new Summary(queued.get(), surfaceCommitted, caveCommitted,
+                    failures, recoveries);
+        }
+
+        private CompletableFuture<Boolean> append(File dimensionDirectory,
+                long worldIdentity, int regionX, int regionZ,
+                RegionContainerV2.Record record, boolean surface) {
+            Path path = containerPath(dimensionDirectory, regionX, regionZ);
+            queued.incrementAndGet();
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    RegionContainerV2.Header header = new RegionContainerV2.Header(
+                            worldIdentity, regionX, regionZ, 1);
+                    boolean recovered = RegionContainerV2.append(path, header, record);
+                    synchronized (this) {
+                        if (surface) surfaceCommitted++;
+                        else caveCommitted++;
+                        if (recovered) recoveries++;
+                    }
+                    if (path.toFile().length() > 32L * 1024L * 1024L) {
+                        RegionContainerV2.compact(path);
+                    }
+                    return true;
+                } catch (IOException exception) {
+                    synchronized (this) { failures++; }
+                    return false;
+                } finally {
+                    queued.decrementAndGet();
+                }
+            }, writer);
+        }
+
+        private static Path containerPath(File dimensionDirectory,
+                int regionX, int regionZ) {
+            return dimensionDirectory.toPath().resolve("containers-v2")
+                    .resolve("r." + regionX + "." + regionZ + ".smr2");
+        }
+
+        private static byte[] encodeSurface(RegionDataStore.StoredRegion region)
+                throws IOException {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream(4 * 1024 * 1024);
+            try (DataOutputStream output = new DataOutputStream(bytes)) {
+                output.writeInt(region.pixels().length);
+                for (long pixel : region.pixels()) output.writeLong(pixel);
+                output.writeInt(region.tints().length);
+                for (int tint : region.tints()) output.writeInt(tint);
+                output.writeInt(region.completeChunks().length);
+                for (long word : region.completeChunks()) output.writeLong(word);
+                writeStrings(output, region.biomePalette());
+                writeStrings(output, region.blockPalette());
+            }
+            return bytes.toByteArray();
+        }
+
+        private static void writeStrings(DataOutputStream output, String[] values)
+                throws IOException {
+            String[] safe = values == null ? new String[0] : values;
+            output.writeInt(safe.length);
+            for (String value : safe) {
+                byte[] encoded = (value == null ? "" : value)
+                        .getBytes(StandardCharsets.UTF_8);
+                output.writeInt(encoded.length);
+                output.write(encoded);
+            }
+        }
+    }
+}
 }

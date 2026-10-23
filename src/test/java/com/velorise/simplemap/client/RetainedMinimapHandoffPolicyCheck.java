@@ -1,4 +1,7 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.renderer.RetainedFullscreenFramePolicy.RetainedMinimapFramePolicy;
+import com.velorise.simplemap.client.renderer.*;
+import com.velorise.simplemap.client.renderer.RetainedFullscreenFramePolicy.RetainedMinimapFramePolicy.RetainedMinimapHandoffPolicy;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,7 +38,7 @@ public final class RetainedMinimapHandoffPolicyCheck {
                         true, false, true),
                 "cold authority switch stayed blocked after coverage became ready");
         String renderer = Files.readString(Path.of(
-                "src/main/java/com/velorise/simplemap/client/MinimapFramebufferRenderer.java"));
+                "src/main/java/com/velorise/simplemap/client/renderer/MinimapFramebufferRenderer.java"));
         require(renderer.contains("frontFrameValid")
                         && renderer.contains("nextColdRedrawAttemptNanos")
                         && renderer.contains("retainLastGood")

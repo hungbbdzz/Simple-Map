@@ -1,6 +1,9 @@
 package com.velorise.simplemap.client.cave;
+import com.velorise.simplemap.client.cave.CaveMode.CaveLayerBand;
 
-/** Dependency-free invariants for Xaero-style layered-cave identities. */
+import com.velorise.simplemap.client.cave.CaveMode.CaveLayerBand.CaveView;
+
+/** Dependency-free invariants for layered-cave identities. */
 public final class CaveLayerBandCheck {
     private CaveLayerBandCheck() { }
 

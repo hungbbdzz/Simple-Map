@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.renderer.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -8,8 +9,8 @@ public final class RetainedFramebufferBindingCheck {
     private RetainedFramebufferBindingCheck() { }
 
     public static void main(String[] args) throws Exception {
-        check("MinimapFramebufferRenderer.java");
-        check("FullscreenMapFramebufferRenderer.java");
+        check("renderer/MinimapFramebufferRenderer.java");
+        check("renderer/FullscreenMapFramebufferRenderer.java");
         System.out.println("RETAINED_FRAMEBUFFER_BINDING_PASS");
     }
 

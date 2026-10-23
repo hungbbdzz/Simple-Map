@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.gpu.GpuPageTable.PageTableEntry;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -11,9 +12,9 @@ public final class SurfaceCoherentSubtilePublicationCheck {
         Path root = Path.of("src/main/java/com/velorise/simplemap/client");
         String manager = Files.readString(root.resolve("MapTextureManager.java"));
         String renderer = Files.readString(root.resolve("MapRenderer.java"));
-        String atlas = Files.readString(root.resolve("cave/SurfaceLeafAtlas.java"));
+        String atlas = Files.readString(root.resolve("lod/SurfaceLeafAtlas.java"));
         String region = Files.readString(root.resolve("RegionSurfaceLodService.java"));
-        String tree = Files.readString(root.resolve("cave/SurfaceLodTree.java"));
+        String tree = Files.readString(root.resolve("lod/SurfaceLodTree.java"));
 
         require(manager.contains("PageTableEntry.withCoverageMask")
                         && manager.contains("SURFACE_VIEWPORT_ATLAS_REBASE")

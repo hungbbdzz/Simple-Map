@@ -80,7 +80,7 @@ public final class MapPageLayout {
      * Returns chunk-sized publication bits only when both the 16x16 body and the
      * projection halo required by tint/slope/depth sampling are known. Publishing
      * a body-only subtile lets a frontier chunk look "complete" and then visibly
-     * change when its neighbour arrives. Xaero waits for neighbouring chunks before
+     * change when its neighbour arrives. The layout waits for neighbouring chunks before
      * committing a tile; this is the equivalent invariant for SimpleMap pages.
      */
     public static int completeSubtileMaskWithHalo(byte[] known, int stride,

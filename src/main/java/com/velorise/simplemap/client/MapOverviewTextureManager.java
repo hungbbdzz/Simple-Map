@@ -1,41 +1,43 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
+import com.velorise.simplemap.client.MapManager.MapConfig;
 
-import com.velorise.simplemap.client.cave.CaveAtlasRegion;
-import com.velorise.simplemap.client.cave.SurfaceLodTree;
-import com.velorise.simplemap.client.lod.RegionLodGraph;
-import com.velorise.simplemap.client.pipeline.RevisionStamp;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.cave.CaveTextureAtlas.CaveAtlasRegion;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager.CaveRegion;
+import com.velorise.simplemap.client.cave.CaveMode.CaveLayerBand.CaveView;
+import com.velorise.simplemap.client.color.*;
+import com.velorise.simplemap.client.color.SurfaceColorizer.BlockTintPolicy;
+import com.velorise.simplemap.client.color.SurfaceColorizer.SurfaceTintData;
+import com.velorise.simplemap.client.gpu.GpuPageTable.TileKey;
+import com.velorise.simplemap.client.lod.SurfaceLodTree;
+import com.velorise.simplemap.client.renderer.*;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapGpuBudgetController;
+import com.velorise.simplemap.client.MapMemoryBudgetPolicy.MapResidencyManager;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy;
+import com.velorise.simplemap.client.MapWorkScheduler.MapProcessor;
+import com.velorise.simplemap.client.MapWorkScheduler.MapTextureBuildWorker;
+import com.velorise.simplemap.client.MapWorkScheduler.MapWorkGraph.RevisionStamp;
+import com.velorise.simplemap.client.RegionSurfaceLodService.RegionLodGraph;
 import com.velorise.simplemap.client.session.MapSessionManager;
+import com.velorise.simplemap.client.session.MapSessionManager.MapSession;
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
-import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.biome.Biome;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.CompletableFuture;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.IntFunction;
 
-/**
- * Legacy region overviews plus the page-rooted recursive surface LOD tree.
- *
- * Keys include the viewed dimension so switching dimensions can retain a small
- * warm GPU cache without ever drawing a tile from another dimension. Layered
- * cave rendering intentionally does not use these parents because downsampling
- * destroys thin cave passages; it streams exact textures instead.
- */
 public final class MapOverviewTextureManager {
     public static final int MODE_SURFACE = 0;
     public static final int MODE_LAYER = 1;
@@ -362,8 +364,8 @@ public final class MapOverviewTextureManager {
                 yield region != null && region.isLoaded();
             }
             case MODE_FULL -> {
-                FullCaveMapManager.FullRegion region = FullCaveMapManager.getInstance()
-                        .getRegion(key.rx, key.rz, false);
+                CaveRegion region = CaveMapManager.getInstance()
+                        .getRegion(Integer.MIN_VALUE, key.rx, key.rz, false);
                 yield region != null && region.isLoaded();
             }
             default -> false;
@@ -390,18 +392,17 @@ public final class MapOverviewTextureManager {
                 CaveMapManager manager = CaveMapManager.getInstance();
                 if (manager.getActiveLayerY() != key.layerY) yield false;
                 CaveRegion region = manager.getRegion(key.rx, key.rz, false);
-                if (region == null && (manager.hasRegionFile(key.rx, key.rz)
-                        || VerticalCaveArchiveManager.getInstance().hasRegionData(key.rx, key.rz))) {
+                if (region == null && manager.hasRegionFile(key.rx, key.rz)) {
                     MapProcessor.getInstance().enqueueCaveLoad(key.layerY, key.rx, key.rz,
                             requestPriority);
                 }
                 yield region != null && region.isLoaded();
             }
             case MODE_FULL -> {
-                FullCaveMapManager manager = FullCaveMapManager.getInstance();
-                FullCaveMapManager.FullRegion region = manager.getRegion(key.rx, key.rz, false);
-                if (region == null && manager.hasRegionFile(key.rx, key.rz)) {
-                    MapProcessor.getInstance().enqueueFullCaveLoad(key.rx, key.rz,
+                CaveMapManager manager = CaveMapManager.getInstance();
+                CaveRegion region = manager.getRegion(Integer.MIN_VALUE, key.rx, key.rz, false);
+                if (region == null && manager.hasRegionFile(Integer.MIN_VALUE, key.rx, key.rz)) {
+                    MapProcessor.getInstance().enqueueCaveLoad(Integer.MIN_VALUE, key.rx, key.rz,
                             requestPriority);
                 }
                 yield region != null && region.isLoaded();
@@ -414,7 +415,7 @@ public final class MapOverviewTextureManager {
         return switch (key.mode) {
             case MODE_SURFACE -> MapManager.getInstance().getGeneration();
             case MODE_LAYER -> CaveMapManager.getInstance().getLayerGeneration();
-            case MODE_FULL -> FullCaveMapManager.getInstance().getGeneration();
+            case MODE_FULL -> CaveMapManager.getInstance().getGeneration();
             default -> 0L;
         };
     }
@@ -425,7 +426,7 @@ public final class MapOverviewTextureManager {
             case MODE_SURFACE -> MapManager.getInstance().isGenerationCurrent(info.generation);
             case MODE_LAYER -> CaveMapManager.getInstance().isLayerGenerationCurrent(
                     info.generation, info.key.layerY);
-            case MODE_FULL -> FullCaveMapManager.getInstance().isGenerationCurrent(info.generation);
+            case MODE_FULL -> CaveMapManager.getInstance().isGenerationCurrent(info.generation);
             default -> false;
         };
     }
@@ -713,8 +714,8 @@ public final class MapOverviewTextureManager {
     private CompletableFuture<MapTextureBuildWorker.PreparedSingle> buildFull(
             TextureInfo info, long revision) {
         Key key = info.key;
-        FullCaveMapManager.FullRegion region = FullCaveMapManager.getInstance()
-                .getRegion(key.rx, key.rz, false);
+        CaveRegion region = CaveMapManager.getInstance()
+                .getRegion(Integer.MIN_VALUE, key.rx, key.rz, false);
         if (region == null || !region.isLoaded()) return null;
         int[] source = region.snapshotPixels();
         return CompletableFuture.supplyAsync(() ->

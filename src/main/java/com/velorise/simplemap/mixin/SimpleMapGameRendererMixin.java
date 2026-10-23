@@ -1,6 +1,6 @@
 package com.velorise.simplemap.mixin;
 
-import com.velorise.simplemap.client.MapScreen;
+import com.velorise.simplemap.client.gui.MapScreen;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;

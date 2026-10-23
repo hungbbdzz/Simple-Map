@@ -1,6 +1,12 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
+import com.velorise.simplemap.client.MapManager.MapConfig;
+import net.minecraft.resources.ResourceLocation;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import com.velorise.simplemap.client.cave.*;
 
-import com.velorise.simplemap.client.cave.CavePipeline;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
@@ -136,7 +142,7 @@ public final class MapMutationBus {
         if (level != null) {
             // Packet ingress remains O(1): record authority and append one primitive
             // key. ChunkScanner owns all expensive 16x16 capture later under its
-            // frame deadline, matching Xaero's writer queue rather than scanning in
+            // frame deadline, matching the chunk writer queue rather than scanning in
             // the packet callback.
             GeneratedChunkIndex.getInstance().markLive(level, chunkX, chunkZ);
             /*
@@ -150,11 +156,11 @@ public final class MapMutationBus {
             // Cave projection is substantially more expensive than Surface capture.
             // Only packets inside the player-hot 9x9 chunk window enter the travel
             // frontier; render-distance edge packets remain available to the normal
-            // centre-out viewport scheduler after movement. This mirrors Xaero's
+            // centre-out viewport scheduler after movement. This mirrors the
             // closest-region shortlist and prevents cold packet order from delaying
             // the cave tile under the player.
-            if (isHotChunk(chunkX, chunkZ)) {
-                CavePipeline.getInstance().enqueueLoadedChunk(chunkX, chunkZ);
+            if (isHotChunk(chunkX, chunkZ) && CaveMode.isActive(Minecraft.getInstance())) {
+                CaveMapManager.getInstance().markRegionDirty(chunkX >> 5, chunkZ >> 5);
             }
         }
         if (MapActivityGate.getInstance().blocksMapWork()) return;
@@ -237,7 +243,7 @@ public final class MapMutationBus {
         }
     }
 
-    /** Runs after CavePipeline observes world/teleport state and before viewport scans. */
+    /** Runs before viewport scans. */
     public void tick(Minecraft minecraft) {
         tick(minecraft, COLUMN_WORK_PER_TICK, CHUNK_EXPANSION_PER_TICK,
                 MapPerformanceGovernor.getInstance().mutationRepairBudgetNanos());
@@ -310,10 +316,8 @@ public final class MapMutationBus {
             }
             int chunkX = ChunkPos.getX(key);
             int chunkZ = ChunkPos.getZ(key);
-            if ((reasons & CHUNK_UNLOAD) != 0) {
-                CavePipeline.getInstance().onChunkUnavailable(chunkX, chunkZ, reasons);
-            } else {
-                CavePipeline.getInstance().onChunkMutation(chunkX, chunkZ, reasons);
+            if ((reasons & CHUNK_UNLOAD) == 0 && CaveMode.isActive(Minecraft.getInstance())) {
+                CaveMapManager.getInstance().markRegionDirty(chunkX >> 5, chunkZ >> 5);
             }
             synchronized (this) {
                 // A packet that arrived while the callback above was running owns
@@ -354,9 +358,8 @@ public final class MapMutationBus {
                 ChunkScanner.getInstance().scanSurfaceColumn(level,
                         mutation.blockX, mutation.blockZ);
             }
-            if (!mutation.caveHandled) {
-                CavePipeline.getInstance().onColumnMutation(
-                        mutation.blockX, mutation.blockZ, mutation.reasons);
+            if (!mutation.caveHandled && CaveMode.isActive(Minecraft.getInstance())) {
+                CaveMapManager.getInstance().markRegionDirty(mutation.blockX >> 9, mutation.blockZ >> 9);
             }
             processed++;
             processedColumns++;
@@ -455,8 +458,6 @@ public final class MapMutationBus {
 
             if ((mutation.reasons & CHUNK_UNLOAD) != 0) {
                 if (!mutation.caveHandled) {
-                    CavePipeline.getInstance().onChunkUnavailable(
-                            mutation.chunkX, mutation.chunkZ, mutation.reasons);
                     mutation.caveHandled = true;
                 }
                 processed += scanDependentBorders(level, mutation,
@@ -504,8 +505,9 @@ public final class MapMutationBus {
             }
 
             if (!mutation.caveHandled) {
-                CavePipeline.getInstance().onChunkMutation(
-                        mutation.chunkX, mutation.chunkZ, mutation.reasons);
+                if (CaveMode.isActive(Minecraft.getInstance())) {
+                    CaveMapManager.getInstance().markRegionDirty(mutation.chunkX >> 5, mutation.chunkZ >> 5);
+                }
                 mutation.caveHandled = true;
             }
 
@@ -1273,5 +1275,207 @@ public final class MapMutationBus {
     public record Snapshot(int pendingColumns, int pendingChunks, int pendingRegions,
             long receivedMutations, long coalescedMutations, long processedColumns,
             long escalatedColumns, long escalatedChunks) {
+    }
+}
+
+/**
+ * Allocation-free admission decisions for sustained chunk travel.
+ *
+ * <p>The policy is dependency-free so movement/backpressure invariants can be
+ * regression-tested without starting Minecraft.</p>
+ */
+final class MovementMutationPolicy {
+    static final int PRECISE_CHUNK_WORKING_SET = 512;
+    static final int BACKLOG_COLUMN_THRESHOLD = 1_024;
+    static final int BACKLOG_CHUNK_THRESHOLD = 384;
+
+    private MovementMutationPolicy() {
+    }
+
+    static boolean schedulesSurfaceWorkForUnload() {
+        return false;
+    }
+
+    static boolean shouldCompactForAuthoritativeFrontier(int pendingChunks) {
+        return pendingChunks >= PRECISE_CHUNK_WORKING_SET;
+    }
+
+    static boolean shouldYieldActiveToUrgent(boolean activeChunkHot,
+            boolean urgentChunkWaiting) {
+        return !activeChunkHot && urgentChunkWaiting;
+    }
+}
+
+/**
+ * Shared provenance and mutation index for surface and cave observations.
+ *
+ * <p>The index does not own chunk data and never creates chunk tickets. It only
+ * records whether a chunk has been observed live or in the local Anvil save, plus
+ * a monotonically increasing mutation epoch used to invalidate derived context,
+ * surface and cave work.</p>
+ */
+class GeneratedChunkIndex {
+    public enum State {
+        UNKNOWN,
+        LIVE,
+        SAVED_PRESENT,
+        KNOWN_ABSENT,
+        FAILED_RETRY
+    }
+
+    private static final GeneratedChunkIndex INSTANCE = new GeneratedChunkIndex();
+    private static final int MAX_ENTRIES = 262_144;
+    private static final long ABSENT_TTL_MS = 30_000L;
+    private static final long FAILURE_TTL_MS = 8_000L;
+    private static final ResourceLocation UNKNOWN_DIMENSION =
+            ResourceLocation.fromNamespaceAndPath("simplemap", "unknown");
+
+    private final LinkedHashMap<Key, Entry> entries =
+            new LinkedHashMap<>(4096, 0.75f, true);
+    private long globalEpoch = 1L;
+
+    private GeneratedChunkIndex() {
+    }
+
+    public static GeneratedChunkIndex getInstance() {
+        return INSTANCE;
+    }
+
+    public synchronized void observeLevel(Level level) {
+        // Keys already include the registry dimension. The live ClientLevel and a
+        // remotely viewed singleplayer ServerLevel can legitimately be observed in
+        // the same tick; clearing here made them continuously erase each other's
+        // saved/live/absent provenance while switching map dimensions.
+    }
+
+    public synchronized void reset() {
+        entries.clear();
+        globalEpoch++;
+    }
+
+    public synchronized long markLive(Level level, int chunkX, int chunkZ) {
+        return mutate(level, chunkX, chunkZ, State.LIVE, 0L, false);
+    }
+
+    public synchronized long markMutation(Level level, int chunkX, int chunkZ) {
+        return mutate(level, chunkX, chunkZ, null, 0L, true);
+    }
+
+    /** Chunk unload revokes live residency, not the fact that local save data may exist. */
+    public synchronized long markUnavailable(Level level, int chunkX, int chunkZ) {
+        Key key = key(level, chunkX, chunkZ);
+        Entry entry = entries.computeIfAbsent(key, ignored -> new Entry());
+        if (entry.state == State.LIVE) entry.state = State.UNKNOWN;
+        entry.epoch = ++globalEpoch;
+        entry.updatedAtMs = System.currentTimeMillis();
+        trim();
+        return entry.epoch;
+    }
+
+    public synchronized void markSavedPresent(Level level, int chunkX, int chunkZ) {
+        mutate(level, chunkX, chunkZ, State.SAVED_PRESENT, 0L, false);
+    }
+
+    public synchronized void markSavedAbsent(Level level, int chunkX, int chunkZ) {
+        mutate(level, chunkX, chunkZ, State.KNOWN_ABSENT,
+                System.currentTimeMillis() + ABSENT_TTL_MS, false);
+    }
+
+    public synchronized void markSavedFailure(Level level, int chunkX, int chunkZ) {
+        mutate(level, chunkX, chunkZ, State.FAILED_RETRY,
+                System.currentTimeMillis() + FAILURE_TTL_MS, false);
+    }
+
+    public synchronized long mutationEpoch(Level level, int chunkX, int chunkZ) {
+        Entry entry = entries.get(key(level, chunkX, chunkZ));
+        return entry == null ? 0L : entry.epoch;
+    }
+
+    /** A compact dependency token for roof/floor and edge-sensitive observations. */
+    public synchronized long neighbourhoodEpoch(Level level, int chunkX, int chunkZ,
+            int radius) {
+        long token = globalEpoch;
+        int safe = Math.max(0, radius);
+        for (int dz = -safe; dz <= safe; dz++) {
+            for (int dx = -safe; dx <= safe; dx++) {
+                Entry entry = entries.get(key(level, chunkX + dx, chunkZ + dz));
+                if (entry == null) continue;
+                token = Long.rotateLeft(token, 7) ^ entry.epoch
+                        ^ ChunkPos.asLong(chunkX + dx, chunkZ + dz);
+            }
+        }
+        return token;
+    }
+
+    public synchronized State state(Level level, int chunkX, int chunkZ) {
+        Entry entry = entries.get(key(level, chunkX, chunkZ));
+        if (entry == null) return State.UNKNOWN;
+        if ((entry.state == State.KNOWN_ABSENT || entry.state == State.FAILED_RETRY)
+                && entry.retryAfterMs > 0L
+                && System.currentTimeMillis() >= entry.retryAfterMs) {
+            entry.state = State.UNKNOWN;
+            entry.retryAfterMs = 0L;
+        }
+        return entry.state;
+    }
+
+    /** Hot-path queue telemetry only needs the resident entry count. */
+    public synchronized int entryCount() {
+        return entries.size();
+    }
+
+    public synchronized Snapshot snapshot() {
+        EnumMap<State, Integer> counts = new EnumMap<>(State.class);
+        for (State state : State.values()) counts.put(state, 0);
+        for (Entry entry : entries.values()) {
+            counts.put(entry.state, counts.get(entry.state) + 1);
+        }
+        return new Snapshot(entries.size(), globalEpoch, Map.copyOf(counts));
+    }
+
+    private long mutate(Level level, int chunkX, int chunkZ, State state,
+            long retryAfterMs, boolean advanceEpoch) {
+        observeLevel(level);
+        Key key = key(level, chunkX, chunkZ);
+        Entry entry = entries.computeIfAbsent(key, ignored -> new Entry());
+        if (state != null) {
+            // A background save result must not demote an actively loaded chunk.
+            if (entry.state != State.LIVE || state == State.LIVE) entry.state = state;
+        }
+        if (advanceEpoch) entry.epoch = ++globalEpoch;
+        else if (entry.epoch == 0L) entry.epoch = globalEpoch;
+        entry.retryAfterMs = retryAfterMs;
+        entry.updatedAtMs = System.currentTimeMillis();
+        trim();
+        return entry.epoch;
+    }
+
+    private Key key(Level level, int chunkX, int chunkZ) {
+        ResourceLocation dimension = level == null
+                ? UNKNOWN_DIMENSION : level.dimension().location();
+        return new Key(dimension, ChunkPos.asLong(chunkX, chunkZ));
+    }
+
+    private void trim() {
+        while (entries.size() > MAX_ENTRIES) {
+            var iterator = entries.entrySet().iterator();
+            if (!iterator.hasNext()) return;
+            iterator.next();
+            iterator.remove();
+        }
+    }
+
+    private record Key(ResourceLocation dimension, long chunkPos) {
+    }
+
+    private static final class Entry {
+        private State state = State.UNKNOWN;
+        private long epoch;
+        private long retryAfterMs;
+        private long updatedAtMs;
+    }
+
+    public record Snapshot(int entries, long globalEpoch,
+            Map<State, Integer> counts) {
     }
 }

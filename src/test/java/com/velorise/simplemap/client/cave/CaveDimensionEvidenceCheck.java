@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client.cave;
+import com.velorise.simplemap.client.cave.CaveMode.CaveDimensionEvidence;
 
 /** Dependency-free invariants for conservative generic cave-dimension classification. */
 public final class CaveDimensionEvidenceCheck {

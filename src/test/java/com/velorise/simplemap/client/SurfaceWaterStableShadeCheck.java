@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.color.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -9,7 +10,7 @@ public final class SurfaceWaterStableShadeCheck {
 
     public static void main(String[] args) throws Exception {
         String source = Files.readString(Path.of(
-                "src/main/java/com/velorise/simplemap/client/SurfaceColorizer.java"));
+                "src/main/java/com/velorise/simplemap/client/color/SurfaceColorizer.java"));
         require(source.contains("0.25f + depth * 0.045f")
                         && source.contains("0.42f + depth * 0.035f")
                         && source.contains("Math.pow(0.975, Math.max(0, depth - 2))")
@@ -22,7 +23,7 @@ public final class SurfaceWaterStableShadeCheck {
                 "a synthetic fluid terrain/noise shade remains active");
 
         String branch = Files.readString(Path.of(
-                "src/main/java/com/velorise/simplemap/client/cave/LodBranchDiskCache.java"));
+                "src/main/java/com/velorise/simplemap/client/lod/LodBranchDiskCache.java"));
         require(branch.contains("private static final int VERSION = 16;"),
                 "old derived ocean textures were not invalidated");
         System.out.println("SURFACE_WATER_STABLE_SHADE_PASS");

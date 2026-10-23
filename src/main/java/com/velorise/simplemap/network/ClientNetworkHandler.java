@@ -1,11 +1,11 @@
 package com.velorise.simplemap.network;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
+import com.velorise.simplemap.client.RegionDataStore;
+import com.velorise.simplemap.client.cave.*;
 
-import com.velorise.simplemap.client.CaveMapManager;
-import com.velorise.simplemap.client.CaveMode;
-import com.velorise.simplemap.client.MapConfig;
+import com.velorise.simplemap.client.MapManager.MapConfig;
 import com.velorise.simplemap.client.MapManager;
 import com.velorise.simplemap.client.MapTextureManager;
-import com.velorise.simplemap.client.RegionDataStore;
 import com.velorise.simplemap.network.payload.AckLearnRegionPayload;
 import com.velorise.simplemap.network.payload.LearnBookCompletePayload;
 import com.velorise.simplemap.network.payload.RequestRegionFilePayload;

@@ -1,4 +1,6 @@
 package com.velorise.simplemap.client.gpu;
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapGpuInstancePlan;
+import com.velorise.simplemap.client.gpu.GpuPageTable.TileKey;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;

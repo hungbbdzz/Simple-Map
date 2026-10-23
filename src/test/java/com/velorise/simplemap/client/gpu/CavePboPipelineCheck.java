@@ -1,4 +1,5 @@
 package com.velorise.simplemap.client.gpu;
+import com.velorise.simplemap.client.cave.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;

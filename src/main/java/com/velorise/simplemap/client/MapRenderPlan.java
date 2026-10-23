@@ -1,12 +1,16 @@
 package com.velorise.simplemap.client;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapLodPolicy;
+import com.velorise.simplemap.client.gpu.GpuPageTable.TileKey;
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapGpuInstancePlan.MapGpuInstanceRenderer;
 
-import com.velorise.simplemap.client.gpu.MapGpuInstancePlan;
-import com.velorise.simplemap.client.renderer.MapGpuRenderer;
+import com.velorise.simplemap.client.renderer.*;
+
+import com.velorise.simplemap.client.gpu.GpuPageTable.MapGpuInstancePlan;
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.client.renderer.GameRenderer;
 import org.joml.Matrix4f;
 import org.lwjgl.opengl.GL11;
-import com.velorise.simplemap.client.gpu.TileKey;
+import com.velorise.simplemap.client.MapRenderer.MapDrawResult;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.resources.ResourceLocation;
 
@@ -24,7 +28,7 @@ import java.util.List;
  * submission per atlas/phase instead of one {@code GuiGraphics.blit()} per
  * exact page or branch node.</p>
  */
-final class MapRenderPlan {
+public final class MapRenderPlan {
     /** Stable 512x512 compatibility texture retained below every finer LOD. */
     static final int PHASE_LEGACY_UNDERLAY = 2;
     /** Region-centric M4 coverage always stays below factor-2 refinement. */
@@ -118,8 +122,8 @@ final class MapRenderPlan {
             int[] phases, Matrix4f matrix) {
         if (matrix == null || phases.length == 0) return;
         for (int phase : phases) {
-            MapGpuRenderer.drawPhasePrepared(instancePlan, phase, matrix);
-            MapAtlasBatchRenderer.drawPhasePrepared(batches, phase, matrix);
+            MapGpuInstanceRenderer.drawPhasePrepared(instancePlan, phase, matrix);
+            MapRenderer.MapAtlasBatchRenderer.drawPhasePrepared(batches, phase, matrix);
         }
     }
 
@@ -390,9 +394,9 @@ final class MapRenderPlan {
     }
 
     /** One immutable atlas/phase submission. */
-    record Batch(ResourceLocation texture, int phase,
+    public record Batch(ResourceLocation texture, int phase,
             float[] vertices, int quadCount) {
-        Batch {
+        public Batch {
             if (texture == null) throw new IllegalArgumentException("texture");
             if (vertices == null || vertices.length != quadCount * 16) {
                 throw new IllegalArgumentException("Invalid map batch vertex data");
