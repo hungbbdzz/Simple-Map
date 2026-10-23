@@ -1318,6 +1318,10 @@ public final class MapWorkScheduler {
     }
 
     public void enqueueCaveLoad(int layerY, int regionX, int regionZ, int priority) {
+        if (layerY == Integer.MIN_VALUE) {
+            enqueueFullCaveLoad(regionX, regionZ, priority);
+            return;
+        }
         MapSession session = MapSessionManager.getInstance().active();
         if (session == null || session.rootToken().isCancelled()) return;
         long generation = CaveMapManager.getInstance().getLayerGeneration();
@@ -1462,7 +1466,9 @@ public final class MapWorkScheduler {
                     CaveMapManager manager = CaveMapManager.getInstance();
                     if (manager.isLayerGenerationCurrent(task.generation, task.layerY)) {
                         int activeTopY = manager.getActiveLayerY();
-                        int targetY = activeTopY != Integer.MIN_VALUE ? activeTopY : task.layerY;
+                        int targetY = task.layerY == Integer.MIN_VALUE
+                                ? Integer.MIN_VALUE
+                                : (activeTopY != Integer.MIN_VALUE ? activeTopY : task.layerY);
                         completionOwnedByManager = manager.requestVisibleRegion(
                                 task.workKey, task.generation, targetY);
                     }

@@ -275,9 +275,10 @@ public final class MapViewportCoordinator {
         lastFullscreenCaveSourceRun = 0L;
         lastLayerUploadRun = 0L;
         Minecraft mc = Minecraft.getInstance();
-        if (mc != null && CaveMode.isActive(mc) && !CaveMode.isFullView(mc)) {
+        if (mc != null && CaveMode.isActive(mc)) {
+            int targetLayer = CaveMode.isFullView(mc) ? Integer.MIN_VALUE : CaveMode.getLayerY(mc);
             com.velorise.simplemap.client.cave.CaveTextureManager.getInstance()
-                    .onLayerActivated(CaveMode.getLayerY(mc));
+                    .onLayerActivated(targetLayer);
         }
     }
 
@@ -708,7 +709,7 @@ public final class MapViewportCoordinator {
             double schedulingFocusX = (request.minX + request.maxX) * 0.5;
             double schedulingFocusZ = (request.minZ + request.maxZ) * 0.5;
             int targetLayer = full ? Integer.MIN_VALUE : layerY;
-            if (!full) CaveMapManager.getInstance().setActiveLayer(layerY);
+            CaveMapManager.getInstance().setActiveLayer(targetLayer);
             requestLayerRegions(request, targetLayer);
             CaveTextureManager.getInstance().requestVisiblePages(
                     targetLayer,

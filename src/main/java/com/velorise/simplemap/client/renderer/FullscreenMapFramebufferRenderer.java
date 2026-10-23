@@ -256,14 +256,13 @@ public final class FullscreenMapFramebufferRenderer {
                         anchorX, anchorZ, physicalRenderScale,
                         policyScale, cavePolicyScale, partialTick, caveActive,
                         retainPrevious)) {
+                    nextColdRedrawAttemptNanos =
+                            RetainedMinimapHandoffPolicy.nextAttemptNanos(nowNanos);
                     if (RetainedMinimapHandoffPolicy.retainLastGood(
                             lastGoodCompatible, false)) {
-                        nextColdRedrawAttemptNanos =
-                                RetainedMinimapHandoffPolicy.nextAttemptNanos(nowNanos);
                         reuseFrames++;
                         coalescedFrames++;
                     } else {
-                        framePolicy.invalidate();
                         fallbackFrames++;
                         return false;
                     }

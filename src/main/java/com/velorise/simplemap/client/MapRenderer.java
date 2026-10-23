@@ -111,6 +111,7 @@ public class MapRenderer {
     private int lastCaveHierarchyLevel = -1;
     private int lastMinimapCaveHierarchyLevel = -1;
     private CachedPlan fullscreenPlan;
+    private CachedPlan fullscreenOffscreenPlan;
     private CachedPlan fullscreenFallbackPlan;
     private long fullscreenFallbackExpiresNanos;
     /**
@@ -291,8 +292,9 @@ public class MapRenderer {
         int caveLayerY = caveMode ? CaveMode.getLayerY(mc) : Integer.MIN_VALUE;
         // Renderer is strictly cache-only. Scans, IO, CPU builds and GPU
         // publication are scheduled from MapViewportCoordinator on client tick.
-        if (caveMode && !fullCaveView) {
-            CaveMapManager.getInstance().setActiveLayer(caveLayerY);
+        if (caveMode) {
+            CaveMapManager.getInstance().setActiveLayer(
+                    fullCaveView ? Integer.MIN_VALUE : caveLayerY);
         }
 
         // Reset shader color to prevent other GUI elements from tinting the map
@@ -537,7 +539,7 @@ public class MapRenderer {
                     fullscreenFallbackPlan = null;
                     fullscreenFallbackExpiresNanos = 0L;
                 }
-                CachedPlan previousPlan = fullscreenPlan;
+                CachedPlan previousPlan = manageScissor ? fullscreenPlan : fullscreenOffscreenPlan;
                 if (fallbackPlan == null) {
                     fallbackPlan = stableFullscreenPlan(
                             StablePlanKey.of(planKey), planKey, topologyRevision);
@@ -604,7 +606,11 @@ public class MapRenderer {
                                         : FULLSCREEN_FALLBACK_MAX_NANOS);
                     }
                     cachedPlan = new CachedPlan(planKey, plan, contentRevision);
-                    fullscreenPlan = cachedPlan;
+                    if (manageScissor) {
+                        fullscreenPlan = cachedPlan;
+                    } else {
+                        fullscreenOffscreenPlan = cachedPlan;
+                    }
                     if (plan.quadCount() > 0) {
                         rememberStableFullscreenPlan(cachedPlan);
                     }
@@ -3114,21 +3120,13 @@ public class MapRenderer {
     }
 
     private float getCaveBrightness(Minecraft mc, float partialTick) {
-        if (MapConfig.minimapNightMode == 0) return 1.0f;
-        if (MapConfig.minimapNightMode == 2) return 0.62f;
-        MapManager manager = MapManager.getInstance();
-        DimensionMapProfile profile = manager.getCurrentDimensionProfile();
-        if (profile == null && mc != null && mc.level != null) {
-            profile = DimensionMapProfile.fromLevel(mc.level,
-                    mc.level.dimension().location().toString());
-        }
-        if (profile != null && profile.forceBrightLightmap()) return 1.0f;
         /*
-         * Cave rendering keeps a layer at DimensionType ambient brightness instead of
-         * making it pulse with surface day/night. This also prevents cached Cave
-         * pages from appearing to change exposure when AUTO crosses a roof boundary.
+         * Cave pixels already bake their exact ambient + BlockLight + SkyLight curve
+         * in CaveTextureManager.applyCaveLighting(). Applying a second 0.45f shader
+         * multiplier here crushed lit torches, lava, and cave floors to 22-45%
+         * brightness because cave maps do not use a separate additive glow pass.
          */
-        return Math.max(0.45f, baseAmbientBrightness(profile));
+        return 1.0f;
     }
 
     private static float baseAmbientBrightness(DimensionMapProfile profile) {
@@ -3435,6 +3433,8 @@ public class MapRenderer {
     }
 
     public void clearFullscreenFallback() {
+        this.fullscreenPlan = null;
+        this.fullscreenOffscreenPlan = null;
         this.fullscreenFallbackPlan = null;
         this.fullscreenFallbackExpiresNanos = 0L;
     }
