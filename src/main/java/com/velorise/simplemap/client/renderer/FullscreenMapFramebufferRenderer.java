@@ -91,6 +91,7 @@ public final class FullscreenMapFramebufferRenderer {
     private String renderedDimension;
     private int renderedCaveProjection;
     private int renderedCaveLayerY = Integer.MIN_VALUE;
+    private int renderedNightMode = -1;
     private long renderedFrames;
     private long redrawFrames;
     private long reuseFrames;
@@ -281,6 +282,7 @@ public final class FullscreenMapFramebufferRenderer {
                     renderedDimension = dimension;
                     renderedCaveProjection = caveProjection;
                     renderedCaveLayerY = caveLayerY;
+                    renderedNightMode = MapConfig.minimapNightMode;
                     renderedTargetWidth = targetWidth;
                     renderedTargetHeight = targetHeight;
                     swapTargets();
@@ -440,6 +442,7 @@ public final class FullscreenMapFramebufferRenderer {
     public void invalidate() {
         framePolicy.invalidate();
         renderedCaveLayerY = Integer.MIN_VALUE;
+        renderedNightMode = -1;
         frontFrameValid = false;
         nextColdRedrawAttemptNanos = 0L;
     }
@@ -537,6 +540,7 @@ public final class FullscreenMapFramebufferRenderer {
         if (!canDisplayLastGood(sessionId, dimension, width, height)
                 || renderedScale <= 0.0f) return false;
         if (renderedCaveProjection != caveProjection
+                || renderedNightMode != MapConfig.minimapNightMode
                 || Float.floatToIntBits(renderedScale)
                         != Float.floatToIntBits(renderScale)) return false;
         if (caveProjection != 0 && renderedCaveLayerY != caveLayerY) return false;

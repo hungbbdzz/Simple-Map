@@ -668,8 +668,7 @@ public class MapRenderer {
                 }
                 cachedPlan.plan().drawBasePrepared(planMatrix);
 
-                if (!caveMode && MapConfig.minimapNightMode != 0
-                        && hierarchyLevel == 0) {
+                if (!caveMode && MapConfig.minimapNightMode != 0) {
                     float glowStrength = MapConfig.minimapNightMode == 2
                             ? 1.0f
                             : Math.max(0.0f, Math.min(1.0f,
@@ -3196,12 +3195,24 @@ public class MapRenderer {
 
     private float getCaveBrightness(Minecraft mc, float partialTick) {
         /*
-         * Cave pixels already bake their exact ambient + BlockLight + SkyLight curve
-         * in CaveTextureManager.applyCaveLighting(). Applying a second 0.45f shader
-         * multiplier here crushed lit torches, lava, and cave floors to 22-45%
-         * brightness because cave maps do not use a separate additive glow pass.
+         * Provide immediate visual response across all Cave modes (Layered & Full)
+         * and all dimensions when cycling Day (0) / Auto (1) / Night (2), while
+         * CaveTextureManager.applyCaveLighting() restyles the underlying tiles so
+         * glowing blocks and block-lit areas stay at 100% brightness.
          */
-        return 1.0f;
+        if (MapConfig.minimapNightMode == 0) return 1.0f;
+        if (MapConfig.minimapNightMode == 2) return 0.78f;
+        if (mc != null && mc.level != null
+                && mc.level.dimensionType().hasSkyLight()
+                && !mc.level.dimensionType().hasCeiling()
+                && !CaveMode.isFullView(mc)) {
+            int layerY = CaveMode.getLayerY(mc);
+            if (layerY >= 56) {
+                float skyDarken = Math.max(0.0f, Math.min(1.0f, mc.level.getSkyDarken(partialTick)));
+                return 0.82f + 0.18f * (1.0f - skyDarken);
+            }
+        }
+        return 0.94f;
     }
 
     private static float baseAmbientBrightness(DimensionMapProfile profile) {

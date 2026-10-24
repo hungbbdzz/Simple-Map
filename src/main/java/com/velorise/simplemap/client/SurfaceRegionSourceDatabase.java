@@ -403,8 +403,14 @@ public final class SurfaceRegionSourceDatabase {
                 MapMemoryLeaseManager.Lease chunkLease =
                         acquireChunkLease(sourceKey, lane);
                 if (chunkLease == null) return captured;
+                byte[] chunkLight = null;
+                MapLightManager.LightRegion lightRegion = MapLightManager.getInstance()
+                        .getRegion(key.regionX(), key.regionZ(), false);
+                if (lightRegion != null && lightRegion.isLoaded()) {
+                    chunkLight = lightRegion.snapshotWindow(chunkX << 4, chunkZ << 4, 16, 16);
+                }
                 MapManager.RegionChunkSnapshot snapshot =
-                        region.snapshotChunk(chunkX, chunkZ, null);
+                        region.snapshotChunk(chunkX, chunkZ, chunkLight);
                 if (snapshot == null) {
                     chunkLease.close();
                     continue;
@@ -482,8 +488,14 @@ public final class SurfaceRegionSourceDatabase {
                 MapMemoryLeaseManager.Lease chunkLease =
                         acquireChunkLease(key, lane);
                 if (chunkLease == null) return captured;
+                byte[] chunkLight = null;
+                MapLightManager.LightRegion lightRegion = MapLightManager.getInstance()
+                        .getRegion(key.regionX(), key.regionZ(), false);
+                if (lightRegion != null && lightRegion.isLoaded()) {
+                    chunkLight = lightRegion.snapshotWindow(chunkX << 4, chunkZ << 4, 16, 16);
+                }
                 MapManager.RegionChunkSnapshot snapshot =
-                        region.snapshotChunk(chunkX, chunkZ, null);
+                        region.snapshotChunk(chunkX, chunkZ, chunkLight);
                 if (snapshot == null) {
                     chunkLease.close();
                     continue;
@@ -1350,7 +1362,10 @@ public final class SurfaceRegionSourceDatabase {
                         long packed = sourcePixels[sourceIndex];
                         destinationKnown[destinationIndex] = 1;
                         destinationTints[destinationIndex] = sourceTints[sourceIndex];
-                        destinationLights[destinationIndex] = sourceLights[sourceIndex];
+                        int packedLight = MapBlockData.isEmpty(packed) ? 0
+                                : (MapBlockData.isGlowing(packed) ? 15 : MapBlockData.getBlockLight(packed));
+                        int srcLight = sourceLights != null ? (sourceLights[sourceIndex] & 0xFF) : 0;
+                        destinationLights[destinationIndex] = (byte) Math.max(packedLight, srcLight);
                         if (blockRemap == null && biomeRemap == null) {
                             // Single-region batches already use the exact retained
                             // region palette. Preserve packed IDs verbatim instead

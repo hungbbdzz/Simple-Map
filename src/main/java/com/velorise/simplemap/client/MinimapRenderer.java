@@ -297,87 +297,64 @@ public class MinimapRenderer {
         float radius = size / 2.0f;
         float cx = x + radius;
         float cy = y + radius;
-        float clipRadius = radius - tHalf;
-        boolean depthWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
-                org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-        boolean stencilWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
-                org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-        // Stencil is disabled in the normal GUI path. Querying seven additional GL
-        // values every minimap frame forced driver synchronization even though
-        // there was no state to preserve. Pay that compatibility cost only when a
-        // previous renderer actually left stencil enabled.
-        int previousStencilFunc = org.lwjgl.opengl.GL11.GL_ALWAYS;
-        int previousStencilRef = 0;
-        int previousStencilValueMask = 0xFF;
-        int previousStencilWriteMask = 0xFF;
-        int previousStencilFail = org.lwjgl.opengl.GL11.GL_KEEP;
-        int previousStencilDepthFail = org.lwjgl.opengl.GL11.GL_KEEP;
-        int previousStencilDepthPass = org.lwjgl.opengl.GL11.GL_KEEP;
-        if (stencilWasEnabled) {
-            previousStencilFunc = org.lwjgl.opengl.GL11.glGetInteger(
-                    org.lwjgl.opengl.GL11.GL_STENCIL_FUNC);
-            previousStencilRef = org.lwjgl.opengl.GL11.glGetInteger(
-                    org.lwjgl.opengl.GL11.GL_STENCIL_REF);
-            previousStencilValueMask = org.lwjgl.opengl.GL11.glGetInteger(
-                    org.lwjgl.opengl.GL11.GL_STENCIL_VALUE_MASK);
-            previousStencilWriteMask = org.lwjgl.opengl.GL11.glGetInteger(
-                    org.lwjgl.opengl.GL11.GL_STENCIL_WRITEMASK);
-            previousStencilFail = org.lwjgl.opengl.GL11.glGetInteger(
-                    org.lwjgl.opengl.GL11.GL_STENCIL_FAIL);
-            previousStencilDepthFail = org.lwjgl.opengl.GL11.glGetInteger(
-                    org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_FAIL);
-            previousStencilDepthPass = org.lwjgl.opengl.GL11.glGetInteger(
-                    org.lwjgl.opengl.GL11.GL_STENCIL_PASS_DEPTH_PASS);
-        }
+        float ringWidth = Math.max(1.5f, size / 72.0f);
+        float innerRingRadius = radius - 0.5f;
+        float outerRingRadius = innerRingRadius + ringWidth;
 
-        mc.getMainRenderTarget().enableStencil();
-        try {
-            org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-            org.lwjgl.opengl.GL11.glStencilMask(0xFF);
-            org.lwjgl.opengl.GL11.glClear(org.lwjgl.opengl.GL11.GL_STENCIL_BUFFER_BIT);
-            org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_ALWAYS, 1, 0xFF);
-            org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_REPLACE,
-                    org.lwjgl.opengl.GL11.GL_REPLACE, org.lwjgl.opengl.GL11.GL_REPLACE);
-            org.lwjgl.opengl.GL11.glColorMask(false, false, false, false);
-            org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        // Draw dark circular backdrop first so cold/unexplored areas are cleanly masked
+        drawSolidCircle(guiGraphics, cx, cy, radius, CIRCLE_SEGMENTS, 0xFF080A0C);
+        guiGraphics.flush();
 
-            float maskRadius = clipRadius + 1.5f;
-            // One buffered 64-segment fan replaces ~2*radius individual GUI fill
-            // commands and square-root calculations on every HUD frame.
-            drawSolidCircle(guiGraphics, cx, cy, maskRadius,
-                    CIRCLE_SEGMENTS, 0xFFFFFFFF);
-            guiGraphics.flush();
-
-            org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
-            org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_EQUAL, 1, 0xFF);
-            org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_KEEP,
-                    org.lwjgl.opengl.GL11.GL_KEEP, org.lwjgl.opengl.GL11.GL_KEEP);
-            org.lwjgl.opengl.GL11.glStencilMask(0x00);
-
-            renderMapContent(guiGraphics, x, y, size, interpX, interpZ,
-                    effectiveZoom, partialTick);
-            guiGraphics.flush();
-        } finally {
-            // A render exception must never leave Minecraft with color writes, depth or
-            // stencil state disabled for the rest of the HUD frame.
-            org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
-            org.lwjgl.opengl.GL11.glStencilFunc(previousStencilFunc, previousStencilRef, previousStencilValueMask);
-            org.lwjgl.opengl.GL11.glStencilOp(previousStencilFail, previousStencilDepthFail, previousStencilDepthPass);
-            org.lwjgl.opengl.GL11.glStencilMask(previousStencilWriteMask);
-            if (stencilWasEnabled) org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-            else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-            if (depthWasEnabled) org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-            else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+        // Retained FBO draws a 64-segment circular mesh directly from its texture,
+        // avoiding fragile GL_STENCIL_TEST state interactions across FBO switches.
+        boolean renderedViaFbo = USE_RETAINED_FRAMEBUFFER
+                && MinimapFramebufferRenderer.getInstance().render(
+                        guiGraphics, x, y, size, interpX, interpZ, effectiveZoom,
+                        MapConfig.minimapRotate, partialTick);
+        if (!renderedViaFbo) {
+            boolean depthWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
+                    org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+            boolean stencilWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(
+                    org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+            mc.getMainRenderTarget().enableStencil();
+            try {
+                org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+                org.lwjgl.opengl.GL11.glStencilMask(0xFF);
+                org.lwjgl.opengl.GL11.glClear(org.lwjgl.opengl.GL11.GL_STENCIL_BUFFER_BIT);
+                org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_ALWAYS, 1, 0xFF);
+                org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_REPLACE,
+                        org.lwjgl.opengl.GL11.GL_REPLACE, org.lwjgl.opengl.GL11.GL_REPLACE);
+                org.lwjgl.opengl.GL11.glColorMask(false, false, false, false);
+                org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+                drawSolidCircle(guiGraphics, cx, cy, radius, CIRCLE_SEGMENTS, 0xFFFFFFFF);
+                guiGraphics.flush();
+                org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
+                org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_EQUAL, 1, 0xFF);
+                org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_KEEP,
+                        org.lwjgl.opengl.GL11.GL_KEEP, org.lwjgl.opengl.GL11.GL_KEEP);
+                org.lwjgl.opengl.GL11.glStencilMask(0x00);
+                MapRenderer.getInstance().drawMap(
+                        guiGraphics, x, y, size, size, interpX, interpZ, effectiveZoom,
+                        false, MapConfig.minimapRotate, true, 0, 0, partialTick);
+                guiGraphics.flush();
+            } finally {
+                org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
+                org.lwjgl.opengl.GL11.glStencilMask(0xFF);
+                if (stencilWasEnabled) org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+                else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
+                if (depthWasEnabled) org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+                else org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
+            }
         }
 
         MapRenderer.getInstance().drawMinimapPlayerOverlay(
                 guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
-        drawCircleRing(guiGraphics, cx, cy, clipRadius, radius, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
-        drawCircleRing(guiGraphics, cx, cy, radius, radius + borderThickness, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
-        drawCircleRing(guiGraphics, cx, cy, radius + borderThickness, radius + borderThickness + 1, CIRCLE_SEGMENTS,
-                0xFF000000);
+        // Sleek, thin circular bezel ring
+        drawCircleRing(guiGraphics, cx, cy, innerRingRadius - 0.5f, innerRingRadius, CIRCLE_SEGMENTS, 0x77000000);
+        drawCircleRing(guiGraphics, cx, cy, innerRingRadius, outerRingRadius, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
+        drawCircleRing(guiGraphics, cx, cy, outerRingRadius, outerRingRadius + 0.75f, CIRCLE_SEGMENTS, 0xE0000000);
         guiGraphics.flush();
-        drawCompassDirections(guiGraphics, mc, cx, cy, radius, borderThickness, player, true, partialTick);
+        drawCompassDirections(guiGraphics, mc, cx, cy, radius, ringWidth, player, true, partialTick);
     }
 
     private void drawCompassDirections(GuiGraphics guiGraphics, Minecraft mc, float cx, float cy, float radius,

@@ -1026,7 +1026,7 @@ public final class CaveTextureManager {
                                 int b = (c >>> 16) & 0xFF;
                                 int lum = Math.max(r, Math.max(g, b));
                                 if (lum > maxLum) maxLum = lum;
-                                int w = 48 + lum;
+                                int w = (r + g + b >= 380 || lum >= 195) ? (420 + lum * 3) : (48 + lum);
                                 weightedRed += (long) r * w;
                                 weightedGreen += (long) g * w;
                                 weightedBlue += (long) b * w;
@@ -1298,11 +1298,16 @@ public final class CaveTextureManager {
         for (int value : values) {
             int childAlpha = (value >>> 24) & 0xFF;
             if (childAlpha == 0 || value == 0) continue;
-            red += value & 0xFF;
-            green += (value >>> 8) & 0xFF;
-            blue += (value >>> 16) & 0xFF;
+            int r = value & 0xFF;
+            int g = (value >>> 8) & 0xFF;
+            int b = (value >>> 16) & 0xFF;
+            int lum = Math.max(r, Math.max(g, b));
+            int w = (r + g + b >= 380 || lum >= 195) ? 4 : 1;
+            red += (long) r * w;
+            green += (long) g * w;
+            blue += (long) b * w;
             alpha = Math.max(alpha, childAlpha);
-            colored++;
+            colored += w;
         }
         if (colored == 0) return 0;
         float coverage = colored == 4 ? 1.0f : (float) Math.pow(colored * 0.25, 0.52);
@@ -2240,6 +2245,10 @@ public final class CaveTextureManager {
 
                 region.lock();
                 try {
+                    // Propagate warm block-light halo around glowing blocks (lava, glowstone, shroomlight,
+                    // torches, lanterns, fire, etc.) in .mca regions where sections lacked BlockLight nibbles.
+                    propagateAnvilGlowingHalo(regionRawColors, regionHeights, regionKinds);
+
                     for (int pz = 0; pz < 512; pz++) {
                         int rowOffset = pz * 512;
                         for (int px = 0; px < 512; px++) {
@@ -2285,6 +2294,51 @@ public final class CaveTextureManager {
                     region.unlock();
                 }
             } catch (Throwable ignored) {
+            }
+        }
+
+        private static void propagateAnvilGlowingHalo(int[] regionRawColors, short[] regionHeights, byte[] regionKinds) {
+            final int radius = 5;
+            for (int pz = 0; pz < 512; pz++) {
+                int row = pz * 512;
+                for (int px = 0; px < 512; px++) {
+                    int idx = row + px;
+                    byte kind = regionKinds[idx];
+                    boolean isGlowing = (kind == DecodedSection.KIND_LAVA || (kind & 0x40) != 0);
+                    if (!isGlowing) continue;
+                    short srcY = regionHeights[idx];
+                    if (srcY == CaveRegion.NO_SURFACE) continue;
+                    int minZ = Math.max(0, pz - radius);
+                    int maxZ = Math.min(511, pz + radius);
+                    int minX = Math.max(0, px - radius);
+                    int maxX = Math.min(511, px + radius);
+                    for (int nz = minZ; nz <= maxZ; nz++) {
+                        int dz = Math.abs(nz - pz);
+                        int nRow = nz * 512;
+                        for (int nx = minX; nx <= maxX; nx++) {
+                            int dx = Math.abs(nx - px);
+                            int dist = dx + dz;
+                            if (dist == 0 || dist > radius) continue;
+                            int nIdx = nRow + nx;
+                            byte nKind = regionKinds[nIdx];
+                            if (nKind == DecodedSection.KIND_LAVA || (nKind & 0x40) != 0) continue;
+                            int c = regionRawColors[nIdx];
+                            if (c == 0) continue;
+                            short nY = regionHeights[nIdx];
+                            if (nY == CaveRegion.NO_SURFACE || Math.abs(nY - srcY) > 6) continue;
+                            float strength = (float) (radius + 1 - dist) / (float) (radius + 1);
+                            float lift = 1.0f + strength * 0.24f;
+                            float warmth = strength * 0.14f;
+                            int r = c & 0xFF;
+                            int g = (c >>> 8) & 0xFF;
+                            int b = (c >>> 16) & 0xFF;
+                            r = Math.min(255, Math.round(r * lift + (255 - r) * warmth));
+                            g = Math.min(255, Math.round(g * lift + (190 - g) * warmth));
+                            b = Math.min(255, Math.round(b * lift + (90 - b) * warmth));
+                            regionRawColors[nIdx] = 0xFF000000 | (b << 16) | (g << 8) | r;
+                        }
+                    }
+                }
             }
         }
 
@@ -3267,20 +3321,34 @@ public final class CaveTextureManager {
                 }
                 return 0xFF000000 | (b0 << 16) | (g0 << 8) | r0;
             }
+            int nightMode = MapConfig.minimapNightMode; // 0 = DAY/BRIGHT, 1 = AUTO, 2 = NIGHT/DARK
             int clampedBlock = Math.max(0, Math.min(15, blockLight));
             int clampedSky = Math.max(0, Math.min(15, skyLight));
-            if (clampedSky >= 15 && clampedBlock <= 4) {
-                // Open-sky surface layer in LAYERED mode (e.g., Top Y: 80 above ground):
+            if (clampedSky >= 15 && clampedBlock <= 4 && nightMode == 0) {
+                // Open-sky surface layer in LAYERED mode during Day mode:
                 // preserve 100% of Surface mode's natural brightness.
                 return abgr;
             }
-            int effectiveLight = Math.max(clampedBlock, clampedSky);
-            // Standard getBlockBrightness(9.0F, blockLight, sun) = (9.0F + effectiveLight) / 24.0F
-            // combined with cave legibility floor and vertical depth shading.
+            int adjustedSky = nightMode == 2 ? Math.round(clampedSky * 0.28f) : clampedSky;
+            int effectiveLight = Math.max(clampedBlock, adjustedSky);
             float standardBlockBrightness = (9.0f + effectiveLight) / 24.0f;
             float heightShade = Math.max(0.92f, Math.min(1.05f, 1.0f + verticalOffset * 0.016f));
-            float lightCurve = 0.22f + 0.78f * standardBlockBrightness;
-            float brightness = Math.max(0.48f, Math.min(1.06f, lightCurve * heightShade));
+            float lightCurve;
+            float minFloor;
+            if (nightMode == 0) {
+                // Day / Bright mode: lift dark cave rock so unlit passages are bright and easy to read
+                lightCurve = 0.56f + 0.46f * standardBlockBrightness;
+                minFloor = 0.72f;
+            } else if (nightMode == 2) {
+                // Night / Dark mode: darken unlit rock while keeping block-lit areas at 100% full brightness
+                lightCurve = 0.10f + 0.90f * standardBlockBrightness;
+                minFloor = 0.30f;
+            } else {
+                // Auto mode: balanced reference cave legibility curve
+                lightCurve = 0.22f + 0.78f * standardBlockBrightness;
+                minFloor = 0.48f;
+            }
+            float brightness = Math.max(minFloor, Math.min(1.06f, lightCurve * heightShade));
 
             int red = Math.round(r0 * brightness);
             int green = Math.round(g0 * brightness);
