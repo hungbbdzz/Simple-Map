@@ -445,6 +445,7 @@ public final class RegionDataStore {
                 // authority path before treating them as current completion.
                 invalidateLegacyFluidCompletion(pixels, completeChunks);
             }
+            repairNetherBedrockColumns(pixels, tints, biomePalette, blockPalette, completeChunks, version);
             repairChunkBorderBiomeSeams(pixels, biomePalette, completeChunks);
             return new StoredRegion(pixels, tints, biomePalette, blockPalette,
                     completeChunks);
@@ -492,6 +493,73 @@ public final class RegionDataStore {
      * inject {@code Biomes.PLAINS} along the 2-4 block chunk border in Warm Ocean,
      * Savanna, etc.).
      */
+    /**
+     * Repairs cached Nether/ceiling-dimension Surface columns that previously
+     * captured the Y=127 Bedrock ceiling or fell through to Y=0 Bedrock on solid
+     * Netherrack pillars when no air existed in the column.
+     */
+    private static void repairNetherBedrockColumns(long[] pixels, int[] tints,
+            String[] biomePalette, String[] blockPalette, long[] completeChunks,
+            int version) {
+        if (pixels == null || pixels.length != PIXEL_COUNT
+                || blockPalette == null || blockPalette.length == 0) {
+            return;
+        }
+        int bedrockIdx = -1;
+        for (int i = 0; i < blockPalette.length; i++) {
+            if ("minecraft:bedrock".equals(blockPalette[i])) {
+                bedrockIdx = i;
+                break;
+            }
+        }
+        if (bedrockIdx < 0) return;
+
+        boolean hasNetherBiome = false;
+        if (biomePalette != null) {
+            for (String b : biomePalette) {
+                if ("minecraft:nether_wastes".equals(b)
+                        || "minecraft:soul_sand_valley".equals(b)
+                        || "minecraft:crimson_forest".equals(b)
+                        || "minecraft:warped_forest".equals(b)
+                        || "minecraft:basalt_deltas".equals(b)) {
+                    hasNetherBiome = true;
+                    break;
+                }
+            }
+        }
+        if (!hasNetherBiome && version >= 7) return;
+
+        for (int cz = 0; cz < SurfaceChunkCoverage.CHUNKS_PER_AXIS; cz++) {
+            int baseZ = cz << 4;
+            for (int cx = 0; cx < SurfaceChunkCoverage.CHUNKS_PER_AXIS; cx++) {
+                int baseX = cx << 4;
+                int chunkIndex = (cz << 5) | cx;
+                boolean clearedAny = false;
+                for (int lz = 0; lz < 16; lz++) {
+                    int row = (baseZ + lz) * REGION_SIZE + baseX;
+                    for (int lx = 0; lx < 16; lx++) {
+                        int idx = row + lx;
+                        long packed = pixels[idx];
+                        if (MapBlockData.isEmpty(packed)) continue;
+                        int blk = MapBlockData.blockId(packed) & 0xFFFF;
+                        if (blk != bedrockIdx) continue;
+                        int topY = MapBlockData.topY(packed);
+                        if (topY >= 122 || (hasNetherBiome && topY <= 4)) {
+                            pixels[idx] = MapBlockData.EMPTY_PACKED;
+                            if (tints != null && idx < tints.length) {
+                                tints[idx] = SurfaceTintData.UNKNOWN;
+                            }
+                            clearedAny = true;
+                        }
+                    }
+                }
+                if (clearedAny && version < 7 && completeChunks != null) {
+                    SurfaceChunkCoverage.clearComplete(completeChunks, chunkIndex);
+                }
+            }
+        }
+    }
+
     private static int repairChunkBorderBiomeSeams(long[] pixels,
             String[] biomePalette, long[] completeChunks) {
         if (pixels == null || pixels.length != PIXEL_COUNT

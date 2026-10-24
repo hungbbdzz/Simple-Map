@@ -2497,10 +2497,15 @@ public static final class RegionLodGraph {
                     int color = child.pixels[sourceRow + sourceX];
                     int a = color >>> 24;
                     if (a == 0) continue;
-                    coloredCount++;
-                    redTotal += color & 0xFF;
-                    greenTotal += (color >>> 8) & 0xFF;
-                    blueTotal += (color >>> 16) & 0xFF;
+                    int r = color & 0xFF;
+                    int g = (color >>> 8) & 0xFF;
+                    int b = (color >>> 16) & 0xFF;
+                    int lum = Math.max(r, Math.max(g, b));
+                    int w = (r + g + b >= 380 || lum >= 195) ? 6 : 1;
+                    coloredCount += w;
+                    redTotal += (long) r * w;
+                    greenTotal += (long) g * w;
+                    blueTotal += (long) b * w;
                 }
             }
             if (knownCount == 0) return ReducedColor.UNKNOWN;
@@ -2529,10 +2534,15 @@ public static final class RegionLodGraph {
                     int color = pixels[sourceRow + sourceX];
                     int a = color >>> 24;
                     if (a == 0) continue;
-                    coloredCount++;
-                    redTotal += color & 0xFF;
-                    greenTotal += (color >>> 8) & 0xFF;
-                    blueTotal += (color >>> 16) & 0xFF;
+                    int r = color & 0xFF;
+                    int g = (color >>> 8) & 0xFF;
+                    int b = (color >>> 16) & 0xFF;
+                    int lum = Math.max(r, Math.max(g, b));
+                    int w = (r + g + b >= 380 || lum >= 195) ? 6 : 1;
+                    coloredCount += w;
+                    redTotal += (long) r * w;
+                    greenTotal += (long) g * w;
+                    blueTotal += (long) b * w;
                 }
             }
             if (knownCount == 0) return ReducedColor.UNKNOWN;

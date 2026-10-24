@@ -2981,7 +2981,7 @@ public class MapTextureManager {
                 SurfaceRegionSourceDatabase.getInstance().captureBatchPlan(stamp,
                         requested.regionX(), requested.regionZ(), batchPageX,
                         batchPageZ, requested.pageX(), requested.pageZ(),
-                        batchSize, batchSize, MapConfig.minimapNightMode != 0, lane);
+                        batchSize, batchSize, true, lane);
         if (source == null) {
             synchronized (pendingSurfaceBatches) {
                 batchCaptureDeferrals.merge(batchKey, 1,
@@ -3458,7 +3458,7 @@ public class MapTextureManager {
                         blockPalette, blockIndices);
 
                 MapLightManager.LightRegion lightRegion = MapLightManager.getInstance().getRegion(
-                        sourceRegionX, sourceRegionZ, MapConfig.minimapNightMode != 0);
+                        sourceRegionX, sourceRegionZ, true);
                 if (lightRegion != null && lightRegion.isLoaded()) {
                     byte[] sourceLight = lightRegion.snapshotWindow(
                             localMinX, localMinZ, width, height);
@@ -3592,7 +3592,7 @@ public class MapTextureManager {
 
         byte[] light = null;
         MapLightManager.LightRegion lightRegion = MapLightManager.getInstance().getRegion(
-                regionX, regionZ, MapConfig.minimapNightMode != 0);
+                regionX, regionZ, true);
         if (lightRegion != null) {
             light = new byte[MapPageLayout.REGION_SIZE * MapPageLayout.REGION_SIZE];
             lightRegion.lock();

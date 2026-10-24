@@ -75,13 +75,13 @@ public class ChunkScanner {
      */
     private static final long SURFACE_QUEUE_REPRIORITIZE_NANOS = 100_000_000L;
     /** Surface remains authoritative even while a cave projection is selected. */
-    private static final long SURFACE_DURING_CAVE_BUDGET_NANOS = 900_000L;
+    private static final long SURFACE_DURING_CAVE_BUDGET_NANOS = 1_400_000L;
     private static final int BASE_VERTICAL_COST = 24;
     // Increase per-tick nano budgets to allow broader scanning for larger explored areas
     private static final long SURFACE_SCAN_BUDGET_NANOS = 5_000_000L;
     private static final long CAVE_SCAN_BUDGET_NANOS = 2_000_000L;
     private static final long MAP_SCREEN_SCAN_BUDGET_NANOS = 2_800_000L;
-    private static final long MAP_SCREEN_BALANCED_BUDGET_NANOS = 2_200_000L;
+    private static final long MAP_SCREEN_BALANCED_BUDGET_NANOS = 4_200_000L;
     private static final int MAP_SCREEN_MAX_VISITED_PIXELS = 32_768;
     private static final int IMMEDIATE_COLUMNS_PER_TICK = 64;
     /** One-shot main-thread budget used only after committing a different Top-Y. */
@@ -142,11 +142,11 @@ public class ChunkScanner {
      * this cursor only walks a bounded number of loaded candidates per pulse so a
      * render-distance halo is never re-probed in one monolithic sweep.
      */
-    private static final int FOREGROUND_SEED_CANDIDATES_PER_PULSE = 24;
+    private static final int FOREGROUND_SEED_CANDIDATES_PER_PULSE = 256;
     private static final long FOREGROUND_SEED_RECONCILE_NANOS = 1_000_000_000L;
     private static final int LIVE_SURFACE_VERIFIED_LIMIT = 8_192;
     private static final int SURFACE_STAGE_LIMIT = 2_048;
-    private static final long SURFACE_WRITER_MIN_PULSE_NANOS = 5_000_000L;
+    private static final long SURFACE_WRITER_MIN_PULSE_NANOS = 1_500_000L;
     private static final boolean[] ALL_SURFACE_COLUMNS_VALID = fullSurfaceValidity();
     private int foregroundSeedChunkX = Integer.MIN_VALUE;
     private int foregroundSeedChunkZ = Integer.MIN_VALUE;
@@ -1169,6 +1169,15 @@ public class ChunkScanner {
         CaveMapManager.getInstance().setActiveLayer(targetLayer);
         CaveTextureManager.getInstance().requestVisiblePages(targetLayer, minX, maxX, minZ, maxZ,
                 scale, focusX, focusZ, lane);
+        if (claimSurfaceWriterPulse()) {
+            long surfaceStarted = System.nanoTime();
+            long surfaceBudget = surfaceDuringCaveBudget(mc);
+            long surfaceDeadline = surfaceStarted + surfaceBudget;
+            seedForegroundSurfaceNeighborhood(mc);
+            scanUrgentLoadedChunks(mc, 0, false, false,
+                    surfaceStarted + foregroundUrgentSlice(surfaceBudget));
+            scanQueuedSurfaceChunks(mc, surfaceDeadline);
+        }
         long budget = scanBudget(mc, true, scale);
         if (budget > 0L) {
             scanVisibleCaveChunks(mc, minX, maxX, minZ, maxZ, focusX, focusZ,
@@ -1295,6 +1304,36 @@ public class ChunkScanner {
      * exact/archive data streams through the normal viewport queue; only a genuinely
      * uncached player region receives a tiny one-chunk prime.
      */
+    public void requestImmediateSurfaceRefresh(Minecraft mc) {
+        if (MapActivityGate.getInstance().blocksMapWork()) return;
+        if (mc == null || mc.level == null || mc.player == null) return;
+        if (!mc.isSameThread()) {
+            mc.execute(() -> requestImmediateSurfaceRefresh(mc));
+            return;
+        }
+        CaveMapManager.getInstance().deactivate();
+        observedCaveModeRevision = CaveMode.getRevision();
+        observedCaveView = null;
+        observedCaveBandY = Integer.MIN_VALUE;
+        observedCaveProjectionTopY = Integer.MIN_VALUE;
+        foregroundSeedChunkX = Integer.MIN_VALUE;
+        foregroundSeedChunkZ = Integer.MIN_VALUE;
+        foregroundSeedCursor = 0;
+        foregroundSeedNanos = 0L;
+        surfaceWriterLastPulseNanos = 0L;
+        MapViewportCoordinator.getInstance().onLayerChanged();
+        SurfaceRegionSourceDatabase.getInstance().invalidateStyle();
+        seedForegroundSurfaceNeighborhood(mc);
+        long started = System.nanoTime();
+        long deadline = started + 8_000_000L;
+        scanUrgentLoadedChunks(mc, 0, false, false, started + 3_000_000L);
+        scanQueuedSurfaceChunks(mc, deadline);
+        if (System.nanoTime() < deadline) {
+            scanNearestChunks(mc, 96, 4096, 0, false, false, deadline);
+        }
+        MapTextureManager.getInstance().uploadExactTextures(MapRequestLane.FULLSCREEN, true);
+    }
+
     public void requestImmediateCaveLayerRefresh(Minecraft mc) {
         if (MapActivityGate.getInstance().blocksMapWork()) return;
         if (mc == null || mc.level == null || mc.player == null) return;
@@ -2791,9 +2830,10 @@ public class ChunkScanner {
         boolean glowing = lava || (!water && visual.emissive());
         BlockPos.MutableBlockPos lightPos = scratch.position(3,
                 blockX, surfaceY, blockZ);
-        int surfaceLight = level.getBrightness(LightLayer.BLOCK, lightPos);
+        int emission = Math.max(visibleState.getLightEmission(), paletteState.getLightEmission());
+        int surfaceLight = Math.max(emission, level.getBrightness(LightLayer.BLOCK, lightPos));
         lightPos.setY(surfaceY + 1);
-        int blockLight = level.getBrightness(LightLayer.BLOCK, lightPos);
+        int blockLight = glowing ? 15 : Math.max(surfaceLight, level.getBrightness(LightLayer.BLOCK, lightPos));
 
         int flags = Math.max(0, Math.min(15, blockLight));
         if (glowing) flags |= 0x10;
@@ -2838,7 +2878,9 @@ public class ChunkScanner {
                         ? level.getBlockState(probe)
                         : loadedChunk.getBlockState(probe);
                 if (!foundAir) {
-                    if (state.isAir()) foundAir = true;
+                    if (state.isAir() || CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
+                        foundAir = true;
+                    }
                     continue;
                 }
                 if (isVisibleMapSurface(level, probe, state)) {
@@ -2846,6 +2888,12 @@ public class ChunkScanner {
                     return output;
                 }
             }
+            // A solid pillar from ceiling to floor in a cave/ceiling dimension has no
+            // open surface; return non-visible so it encodes as EMPTY_PACKED (mapped void)
+            // instead of falling through to minimumY=0 Bedrock!
+            output.surfaceY = minimumY;
+            output.visible = false;
+            return output;
         } else {
             int highestY = loadedChunk == null
                     ? level.getHeight(Heightmap.Types.WORLD_SURFACE,

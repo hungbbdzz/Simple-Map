@@ -1950,15 +1950,25 @@ public class MapManager {
                 int[] chunkTints = new int[16 * 16];
                 int startX = localChunkX * 16;
                 int startZ = localChunkZ * 16;
+                byte[] resolvedLights = new byte[16 * 16];
                 for (int z = 0; z < 16; z++) {
                     int source = (startZ + z) * 512 + startX;
                     int target = z * 16;
                     System.arraycopy(pixels, source, chunkPixels, target, 16);
                     System.arraycopy(tints, source, chunkTints, target, 16);
+                    for (int x = 0; x < 16; x++) {
+                        int idx = target + x;
+                        long packed = chunkPixels[idx];
+                        int packedLight = MapBlockData.isEmpty(packed) ? 0
+                                : (MapBlockData.isGlowing(packed) ? 15 : MapBlockData.getBlockLight(packed));
+                        int externalLight = (lightLevels != null && idx < lightLevels.length)
+                                ? (lightLevels[idx] & 0xFF) : 0;
+                        resolvedLights[idx] = (byte) Math.max(packedLight, externalLight);
+                    }
                 }
                 return RegionChunkSnapshot.owned(localChunkX, localChunkZ,
                         chunkRevisions[chunkIndex],
-                        chunkPixels, chunkTints, lightLevels);
+                        chunkPixels, chunkTints, resolvedLights);
             } finally {
                 lock.unlock();
             }

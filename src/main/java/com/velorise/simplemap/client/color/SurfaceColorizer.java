@@ -153,6 +153,13 @@ public final class SurfaceColorizer {
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
+                int blockLight = sampleSmoothedBlockLight(pixels, px, pz, SIZE, SIZE);
+                if (blockLight > 4) {
+                    float warmth = Math.min(0.26f, ((blockLight - 4) / 11.0f) * 0.26f);
+                    red = clamp(Math.round(red + (255 - red) * warmth));
+                    green = clamp(Math.round(green + (192 - green) * warmth));
+                    blue = clamp(Math.round(blue + (92 - blue) * warmth));
+                }
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0 && !glowingPixel) {
@@ -305,6 +312,13 @@ public final class SurfaceColorizer {
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
+                int blockLight = sampleSmoothedBlockLight(pixels, px, pz, stride, stride);
+                if (blockLight > 4) {
+                    float warmth = Math.min(0.26f, ((blockLight - 4) / 11.0f) * 0.26f);
+                    red = clamp(Math.round(red + (255 - red) * warmth));
+                    green = clamp(Math.round(green + (192 - green) * warmth));
+                    blue = clamp(Math.round(blue + (92 - blue) * warmth));
+                }
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0 && !glowingPixel) {
@@ -401,6 +415,17 @@ public final class SurfaceColorizer {
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
+                int blockLight = sampleSmoothedBlockLight(pixels, px, pz, stride, stride);
+                if (blockLight > 4) {
+                    float warmth = Math.min(0.32f, ((blockLight - 4) / 11.0f) * 0.32f);
+                    red = clamp(Math.round(red + (255 - red) * warmth));
+                    green = clamp(Math.round(green + (196 - green) * warmth));
+                    blue = clamp(Math.round(blue + (96 - blue) * warmth));
+                    float lift = 1.0f + ((blockLight - 4) / 11.0f) * 0.18f;
+                    red = clamp(Math.round(red * lift));
+                    green = clamp(Math.round(green * lift));
+                    blue = clamp(Math.round(blue * lift));
+                }
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0 && !glowingPixel) {
                     argb = applyAccurateFilter(argb,
@@ -414,6 +439,36 @@ public final class SurfaceColorizer {
             }
         }
         return output;
+    }
+
+    private static int sampleSmoothedBlockLight(long[] pixels, int px, int pz, int width, int height) {
+        if (pixels == null || width <= 0 || height <= 0) return 0;
+        int centerIdx = pz * width + px;
+        if (centerIdx < 0 || centerIdx >= pixels.length) return 0;
+        long centerPacked = pixels[centerIdx];
+        int centerLight = MapBlockData.isEmpty(centerPacked) ? 0
+                : (MapBlockData.isGlowing(centerPacked) ? 15 : MapBlockData.getBlockLight(centerPacked));
+        int weighted = 0;
+        int weight = 0;
+        for (int dz = -1; dz <= 1; dz++) {
+            int sz = pz + dz;
+            if (sz < 0 || sz >= height) continue;
+            int wz = dz == 0 ? 2 : 1;
+            int row = sz * width;
+            for (int dx = -1; dx <= 1; dx++) {
+                int sx = px + dx;
+                if (sx < 0 || sx >= width) continue;
+                int wx = dx == 0 ? 2 : 1;
+                int w = wx * wz;
+                long p = pixels[row + sx];
+                int l = MapBlockData.isEmpty(p) ? 0
+                        : (MapBlockData.isGlowing(p) ? 15 : MapBlockData.getBlockLight(p));
+                weighted += l * w;
+                weight += w;
+            }
+        }
+        int filtered = weight > 0 ? Math.round((float) weighted / weight) : centerLight;
+        return Math.max(centerLight, filtered);
     }
 
     private static int resolveBaseColor(long packed, int storedTint,

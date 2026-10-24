@@ -178,6 +178,7 @@ public final class SimpleMapClientMod {
         public static void cycleNightMode(Minecraft mc) {
             MapConfig.minimapNightMode = (MapConfig.minimapNightMode + 1) % 3;
             MapConfig.save();
+            MapManager.getInstance().reloadAllRegions();
             Component mode = switch (MapConfig.minimapNightMode) {
                 case 1 -> Component.translatable("gui.simplemap.value.auto");
                 case 2 -> Component.translatable("gui.simplemap.value.on");

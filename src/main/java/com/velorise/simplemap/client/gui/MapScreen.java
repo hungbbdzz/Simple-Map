@@ -232,6 +232,7 @@ public class MapScreen extends Screen {
         nightModeButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.SUN, button -> {
             MapConfig.minimapNightMode = (MapConfig.minimapNightMode + 1) % 3;
             MapConfig.save();
+            MapManager.getInstance().reloadAllRegions();
             updateToolbarTooltips();
         });
         this.addRenderableWidget(nightModeButton);
@@ -270,8 +271,10 @@ public class MapScreen extends Screen {
                 FullscreenMapFramebufferRenderer.getInstance().invalidate();
                 FullscreenMapFramebufferRenderer.getInstance().resetFailureState();
                 MapRenderer.getInstance().clearFullscreenFallback();
+                this.lastViewportInteractionNanos = 0L;
+                MapPerformanceGovernor.getInstance().setFullscreenState(true, false);
                 if (CaveMode.getCaveType(this.minecraft) == CaveMode.CaveType.OFF) {
-                    CaveMapManager.getInstance().deactivate();
+                    ChunkScanner.getInstance().requestImmediateSurfaceRefresh(this.minecraft);
                 } else if (CaveMode.getCaveType(this.minecraft) == CaveMode.CaveType.LAYERED) {
                     ChunkScanner.getInstance().requestImmediateCaveLayerRefresh(this.minecraft);
                 } else {
@@ -1180,16 +1183,22 @@ public class MapScreen extends Screen {
 
         int highestY;
         if (scanFromWorldTop) {
-            int dimensionTopY = level.getMaxBuildHeight() - 1;
-            highestY = dimensionTopY;
+            int dimensionTopY = level.dimensionType().hasCeiling()
+                    ? Math.min(122, level.getMaxBuildHeight() - 1)
+                    : (level.getMaxBuildHeight() - 1);
+            highestY = minBuildHeight;
             boolean foundAir = false;
             for (int y = dimensionTopY; y >= minBuildHeight; y--) {
                 pos.setY(y);
                 net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
                 if (!foundAir) {
-                    if (state.isAir()) foundAir = true;
+                    if (state.isAir() || CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
+                        foundAir = true;
+                    }
                 } else {
-                    if (!state.isAir() && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE) {
+                    if (!state.isAir()
+                            && !CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)
+                            && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE) {
                         highestY = y;
                         break;
                     }
@@ -3357,12 +3366,13 @@ public class MapScreen extends Screen {
                     org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
                 }
 
-                // 5. Draw the bezel overlay (borders) always on top using vector rings
-                drawCircleRing(guiGraphics, cx, cy, clipRadius, radius, 64, MapConfig.minimapRingColor);
-                drawCircleRing(guiGraphics, cx, cy, radius, radius + borderThickness, 64, circleBorderColor); // Outer
-                                                                                                              // black /
-                                                                                                              // highlight
-                                                                                                              // ring
+                // 5. Draw the sleek thin bezel overlay (borders) always on top using vector rings
+                float ringWidth = Math.max(1.5f, size / 72.0f);
+                float innerRingR = radius - 0.5f;
+                float outerRingR = innerRingR + ringWidth;
+                drawCircleRing(guiGraphics, cx, cy, innerRingR - 0.5f, innerRingR, 64, 0x77000000);
+                drawCircleRing(guiGraphics, cx, cy, innerRingR, outerRingR, 64, MapConfig.minimapRingColor);
+                drawCircleRing(guiGraphics, cx, cy, outerRingR, outerRingR + 0.75f, 64, circleBorderColor);
 
                 // Dragging highlight overlay
                 if (isHovered || isDraggingMinimap || selectedMinimap) {
