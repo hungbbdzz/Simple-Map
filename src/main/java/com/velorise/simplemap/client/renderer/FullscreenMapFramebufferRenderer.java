@@ -87,6 +87,7 @@ public final class FullscreenMapFramebufferRenderer {
     private long renderedAnchorPixelZ;
     private float renderedScale;
     private long renderedSessionId;
+    private long renderedStyleGeneration;
     private String renderedDimension;
     private int renderedCaveProjection;
     private int renderedCaveLayerY = Integer.MIN_VALUE;
@@ -251,7 +252,8 @@ public final class FullscreenMapFramebufferRenderer {
                 reuseFrames++;
                 coalescedFrames++;
             } else if (redrawRequested) {
-                boolean retainPrevious = canRetainPreviousFrame(sessionId,
+                boolean retainPrevious = renderedStyleGeneration == styleGeneration
+                        && canRetainPreviousFrame(sessionId,
                         dimension, caveProjection, caveLayerY, physicalRenderScale,
                         anchorX, anchorZ, targetWidth, targetHeight);
                 if (!redrawTarget(guiGraphics, minecraft, targetWidth, targetHeight,
@@ -275,6 +277,7 @@ public final class FullscreenMapFramebufferRenderer {
                     renderedAnchorPixelZ = anchorPixelZ;
                     renderedScale = physicalRenderScale;
                     renderedSessionId = sessionId;
+                    renderedStyleGeneration = styleGeneration;
                     renderedDimension = dimension;
                     renderedCaveProjection = caveProjection;
                     renderedCaveLayerY = caveLayerY;

@@ -217,9 +217,7 @@ public final class SurfaceRegionSource {
         for (int chunkZ = startChunkZ; chunkZ < startChunkZ + 4; chunkZ++) {
             for (int chunkX = startChunkX; chunkX < startChunkX + 4; chunkX++) {
                 int index = chunkZ * CHUNKS_PER_AXIS + chunkX;
-                if (chunks[index] == null
-                        || (dirtyChunkMask[index >>> 6]
-                        & (1L << (index & 63))) != 0L) return false;
+                if (chunks[index] == null) return false;
             }
         }
         return true;
@@ -246,8 +244,7 @@ public final class SurfaceRegionSource {
                 int chunkZ = startChunkZ + z;
                 int index = chunkZ * CHUNKS_PER_AXIS + chunkX;
                 long bit = 1L << (index & 63);
-                if (chunks[index] != null
-                        && (dirtyChunkMask[index >>> 6] & bit) == 0L) {
+                if (chunks[index] != null) {
                     mask |= 1 << (z * 4 + x);
                 }
             }

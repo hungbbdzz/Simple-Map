@@ -381,7 +381,33 @@ public final class RegionSurfaceLodService {
     }
 
     public void invalidate(RevisionStamp stamp) {
-        if (stamp != null) graph.invalidate(stamp, PROJECTION_SURFACE);
+        if (stamp == null) return;
+        lifecycleEpoch++;
+        List<CompletableFuture<PreparedBranch>> cancel = new ArrayList<>();
+        synchronized (pending) {
+            for (PendingTask task : pending.values()) {
+                cancel.add(task.future);
+                if (task.source != null) task.source.close();
+                graph.defer(task.lease);
+            }
+            pending.clear();
+        }
+        for (CompletableFuture<PreparedBranch> future : cancel) {
+            future.cancel(false);
+        }
+        completions.clear();
+        synchronized (records) {
+            for (NodeRecord record : records.values()) {
+                record.exactLeaves = null;
+                record.lastDirectAttemptNanos = 0L;
+                record.lastSourceWatermark = 0L;
+                record.unchangedSourceAttempts = 0;
+                record.directProbeMisses = 0;
+            }
+        }
+        directScanCursor = 0;
+        visibleLoadCursor = 0;
+        graph.invalidate(stamp, PROJECTION_SURFACE);
     }
 
     public void clear() {
@@ -475,9 +501,11 @@ public final class RegionSurfaceLodService {
         boolean visibleForeground = view.lane == MapRequestLane.MINIMAP
                 || view.lane == MapRequestLane.FULLSCREEN;
         int budget = visibleForeground
-                ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
-                        ? DIRECT_SCHEDULE_FAR_FOCUSED
-                        : DIRECT_SCHEDULE_FOCUSED)
+                ? (MapOverviewTextureManager.getInstance().isStyleRefreshActive()
+                        ? 6
+                        : (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
+                                ? DIRECT_SCHEDULE_FAR_FOCUSED
+                                : DIRECT_SCHEDULE_FOCUSED))
                 : DIRECT_SCHEDULE_BACKGROUND;
         int total = visibleRegionPlan.length;
         if (total == 0) return;
@@ -1818,11 +1846,26 @@ public static final class RegionLodGraph {
                     || node.cancelled || !isNewer(stamp, node.stamp)) continue;
             node.stamp = stamp;
             long affected = node.knownMask != 0L
-                    ? node.knownMask : node.dirtyChildMask;
+                    ? node.knownMask
+                    : (node.dirtyChildMask != 0L
+                            ? node.dirtyChildMask
+                            : completeMaskForLevel(node.key.level()));
             if (affected == 0L) continue;
+            if (node.key.level() == 0) {
+                node.directSeedMask = completeMaskForLevel(0);
+                for (int i = 0; i < CHILD_COUNT; i++) {
+                    if (node.childVersionSums[i] > 0L) {
+                        node.childVersionSums[i]++;
+                    }
+                }
+                recomputeAggregate(node);
+            }
             node.dirtyChildMask |= affected;
-            node.targetRevision = revisionFor(node);
+            node.targetRevision = Math.max(node.targetRevision + 1L, revisionFor(node));
             markDirty(node);
+            if (node.key.level() == 0) {
+                propagate(node);
+            }
             invalidated++;
         }
         return invalidated;

@@ -84,6 +84,7 @@ public final class MinimapFramebufferRenderer {
     private long renderedAnchorPixelZ;
     private float renderedTargetScale;
     private long renderedSessionId;
+    private long renderedStyleGeneration;
     private String renderedDimension;
     private int renderedCaveProjection;
     private int renderedCaveLayerY = Integer.MIN_VALUE;
@@ -115,6 +116,10 @@ public final class MinimapFramebufferRenderer {
 
     public static MinimapFramebufferRenderer getInstance() {
         return INSTANCE;
+    }
+
+    public void invalidate() {
+        framePolicy.invalidate();
     }
 
     public static float demandCoverageFactor(boolean rotateWithPlayer) {
@@ -245,7 +250,8 @@ public final class MinimapFramebufferRenderer {
                 reuseFrames++;
                 coalescedFrames++;
             } else if (redrawRequested) {
-                boolean retainPrevious = canRetainPreviousFrame(sessionId,
+                boolean retainPrevious = renderedStyleGeneration == styleGeneration
+                        && canRetainPreviousFrame(sessionId,
                         dimension, caveProjection, caveLayerY, targetScale,
                         snappedX, snappedZ);
                 RedrawResult redraw = redrawTarget(guiGraphics, minecraft,
@@ -289,6 +295,7 @@ public final class MinimapFramebufferRenderer {
                     renderedAnchorPixelZ = snappedPixelZ;
                     renderedTargetScale = targetScale;
                     renderedSessionId = sessionId;
+                    renderedStyleGeneration = styleGeneration;
                     renderedDimension = dimension;
                     renderedCaveProjection = caveProjection;
                     renderedCaveLayerY = caveLayerY;

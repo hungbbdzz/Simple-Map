@@ -47,7 +47,7 @@ public final class MapOverviewTextureManager {
     private static final int MAX_TEXTURES =
             MapMemoryBudgetPolicy.overviewTextureLimit();
     /** Short visible-first recolour sweep after a style generation change. */
-    private static final long STYLE_REFRESH_WINDOW_MS = 2_500L;
+    private static final long STYLE_REFRESH_WINDOW_MS = 6_000L;
 
     private final Map<Key, TextureInfo> textures = new LinkedHashMap<>(32, 0.75f, true);
     private final Set<Key> dirty = new LinkedHashSet<>();
@@ -852,8 +852,12 @@ public final class MapOverviewTextureManager {
         if (close != null) for (TextureInfo info : close) info.close();
     }
 
+    public boolean isStyleRefreshActive() {
+        return System.currentTimeMillis() < styleRefreshUntilMs;
+    }
+
     public void invalidateStyle() {
-        SurfaceLodTree.invalidatePersistentCache();
+        surfaceLodTree.invalidateStyle();
         RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
         regionLodService.invalidate(stamp);
         styleRefreshUntilMs = System.currentTimeMillis() + STYLE_REFRESH_WINDOW_MS;

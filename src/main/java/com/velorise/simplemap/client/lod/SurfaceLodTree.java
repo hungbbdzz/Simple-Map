@@ -594,6 +594,35 @@ public final class SurfaceLodTree {
         return published;
     }
 
+    public void invalidateStyle() {
+        invalidatePersistentCache();
+        for (Node node : nodes.values()) {
+            node.initialized = false;
+            node.uploadedKnownMask = 0L;
+            node.uploadedCompleteMask = 0L;
+            node.knownMask = 0L;
+            node.completeMask = 0L;
+            java.util.Arrays.fill(node.knownRows, 0L);
+            java.util.Arrays.fill(node.completeRows, 0L);
+            java.util.Arrays.fill(node.pixels, 0);
+            node.clearDirty();
+        }
+        for (int level = 1; level <= MAX_LEVEL; level++) dirtyQueues[level].clear();
+        dirtySet.clear();
+        loadGeneration++;
+        loadingFromDisk.clear();
+        loadedFromDisk.clear();
+        synchronized (leafLock) {
+            leafStates.clear();
+            pendingLeafQueue.clear();
+            pendingLeafSet.clear();
+            inFlightLeafDerivations.clear();
+        }
+        preparedLeaves.clear();
+        gpuAdmissionFailures = 0;
+        gpuAdmissionRetryAfterNanos = 0L;
+    }
+
     public void clear() {
         for (Node node : nodes.values()) node.close();
         nodes.clear();

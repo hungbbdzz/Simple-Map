@@ -663,7 +663,7 @@ public class MapRenderer {
                 float baseBrightness = caveMode ? caveBrightness : mapBrightness;
                 RenderSystem.setShaderColor(baseBrightness, baseBrightness,
                         baseBrightness, 1.0F);
-                if (fallbackPlan != null) {
+                if (fallbackPlan != null && (!caveMode || cachedPlan.plan().quadCount() == 0)) {
                     fallbackPlan.plan().drawBasePrepared(planMatrix);
                 }
                 cachedPlan.plan().drawBasePrepared(planMatrix);
@@ -1374,23 +1374,17 @@ public class MapRenderer {
         if (level <= 0) {
             if (branchOnly) return;
             /*
-             * The renderer does not turn an already-known parent into black while exact
-             * cave leaves are rebuilding. PASS98 intentionally left L0 unresolved
-             * pages black to avoid a brief coarse->sharp transition; that traded a
-             * cosmetic refinement for persistent holes and made the retained FBO
-             * learn those holes as its next underlay. Keep the already-published L1
-             * branch below exact L0 instead. Exact pages still win at PHASE_EXACT;
-             * the branch is only last-good coverage for cold/unknown children.
+             * Cave exact pages store solid rock as transparent (alpha = 0). Emitting
+             * a coarse L1/L2/L3 branch quad underneath an already-resident L0 page
+             * makes 8x8/2x2 opaque branch squares bleed through the empty rock around
+             * every tunnel. Only emit a cropped branch underlay for 64x64 page cells
+             * where the exact L0 page is not resident yet.
              */
-            collectCaveLevelZeroUnderlay(builder, source,
-                    minPageX, maxPageX, minPageZ, maxPageZ,
-                    scale, focusPageX, focusPageZ, drawnRegions);
             if (!centerOutTraversal) {
                 for (int pageZ = minPageZ; pageZ <= maxPageZ; pageZ++) {
                     for (int pageX = minPageX; pageX <= maxPageX; pageX++) {
-                        collectCaveLeaf(builder, source, pageX, pageZ, scale,
-                                drawnRegions, MapRenderPlan.PHASE_EXACT,
-                                logicalExactCoverage);
+                        collectCaveLeafOrUnderlay(builder, source, pageX, pageZ, scale,
+                                drawnRegions, logicalExactCoverage);
                     }
                 }
                 return;
@@ -1407,31 +1401,27 @@ public class MapRenderer {
                 if (top >= minPageZ && top <= maxPageZ) {
                     for (int pageX = Math.max(minPageX, left);
                             pageX <= Math.min(maxPageX, right); pageX++) {
-                        collectCaveLeaf(builder, source, pageX, top, scale,
-                                drawnRegions, MapRenderPlan.PHASE_EXACT,
-                                logicalExactCoverage);
+                        collectCaveLeafOrUnderlay(builder, source, pageX, top, scale,
+                                drawnRegions, logicalExactCoverage);
                     }
                 }
                 if (radius == 0) continue;
                 for (int pageZ = Math.max(minPageZ, top + 1);
                         pageZ <= Math.min(maxPageZ, bottom - 1); pageZ++) {
                     if (left >= minPageX && left <= maxPageX) {
-                        collectCaveLeaf(builder, source, left, pageZ, scale,
-                                drawnRegions, MapRenderPlan.PHASE_EXACT,
-                                logicalExactCoverage);
+                        collectCaveLeafOrUnderlay(builder, source, left, pageZ, scale,
+                                drawnRegions, logicalExactCoverage);
                     }
                     if (right != left && right >= minPageX && right <= maxPageX) {
-                        collectCaveLeaf(builder, source, right, pageZ, scale,
-                                drawnRegions, MapRenderPlan.PHASE_EXACT,
-                                logicalExactCoverage);
+                        collectCaveLeafOrUnderlay(builder, source, right, pageZ, scale,
+                                drawnRegions, logicalExactCoverage);
                     }
                 }
                 if (bottom >= minPageZ && bottom <= maxPageZ) {
                     for (int pageX = Math.max(minPageX, left);
                             pageX <= Math.min(maxPageX, right); pageX++) {
-                        collectCaveLeaf(builder, source, pageX, bottom, scale,
-                                drawnRegions, MapRenderPlan.PHASE_EXACT,
-                                logicalExactCoverage);
+                        collectCaveLeafOrUnderlay(builder, source, pageX, bottom, scale,
+                                drawnRegions, logicalExactCoverage);
                     }
                 }
             }
@@ -1608,61 +1598,59 @@ public class MapRenderer {
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
 
         CaveAtlasRegion branch = source.branch(level, nodeX, nodeZ);
-        CaveAtlasRegion ancestor = null;
-        if (branch == null) {
-            ancestor = findCaveAncestor(source, level, nodeX, nodeZ);
-            if (ancestor != null && traversalBudget.emitQuad()) {
-                addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
-                markDrawnPageRange(drawnRegions,
-                        Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
-                        Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
-            }
-        }
+        CaveAtlasRegion ancestor = branch == null
+                ? findCaveAncestor(source, level, nodeX, nodeZ) : null;
         if (branchOnly) {
             /*
-             * Branch-only controls preferred density, not visibility. At L1 a
-             * resident exact page is a temporary underlay while its coherent 2x2
-             * branch is deriving/loading. This also applies to a partial branch:
-             * transparent/unknown child quadrants must not erase exact data that is
-             * already GPU-ready. Phase 27 sorts exact below the L1 branch (phase 28).
+             * Branch-only controls preferred density, not visibility. Never draw
+             * both an exact leaf and a coarse branch over the same 64x64 cell, as
+             * transparent solid-rock texels would expose the coarse branch halo.
              */
             if (level == 1) {
+                if (branch != null && (branch.completeMask() & 0xFL) == 0xFL) {
+                    if (traversalBudget.emitQuad()) {
+                        addNodeQuad(builder, branch, nodeX, nodeZ, level);
+                        markDrawnPageRange(drawnRegions,
+                                Math.max(firstPageX, minPageX),
+                                Math.min(lastPageX, maxPageX),
+                                Math.max(firstPageZ, minPageZ),
+                                Math.min(lastPageZ, maxPageZ));
+                    }
+                    return;
+                }
                 for (int childX = 0; childX < 2
                         && !traversalBudget.exhausted(); childX++) {
                     for (int childZ = 0; childZ < 2
                             && !traversalBudget.exhausted(); childZ++) {
                         int childIndex = childZ * 2 + childX;
-                        if (branch != null && branch.childComplete(childIndex)) {
-                            continue;
-                        }
                         int pageX = firstPageX + childX;
                         int pageZ = firstPageZ + childZ;
                         if (pageX < minPageX || pageX > maxPageX
                                 || pageZ < minPageZ || pageZ > maxPageZ) continue;
+                        if (branch != null && branch.childComplete(childIndex)) {
+                            if (traversalBudget.emitQuad()) {
+                                addAncestorQuad(builder, branch, 0, pageX, pageZ);
+                                markPageDrawn(drawnRegions, pageX, pageZ);
+                            }
+                            continue;
+                        }
                         if (!traversalBudget.emitQuad()) return;
-                        if (!collectCaveLeaf(builder, source, pageX, pageZ, scale,
+                        if (collectCaveLeaf(builder, source, pageX, pageZ, scale,
                                 drawnRegions,
                                 MapRenderPlan.PHASE_L1_EXACT_UNDERLAY)) {
-                            traversalBudget.refundQuad();
+                            continue;
+                        }
+                        traversalBudget.refundQuad();
+                        CaveAtlasRegion fallback = (branch != null && branch.childKnown(childIndex))
+                                ? branch : ancestor;
+                        if (fallback != null && traversalBudget.emitQuad()) {
+                            addAncestorQuad(builder, fallback, 0, pageX, pageZ);
+                            markPageDrawn(drawnRegions, pageX, pageZ);
                         }
                     }
                 }
-                if (branch != null && traversalBudget.emitQuad()) {
-                    addNodeQuad(builder, branch, nodeX, nodeZ, level);
-                    markDrawnPageRange(drawnRegions,
-                            Math.max(firstPageX, minPageX),
-                            Math.min(lastPageX, maxPageX),
-                            Math.max(firstPageZ, minPageZ),
-                            Math.min(lastPageZ, maxPageZ));
-                }
-                // An ancestor was already added above at the correct phase. Exact
-                // underlay fills only its transparent gaps; no recursive probe is
-                // needed after either coherent representation exists.
                 return;
             }
-            // A coarser ancestor already covers this higher-level node. Descending
-            // after drawing it causes overlap and exponential traversal.
-            if (ancestor != null) return;
             if (branch != null) {
                 if (traversalBudget.emitQuad()) {
                     addNodeQuad(builder, branch, nodeX, nodeZ, level);
@@ -1674,8 +1662,17 @@ public class MapRenderer {
                 }
                 return;
             }
-            // At higher levels descend only when an exact/child branch subtree is
-            // resident. Disk metadata alone is not a reason to hide useful leaves.
+            if (ancestor != null) {
+                if (traversalBudget.emitQuad()) {
+                    addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
+                    markDrawnPageRange(drawnRegions,
+                            Math.max(firstPageX, minPageX),
+                            Math.min(lastPageX, maxPageX),
+                            Math.max(firstPageZ, minPageZ),
+                            Math.min(lastPageZ, maxPageZ));
+                }
+                return;
+            }
             if (!source.hasResidentPageInNode(level, nodeX, nodeZ)) return;
             for (int childX = 0; childX < 2 && !traversalBudget.exhausted(); childX++) {
                 for (int childZ = 0; childZ < 2
@@ -1690,9 +1687,6 @@ public class MapRenderer {
         }
         if (branch == null && ancestor == null
                 && !source.hasResidentPageInNode(level, nodeX, nodeZ)) return;
-        if (branch != null && traversalBudget.emitQuad()) {
-            addNodeQuad(builder, branch, nodeX, nodeZ, level);
-        }
         if (level == 1) {
             for (int childX = 0; childX < 2; childX++) {
                 for (int childZ = 0; childZ < 2; childZ++) {
@@ -1702,32 +1696,70 @@ public class MapRenderer {
                     if (pageX < minPageX || pageX > maxPageX
                             || pageZ < minPageZ || pageZ > maxPageZ) continue;
                     if (branch != null && branch.childComplete(childIndex) && scale < 0.35f) {
-                        markPageDrawn(drawnRegions, pageX, pageZ);
+                        if (traversalBudget.emitQuad()) {
+                            addAncestorQuad(builder, branch, 0, pageX, pageZ);
+                            markPageDrawn(drawnRegions, pageX, pageZ);
+                        }
                         continue;
                     }
                     if (collectCaveLeaf(builder, source, pageX, pageZ, scale,
                             drawnRegions)) continue;
-                    if (branch != null && branch.childComplete(childIndex)) {
+                    CaveAtlasRegion fallback = (branch != null && branch.childKnown(childIndex))
+                            ? branch
+                            : (ancestor != null ? ancestor : findCaveAncestor(source, 0, pageX, pageZ));
+                    if (fallback != null && traversalBudget.emitQuad()) {
+                        addAncestorQuad(builder, fallback, 0, pageX, pageZ);
                         markPageDrawn(drawnRegions, pageX, pageZ);
                     }
                 }
             }
             return;
         }
+        int childSpan = MapLodPolicy.pageSpanForBranch(level - 1);
         for (int childX = 0; childX < 2; childX++) {
             for (int childZ = 0; childZ < 2; childZ++) {
                 int childIndex = childZ * 2 + childX;
                 int childNodeX = nodeX * 2 + childX;
                 int childNodeZ = nodeZ * 2 + childZ;
+                int childFirstPageX = childNodeX * childSpan;
+                int childFirstPageZ = childNodeZ * childSpan;
+                int childLastPageX = childFirstPageX + childSpan - 1;
+                int childLastPageZ = childFirstPageZ + childSpan - 1;
+                if (childLastPageX < minPageX || childFirstPageX > maxPageX
+                        || childLastPageZ < minPageZ || childFirstPageZ > maxPageZ) continue;
                 if (branch != null && branch.childComplete(childIndex)
                         && !source.hasResidentPageInNode(level - 1,
                                 childNodeX, childNodeZ)
-                        && scale < (level <= 2 ? 0.25f : 0.125f)) continue;
+                        && scale < (level <= 2 ? 0.25f : 0.125f)) {
+                    if (traversalBudget.emitQuad()) {
+                        addAncestorQuad(builder, branch, level - 1, childNodeX, childNodeZ);
+                        markDrawnPageRange(drawnRegions,
+                                Math.max(childFirstPageX, minPageX),
+                                Math.min(childLastPageX, maxPageX),
+                                Math.max(childFirstPageZ, minPageZ),
+                                Math.min(childLastPageZ, maxPageZ));
+                    }
+                    continue;
+                }
                 collectCaveNode(builder, source, level - 1,
                         childNodeX, childNodeZ, scale, false,
                         minPageX, maxPageX, minPageZ, maxPageZ, drawnRegions,
                         traversalBudget);
             }
+        }
+    }
+
+    private void collectCaveLeafOrUnderlay(MapRenderPlan.Builder builder,
+            CaveHierarchySource source, int globalPageX, int globalPageZ,
+            float scale, LongKeySet drawnRegions, boolean logicalExactCoverage) {
+        if (collectCaveLeaf(builder, source, globalPageX, globalPageZ, scale,
+                drawnRegions, MapRenderPlan.PHASE_EXACT, logicalExactCoverage)) {
+            return;
+        }
+        CaveAtlasRegion underlay = findCaveAncestor(source, 0, globalPageX, globalPageZ);
+        if (underlay != null) {
+            addAncestorQuad(builder, underlay, 0, globalPageX, globalPageZ);
+            markPageDrawn(drawnRegions, globalPageX, globalPageZ);
         }
     }
 
@@ -2616,25 +2648,12 @@ public class MapRenderer {
             return;
         }
 
-        if (ancestorFallback != null) {
-            drawCaveAncestorSubRect(guiGraphics, ancestorFallback,
-                    level, nodeX, nodeZ);
-            stats.branchNodes++;
-            markDrawnPageRange(drawnRegions,
-                    Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
-                    Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
-        }
-
         // A missing branch is not allowed to hide resident exact pages at close and
         // medium zoom. Query the exact-page authority once and stop only when neither
         // branch nor resident child data exists.
         if (branch == null && ancestorFallback == null
                 && !source.hasResidentPageInNode(level, nodeX, nodeZ)) {
             return;
-        }
-        if (branch != null) {
-            drawAtlasNode(guiGraphics, branch, nodeX, nodeZ);
-            stats.branchNodes++;
         }
 
         if (level == 1) {
@@ -2648,9 +2667,12 @@ public class MapRenderer {
                     boolean exactDrawn = drawCaveLeafPage(guiGraphics, source,
                             pageX, pageZ, scale, drawnRegions, stats);
                     if (exactDrawn) continue;
-                    if (branch != null && branch.childComplete(childIndex)) {
+                    CaveAtlasRegion fallback = (branch != null && branch.childKnown(childIndex))
+                            ? branch : ancestorFallback;
+                    if (fallback != null) {
+                        drawCaveAncestorSubRect(guiGraphics, fallback, 0, pageX, pageZ);
+                        stats.branchNodes++;
                         markPageDrawn(drawnRegions, pageX, pageZ);
-                        continue;
                     }
                 }
             }

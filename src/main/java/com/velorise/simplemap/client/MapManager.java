@@ -888,6 +888,18 @@ public class MapManager {
      * displayed image. Existing CPU/GPU pages remain the visual fallback while
      * replacement revisions are built and uploaded region by region.
      */
+    public List<Long> loadedRegionCoordinates() {
+        List<Long> coords = new ArrayList<>();
+        synchronized (loadedRegions) {
+            for (Region region : loadedRegions.values()) {
+                if (region != null && region.isLoaded() && region.hasAnyData()) {
+                    coords.add(key(region.rx, region.rz));
+                }
+            }
+        }
+        return coords;
+    }
+
     public void reloadAllRegions() {
         MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().clearDerivedColorCaches();
@@ -897,9 +909,13 @@ public class MapManager {
 
         // Do not increment worldGeneration and do not clear any texture/data store.
         // Generation changes are reserved for a real world/dimension replacement.
+        SurfaceRegionSourceDatabase.getInstance().invalidateStyle();
         MapTextureManager.getInstance().invalidateStyle();
         MapOverviewTextureManager.getInstance().invalidateStyle();
         CaveTextureManager.getInstance().invalidateStyle();
+        com.velorise.simplemap.client.renderer.FullscreenMapFramebufferRenderer.getInstance().invalidate();
+        com.velorise.simplemap.client.renderer.MinimapFramebufferRenderer.getInstance().invalidate();
+        MapRenderer.getInstance().clearFullscreenFallback();
 
         // Do not enqueue every .smdat file in filesystem order. That old path
         // saturated the worker queue and made Reload All reveal random distant
