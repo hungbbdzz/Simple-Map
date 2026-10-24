@@ -765,12 +765,9 @@ public class MapScreen extends Screen {
         }
 
         String biomeText = null;
-        // ClientLevel biome access is only authoritative while the chunk is live.
-        // Cached surface data currently stores a compact biome palette internally,
-        // but the cursor does not force-load world chunks merely to display it.
-        if (MapConfig.cursorBiomeEnabled && hasY && chunkLoaded
+        if (MapConfig.cursorBiomeEnabled && hasY
                 && this.minecraft != null && this.minecraft.level != null) {
-            biomeText = resolveCursorBiomeText(bx, yCoord, bz);
+            biomeText = resolveCursorBiomeText(bx, yCoord, bz, chunkLoaded);
         }
 
         int coordWidth = this.font.width(coordText);
@@ -913,16 +910,72 @@ public class MapScreen extends Screen {
     }
 
     private String resolveCursorBiomeText(int x, int y, int z) {
+        boolean chunkLoaded = MapManager.getInstance().isViewingLiveDimension()
+                && this.minecraft != null && this.minecraft.level != null
+                && this.minecraft.level.hasChunk(x >> 4, z >> 4);
+        return resolveCursorBiomeText(x, y, z, chunkLoaded);
+    }
+
+    private String resolveCursorBiomeText(int x, int y, int z, boolean chunkLoaded) {
         if (x == cachedBiomeX && y == cachedBiomeY && z == cachedBiomeZ
                 && cachedBiomeText != null) return cachedBiomeText;
-        net.minecraft.core.BlockPos biomePos = new net.minecraft.core.BlockPos(x, y, z);
-        cachedBiomeText = this.minecraft.level.getBiome(biomePos).unwrapKey()
-                .map(key -> prettifyId(key.location().getPath()))
-                .orElse("Unknown Biome");
+        String resolvedId = null;
+        if (chunkLoaded && this.minecraft != null && this.minecraft.level != null) {
+            try {
+                int chunkX = x >> 4;
+                int chunkZ = z >> 4;
+                int localX = x & 15;
+                int localZ = z & 15;
+                int sampleX = x;
+                int sampleZ = z;
+                if (localX < 2 && !this.minecraft.level.hasChunk(chunkX - 1, chunkZ)) {
+                    sampleX = (chunkX << 4) + 2;
+                } else if (localX > 13 && !this.minecraft.level.hasChunk(chunkX + 1, chunkZ)) {
+                    sampleX = (chunkX << 4) + 13;
+                }
+                if (localZ < 2 && !this.minecraft.level.hasChunk(chunkX, chunkZ - 1)) {
+                    sampleZ = (chunkZ << 4) + 2;
+                } else if (localZ > 13 && !this.minecraft.level.hasChunk(chunkX, chunkZ + 1)) {
+                    sampleZ = (chunkZ << 4) + 13;
+                }
+                net.minecraft.core.BlockPos biomePos = new net.minecraft.core.BlockPos(sampleX, y, sampleZ);
+                resolvedId = this.minecraft.level.getBiome(biomePos).unwrapKey()
+                        .map(key -> key.location().toString())
+                        .orElse(null);
+            } catch (Throwable ignored) {
+            }
+        }
+        if (resolvedId == null || resolvedId.isBlank()) {
+            resolvedId = MapManager.getInstance().getBiomeId(x, z);
+        }
+        if (resolvedId == null || resolvedId.isBlank()) {
+            return null;
+        }
+        cachedBiomeText = formatBiomeDisplayName(resolvedId);
         cachedBiomeX = x;
         cachedBiomeY = y;
         cachedBiomeZ = z;
         return cachedBiomeText;
+    }
+
+    private static String formatBiomeDisplayName(String biomeId) {
+        if (biomeId == null || biomeId.isBlank()) return null;
+        int colon = biomeId.indexOf(':');
+        String namespace = colon >= 0 ? biomeId.substring(0, colon) : "minecraft";
+        String path = colon >= 0 ? biomeId.substring(colon + 1) : biomeId;
+        String translationKey = "biome." + namespace + "." + path;
+        try {
+            net.minecraft.locale.Language language = net.minecraft.locale.Language.getInstance();
+            if (language != null && language.has(translationKey)) {
+                String translated = Component.translatable(translationKey).getString();
+                if (translated != null && !translated.isBlank()
+                        && !translated.equals(translationKey)) {
+                    return translated;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return prettifyId(path);
     }
 
     private static void appendGroupedInteger(StringBuilder builder, int value) {
@@ -1018,16 +1071,46 @@ public class MapScreen extends Screen {
         if (CaveMode.isActive(this.minecraft)) {
             boolean fullView = CaveMode.isFullView(this.minecraft);
             int layerY = fullView ? Integer.MIN_VALUE : CaveMode.getLayerY(this.minecraft);
+            int maxBuildY = level.getMaxBuildHeight() - 1;
+            int ceilingCap = level.dimensionType().hasCeiling() ? 122 : maxBuildY;
+            int scanMaximum = fullView
+                    ? ceilingCap
+                    : Math.min(ceilingCap, CaveMode.getScanMaximum(level, layerY));
+            int scanMinimum = fullView
+                    ? minBuildHeight
+                    : CaveMode.getScanMinimum(level, layerY);
+
             int surfaceY = CaveMapManager.getInstance().getSurfaceY(layerY, bx, bz);
             if (surfaceY != CaveMapManager.NO_SURFACE) {
-                // Check surfaceY + 1 first in case a thin floor block (carpet/rail) adjusted height by -1
-                if (surfaceY + 1 < level.getMaxBuildHeight()) {
+                // 1. If the cave floor is under water (surfaceY = floorY), walk up to find waterSurfaceY
+                // so the cursor displays Y: floorY (waterSurfaceY) consistently.
+                if (surfaceY + 1 <= scanMaximum) {
                     pos.setY(surfaceY + 1);
                     net.minecraft.world.level.block.state.BlockState aboveState = level.getBlockState(pos);
+                    if (aboveState.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
+                        int waterTopY = surfaceY + 1;
+                        for (int wy = surfaceY + 2; wy <= scanMaximum; wy++) {
+                            pos.setY(wy);
+                            if (!level.getBlockState(pos).getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
+                                break;
+                            }
+                            waterTopY = wy;
+                        }
+                        pos.setY(surfaceY);
+                        net.minecraft.world.level.block.state.BlockState floorState = level.getBlockState(pos);
+                        String floorId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                                .getKey(floorState.getBlock()).toString();
+                        return new BlockInfo(floorState.getBlock().getName().getString(),
+                                floorId, surfaceY, waterTopY);
+                    }
+                    // 2. Check surfaceY + 1 in case a thin floor block (carpet/rail) adjusted height by -1
                     if (!aboveState.isAir()
                             && !CaveMode.isCaveOpenOrInvisible(aboveState, MapConfig.displayFlowers)
                             && CaveMode.isShortFloorBlock(level, pos, aboveState)) {
-                        return createBlockInfo(level, pos, surfaceY + 1);
+                        String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                                .getKey(aboveState.getBlock()).toString();
+                        return new BlockInfo(aboveState.getBlock().getName().getString(),
+                                blockId, surfaceY);
                     }
                 }
                 pos.setY(surfaceY);
@@ -1037,23 +1120,56 @@ public class MapScreen extends Screen {
                 }
                 return new BlockInfo("", "", surfaceY, Integer.MIN_VALUE, true);
             }
-            if (fullView) {
-                return new BlockInfo("", "", minBuildHeight);
+
+            // If this chunk is already live in CaveRegion at the current layer and getSurfaceY
+            // is NO_SURFACE, this pixel is genuinely empty cave void — do not return a fake Y: -64.
+            if (CaveMapManager.getInstance().isChunkLiveAtLayer(layerY, bx >> 4, bz >> 4)) {
+                return null;
             }
-            int scanMinimum = CaveMode.getScanMinimum(level, layerY);
-            int scanMaximum = CaveMode.getScanMaximum(level, layerY);
-            boolean underair = false;
+
+            boolean isCaveDim = scanFromWorldTop;
+            boolean shouldEnterGround = fullView && !isCaveDim;
+            boolean underair = fullView;
+            boolean passedSolidRoof = fullView || isCaveDim;
+            boolean showFlowers = MapConfig.displayFlowers;
+
             for (int y = scanMaximum; y >= scanMinimum; y--) {
                 pos.setY(y);
                 net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
-                if (!underair) {
-                    if (CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
-                        underair = true;
+                if (state.isAir()) {
+                    if (!shouldEnterGround) underair = true;
+                    continue;
+                }
+                if (shouldEnterGround) {
+                    if (CaveMode.isUndergroundSolidRoof(state)) {
+                        shouldEnterGround = false;
+                        underair = false;
+                        passedSolidRoof = true;
                     }
                     continue;
                 }
-                if (CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
+                if (!underair) {
+                    if (CaveMode.isCaveOpenOrInvisible(state, showFlowers)) {
+                        underair = true;
+                        continue;
+                    }
+                    if (!fullView && !passedSolidRoof && state.getFluidState().isEmpty()
+                            && !CaveMode.isUndergroundSolidRoof(state)) {
+                        underair = true;
+                    } else {
+                        passedSolidRoof = true;
+                        continue;
+                    }
+                }
+                if (CaveMode.isCaveOpenOrInvisible(state, showFlowers)
+                        || (fullView && state.is(net.minecraft.tags.BlockTags.LEAVES))) {
                     continue;
+                }
+                if (CaveMode.isShortFloorBlock(level, pos, state) && y > minBuildHeight) {
+                    String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                            .getKey(state.getBlock()).toString();
+                    return new BlockInfo(state.getBlock().getName().getString(),
+                            blockId, y - 1);
                 }
                 return createBlockInfo(level, pos, y);
             }

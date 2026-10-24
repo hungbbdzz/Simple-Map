@@ -634,6 +634,31 @@ public final class CaveTextureManager {
         return false;
     }
 
+    public boolean hasResidentCoverageForRegion(int layerY, int rx, int rz) {
+        if (hasAnyPageTexture(layerY, rx, rz)) return true;
+        int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
+        int firstPageX = rx << 3;
+        int lastPageX = firstPageX + 7;
+        int firstPageZ = rz << 3;
+        int lastPageZ = firstPageZ + 7;
+        synchronized (branchPages) {
+            for (int level = 1; level <= 3; level++) {
+                int span = MapViewportCoordinator.MapLodPolicy.pageSpanForBranch(level);
+                int minNodeX = Math.floorDiv(firstPageX, span);
+                int maxNodeX = Math.floorDiv(lastPageX, span);
+                int minNodeZ = Math.floorDiv(firstPageZ, span);
+                int maxNodeZ = Math.floorDiv(lastPageZ, span);
+                for (int nz = minNodeZ; nz <= maxNodeZ; nz++) {
+                    for (int nx = minNodeX; nx <= maxNodeX; nx++) {
+                        BranchEntry bEntry = branchPages.get(new BranchKey(band, level, nx, nz));
+                        if (bEntry != null && bEntry.slot >= 0 && bEntry.hasContent) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     public ResourceLocation getRegionTexture(int layerY, int rx, int rz) {
         requestVisibleRegion(layerY, rx, rz);
         return null;
@@ -1397,7 +1422,7 @@ public final class CaveTextureManager {
 
         public static final short NO_SURFACE = CaveRegion.NO_SURFACE;
         public static final int EPOCH = 10;
-        public static final int LOD_BRANCH_VERSION = 18;
+        public static final int LOD_BRANCH_VERSION = 19;
 
         public long getLayerGeneration() {
             return layerGeneration.get();
@@ -1611,19 +1636,27 @@ public final class CaveTextureManager {
         }
 
         public boolean isRegionPending(int layerY, int rx, int rz) {
+            if (CaveTextureManager.getInstance().hasResidentCoverageForRegion(layerY, rx, rz)) {
+                return false;
+            }
             int band = (layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY));
             String key = (band == Integer.MIN_VALUE ? "full" : String.valueOf(band)) + ":" + rx + ',' + rz;
             synchronized (regions) {
                 RegionHolder holder = regions.get(key);
                 if (holder != null) {
                     CaveRegion reg = holder.region;
-                    if (reg.isAnvilSlicing() || reg.hasPendingAnvilSlice() || !reg.isLoaded()) {
-                        return true;
-                    }
-                    return reg.hasContent();
+                    return reg.isAnvilSlicing() || reg.hasPendingAnvilSlice() || !reg.isLoaded();
                 }
             }
             return hasRegionFile(layerY, rx, rz);
+        }
+
+        public boolean isChunkLiveAtLayer(int layerY, int chunkX, int chunkZ) {
+            int rx = chunkX >> 5;
+            int rz = chunkZ >> 5;
+            CaveRegion reg = getRegion(layerY, rx, rz, false);
+            if (reg == null) return false;
+            return reg.isChunkLiveAtLayer(chunkX & 31, chunkZ & 31, layerY);
         }
 
         public boolean isRegionAnvilSlicedAtLayer(int layerY, int rx, int rz) {
@@ -2236,7 +2269,13 @@ public final class CaveTextureManager {
                             int blockLight = Math.max(
                                     lightSec != null ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0,
                                     sec.getBlockLight(lx, y & 15, lz));
-                            int skyLight = exposedToSky ? 15 : 0;
+                            int skyLight = exposedToSky
+                                    ? 15
+                                    : (hasSkyLight && !isFullCave
+                                            ? Math.max(
+                                                    lightSec != null ? lightSec.getSkyLight(lx, lightY & 15, lz) : 0,
+                                                    sec.getSkyLight(lx, y & 15, lz))
+                                            : 0);
                             int effectiveY = Math.max(worldMinY, y - 1);
                             int shadeOffset = computeCaveVerticalOffset(effectiveY);
                             regionHeights[regIdx] = (short) effectiveY;
@@ -2257,7 +2296,13 @@ public final class CaveTextureManager {
                             int blockLight = Math.max(
                                     lightSec != null ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0,
                                     sec.getBlockLight(lx, y & 15, lz));
-                            int skyLight = exposedToSky ? 15 : 0;
+                            int skyLight = exposedToSky
+                                    ? 15
+                                    : (hasSkyLight && !isFullCave
+                                            ? Math.max(
+                                                    lightSec != null ? lightSec.getSkyLight(lx, lightY & 15, lz) : 0,
+                                                    sec.getSkyLight(lx, y & 15, lz))
+                                            : 0);
                             int shadeOffset = computeCaveVerticalOffset(y);
 
                             regionHeights[regIdx] = (short) y;
@@ -2332,7 +2377,11 @@ public final class CaveTextureManager {
             int lightSecIdx = lightSecY - minSecY;
             DecodedSection lightSec = (sectionArray != null && lightSecIdx >= 0 && lightSecIdx < secSpan) ? sectionArray[lightSecIdx] : null;
             int blockLight = (lightSec != null) ? lightSec.getBlockLight(lx, lightY & 15, lz) : 0;
-            int skyLight = exposedToSky ? 15 : 0;
+            int skyLight = exposedToSky
+                    ? 15
+                    : ((level != null && level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling() && lightSec != null)
+                            ? lightSec.getSkyLight(lx, lightY & 15, lz)
+                            : 0);
             int shadeOffset = computeCaveVerticalOffset(floorY);
 
             regionHeights[regIdx] = (short) floorY;
@@ -2988,10 +3037,12 @@ public final class CaveTextureManager {
                 return abgr;
             }
             int effectiveLight = isLava ? 15 : Math.max(clampedBlock, clampedSky);
-            float normalized = effectiveLight / 15.0f;
-            float heightShade = Math.max(0.94f, Math.min(1.04f, 1.0f + verticalOffset * 0.015f));
-            float lightCurve = 0.58f + 0.42f * (float) Math.pow(normalized, 0.85f);
-            float brightness = Math.max(0.52f, Math.min(1.06f, lightCurve * heightShade));
+            // Standard getBlockBrightness(9.0F, blockLight, sun) = (9.0F + effectiveLight) / 24.0F
+            // combined with cave legibility floor and vertical depth shading.
+            float standardBlockBrightness = (9.0f + effectiveLight) / 24.0f;
+            float heightShade = Math.max(0.92f, Math.min(1.05f, 1.0f + verticalOffset * 0.016f));
+            float lightCurve = 0.22f + 0.78f * standardBlockBrightness;
+            float brightness = Math.max(0.48f, Math.min(1.06f, lightCurve * heightShade));
 
             int red = Math.round((abgr & 0xFF) * brightness);
             int green = Math.round(((abgr >>> 8) & 0xFF) * brightness);

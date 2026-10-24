@@ -1985,7 +1985,9 @@ public class ChunkScanner {
                 }
                 lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, waterSurfaceY + 1), blockZ);
                 int blockLight = Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), colorState.getLightEmission());
-                int skyLight = exposedToSky ? 15 : 0;
+                int skyLight = exposedToSky
+                        ? 15
+                        : (hasSkyLight && !fullView ? level.getBrightness(LightLayer.SKY, lightPos) : 0);
                 int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(floorY);
                 return packCavePixel(
                         CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, false),
@@ -2000,7 +2002,11 @@ public class ChunkScanner {
                 if (baseColor == 0) continue;
                 lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, y + 1), blockZ);
                 int blockLight = isLava ? 15 : Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), state.getLightEmission());
-                int skyLight = (!isLava && exposedToSky) ? 15 : 0;
+                int skyLight = isLava
+                        ? 0
+                        : (exposedToSky
+                                ? 15
+                                : (hasSkyLight && !fullView ? level.getBrightness(LightLayer.SKY, lightPos) : 0));
                 int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(y);
                 return packCavePixel(
                         CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isLava),
@@ -2034,7 +2040,14 @@ public class ChunkScanner {
                             Math.max(level.getBrightness(LightLayer.BLOCK, lightPos),
                                     level.getBrightness(LightLayer.BLOCK, colorPos)),
                             state.getLightEmission());
-            int skyLight = (!isLava && exposedToSky) ? 15 : 0;
+            int skyLight = isLava
+                    ? 0
+                    : (exposedToSky
+                            ? 15
+                            : (hasSkyLight && !fullView
+                                    ? Math.max(level.getBrightness(LightLayer.SKY, lightPos),
+                                            level.getBrightness(LightLayer.SKY, colorPos))
+                                    : 0));
             int effectiveY = (shortBlock && y > minimumY) ? (y - 1) : y;
             int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(effectiveY);
             return packCavePixel(
@@ -2264,8 +2277,11 @@ public class ChunkScanner {
 
     private net.minecraft.world.level.biome.Biome resolveCaveBiome(Level level, LevelChunk chunk, BlockPos pos) {
         try {
-            var holder = chunk != null
-                    ? chunk.getNoiseBiome(pos.getX() >> 2, pos.getY() >> 2, pos.getZ() >> 2)
+            LevelChunk effectiveChunk = chunk != null
+                    ? chunk
+                    : readySurfaceChunk(level, pos.getX() >> 4, pos.getZ() >> 4);
+            var holder = effectiveChunk != null
+                    ? effectiveChunk.getNoiseBiome(pos.getX() >> 2, pos.getY() >> 2, pos.getZ() >> 2)
                     : level.getNoiseBiome(pos.getX() >> 2, pos.getY() >> 2, pos.getZ() >> 2);
             if (holder != null && holder.isBound()) {
                 return holder.value();
@@ -2742,7 +2758,7 @@ public class ChunkScanner {
                 ? visual : visualClassifier.info(paletteState);
         String blockId = paletteVisual.blockId();
         pos.setY(surfaceY);
-        String biomeId = resolveSurfaceBiomeId(level, pos, scratch);
+        String biomeId = resolveSurfaceBiomeId(level, loadedChunk, pos, scratch);
 
         MapManager.Region region = preparedRegion;
         if (region == null) {
@@ -2880,31 +2896,119 @@ public class ChunkScanner {
      */
     private String resolveSurfaceBiomeId(Level level,
             BlockPos.MutableBlockPos position, ScanScratch scratch) {
+        return resolveSurfaceBiomeId(level,
+                readySurfaceChunk(level, position.getX() >> 4, position.getZ() >> 4),
+                position, scratch);
+    }
+
+    /**
+     * Resolves the column's biome ID without ever allowing Minecraft's Voronoi
+     * zoomer ({@code BiomeManager.getBiome}) to sample an unloaded neighbour chunk.
+     *
+     * <p>For {@code localX < 2}, {@code localX > 13}, {@code localZ < 2} or
+     * {@code localZ > 13}, {@code BiomeManager.getBiome} queries quart coordinates
+     * in the adjacent chunk. When that neighbour chunk has not arrived on the
+     * client yet, {@code ClientLevel.getUncachedNoiseBiome} returns hardcoded
+     * {@code Biomes.PLAINS}, which previously poisoned a 2-4 block wide border on
+     * every Warm Ocean and Savanna chunk. Standardize
+     * {@code WorldDataBiomeManager} fallback by clamping the sample coordinate into
+     * the loaded chunk interior whenever the required neighbour chunk is absent.</p>
+     */
+    private String resolveSurfaceBiomeId(Level level, LevelChunk loadedChunk,
+            BlockPos.MutableBlockPos position, ScanScratch scratch) {
         scratch.beginSurfaceLevel(level);
-        int quartX = position.getX() >> 2;
-        int quartY = position.getY() >> 2;
-        int quartZ = position.getZ() >> 2;
+        int blockX = position.getX();
+        int blockY = position.getY();
+        int blockZ = position.getZ();
+        int chunkX = blockX >> 4;
+        int chunkZ = blockZ >> 4;
+        int localX = blockX & 15;
+        int localZ = blockZ & 15;
+
+        LevelChunk ownChunk = loadedChunk != null
+                ? loadedChunk : readySurfaceChunk(level, chunkX, chunkZ);
+
+        int sampleX = blockX;
+        int sampleZ = blockZ;
+        int nx = localX < 2 ? -1 : (localX > 13 ? 1 : 0);
+        int nz = localZ < 2 ? -1 : (localZ > 13 ? 1 : 0);
+        boolean clampedBorder = false;
+
+        if (nx != 0 && readySurfaceChunk(level, chunkX + nx, chunkZ) == null) {
+            sampleX = (chunkX << 4) + (nx < 0 ? 2 : 13);
+            clampedBorder = true;
+        }
+        if (nz != 0 && readySurfaceChunk(level, chunkX, chunkZ + nz) == null) {
+            sampleZ = (chunkZ << 4) + (nz < 0 ? 2 : 13);
+            clampedBorder = true;
+        }
+        if (nx != 0 && nz != 0 && !clampedBorder
+                && readySurfaceChunk(level, chunkX + nx, chunkZ + nz) == null) {
+            sampleX = (chunkX << 4) + (nx < 0 ? 2 : 13);
+            sampleZ = (chunkZ << 4) + (nz < 0 ? 2 : 13);
+            clampedBorder = true;
+        }
+
+        boolean interiorQuart = (localX >= 2 && localX <= 13 && localZ >= 2 && localZ <= 13);
+        int quartX = sampleX >> 2;
+        int quartY = blockY >> 2;
+        int quartZ = sampleZ >> 2;
         long key = ((long) (quartX & 0x03FF_FFFF) << 38)
                 | ((long) (quartZ & 0x03FF_FFFF) << 12)
                 | (quartY & 0xFFFL);
-        String cached = scratch.surfaceBiome(key);
-        if (cached != null) return cached;
-        String biomeId = "minecraft:plains";
+        if (interiorQuart && !clampedBorder) {
+            String cached = scratch.surfaceBiome(key);
+            if (cached != null) return cached;
+        }
+
+        String biomeId = null;
         try {
-            Holder<Biome> biomeHolder = level.getBiome(position);
-            java.util.Optional<net.minecraft.resources.ResourceKey<Biome>> keyOpt =
-                    biomeHolder.unwrapKey();
-            if (keyOpt.isPresent()) {
-                ResourceLocation location = keyOpt.get().location();
-                biomeId = biomeIdStrings.get(location);
-                if (biomeId == null) {
-                    biomeId = location.toString();
-                    biomeIdStrings.put(location, biomeId);
+            Holder<Biome> biomeHolder;
+            if (sampleX == blockX && sampleZ == blockZ) {
+                biomeHolder = level.getBiome(position);
+            } else {
+                BlockPos.MutableBlockPos clampedPos = scratch.position(3,
+                        sampleX, blockY, sampleZ);
+                biomeHolder = level.getBiome(clampedPos);
+            }
+            if (biomeHolder != null) {
+                java.util.Optional<net.minecraft.resources.ResourceKey<Biome>> keyOpt =
+                        biomeHolder.unwrapKey();
+                if (keyOpt.isPresent()) {
+                    ResourceLocation location = keyOpt.get().location();
+                    biomeId = biomeIdStrings.get(location);
+                    if (biomeId == null) {
+                        biomeId = location.toString();
+                        biomeIdStrings.put(location, biomeId);
+                    }
+                }
+            }
+            if ((biomeId == null || ("minecraft:plains".equals(biomeId) && (nx != 0 || nz != 0)))
+                    && ownChunk != null) {
+                Holder<Biome> ownHolder = ownChunk.getNoiseBiome(
+                        blockX >> 2, blockY >> 2, blockZ >> 2);
+                if (ownHolder != null) {
+                    java.util.Optional<net.minecraft.resources.ResourceKey<Biome>> ownKeyOpt =
+                            ownHolder.unwrapKey();
+                    if (ownKeyOpt.isPresent()) {
+                        ResourceLocation ownLoc = ownKeyOpt.get().location();
+                        String ownBiomeId = biomeIdStrings.get(ownLoc);
+                        if (ownBiomeId == null) {
+                            ownBiomeId = ownLoc.toString();
+                            biomeIdStrings.put(ownLoc, ownBiomeId);
+                        }
+                        if (biomeId == null || !"minecraft:plains".equals(ownBiomeId)) {
+                            biomeId = ownBiomeId;
+                        }
+                    }
                 }
             }
         } catch (Exception ignored) {
         }
-        scratch.putSurfaceBiome(key, biomeId);
+        if (biomeId == null) biomeId = "minecraft:plains";
+        if (interiorQuart && !clampedBorder) {
+            scratch.putSurfaceBiome(key, biomeId);
+        }
         return biomeId;
     }
 

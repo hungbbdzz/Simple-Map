@@ -123,6 +123,10 @@ public final class MapBlockData {
         return (byte) (packed >>> 32);
     }
 
+    public static long withBiomeId(long packed, byte biomeId) {
+        return (packed & ~(0xFFL << 32)) | (((long) biomeId & 0xFFL) << 32);
+    }
+
     public static byte flags(long packed) {
         return (byte) (packed >>> 40);
     }
