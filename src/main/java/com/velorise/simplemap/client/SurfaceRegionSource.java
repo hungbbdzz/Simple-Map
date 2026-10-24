@@ -187,6 +187,36 @@ public final class SurfaceRegionSource {
         return paletteRevision;
     }
 
+    public synchronized long getPackedBlockData(int localX, int localZ) {
+        if (released || closeRequested || localX < 0 || localX >= 512
+                || localZ < 0 || localZ >= 512) {
+            return MapBlockData.EMPTY_PACKED;
+        }
+        int chunkIndex = (localZ >>> 4) * CHUNKS_PER_AXIS + (localX >>> 4);
+        ChunkSnapshot chunk = chunks[chunkIndex];
+        if (chunk == null) return MapBlockData.EMPTY_PACKED;
+        return chunk.packedPixelsUnsafe()[((localZ & 15) << 4) | (localX & 15)];
+    }
+
+    public synchronized String getBlockId(int localX, int localZ) {
+        long packed = getPackedBlockData(localX, localZ);
+        if (MapBlockData.isEmpty(packed)) return null;
+        int index = MapBlockData.blockId(packed) & 0xFFFF;
+        if (index < 0 || index >= blockPalette.length) return null;
+        return blockPalette[index];
+    }
+
+    public synchronized String getBiomeId(int localX, int localZ) {
+        long packed = getPackedBlockData(localX, localZ);
+        if (MapBlockData.isEmpty(packed)) return null;
+        int index = MapBlockData.biomeId(packed) & 0xFF;
+        if (index == (MapBlockData.NO_BIOME & 0xFF)
+                || index < 0 || index >= biomePalette.length) {
+            return null;
+        }
+        return biomePalette[index];
+    }
+
     public synchronized void markChunkDirty(int localChunkIndex) {
         if (released || closeRequested || localChunkIndex < 0
                 || localChunkIndex >= CHUNK_COUNT) return;

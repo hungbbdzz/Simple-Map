@@ -110,6 +110,8 @@ public class MapScreen extends Screen {
     private int cachedBiomeX = Integer.MIN_VALUE;
     private int cachedBiomeY = Integer.MIN_VALUE;
     private int cachedBiomeZ = Integer.MIN_VALUE;
+    private String cachedBiomeDimension = "";
+    private long cachedBiomeCaveRevision = Long.MIN_VALUE;
     private String cachedBiomeText;
     private final CaveStateClassifier caveStateClassifier = CaveStateClassifier.getInstance();
     private final MapVisualClassifier visualClassifier = MapVisualClassifier.getInstance();
@@ -396,39 +398,28 @@ public class MapScreen extends Screen {
     }
 
     private void saveCurrentDimensionCamera() {
-        dimensionCameras.put(selectedDimension, new double[] { centerX, centerZ, scale });
+        // Intentionally unused: Camera scales camera position proportionally from the current view
+        // rather than jumping to a stale cached coordinate from an earlier dimension visit.
     }
 
     private void restoreDimensionCamera(String previous, String target) {
-        double[] cached = dimensionCameras.get(target);
-        if (cached != null) {
-            centerX = cached[0];
-            centerZ = cached[1];
-            scale = (float) cached[2];
-            currentRenderScale = scale;
-            cancelMotionAndOpenAnimation();
-            return;
+        MapManager mapManager = MapManager.getInstance();
+        String from = "LIVE".equals(previous)
+                ? mapManager.getLiveDimensionResourceId() : previous;
+        String to = "LIVE".equals(target)
+                ? mapManager.getLiveDimensionResourceId() : target;
+        // Scale the current map camera proportionally by each dimension's coordinateScale()
+        // (e.g. 8:1 Nether -> Overworld, 1:8 Overworld -> Nether), matching cross-dimension coordinate scaling
+        // (GuiMap.playerDimDiv). This opens the target dimension at the exact corresponding
+        // relative position of the current map view instead of snapping to an old saved camera.
+        DimensionMapProfile fromProfile = mapManager.getDimensionProfile(from);
+        DimensionMapProfile toProfile = mapManager.getDimensionProfile(to);
+        double ratio = fromProfile.coordinateScale() / toProfile.coordinateScale();
+        if (Double.isFinite(ratio) && ratio > 0.0) {
+            centerX *= ratio;
+            centerZ *= ratio;
         }
-        if ("LIVE".equals(target) && minecraft != null && minecraft.player != null) {
-            centerX = minecraft.player.getX();
-            centerZ = minecraft.player.getZ();
-        } else {
-            String from = "LIVE".equals(previous)
-                    ? MapManager.getInstance().getLiveDimensionResourceId() : previous;
-            String to = "LIVE".equals(target)
-                    ? MapManager.getInstance().getLiveDimensionResourceId() : target;
-            // Derives cross-dimension map coordinates from each target
-            // DimensionType.coordinateScale(), not hard-coded Overworld/Nether ids.
-            // Persisted profiles extend the same behavior to modded dimensions.
-            MapManager mapManager = MapManager.getInstance();
-            DimensionMapProfile fromProfile = mapManager.getDimensionProfile(from);
-            DimensionMapProfile toProfile = mapManager.getDimensionProfile(to);
-            double ratio = fromProfile.coordinateScale() / toProfile.coordinateScale();
-            if (Double.isFinite(ratio) && ratio > 0.0) {
-                centerX *= ratio;
-                centerZ *= ratio;
-            }
-        }
+        cachedBiomeText = null;
         cancelMotionAndOpenAnimation();
     }
 
@@ -925,10 +916,42 @@ public class MapScreen extends Screen {
         return resolveCursorBiomeText(x, y, z, chunkLoaded);
     }
 
+    private static boolean isInvalidPlainsForDimension(String biomeId, boolean isNether, boolean isEnd) {
+        return (isNether || isEnd) && "minecraft:plains".equals(biomeId);
+    }
+
+    private static String inferNetherBiomeFromBlockId(String blockId) {
+        if (blockId == null || blockId.isBlank()) return "minecraft:nether_wastes";
+        if (blockId.contains("crimson") || blockId.contains("nether_wart_block") || blockId.contains("weeping_vines")) {
+            return "minecraft:crimson_forest";
+        }
+        if (blockId.contains("warped") || blockId.contains("twisting_vines")) {
+            return "minecraft:warped_forest";
+        }
+        if (blockId.contains("soul_sand") || blockId.contains("soul_soil") || blockId.contains("bone_block")) {
+            return "minecraft:soul_sand_valley";
+        }
+        if (blockId.contains("basalt") || blockId.contains("blackstone") || blockId.contains("magma_block")) {
+            return "minecraft:basalt_deltas";
+        }
+        return "minecraft:nether_wastes";
+    }
+
     private String resolveCursorBiomeText(int x, int y, int z, boolean chunkLoaded) {
+        MapManager mapManager = MapManager.getInstance();
+        String currentDim = mapManager.getCurrentDimensionResourceId();
+        long caveRev = CaveMode.getRevision();
         if (x == cachedBiomeX && y == cachedBiomeY && z == cachedBiomeZ
-                && cachedBiomeText != null) return cachedBiomeText;
+                && currentDim.equals(cachedBiomeDimension)
+                && caveRev == cachedBiomeCaveRevision
+                && cachedBiomeText != null) {
+            return cachedBiomeText;
+        }
+
+        boolean isNether = "minecraft:the_nether".equals(currentDim);
+        boolean isEnd = "minecraft:the_end".equals(currentDim);
         String resolvedId = null;
+
         if (chunkLoaded && this.minecraft != null && this.minecraft.level != null) {
             try {
                 int chunkX = x >> 4;
@@ -951,20 +974,104 @@ public class MapScreen extends Screen {
                 resolvedId = this.minecraft.level.getBiome(biomePos).unwrapKey()
                         .map(key -> key.location().toString())
                         .orElse(null);
+                if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                    net.minecraft.world.level.chunk.LevelChunk chunk = this.minecraft.level.getChunk(chunkX, chunkZ);
+                    if (chunk != null) {
+                        resolvedId = chunk.getNoiseBiome(sampleX >> 2, y >> 2, sampleZ >> 2)
+                                .unwrapKey()
+                                .map(key -> key.location().toString())
+                                .orElse(null);
+                    }
+                    if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                        resolvedId = null;
+                    }
+                }
             } catch (Throwable ignored) {
             }
         }
-        if (resolvedId == null || resolvedId.isBlank()) {
-            resolvedId = MapManager.getInstance().getBiomeId(x, z);
+
+        boolean caveActive = CaveMode.isActive(this.minecraft);
+        int targetLayer = caveActive
+                ? (CaveMode.isFullView(this.minecraft) ? Integer.MIN_VALUE : CaveMode.getLayerY(this.minecraft))
+                : Integer.MIN_VALUE;
+
+        if ((resolvedId == null || resolvedId.isBlank()) && caveActive) {
+            resolvedId = CaveMapManager.getInstance().getBiomeId(targetLayer, x, z);
+            if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                resolvedId = null;
+            }
         }
+
         if (resolvedId == null || resolvedId.isBlank()) {
-            return null;
+            resolvedId = mapManager.getBiomeId(x, z);
+            if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                resolvedId = null;
+            }
         }
+
+        if ((resolvedId == null || resolvedId.isBlank()) && !caveActive) {
+            int regionX = x >> 9;
+            int regionZ = z >> 9;
+            if (mapManager.hasRegionFile(regionX, regionZ)
+                    && !mapManager.isRegionLoadedInCache(regionX, regionZ)) {
+                mapManager.getRegion(regionX, regionZ, true);
+                MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
+            }
+            resolvedId = CaveMapManager.getInstance().getBiomeId(Integer.MIN_VALUE, x, z);
+            if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                resolvedId = null;
+            }
+        }
+
+        if (resolvedId == null || resolvedId.isBlank()) {
+            if (isNether) {
+                String blkId = cachedCursorInfo != null && cachedCursorX == x && cachedCursorZ == z
+                        ? cachedCursorInfo.id : null;
+                if (blkId == null || blkId.isBlank()) {
+                    blkId = caveActive
+                            ? CaveMapManager.getInstance().getBlockId(targetLayer, x, z)
+                            : mapManager.getBlockId(x, z);
+                }
+                resolvedId = inferNetherBiomeFromBlockId(blkId);
+            } else if (isEnd) {
+                resolvedId = "minecraft:the_end";
+            } else {
+                return null;
+            }
+        }
+
         cachedBiomeText = formatBiomeDisplayName(resolvedId);
         cachedBiomeX = x;
         cachedBiomeY = y;
         cachedBiomeZ = z;
+        cachedBiomeDimension = currentDim;
+        cachedBiomeCaveRevision = caveRev;
         return cachedBiomeText;
+    }
+
+    private static String formatBlockDisplayName(String blockId) {
+        if (blockId == null || blockId.isBlank()
+                || "minecraft:air".equals(blockId)
+                || "minecraft:cave_air".equals(blockId)
+                || "minecraft:void_air".equals(blockId)) {
+            return "";
+        }
+        try {
+            net.minecraft.resources.ResourceLocation loc = net.minecraft.resources.ResourceLocation.tryParse(blockId);
+            if (loc != null && net.minecraft.core.registries.BuiltInRegistries.BLOCK.containsKey(loc)) {
+                net.minecraft.world.level.block.Block block = net.minecraft.core.registries.BuiltInRegistries.BLOCK.get(loc);
+                if (block != null && block != net.minecraft.world.level.block.Blocks.AIR) {
+                    String translated = block.getName().getString();
+                    if (translated != null && !translated.isBlank()) {
+                        return translated;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        int colon = blockId.indexOf(':');
+        String path = colon >= 0 ? blockId.substring(colon + 1) : blockId;
+        return prettifyId(path);
     }
 
     private static String formatBiomeDisplayName(String biomeId) {
@@ -1042,34 +1149,69 @@ public class MapScreen extends Screen {
 
     private BlockInfo getCachedBlockInfoAt(int bx, int bz) {
         if (this.minecraft == null || this.minecraft.level == null) return null;
-        net.minecraft.world.level.Level level = this.minecraft.level;
+        MapManager manager = MapManager.getInstance();
+        CaveMapManager caveManager = CaveMapManager.getInstance();
 
         if (CaveMode.isActive(this.minecraft)) {
-            int targetLayer = CaveMode.isFullView(this.minecraft)
+            boolean fullView = CaveMode.isFullView(this.minecraft);
+            int targetLayer = fullView
                     ? Integer.MIN_VALUE
                     : CaveMode.getLayerY(this.minecraft);
-            int cachedY = CaveMapManager.getInstance().getSurfaceY(targetLayer, bx, bz);
+            int cachedY = caveManager.getSurfaceY(targetLayer, bx, bz);
             if (cachedY != CaveMapManager.NO_SURFACE) {
-                return new BlockInfo("", "", cachedY, Integer.MIN_VALUE, true);
+                String blockId = caveManager.getBlockId(targetLayer, bx, bz);
+                if (blockId == null || blockId.isBlank()) {
+                    MapBlockData surfData = manager.getBlockData(bx, bz);
+                    if (surfData != null && !surfData.isEmpty()
+                            && (fullView || Math.abs(surfData.getReliefY() - cachedY) <= 2)) {
+                        blockId = manager.getBlockId(bx, bz);
+                    }
+                }
+                String blockName = formatBlockDisplayName(blockId);
+                return new BlockInfo(blockName, blockId != null ? blockId : "", cachedY, Integer.MIN_VALUE, true);
+            }
+            if (fullView) {
+                MapBlockData surfData = manager.getBlockData(bx, bz);
+                if (surfData != null && !surfData.isEmpty()) {
+                    String blockId = manager.getBlockId(bx, bz);
+                    String blockName = formatBlockDisplayName(blockId);
+                    int waterSurface = surfData.isFluid() && !surfData.isGlowing()
+                            ? surfData.topY : Integer.MIN_VALUE;
+                    return new BlockInfo(blockName, blockId != null ? blockId : "",
+                            surfData.getReliefY(), waterSurface, true);
+                }
             }
             return null;
         }
 
-        MapManager manager = MapManager.getInstance();
         MapBlockData data = manager.getBlockData(bx, bz);
         if (data == null) {
             int regionX = bx >> 9;
             int regionZ = bz >> 9;
             if (manager.hasRegionFile(regionX, regionZ)
                     && !manager.isRegionLoadedInCache(regionX, regionZ)) {
+                manager.getRegion(regionX, regionZ, true);
                 MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
+            }
+            // In ceiling dimensions (or when Full Cave is already materialized from .mca),
+            // allow immediate fallback while the .smdat region loads asynchronously.
+            int caveY = caveManager.getSurfaceY(Integer.MIN_VALUE, bx, bz);
+            if (caveY != CaveMapManager.NO_SURFACE) {
+                String blockId = caveManager.getBlockId(Integer.MIN_VALUE, bx, bz);
+                String blockName = formatBlockDisplayName(blockId);
+                return new BlockInfo(blockName, blockId != null ? blockId : "", caveY, Integer.MIN_VALUE, true);
             }
             return null;
         }
         if (data.isEmpty()) return null;
+        String blockId = manager.getBlockId(bx, bz);
+        if (blockId == null || blockId.isBlank()) {
+            blockId = caveManager.getBlockId(Integer.MIN_VALUE, bx, bz);
+        }
+        String blockName = formatBlockDisplayName(blockId);
         int waterSurface = data.isFluid() && !data.isGlowing()
                 ? data.topY : Integer.MIN_VALUE;
-        return new BlockInfo("", "", data.getReliefY(), waterSurface, true);
+        return new BlockInfo(blockName, blockId != null ? blockId : "", data.getReliefY(), waterSurface, true);
     }
 
     private BlockInfo getBlockInfoAt(net.minecraft.world.level.Level level, int bx, int bz) {
@@ -1127,7 +1269,9 @@ public class MapScreen extends Screen {
                 if (!state.isAir()) {
                     return createBlockInfo(level, pos, surfaceY);
                 }
-                return new BlockInfo("", "", surfaceY, Integer.MIN_VALUE, true);
+                String cachedBlockId = CaveMapManager.getInstance().getBlockId(layerY, bx, bz);
+                return new BlockInfo(formatBlockDisplayName(cachedBlockId),
+                        cachedBlockId != null ? cachedBlockId : "", surfaceY, Integer.MIN_VALUE, true);
             }
 
             // If this chunk is already live in CaveRegion at the current layer and getSurfaceY
@@ -1883,7 +2027,7 @@ public class MapScreen extends Screen {
     public void onClose() {
         // Retain the selected dimension in MapManager when closing MapScreen so
         // the Minimap can display the chosen dimension with proportional coordinate scaling
-        // (1:8 Nether <-> Overworld), just like cross-dimension scaling!
+        // (1:8 Nether <-> Overworld), cross-dimension scaling.
         MapViewportCoordinator.getInstance().closeFullscreen();
         FullscreenMapFramebufferRenderer.getInstance().destroy();
         super.onClose();

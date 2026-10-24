@@ -446,6 +446,7 @@ public final class RegionDataStore {
                 invalidateLegacyFluidCompletion(pixels, completeChunks);
             }
             repairNetherBedrockColumns(pixels, tints, biomePalette, blockPalette, completeChunks, version);
+            repairNetherAndEndPlainsBiomes(pixels, biomePalette, blockPalette);
             repairChunkBorderBiomeSeams(pixels, biomePalette, completeChunks);
             return new StoredRegion(pixels, tints, biomePalette, blockPalette,
                     completeChunks);
@@ -558,6 +559,117 @@ public final class RegionDataStore {
                 }
             }
         }
+    }
+
+    private static void repairNetherAndEndPlainsBiomes(long[] pixels,
+            String[] biomePalette, String[] blockPalette) {
+        if (pixels == null || pixels.length != PIXEL_COUNT
+                || biomePalette == null || biomePalette.length == 0) {
+            return;
+        }
+        int plainsIdx = -1;
+        boolean hasNetherBiome = false;
+        boolean hasEndBiome = false;
+        int dominantNonPlainsIdx = -1;
+        int[] biomeCounts = new int[biomePalette.length];
+
+        for (int i = 0; i < biomePalette.length; i++) {
+            String b = biomePalette[i];
+            if ("minecraft:plains".equals(b)) {
+                plainsIdx = i;
+            } else if ("minecraft:nether_wastes".equals(b)
+                    || "minecraft:soul_sand_valley".equals(b)
+                    || "minecraft:crimson_forest".equals(b)
+                    || "minecraft:warped_forest".equals(b)
+                    || "minecraft:basalt_deltas".equals(b)) {
+                hasNetherBiome = true;
+            } else if ("minecraft:the_end".equals(b)
+                    || "minecraft:end_highlands".equals(b)
+                    || "minecraft:end_midlands".equals(b)
+                    || "minecraft:end_barrens".equals(b)
+                    || "minecraft:small_end_islands".equals(b)) {
+                hasEndBiome = true;
+            }
+        }
+        if (plainsIdx < 0) return;
+
+        if (!hasNetherBiome && !hasEndBiome && blockPalette != null) {
+            boolean hasNetherrackOrBlackstone = false;
+            boolean hasEndStone = false;
+            boolean hasOverworldGrass = false;
+            for (String blk : blockPalette) {
+                if ("minecraft:netherrack".equals(blk)
+                        || "minecraft:crimson_nylium".equals(blk)
+                        || "minecraft:warped_nylium".equals(blk)
+                        || "minecraft:soul_soil".equals(blk)) {
+                    hasNetherrackOrBlackstone = true;
+                } else if ("minecraft:end_stone".equals(blk)) {
+                    hasEndStone = true;
+                } else if ("minecraft:grass_block".equals(blk)
+                        || "minecraft:podzol".equals(blk)
+                        || "minecraft:mycelium".equals(blk)) {
+                    hasOverworldGrass = true;
+                }
+            }
+            if (!hasOverworldGrass) {
+                if (hasNetherrackOrBlackstone) hasNetherBiome = true;
+                else if (hasEndStone) hasEndBiome = true;
+            }
+        }
+
+        if (!hasNetherBiome && !hasEndBiome) return;
+
+        for (long packed : pixels) {
+            if (MapBlockData.isEmpty(packed)) continue;
+            int bId = MapBlockData.biomeId(packed) & 0xFF;
+            if (bId >= 0 && bId < biomeCounts.length && bId != plainsIdx) {
+                biomeCounts[bId]++;
+            }
+        }
+        int bestCount = 0;
+        for (int i = 0; i < biomeCounts.length; i++) {
+            if (i != plainsIdx && biomeCounts[i] > bestCount) {
+                bestCount = biomeCounts[i];
+                dominantNonPlainsIdx = i;
+            }
+        }
+
+        // Replace any pixel that has plainsIdx with the nearest valid non-plains biome in its chunk/neighborhood
+        if (dominantNonPlainsIdx >= 0) {
+            for (int i = 0; i < pixels.length; i++) {
+                long packed = pixels[i];
+                if (MapBlockData.isEmpty(packed)) continue;
+                int bId = MapBlockData.biomeId(packed) & 0xFF;
+                if (bId != plainsIdx) continue;
+                int px = i & 511;
+                int pz = i >>> 9;
+                byte replacement = (byte) dominantNonPlainsIdx;
+                searchNear:
+                for (int radius = 1; radius <= 6; radius++) {
+                    int minDz = Math.max(0, pz - (radius << 2));
+                    int maxDz = Math.min(511, pz + (radius << 2));
+                    int minDx = Math.max(0, px - (radius << 2));
+                    int maxDx = Math.min(511, px + (radius << 2));
+                    for (int nz = minDz; nz <= maxDz; nz += 4) {
+                        int row = nz << 9;
+                        for (int nx = minDx; nx <= maxDx; nx += 4) {
+                            long np = pixels[row + nx];
+                            if (MapBlockData.isEmpty(np)) continue;
+                            int nb = MapBlockData.biomeId(np) & 0xFF;
+                            if (nb != plainsIdx && nb != (MapBlockData.NO_BIOME & 0xFF)
+                                    && nb < biomePalette.length) {
+                                replacement = (byte) nb;
+                                break searchNear;
+                            }
+                        }
+                    }
+                }
+                pixels[i] = MapBlockData.withBiomeId(packed, replacement);
+            }
+        }
+
+        // Finally replace "minecraft:plains" in the palette itself so no pixel in a Nether/End region can ever resolve to Plains
+        biomePalette[plainsIdx] = hasNetherBiome ? "minecraft:nether_wastes" : "minecraft:the_end";
     }
 
     private static int repairChunkBorderBiomeSeams(long[] pixels,
