@@ -239,8 +239,13 @@ public class MapManager {
 
         String liveResourceId = canonicalDimensionId(level.dimension().location().toString());
         String liveStorageId = dimensionStorageId(liveResourceId);
+        boolean liveDimensionChanged = !liveStorageId.equals(observedLiveDimensionId)
+                && !observedLiveDimensionId.isEmpty();
         liveDimensionResourceId = liveResourceId;
         liveDimensionId = liveStorageId;
+        if (liveDimensionChanged) {
+            viewDimensionOverride = null;
+        }
 
         boolean worldChanged = !worldId.equals(currentWorldId)
                 || currentWorldDir == null
@@ -349,14 +354,17 @@ public class MapManager {
         MapMutationBus.getInstance().reset();
         MapProcessor.getInstance().clear();
         clearSurfaceDimensionData();
+        SurfaceRegionSourceDatabase.getInstance().clear();
+        RegionSurfaceLodService.getInstance().clear();
+        MapTextureManager.getInstance().clearCache();
+        MapOverviewTextureManager.getInstance().clearCache();
         MapLightManager.getInstance().flushAndClear();
         CaveMapManager.getInstance().flushDataForDimensionSwitch();
         CaveTextureManager.getInstance().suspendForDimensionSwitch();
         ChunkScanner.getInstance().reset();
-        // Surface exact/legacy keys, overview keys and unified cave keys all include
-        // the dimension cache identity. Keep their last-good immutable images so a
-        // dimension cycle is a source-context handoff rather than a destructive GPU
-        // cold start. A true world change still uses flushAndClear().
+        com.velorise.simplemap.client.renderer.FullscreenMapFramebufferRenderer.getInstance().invalidate();
+        com.velorise.simplemap.client.renderer.MinimapFramebufferRenderer.getInstance().invalidate();
+        MapRenderer.getInstance().clearFullscreenFallback();
         configureDimension(storageId, resourceId);
         MapSessionManager.getInstance().open(currentWorldId, resourceId);
     }
@@ -467,6 +475,26 @@ public class MapManager {
         return viewDimensionOverride == null;
     }
 
+    public String getViewDimensionOverride() {
+        return viewDimensionOverride;
+    }
+
+    /**
+     * Returns the coordinate scale multiplier from the player's live dimension
+     * to the currently viewed map dimension (e.g., 8.0 when in Nether viewing Overworld,
+     * or 0.125 when in Overworld viewing Nether).
+     */
+    public double getCrossDimensionCoordinateScale() {
+        if (viewDimensionOverride == null) return 1.0;
+        DimensionMapProfile liveProfile = getDimensionProfile(liveDimensionResourceId);
+        DimensionMapProfile viewedProfile = currentDimensionProfile != null
+                ? currentDimensionProfile : getDimensionProfile(currentDimensionResourceId);
+        double liveScale = liveProfile != null ? liveProfile.coordinateScale() : 1.0;
+        double viewedScale = viewedProfile != null ? viewedProfile.coordinateScale() : 1.0;
+        double ratio = liveScale / Math.max(0.0001, viewedScale);
+        return (Double.isFinite(ratio) && ratio > 0.0) ? ratio : 1.0;
+    }
+
     /**
      * Dimension fence for data sampled from the live ClientLevel.
      *
@@ -513,15 +541,13 @@ public class MapManager {
     public boolean hasSavedDataForCurrentDimension() {
         if (!regionFileExists.isEmpty() || currentDimensionHasSavedData) return true;
         long now = System.currentTimeMillis();
-        // This method is queried every rendered frame. Probe the filesystem at most
-        // once per second so an unvisited dimension remains cheap while newly saved
-        // cave-only data is still detected without reopening the screen.
         if (now - lastSavedDataProbeMs < 1_000L) return false;
         lastSavedDataProbeMs = now;
         File cave = currentWorldDir == null ? null
                 : new File(currentWorldDir, "caves/" + currentDimensionId);
         currentDimensionHasSavedData = hasAnyMapFiles(currentDimensionDir)
-                || hasAnyMapFiles(cave);
+                || hasAnyMapFiles(cave)
+                || CaveMapManager.getInstance().hasAnyMcaFilesForCurrentDimension();
         return currentDimensionHasSavedData;
     }
 
@@ -562,7 +588,7 @@ public class MapManager {
         for (File file : files) {
             if (file.isFile()) {
                 String name = file.getName().toLowerCase(Locale.ROOT);
-                if (name.endsWith(".smdat") || name.endsWith(".vca")
+                if (name.endsWith(".smdat") || name.endsWith(".scdat") || name.endsWith(".vca")
                         || name.endsWith(".dat") || name.endsWith(".png")) return true;
             } else if (file.isDirectory() && hasAnyMapFiles(file, depth + 1)) {
                 return true;
@@ -1144,12 +1170,17 @@ public class MapManager {
         worldGeneration.incrementAndGet();
         MapProcessor.getInstance().clear();
         clearCache();
+        SurfaceRegionSourceDatabase.getInstance().clear();
+        RegionSurfaceLodService.getInstance().clear();
         MapTextureManager.getInstance().clearCache();
         MapOverviewTextureManager.getInstance().clearCache();
         MapLightManager.getInstance().flushAndClear();
         CaveMapManager.getInstance().flushAndClear();
         CaveTextureManager.getInstance().clearCache();
         ChunkScanner.getInstance().reset();
+        com.velorise.simplemap.client.renderer.FullscreenMapFramebufferRenderer.getInstance().invalidate();
+        com.velorise.simplemap.client.renderer.MinimapFramebufferRenderer.getInstance().invalidate();
+        MapRenderer.getInstance().clearFullscreenFallback();
     }
 
     private void clearCache() {

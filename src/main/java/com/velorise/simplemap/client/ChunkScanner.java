@@ -1342,7 +1342,7 @@ public class ChunkScanner {
             return;
         }
         if (!CaveMode.isActive(mc)) {
-            requestRefresh(mc);
+            requestImmediateSurfaceRefresh(mc);
             return;
         }
         boolean fullView = CaveMode.isFullView(mc);

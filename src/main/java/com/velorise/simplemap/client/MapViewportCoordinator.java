@@ -345,8 +345,8 @@ public final class MapViewportCoordinator {
                 && now - minimap.submittedNanos < 500_000_000L
                 && now - lastMinimapRun >= profile.minimapIntervalNanos()) {
             lastMinimapRun = now;
-            // Minimap always represents the player's live level.
-            if (MapManager.getInstance().isViewingLiveDimension()) {
+            boolean viewingLive = MapManager.getInstance().isViewingLiveDimension();
+            if (viewingLive) {
                 boolean caveVisibleNow = CaveMode.isActive(minecraft);
                 if (caveVisibleNow) {
                     if (profile.allowVisibleScan()) {
@@ -361,37 +361,24 @@ public final class MapViewportCoordinator {
                             minimap.minZ, minimap.maxZ, minimap.scale,
                             minimap.focusX, minimap.focusZ, minimap.lane);
                 }
-                if (profile.allowSavedVisible()) {
-                    long savedStarted = System.nanoTime();
-                    requestTextures(minecraft, minimap);
-                    MapObservationTelemetry.getInstance().record(
-                            MapObservationTelemetry.Lane.SAVED_VISIBLE,
-                            System.nanoTime() - savedStarted, 1);
-                } else if (profile.allowPublication()) {
-                    /*
-                     * Travel deliberately disables Anvil/world-save IO, but the
-                     * foreground writer is still committing already-loaded chunks
-                     * into the live Surface/Cave repositories. Keep a tiny visible
-                     * demand alive so those commits can become exact leaves and be
-                     * uploaded while the player moves. PASS49 requested only the
-                     * publication drain here; with no active page demand there was
-                     * nothing to build, so the minimap retained a black/old texture
-                     * until the three-second settle window ended.
-                     */
-                    requestLiveTextures(minecraft, minimap);
-                }
-                boolean cave = CaveMode.isActive(minecraft);
-                boolean full = cave && CaveMode.isFullView(minecraft);
-                if (full) {
-                    publication.requestFullCave(false);
-                } else if (cave) {
-                    publication.requestLayeredCave();
-                } else {
-                    // requestTextures() already admitted the minimap exact hot set.
-                    // Only publish intent here; a second request pass used to repeat
-                    // the same center-out traversal every minimap tick.
-                    publication.requestSurface(MapRequestLane.MINIMAP, false);
-                }
+            }
+            if (profile.allowSavedVisible() || !viewingLive) {
+                long savedStarted = System.nanoTime();
+                requestTextures(minecraft, minimap);
+                MapObservationTelemetry.getInstance().record(
+                        MapObservationTelemetry.Lane.SAVED_VISIBLE,
+                        System.nanoTime() - savedStarted, 1);
+            } else if (profile.allowPublication()) {
+                requestLiveTextures(minecraft, minimap);
+            }
+            boolean cave = CaveMode.isActive(minecraft);
+            boolean full = cave && CaveMode.isFullView(minecraft);
+            if (full) {
+                publication.requestFullCave(false);
+            } else if (cave) {
+                publication.requestLayeredCave();
+            } else {
+                publication.requestSurface(MapRequestLane.MINIMAP, false);
             }
         }
 
