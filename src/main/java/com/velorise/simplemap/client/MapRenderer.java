@@ -573,7 +573,8 @@ public class MapRenderer {
                         caveMode, caveBranchOnly, hierarchyLevel);
                 boolean contentRefreshDue = contentChanged
                         && (!cachedPlan.plan().logicalExactCoverage() || caveMode)
-                        && (cachedPlan.plan().quadCount() == 0
+                        && (!manageScissor
+                                || cachedPlan.plan().quadCount() == 0
                                 || nowNanos - cachedPlan.plan().builtAtNanos()
                                         >= contentRefreshNanos);
                 if (cachedPlan == null || keyChanged || topologyChanged
@@ -1083,7 +1084,7 @@ public class MapRenderer {
             return MapPerformanceGovernor.getInstance().underPressure()
                     ? 500_000_000L : FULLSCREEN_BRANCH_PLAN_REFRESH_NANOS;
         }
-        if (caveMode) return 200_000_000L;
+        if (caveMode) return 80_000_000L;
         // Surface hierarchy plan construction is the dominant render-thread stall in
         // PASS94 (65/68 slow plans; up to ~199 ms). Coalesce streaming revisions at
         // branch/region density instead of rebuilding the same immutable geometry at
@@ -1154,7 +1155,13 @@ public class MapRenderer {
                 @Override
                 public CaveAtlasRegion branch(int level, int nodeX, int nodeZ) {
                     return caveTextures.peekBranchRegion(activeLayer, level,
-                            nodeX, nodeZ, renderLane);
+                            nodeX, nodeZ, renderLane, true);
+                }
+
+                @Override
+                public CaveAtlasRegion residentBranch(int level, int nodeX, int nodeZ) {
+                    return caveTextures.peekBranchRegion(activeLayer, level,
+                            nodeX, nodeZ, renderLane, false);
                 }
 
                 @Override
@@ -1567,7 +1574,7 @@ public class MapRenderer {
         if (lastPageX < minPageX || firstPageX > maxPageX
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
 
-        CaveAtlasRegion branch = source.branch(level, nodeX, nodeZ);
+        CaveAtlasRegion branch = source.residentBranch(level, nodeX, nodeZ);
         if (branch != null) {
             if (budget.emitQuad()) {
                 addNodeQuad(builder, branch, nodeX, nodeZ, level);
@@ -1712,7 +1719,10 @@ public class MapRenderer {
                 int childIndex = childZ * 2 + childX;
                 int childNodeX = nodeX * 2 + childX;
                 int childNodeZ = nodeZ * 2 + childZ;
-                if (branch != null && branch.childComplete(childIndex)) continue;
+                if (branch != null && branch.childComplete(childIndex)
+                        && !source.hasResidentPageInNode(level - 1,
+                                childNodeX, childNodeZ)
+                        && scale < (level <= 2 ? 0.25f : 0.125f)) continue;
                 collectCaveNode(builder, source, level - 1,
                         childNodeX, childNodeZ, scale, false,
                         minPageX, maxPageX, minPageZ, maxPageZ, drawnRegions,
@@ -2741,7 +2751,7 @@ public class MapRenderer {
         for (int ancestorLevel = level + 1;
                 ancestorLevel <= MapLodPolicy.MAX_BRANCH_LEVEL; ancestorLevel++) {
             int scale = 1 << (ancestorLevel - level);
-            CaveAtlasRegion ancestor = source.branch(ancestorLevel,
+            CaveAtlasRegion ancestor = source.residentBranch(ancestorLevel,
                     Math.floorDiv(nodeX, scale), Math.floorDiv(nodeZ, scale));
             if (ancestor != null) return ancestor;
         }
@@ -2802,6 +2812,10 @@ public class MapRenderer {
 
     private interface CaveHierarchySource {
         CaveAtlasRegion branch(int level, int nodeX, int nodeZ);
+
+        default CaveAtlasRegion residentBranch(int level, int nodeX, int nodeZ) {
+            return branch(level, nodeX, nodeZ);
+        }
 
         boolean hasBranchData(int level, int nodeX, int nodeZ);
 

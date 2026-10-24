@@ -1115,6 +1115,7 @@ public class ChunkScanner {
             byte flags = 0;
             if (cavePixelIsFluid(packed)) flags |= 1;
             if (cavePixelIsLeaves(packed)) flags |= 2;
+            if (cavePixelIsGlowing(packed)) flags |= 4;
             caveFlags[p] = flags;
         }
 
@@ -1131,8 +1132,9 @@ public class ChunkScanner {
             byte flags = caveFlags[p];
             boolean isFluid = (flags & 1) != 0;
             boolean isLeaves = (flags & 2) != 0;
+            boolean isGlowing = (flags & 4) != 0;
             float shade = isFluid ? 1.0f : calculateFastCaveShade(mc.level, caveHeights, chunkX, chunkZ, p, surfaceY, layerY, fullView);
-            caveColors[p] = CaveTextureManager.styleCavePixel(rawColor, shade, blockX, blockZ, surfaceY, isFluid, isLeaves);
+            caveColors[p] = CaveTextureManager.styleCavePixel(rawColor, shade, blockX, blockZ, surfaceY, isFluid, isLeaves, isGlowing);
         }
         CaveMapManager.getInstance().setChunkPixels(targetLayer, chunkX, chunkZ, caveColors, caveHeights);
         urgentChunkCursors.remove(key);
@@ -1821,8 +1823,9 @@ public class ChunkScanner {
         }
         boolean isFluid = cavePixelIsFluid(pixel);
         boolean isLeaves = cavePixelIsLeaves(pixel);
+        boolean isGlowing = cavePixelIsGlowing(pixel);
         float shade = isFluid ? 1.0f : calculateCaveTerrainShade(level, blockX, blockZ, layerY, fullView, surfaceY);
-        int displayedColor = CaveTextureManager.styleCavePixel(rawColor, shade, blockX, blockZ, surfaceY, isFluid, isLeaves);
+        int displayedColor = CaveTextureManager.styleCavePixel(rawColor, shade, blockX, blockZ, surfaceY, isFluid, isLeaves, isGlowing);
         CaveMapManager.getInstance().setPixel(targetLayer, blockX, blockZ, displayedColor, surfaceY, true);
     }
 
@@ -1998,19 +2001,20 @@ public class ChunkScanner {
             if (!state.getFluidState().isEmpty()) {
                 colorPos.setY(y);
                 boolean isLava = state.is(Blocks.LAVA) || state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
+                boolean isGlowing = isLava || state.getLightEmission() > 0;
                 int baseColor = getCaveBlockColor(level, chunk, colorPos, state);
                 if (baseColor == 0) continue;
                 lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, y + 1), blockZ);
-                int blockLight = isLava ? 15 : Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), state.getLightEmission());
-                int skyLight = isLava
+                int blockLight = isGlowing ? 15 : Math.max(level.getBrightness(LightLayer.BLOCK, lightPos), state.getLightEmission());
+                int skyLight = isGlowing
                         ? 0
                         : (exposedToSky
                                 ? 15
                                 : (hasSkyLight && !fullView ? level.getBrightness(LightLayer.SKY, lightPos) : 0));
                 int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(y);
                 return packCavePixel(
-                        CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isLava),
-                        y, false, false);
+                        CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isGlowing),
+                        y, false, false, isGlowing);
             }
 
             // 6. Solid or thin floor block (carpets, rails, redstone wire, glow lichen, mineshaft planks, leaves, stone, etc.):
@@ -2032,15 +2036,16 @@ public class ChunkScanner {
             if (baseColor == 0) continue;
 
             boolean isLava = state.is(Blocks.LAVA) || state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
+            boolean isGlowing = isLava || state.getLightEmission() > 0;
             boolean isLeaves = state.is(net.minecraft.tags.BlockTags.LEAVES);
             lightPos.set(blockX, Math.min(level.getMaxBuildHeight() - 1, y + 1), blockZ);
-            int blockLight = isLava
+            int blockLight = isGlowing
                     ? 15
                     : Math.max(
                             Math.max(level.getBrightness(LightLayer.BLOCK, lightPos),
                                     level.getBrightness(LightLayer.BLOCK, colorPos)),
                             state.getLightEmission());
-            int skyLight = isLava
+            int skyLight = isGlowing
                     ? 0
                     : (exposedToSky
                             ? 15
@@ -2051,11 +2056,11 @@ public class ChunkScanner {
             int effectiveY = (shortBlock && y > minimumY) ? (y - 1) : y;
             int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(effectiveY);
             return packCavePixel(
-                    CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isLava),
-                    effectiveY, false, isLeaves);
+                    CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isGlowing),
+                    effectiveY, false, isLeaves, isGlowing);
         }
 
-        return packCavePixel(0, CaveRegion.NO_SURFACE, false, false);
+        return packCavePixel(0, CaveRegion.NO_SURFACE, false, false, false);
     }
 
     private boolean isUndergroundTerrainEntry(Level level, BlockPos pos,
@@ -2193,7 +2198,11 @@ public class ChunkScanner {
     }
 
     private static long packCavePixel(int color, int surfaceY, boolean isFluid, boolean isLeaves) {
-        long flags = (isFluid ? 0x10000L : 0L) | (isLeaves ? 0x20000L : 0L);
+        return packCavePixel(color, surfaceY, isFluid, isLeaves, false);
+    }
+
+    private static long packCavePixel(int color, int surfaceY, boolean isFluid, boolean isLeaves, boolean isGlowing) {
+        long flags = (isFluid ? 0x10000L : 0L) | (isLeaves ? 0x20000L : 0L) | (isGlowing ? 0x40000L : 0L);
         return ((long) color << 32) | flags | ((short) surfaceY & 0xFFFFL);
     }
 
@@ -2211,6 +2220,10 @@ public class ChunkScanner {
 
     private static boolean cavePixelIsLeaves(long pixel) {
         return (pixel & 0x20000L) != 0L;
+    }
+
+    private static boolean cavePixelIsGlowing(long pixel) {
+        return (pixel & 0x40000L) != 0L;
     }
 
     /** Cave relief follows the actual visible floor selected by the Top-Y band,

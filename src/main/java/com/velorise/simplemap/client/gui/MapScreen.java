@@ -4526,6 +4526,12 @@ public class MapScreen extends Screen {
         private int panelTop;
         private int panelWidth;
         private int panelHeight;
+        private float previewScale = 0.55f;
+        private double mapPanOffsetX = 0.0;
+        private double mapPanOffsetZ = 0.0;
+        private boolean draggingMap = false;
+        private double dragStartX = 0.0;
+        private double dragStartY = 0.0;
 
         public AddWaypointScreen(Screen parent, double worldX, double worldZ, String dimension) {
             this(parent, worldX, defaultY(dimension), worldZ, dimension);
@@ -4607,25 +4613,32 @@ public class MapScreen extends Screen {
             searchButtons.clear();
             tabButtons.clear();
 
-            panelWidth = Math.max(360, Math.min(570, this.width - 20));
-            panelHeight = Math.max(290, Math.min(330, this.height - 20));
-            panelLeft = (this.width - panelWidth) / 2;
-            panelTop = (this.height - panelHeight) / 2;
+            if (parent instanceof MapScreen mapScreen && mapScreen.scale > 0.05f) {
+                previewScale = mapScreen.scale;
+            } else {
+                previewScale = Math.max(0.35f, Math.min(0.85f, (this.width - 2) / 1200.0f));
+            }
 
-            int leftX = panelLeft + 18;
-            int rightX = panelLeft + panelWidth / 2 + 6;
-            int fieldWidth = panelWidth / 2 - 32;
-            int top = panelTop + 38;
+            // Compact, translucent left-docked card so the live map and waypoints
+            // remain unobstructed across the screen.
+            panelWidth = Math.min(216, Math.max(188, this.width - 24));
+            panelHeight = Math.min(212, Math.max(198, this.height - 12));
+            panelLeft = Math.max(8, Math.min(14, this.width / 28));
+            panelTop = Math.max(6, (this.height - panelHeight) / 2);
 
-            nameInput = new EditBox(this.font, leftX, top + 14, fieldWidth, 20,
+            int leftX = panelLeft + 8;
+            int fieldWidth = panelWidth - 16;
+            int top = panelTop + 22;
+
+            nameInput = new EditBox(this.font, leftX, top, fieldWidth, 18,
                     Component.literal("Waypoint name"));
             nameInput.setMaxLength(64);
             nameInput.setValue(draftName);
             nameInput.setHint(Component.literal(defaultName()));
             addRenderableWidget(nameInput);
 
-            int coordinateY = top + 58;
-            int coordinateGap = 5;
+            int coordinateY = top + 28;
+            int coordinateGap = 4;
             int coordinateWidth = (fieldWidth - coordinateGap * 2) / 3;
             xInput = coordinateBox(leftX, coordinateY, coordinateWidth, draftX, "X coordinate");
             yInput = coordinateBox(leftX + coordinateWidth + coordinateGap, coordinateY,
@@ -4633,55 +4646,59 @@ public class MapScreen extends Screen {
             zInput = coordinateBox(leftX + (coordinateWidth + coordinateGap) * 2,
                     coordinateY, coordinateWidth, draftZ, "Z coordinate");
 
+            int halfButton = (fieldWidth - 4) / 2;
+            int row3Y = top + 50;
             dimensionButton = Button.builder(dimensionLabel(), button -> cycleDimension())
-                    .bounds(leftX, top + 112, fieldWidth, 20).build();
+                    .bounds(leftX, row3Y, halfButton, 18).build();
             addRenderableWidget(dimensionButton);
 
-            int halfButton = (fieldWidth - 5) / 2;
-            addRenderableWidget(Button.builder(Component.literal("Use Player Position"), button -> usePlayerPosition())
-                    .bounds(leftX, top + 142, halfButton, 20).build());
-            addRenderableWidget(Button.builder(Component.literal("Pick on Map"), button -> openMapPicker())
-                    .bounds(leftX + halfButton + 5, top + 142, halfButton, 20).build());
-
             double sliderValue = (waypointScale - 0.5) / 1.5;
-            localScaleSlider = new SimpleSlider(leftX, top + 177, fieldWidth, 20,
+            localScaleSlider = new SimpleSlider(leftX + halfButton + 4, row3Y, halfButton, 18,
                     Math.max(0.0, Math.min(1.0, sliderValue)),
-                    value -> String.format(Locale.ROOT, "Icon Size: %.1fx", 0.5 + value * 1.5),
+                    value -> String.format(Locale.ROOT, "Size: %.1fx", 0.5 + value * 1.5),
                     value -> waypointScale = (float) (0.5 + value * 1.5));
             addRenderableWidget(localScaleSlider);
 
-            String[] tabNames = { "Mining", "Combat", "Travel", "Food", "Search" };
+            int row4Y = top + 71;
+            addRenderableWidget(Button.builder(Component.literal("Player Pos"), button -> usePlayerPosition())
+                    .bounds(leftX, row4Y, halfButton, 18).build());
+            addRenderableWidget(Button.builder(Component.literal("Pick on Map"), button -> openMapPicker())
+                    .bounds(leftX + halfButton + 4, row4Y, halfButton, 18).build());
+
+            String[] tabNames = { "Mine", "Fight", "Move", "Food", "Find" };
             int tabGap = 2;
             int tabWidth = Math.max(28, (fieldWidth - tabGap * 4) / 5);
+            int tabY = top + 93;
             for (int index = 0; index < tabNames.length; index++) {
                 final int tab = index;
                 Button button = Button.builder(Component.literal(tabNames[index]), b -> setTab(tab))
-                        .bounds(rightX + index * (tabWidth + tabGap), top + 14, tabWidth, 18).build();
+                        .bounds(leftX + index * (tabWidth + tabGap), tabY, tabWidth, 16).build();
                 tabButtons.add(button);
                 addRenderableWidget(button);
             }
 
-            int iconStartX = rightX + 8;
-            int iconStartY = top + 48;
-            addItemGroupButtons(MINING_ITEMS, 0, iconStartX, iconStartY);
-            addItemGroupButtons(COMBAT_ITEMS, 1, iconStartX, iconStartY);
-            addItemGroupButtons(TRAVEL_ITEMS, 2, iconStartX, iconStartY);
-            addItemGroupButtons(FOOD_ITEMS, 3, iconStartX, iconStartY);
+            int iconStartY = top + 113;
+            addItemGroupButtons(MINING_ITEMS, 0, leftX, iconStartY, fieldWidth);
+            addItemGroupButtons(COMBAT_ITEMS, 1, leftX, iconStartY, fieldWidth);
+            addItemGroupButtons(TRAVEL_ITEMS, 2, leftX, iconStartY, fieldWidth);
+            addItemGroupButtons(FOOD_ITEMS, 3, leftX, iconStartY, fieldWidth);
 
-            searchBox = new EditBox(this.font, rightX, iconStartY, fieldWidth, 18,
+            searchBox = new EditBox(this.font, leftX, iconStartY, fieldWidth, 16,
                     Component.literal("Search waypoint icon"));
             searchBox.setMaxLength(48);
             searchBox.setHint(Component.literal("Search item id..."));
             searchBox.setResponder(value -> updateSearchResults());
             addRenderableWidget(searchBox);
 
-            int searchY = iconStartY + 28;
-            for (int index = 0; index < 9; index++) {
+            int searchY = iconStartY + 19;
+            int iconSlotStep = Math.max(24, fieldWidth / 6);
+            int iconOffsetX = leftX + Math.max(0, (fieldWidth - (5 * iconSlotStep + 22)) / 2);
+            for (int index = 0; index < 6; index++) {
                 final int resultIndex = index;
                 ItemIconButton button = new ItemIconButton(
-                        rightX + (index % 5) * 28,
-                        searchY + (index / 5) * 28,
-                        24, 24, "", b -> {
+                        iconOffsetX + index * iconSlotStep,
+                        searchY,
+                        22, 22, "", () -> selectedIconItem, b -> {
                             if (resultIndex < searchResults.size()) {
                                 selectIcon(searchResults.get(resultIndex));
                             }
@@ -4690,18 +4707,18 @@ public class MapScreen extends Screen {
                 addRenderableWidget(button);
             }
 
-            int bottomY = panelTop + panelHeight - 30;
+            int bottomY = panelTop + panelHeight - 23;
             addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.cancel"), button -> onClose())
-                    .bounds(panelLeft + panelWidth - 174, bottomY, 76, 20).build());
+                    .bounds(leftX, bottomY, halfButton, 18).build());
             addRenderableWidget(Button.builder(Component.literal(original == null ? "Add" : "Save"),
                     button -> saveWaypoint())
-                    .bounds(panelLeft + panelWidth - 92, bottomY, 76, 20).build());
+                    .bounds(leftX + halfButton + 4, bottomY, halfButton, 18).build());
 
             updateTabVisibility();
         }
 
         private EditBox coordinateBox(int x, int y, int width, double value, String narration) {
-            EditBox box = new EditBox(this.font, x, y, width, 20, Component.literal(narration));
+            EditBox box = new EditBox(this.font, x, y, width, 18, Component.literal(narration));
             box.setMaxLength(18);
             box.setValue(formatCoordinate(value));
             addRenderableWidget(box);
@@ -4721,7 +4738,7 @@ public class MapScreen extends Screen {
         }
 
         private Component dimensionLabel() {
-            return Component.literal("Dimension: " + MapManager.displayDimensionName(draftDimension));
+            return Component.literal("Dim: " + MapManager.displayDimensionName(draftDimension));
         }
 
         private void cycleDimension() {
@@ -4737,6 +4754,8 @@ public class MapScreen extends Screen {
             draftX = minecraft.player.getX();
             draftY = minecraft.player.getY();
             draftZ = minecraft.player.getZ();
+            mapPanOffsetX = 0.0;
+            mapPanOffsetZ = 0.0;
             draftDimension = normalizeDimension(MapManager.getInstance().getLiveDimensionResourceId());
             ensureDraftDimensionViewed();
             ensureDimensionPresent(draftDimension);
@@ -4755,12 +4774,15 @@ public class MapScreen extends Screen {
         void acceptPickedLocation(double x, double z, String dimension) {
             draftX = x;
             draftZ = z;
+            mapPanOffsetX = 0.0;
+            mapPanOffsetZ = 0.0;
             draftDimension = normalizeDimension(dimension);
             ensureDimensionPresent(draftDimension);
             if (minecraft != null && minecraft.player != null
                     && draftDimension.equals(normalizeDimension(MapManager.getInstance().getLiveDimensionResourceId()))) {
                 draftY = minecraft.player.getY();
             }
+            updateCoordinateInputs();
             validationMessage = "";
         }
 
@@ -4859,13 +4881,15 @@ public class MapScreen extends Screen {
             updateTabVisibility();
         }
 
-        private void addItemGroupButtons(String[] items, int tab, int startX, int startY) {
+        private void addItemGroupButtons(String[] items, int tab, int startX, int startY, int fieldWidth) {
+            int slotStep = Math.max(24, fieldWidth / 6);
+            int offsetX = startX + Math.max(0, (fieldWidth - (5 * slotStep + 22)) / 2);
             for (int index = 0; index < items.length; index++) {
                 String itemId = items[index];
                 ItemIconButton button = new ItemIconButton(
-                        startX + (index % 5) * 28,
-                        startY + (index / 5) * 28,
-                        24, 24, itemId, b -> selectIcon(itemId));
+                        offsetX + (index % 6) * slotStep,
+                        startY + (index / 6) * 24 + 8,
+                        22, 22, itemId, () -> selectedIconItem, b -> selectIcon(itemId));
                 button.tab = tab;
                 iconButtons.add(button);
                 addRenderableWidget(button);
@@ -4881,13 +4905,13 @@ public class MapScreen extends Screen {
             for (int index = 0; index < tabButtons.size(); index++) {
                 Button button = tabButtons.get(index);
                 String plain = switch (index) {
-                    case 0 -> "Mining";
-                    case 1 -> "Combat";
-                    case 2 -> "Travel";
+                    case 0 -> "Mine";
+                    case 1 -> "Fight";
+                    case 2 -> "Move";
                     case 3 -> "Food";
-                    default -> "Search";
+                    default -> "Find";
                 };
-                button.setMessage(Component.literal(index == activeTab ? "[" + plain + "]" : plain));
+                button.setMessage(Component.literal(index == activeTab ? "§b" + plain : plain));
             }
             for (ItemIconButton button : iconButtons) button.visible = button.tab == activeTab;
             boolean searching = activeTab == 4;
@@ -4920,6 +4944,87 @@ public class MapScreen extends Screen {
             }
         }
 
+        private boolean isInsidePanel(double mouseX, double mouseY) {
+            return mouseX >= panelLeft && mouseX <= panelLeft + panelWidth
+                    && mouseY >= panelTop && mouseY <= panelTop + panelHeight;
+        }
+
+        private double getMapAreaCenterX() {
+            int rightAreaLeft = panelLeft + panelWidth;
+            int rightAreaWidth = Math.max(40, this.width - rightAreaLeft);
+            return rightAreaLeft + rightAreaWidth * 0.5;
+        }
+
+        @Override
+        public boolean mouseClicked(double mouseX, double mouseY, int button) {
+            if (super.mouseClicked(mouseX, mouseY, button)) return true;
+            if (!isInsidePanel(mouseX, mouseY)) {
+                if (button == 0) {
+                    draggingMap = true;
+                    dragStartX = mouseX;
+                    dragStartY = mouseY;
+                    return true;
+                } else if (button == 1) {
+                    double anchorScreenX = getMapAreaCenterX();
+                    double anchorScreenY = this.height * 0.5;
+                    double mapCenterX = (draftX + mapPanOffsetX)
+                            - (anchorScreenX - this.width * 0.5) / previewScale;
+                    double mapCenterZ = (draftZ + mapPanOffsetZ)
+                            - (anchorScreenY - this.height * 0.5) / previewScale;
+                    draftX = Math.floor(mapCenterX + (mouseX - this.width * 0.5) / previewScale) + 0.5;
+                    draftZ = Math.floor(mapCenterZ + (mouseY - this.height * 0.5) / previewScale) + 0.5;
+                    mapPanOffsetX = 0.0;
+                    mapPanOffsetZ = 0.0;
+                    updateCoordinateInputs();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+            if (draggingMap && button == 0) {
+                mapPanOffsetX -= dragX / Math.max(0.01f, previewScale);
+                mapPanOffsetZ -= dragY / Math.max(0.01f, previewScale);
+                return true;
+            }
+            return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+        }
+
+        @Override
+        public boolean mouseReleased(double mouseX, double mouseY, int button) {
+            if (draggingMap && button == 0) {
+                draggingMap = false;
+                if (Math.hypot(mouseX - dragStartX, mouseY - dragStartY) < 4.0
+                        && !isInsidePanel(mouseX, mouseY)) {
+                    double anchorScreenX = getMapAreaCenterX();
+                    double anchorScreenY = this.height * 0.5;
+                    double mapCenterX = (draftX + mapPanOffsetX)
+                            - (anchorScreenX - this.width * 0.5) / previewScale;
+                    double mapCenterZ = (draftZ + mapPanOffsetZ)
+                            - (anchorScreenY - this.height * 0.5) / previewScale;
+                    draftX = Math.floor(mapCenterX + (mouseX - this.width * 0.5) / previewScale) + 0.5;
+                    draftZ = Math.floor(mapCenterZ + (mouseY - this.height * 0.5) / previewScale) + 0.5;
+                    mapPanOffsetX = 0.0;
+                    mapPanOffsetZ = 0.0;
+                    updateCoordinateInputs();
+                }
+                return true;
+            }
+            return super.mouseReleased(mouseX, mouseY, button);
+        }
+
+        @Override
+        public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+            if (!isInsidePanel(mouseX, mouseY)) {
+                previewScale = Math.max(0.0625f,
+                        Math.min(8.0f, previewScale + (float) scrollY * 0.15f * previewScale));
+                return true;
+            }
+            return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        }
+
         @Override
         public void renderBackground(GuiGraphics guiGraphics, int mouseX, int mouseY,
                 float partialTick) {
@@ -4928,72 +5033,73 @@ public class MapScreen extends Screen {
         @Override
         public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
             syncDraftQuietly();
-            float backgroundScale = Math.max(0.28f,
-                    Math.min(0.65f, (width - 2) / 1500.0f));
-            double markerScreenX = panelLeft >= 90 ? panelLeft / 2.0 : width / 2.0;
-            double markerScreenY = height / 2.0;
-            double mapCenterX = draftX
-                    - (markerScreenX - width / 2.0) / backgroundScale;
-            double mapCenterZ = draftZ
-                    - (markerScreenY - height / 2.0) / backgroundScale;
+            float backgroundScale = Math.max(0.0625f, previewScale);
+            double anchorScreenX = getMapAreaCenterX();
+            double anchorScreenY = height * 0.5;
+            double mapCenterX = (draftX + mapPanOffsetX)
+                    - (anchorScreenX - width * 0.5) / backgroundScale;
+            double mapCenterZ = (draftZ + mapPanOffsetZ)
+                    - (anchorScreenY - height * 0.5) / backgroundScale;
             double mouseWorldX = mapCenterX
-                    + (mouseX - width / 2.0) / backgroundScale;
+                    + (mouseX - width * 0.5) / backgroundScale;
             double mouseWorldZ = mapCenterZ
-                    + (mouseY - height / 2.0) / backgroundScale;
+                    + (mouseY - height * 0.5) / backgroundScale;
+
+            // Render full, unobstructed live map + existing waypoints in the background
+            // without any full-screen dark veil so terrain and markers stay crystal clear.
             MapRenderer.getInstance().drawMap(guiGraphics, 0, 0, width, height,
                     mapCenterX, mapCenterZ, backgroundScale,
                     MapManager.getInstance().isViewingLiveDimension(), false, false,
                     mouseWorldX, mouseWorldZ, partialTick, false);
-            guiGraphics.fill(0, 0, width, height, 0x520A0A0A);
-            renderScaledItem(guiGraphics, selectedIconItem,
-                    (int) Math.round(markerScreenX), (int) Math.round(markerScreenY),
-                    0.20f * MapConfig.waypointScale * waypointScale);
-            String mapPreview = "Waypoint preview · "
-                    + MapManager.displayDimensionName(draftDimension);
-            guiGraphics.drawCenteredString(font, mapPreview,
-                    (int) Math.round(markerScreenX),
-                    (int) Math.round(markerScreenY + 18.0 * waypointScale),
-                    0xFFFFFFFF);
 
+            // Draw the live target waypoint marker at its exact world position on the map
+            int markerScreenX = (int) Math.round(width * 0.5 + (draftX - mapCenterX) * backgroundScale);
+            int markerScreenY = (int) Math.round(height * 0.5 + (draftZ - mapCenterZ) * backgroundScale);
+            guiGraphics.renderOutline(markerScreenX - 10, markerScreenY - 10, 20, 20, 0xB000E5FF);
+            renderScaledItem(guiGraphics, selectedIconItem,
+                    markerScreenX, markerScreenY,
+                    0.20f * MapConfig.waypointScale * waypointScale);
+            String liveName = (draftName == null || draftName.isBlank()) ? defaultName() : draftName;
+            String mapPreview = liveName + " [" + Math.round(draftX) + ", " + Math.round(draftZ) + "]";
+            int labelW = font.width(mapPreview);
+            int labelY = (int) Math.round(markerScreenY + 13.0 * Math.max(0.8f, waypointScale));
+            guiGraphics.fill(markerScreenX - labelW / 2 - 3, labelY - 2,
+                    markerScreenX + labelW / 2 + 3, labelY + 9, 0x78000000);
+            guiGraphics.drawCenteredString(font, mapPreview, markerScreenX, labelY, 0xFFFFFFFF);
+
+            // Subtle map interaction hint at top of the open map area
+            String mapHint = "Click map: set X/Z · Drag: pan · Scroll: zoom";
+            int hintW = font.width(mapHint);
+            int hintX = (int) Math.round(anchorScreenX) - hintW / 2;
+            guiGraphics.fill(hintX - 5, 6, hintX + hintW + 5, 19, 0x680C0E12);
+            guiGraphics.drawString(font, mapHint, hintX, 9, 0xFFD0D8E0, false);
+
+            // Sleek translucent glass panel on the left (map remains visible behind & around it)
             guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
-                    panelTop + panelHeight, 0xF2202020);
-            guiGraphics.renderOutline(panelLeft, panelTop, panelWidth, panelHeight, 0xFF707070);
-            guiGraphics.renderOutline(panelLeft + 1, panelTop + 1,
-                    panelWidth - 2, panelHeight - 2, 0xFF080808);
+                    panelTop + panelHeight, 0x7A101318);
+            guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
+                    panelTop + 18, 0x88181D24);
+            guiGraphics.renderOutline(panelLeft, panelTop, panelWidth, panelHeight, 0x984A5462);
 
-            int dividerX = panelLeft + panelWidth / 2;
-            guiGraphics.fill(dividerX, panelTop + 30, dividerX + 1,
-                    panelTop + panelHeight - 38, 0xFF505050);
-
-            guiGraphics.drawCenteredString(font, title, width / 2, panelTop + 11, 0xFFFFFFFF);
-            int leftX = panelLeft + 18;
-            int rightX = panelLeft + panelWidth / 2 + 6;
-            int top = panelTop + 38;
-            guiGraphics.drawString(font, "Name", leftX, top + 2, 0xFFBFBFBF, false);
-            guiGraphics.drawString(font, "Coordinates", leftX, top + 42, 0xFFBFBFBF, false);
-            int fieldWidth = panelWidth / 2 - 32;
-            int coordinateGap = 5;
-            int coordinateWidth = (fieldWidth - coordinateGap * 2) / 3;
-            guiGraphics.drawString(font, "X", leftX + 2, top + 52, 0xFF8F8F8F, false);
-            guiGraphics.drawString(font, "Y", leftX + coordinateWidth + coordinateGap + 2,
-                    top + 52, 0xFF8F8F8F, false);
-            guiGraphics.drawString(font, "Z", leftX + (coordinateWidth + coordinateGap) * 2 + 2,
-                    top + 52, 0xFF8F8F8F, false);
-            guiGraphics.drawString(font, "Icon", rightX, top + 2, 0xFFBFBFBF, false);
-
-            int previewX = rightX;
-            int previewY = top + 146;
-            guiGraphics.fill(previewX, previewY, previewX + 40, previewY + 40, 0xFF111111);
-            guiGraphics.renderOutline(previewX, previewY, 40, 40, 0xFF909090);
+            // Header with title and inline selected icon preview
             renderScaledItem(guiGraphics, selectedIconItem,
-                    previewX + 20, previewY + 20,
-                    0.20f * MapConfig.waypointScale * waypointScale);
-            guiGraphics.drawString(font, String.format(Locale.ROOT, "Preview %.1fx", waypointScale),
-                    previewX + 47, previewY + 16, 0xFFBFBFBF, false);
+                    panelLeft + 12, panelTop + 9, 0.75f);
+            guiGraphics.drawString(font, title, panelLeft + 24, panelTop + 5, 0xFFFFFFFF, false);
+
+            int leftX = panelLeft + 8;
+            int top = panelTop + 22;
+            int fieldWidth = panelWidth - 16;
+            int coordinateGap = 4;
+            int coordinateWidth = (fieldWidth - coordinateGap * 2) / 3;
+            guiGraphics.drawString(font, "X", leftX + 1, top + 20, 0xFFA8B2BD, false);
+            guiGraphics.drawString(font, "Y", leftX + coordinateWidth + coordinateGap + 1,
+                    top + 20, 0xFFA8B2BD, false);
+            guiGraphics.drawString(font, "Z", leftX + (coordinateWidth + coordinateGap) * 2 + 1,
+                    top + 20, 0xFFA8B2BD, false);
 
             if (!validationMessage.isBlank()) {
-                guiGraphics.drawString(font, validationMessage, panelLeft + 18,
-                        panelTop + panelHeight - 27, 0xFFFFFFFF, false);
+                guiGraphics.drawString(font, validationMessage, leftX,
+                        panelTop + panelHeight - 34, 0xFFFF6B6B, false);
             }
 
             super.render(guiGraphics, mouseX, mouseY, partialTick);
@@ -5058,17 +5164,26 @@ public class MapScreen extends Screen {
         private static class ItemIconButton extends Button {
             private String itemId;
             private int tab = -1;
+            private final java.util.function.Supplier<String> selectedSupplier;
 
-            ItemIconButton(int x, int y, int width, int height, String itemId, OnPress onPress) {
+            ItemIconButton(int x, int y, int width, int height, String itemId,
+                    java.util.function.Supplier<String> selectedSupplier, OnPress onPress) {
                 super(x, y, width, height, Component.empty(), onPress, DEFAULT_NARRATION);
                 this.itemId = itemId;
+                this.selectedSupplier = selectedSupplier;
             }
 
             @Override
             public void renderWidget(GuiGraphics guiGraphics, int mouseX, int mouseY,
                     float partialTick) {
-                super.renderWidget(guiGraphics, mouseX, mouseY, partialTick);
-                if (visible && itemId != null && !itemId.isBlank()) {
+                if (!visible) return;
+                boolean selected = itemId != null && !itemId.isBlank()
+                        && selectedSupplier != null && itemId.equals(selectedSupplier.get());
+                int bg = selected ? 0x88243B52 : (isHoveredOrFocused() ? 0x70222830 : 0x4812161C);
+                int border = selected ? 0xCC00D4FF : (isHoveredOrFocused() ? 0xAA9098A4 : 0x66404854);
+                guiGraphics.fill(getX(), getY(), getX() + getWidth(), getY() + getHeight(), bg);
+                guiGraphics.renderOutline(getX(), getY(), getWidth(), getHeight(), border);
+                if (itemId != null && !itemId.isBlank()) {
                     renderItem(guiGraphics, itemId, getX() + (width - 16) / 2,
                             getY() + (height - 16) / 2);
                 }

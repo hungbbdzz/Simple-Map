@@ -117,6 +117,16 @@ public final class SurfaceColorizer {
                 int blue = baseColor & 0xFF;
                 int reliefY = MapBlockData.reliefY(packed);
                 boolean fluidPixel = MapBlockData.isFluid(packed);
+                boolean glowingPixel = MapBlockData.isGlowing(packed);
+                if (glowingPixel) {
+                    int total = red + green + blue;
+                    if (total > 0) {
+                        float brightener = Math.max(1.0f, 407.0f / (float) total);
+                        red = clamp(Math.round(red * brightener));
+                        green = clamp(Math.round(green * brightener));
+                        blue = clamp(Math.round(blue * brightener));
+                    }
+                }
 
                 /*
                  * Water depth and bottom colour are already handled in resolveBaseColor().
@@ -133,7 +143,11 @@ public final class SurfaceColorizer {
                 float shade = fluidPixel ? 1.0f
                         : calculateShade(pixels, px, pz, SIZE, SIZE,
                                 reliefY, terrainSlopes);
-                if (!fluidPixel) {
+                if (glowingPixel && !fluidPixel) {
+                    shade = shade > 1.0f
+                            ? 1.0f + Math.min(0.22222224f, (shade - 1.0f) * 0.35f)
+                            : 1.0f;
+                } else if (!fluidPixel) {
                     shade *= 1.0f + microNoise(index, packed, reliefY);
                 }
                 red = clamp(Math.round(red * shade));
@@ -141,7 +155,7 @@ public final class SurfaceColorizer {
                 blue = clamp(Math.round(blue * shade));
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
-                if (colourMode == 0) {
+                if (colourMode == 0 && !glowingPixel) {
                     argb = applyAccurateFilter(argb,
                             MapBlockData.isLeaves(packed),
                             MapBlockData.isFluid(packed));
@@ -263,6 +277,16 @@ public final class SurfaceColorizer {
                 int blue = baseColor & 0xFF;
                 int reliefY = MapBlockData.reliefY(packed);
                 boolean fluidPixel = MapBlockData.isFluid(packed);
+                boolean glowingPixel = MapBlockData.isGlowing(packed);
+                if (glowingPixel) {
+                    int total = red + green + blue;
+                    if (total > 0) {
+                        float brightener = Math.max(1.0f, 407.0f / (float) total);
+                        red = clamp(Math.round(red * brightener));
+                        green = clamp(Math.round(green * brightener));
+                        blue = clamp(Math.round(blue * brightener));
+                    }
+                }
                 int worldX = worldPageStartX + localX;
                 int worldZ = worldPageStartZ + localZ;
                 float shade = fluidPixel ? 1.0f
@@ -270,7 +294,11 @@ public final class SurfaceColorizer {
                                 reliefY, terrainSlopes);
                 int regionLocalX = Math.floorMod(worldX, SIZE);
                 int regionLocalZ = Math.floorMod(worldZ, SIZE);
-                if (!fluidPixel) {
+                if (glowingPixel && !fluidPixel) {
+                    shade = shade > 1.0f
+                            ? 1.0f + Math.min(0.22222224f, (shade - 1.0f) * 0.35f)
+                            : 1.0f;
+                } else if (!fluidPixel) {
                     shade *= 1.0f + microNoise(regionLocalZ * SIZE + regionLocalX,
                             packed, reliefY);
                 }
@@ -279,7 +307,7 @@ public final class SurfaceColorizer {
                 blue = clamp(Math.round(blue * shade));
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
-                if (colourMode == 0) {
+                if (colourMode == 0 && !glowingPixel) {
                     argb = applyAccurateFilter(argb,
                             MapBlockData.isLeaves(packed),
                             MapBlockData.isFluid(packed));
@@ -344,12 +372,26 @@ public final class SurfaceColorizer {
                 int blue = baseColor & 0xFF;
                 int reliefY = MapBlockData.reliefY(packed);
                 boolean fluidPixel = MapBlockData.isFluid(packed);
+                boolean glowingPixel = MapBlockData.isGlowing(packed);
+                if (glowingPixel) {
+                    int total = red + green + blue;
+                    if (total > 0) {
+                        float brightener = Math.max(1.0f, 407.0f / (float) total);
+                        red = clamp(Math.round(red * brightener));
+                        green = clamp(Math.round(green * brightener));
+                        blue = clamp(Math.round(blue * brightener));
+                    }
+                }
                 float shade = fluidPixel ? 1.0f
                         : calculateShade(pixels, px, pz, stride, stride,
                                 reliefY, terrainSlopes);
                 int worldX = worldStartX + localX * worldSampleStep;
                 int worldZ = worldStartZ + localZ * worldSampleStep;
-                if (!fluidPixel) {
+                if (glowingPixel && !fluidPixel) {
+                    shade = shade > 1.0f
+                            ? 1.0f + Math.min(0.22222224f, (shade - 1.0f) * 0.35f)
+                            : 1.0f;
+                } else if (!fluidPixel) {
                     int regionLocalX = Math.floorMod(worldX, SIZE);
                     int regionLocalZ = Math.floorMod(worldZ, SIZE);
                     shade *= 1.0f + microNoise(
@@ -360,7 +402,7 @@ public final class SurfaceColorizer {
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
-                if (colourMode == 0) {
+                if (colourMode == 0 && !glowingPixel) {
                     argb = applyAccurateFilter(argb,
                             MapBlockData.isLeaves(packed), fluidPixel);
                 }
