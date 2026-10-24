@@ -249,10 +249,11 @@ public final class SurfaceLodTree {
                     continue;
                 }
                 if (!inFlightLeafDerivations.add(key)) continue;
+                state.queuedNanos = now;
                 input = new LeafInput(key, state.pixels64, state.knownRows,
                         state.complete, state.sourceRevision,
                         state.lane == null ? MapRequestLane.BACKGROUND : state.lane,
-                        state.queuedNanos, loadGeneration);
+                        now, loadGeneration);
             }
             CompletableFuture<PreparedLeaf> future = MapWorkScheduler.tryCpuFuture(
                     input.lane(), MapWorkScheduler.WorkType.BRANCH_DERIVE,
@@ -831,7 +832,7 @@ public final class SurfaceLodTree {
     }
 
     private static LodBranchDiskCache.Key diskKey(NodeKey key) {
-        return new LodBranchDiskCache.Key("surface_v2_chunk16_" + key.dimension,
+        return new LodBranchDiskCache.Key("surface_v3_chunk16_" + key.dimension,
                 key.level, key.nodeX, key.nodeZ);
     }
 

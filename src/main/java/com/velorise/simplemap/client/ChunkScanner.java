@@ -389,6 +389,12 @@ public class ChunkScanner {
             int chunkX, int chunkZ) {
         MapManager manager = MapManager.getInstance();
         if (!manager.isChunkSurfaceComplete(chunkX, chunkZ)) return false;
+        if (level != null && level.dimensionType().hasCeiling()) {
+            long sample = manager.getPackedBlockData((chunkX << 4) + 8, (chunkZ << 4) + 8);
+            if (MapBlockData.isEmpty(sample) || MapBlockData.topY(sample) <= 122) {
+                return false;
+            }
+        }
         // Empty End chunks are legitimate void. Open terrain and hard-ceiling
         // dimensions always contain a visible surface in a generated FULL chunk.
         return level != null && level.dimension() == Level.END
@@ -1968,9 +1974,14 @@ public class ChunkScanner {
                     underair = true;
                     continue;
                 }
-                // Fluids (lava seas at Nether Y<=31, underground water lakes) are never a solid rock ceiling;
-                // Reference MapWriter: hitting any fluid when !shouldEnterGround sets underair = true.
-                if (!state.getFluidState().isEmpty()) {
+                // Lava seas (Nether Y<=31) and open-sky water in Layered Cave (!passedSolidRoof) set underair = true;
+                // enclosed 100%-submerged Overworld water aquifers under a solid roof without cave air above them
+                // are skipped in Full Cave so deeper cave networks beneath aquifers remain visible.
+                boolean isLavaFluid = state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA)
+                        || state.is(Blocks.LAVA);
+                boolean isOpenSkyWater = !fullView && !passedSolidRoof
+                        && state.getFluidState().is(net.minecraft.tags.FluidTags.WATER);
+                if (isLavaFluid || isOpenSkyWater) {
                     underair = true;
                 } else if (!fullView && !passedSolidRoof
                         && !CaveMode.isUndergroundSolidRoof(state)) {

@@ -506,15 +506,6 @@ public final class RegionDataStore {
                 || blockPalette == null || blockPalette.length == 0) {
             return;
         }
-        int bedrockIdx = -1;
-        for (int i = 0; i < blockPalette.length; i++) {
-            if ("minecraft:bedrock".equals(blockPalette[i])) {
-                bedrockIdx = i;
-                break;
-            }
-        }
-        if (bedrockIdx < 0) return;
-
         boolean hasNetherBiome = false;
         if (biomePalette != null) {
             for (String b : biomePalette) {
@@ -528,8 +519,12 @@ public final class RegionDataStore {
                 }
             }
         }
-        if (!hasNetherBiome && version >= 7) return;
+        if (!hasNetherBiome) return;
 
+        // In Cave Mode: OFF (Surface mode), the Nether surface is the roof at Y >= 127
+        // (plus any blocks built on the roof at Y >= 123). Any column in a Nether .smdat
+        // file with topY <= 122 is stale interior cave data from an older build and must
+        // be cleared so live scanning / Anvil .mca roof backfill replaces it cleanly.
         for (int cz = 0; cz < SurfaceChunkCoverage.CHUNKS_PER_AXIS; cz++) {
             int baseZ = cz << 4;
             for (int cx = 0; cx < SurfaceChunkCoverage.CHUNKS_PER_AXIS; cx++) {
@@ -542,10 +537,8 @@ public final class RegionDataStore {
                         int idx = row + lx;
                         long packed = pixels[idx];
                         if (MapBlockData.isEmpty(packed)) continue;
-                        int blk = MapBlockData.blockId(packed) & 0xFFFF;
-                        if (blk != bedrockIdx) continue;
                         int topY = MapBlockData.topY(packed);
-                        if (topY >= 122 || (hasNetherBiome && topY <= 4)) {
+                        if (topY <= 122) {
                             pixels[idx] = MapBlockData.EMPTY_PACKED;
                             if (tints != null && idx < tints.length) {
                                 tints[idx] = SurfaceTintData.UNKNOWN;
@@ -554,7 +547,7 @@ public final class RegionDataStore {
                         }
                     }
                 }
-                if (clearedAny && version < 7 && completeChunks != null) {
+                if (clearedAny && completeChunks != null) {
                     SurfaceChunkCoverage.clearComplete(completeChunks, chunkIndex);
                 }
             }
