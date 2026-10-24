@@ -316,9 +316,7 @@ public final class SimpleMapClientMod {
         }
 
         private static void invalidateMapStyle() {
-            MapSessionManager.getInstance().bumpStyleGeneration();
-            MapTextureManager.getInstance().invalidateStyle();
-            CaveTextureManager.getInstance().invalidateStyle();
+            MapManager.getInstance().reloadAllRegions();
         }
 
         private static boolean ready(Minecraft mc) {

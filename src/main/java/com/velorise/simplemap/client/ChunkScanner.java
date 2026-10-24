@@ -1886,11 +1886,12 @@ public class ChunkScanner {
         int localX = blockX & 15;
         int localZ = blockZ & 15;
         boolean isCaveDim = isCaveLikeDimension(level);
-        boolean hasSkyLight = level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling();
+        boolean hasCeiling = level.dimensionType().hasCeiling();
+        boolean hasSkyLight = level.dimensionType().hasSkyLight() && !hasCeiling;
         boolean showFlowers = MapConfig.displayFlowers;
 
         boolean shouldEnterGround = fullView && !isCaveDim;
-        boolean underair = fullView;
+        boolean underair = fullView && !hasCeiling;
         boolean passedSolidRoof = fullView || isCaveDim;
 
         for (int y = scanMaximum; y >= scanMinimum; y--) {
@@ -2828,7 +2829,10 @@ public class ChunkScanner {
 
         if (isCaveLikeDimension(level)) {
             boolean foundAir = false;
-            for (int y = level.getMaxBuildHeight() - 1; y >= minimumY; y--) {
+            int startY = level.dimensionType().hasCeiling()
+                    ? Math.min(122, level.getMaxBuildHeight() - 1)
+                    : (level.getMaxBuildHeight() - 1);
+            for (int y = startY; y >= minimumY; y--) {
                 probe.setY(y);
                 BlockState state = loadedChunk == null
                         ? level.getBlockState(probe)
@@ -3049,7 +3053,9 @@ public class ChunkScanner {
                 blockX, 0, blockZ);
 
         if (isCaveLike) {
-            int startY = level.getMaxBuildHeight() - 1;
+            int startY = level.dimensionType().hasCeiling()
+                    ? Math.min(122, level.getMaxBuildHeight() - 1)
+                    : (level.getMaxBuildHeight() - 1);
             boolean foundAir = false;
             for (int y = startY; y >= minBuildHeight; y--) {
                 pos.setY(y);
@@ -3283,11 +3289,19 @@ public class ChunkScanner {
             return referenceY;
         }
 
-        int top = Math.min(level.getMaxBuildHeight() - 1, referenceY + 8);
+        int maxTop = level.dimensionType().hasCeiling()
+                ? Math.min(122, level.getMaxBuildHeight() - 1)
+                : (level.getMaxBuildHeight() - 1);
+        int top = Math.min(maxTop, referenceY + 8);
         int bottom = Math.max(level.getMinBuildHeight(), referenceY - 16);
+        boolean foundAir = false;
         for (int y = top; y >= bottom; y--) {
             pos.setY(y);
             BlockState state = level.getBlockState(pos);
+            if (!foundAir) {
+                if (state.isAir()) foundAir = true;
+                continue;
+            }
             if (isVisibleMapSurface(level, pos, state)) return y;
         }
         return referenceY;

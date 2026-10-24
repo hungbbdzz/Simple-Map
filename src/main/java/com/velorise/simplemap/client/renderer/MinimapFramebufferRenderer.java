@@ -461,11 +461,13 @@ public final class MinimapFramebufferRenderer {
                 // construction. Only cold redraws need the expensive hierarchy
                 // readiness walk before they are eligible to become the front frame.
                 boolean coldCoverageReady = underlayDrawn || (caveActive
-                        ? MapRenderer.getInstance()
-                                .caveMinimapRetainedCoverageReady(
-                                        CaveMode.isFullView(minecraft),
-                                        caveLayerY, snappedX, snappedZ,
-                                        targetScale, targetSize)
+                        ? ((MapLodPolicy.branchLevel(policyScale, 3) <= 0
+                                && result.exactPagesDrawn() > 0)
+                                || MapRenderer.getInstance()
+                                        .caveMinimapRetainedCoverageReady(
+                                                CaveMode.isFullView(minecraft),
+                                                caveLayerY, snappedX, snappedZ,
+                                                targetScale, targetSize))
                         : MapRenderer.getInstance()
                                 .surfaceMinimapRetainedCoverageReady(
                                         snappedX, snappedZ, targetScale, targetSize));
@@ -579,7 +581,8 @@ public final class MinimapFramebufferRenderer {
         if (renderedTargetScale > 0.0f) {
             double shiftX = Math.abs((centerX - renderedSnappedX) * renderedTargetScale);
             double shiftZ = Math.abs((centerZ - renderedSnappedZ) * renderedTargetScale);
-            if (shiftX >= renderedTargetSize || shiftZ >= renderedTargetSize) {
+            int maxGuardShift = Math.max(1, renderedOverscan);
+            if (shiftX > maxGuardShift || shiftZ > maxGuardShift) {
                 return false;
             }
         }

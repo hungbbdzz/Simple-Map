@@ -1337,6 +1337,13 @@ public class MapTextureManager {
                 // requestLeafResident(), which queues the bounded restore.
                 return null;
             }
+            RevisionStamp activeStamp = MapSessionManager.getInstance().activeStamp();
+            if (activeStamp != null
+                    && (info.publishedStamp == null
+                            || info.publishedStamp.styleGeneration() != activeStamp.styleGeneration())
+                    && RegionSurfaceLodService.getInstance().hasCurrentStyleLevel0(regionX, regionZ)) {
+                return null;
+            }
             MapResidencyManager.getInstance().touch("surface:" + key);
             if (info.publishedStamp != null) {
                 int globalPageX = regionX * MapPageLayout.PAGES_PER_REGION + pageX;
@@ -1653,11 +1660,11 @@ public class MapTextureManager {
         int pageBudget;
         long pageBudgetNanos;
         if (styleRefresh) {
-            // Style refresh is resident-source work, but it still shares an 8 ms
-            // target frame. Reveal a few centre-out pages per callback rather than
-            // reserving five milliseconds and starving Minecraft rendering.
-            pageBudget = Math.min(4, governor.texturePageBudget(true));
-            pageBudgetNanos = Math.min(1_500_000L,
+            // Style refresh is resident-source work. Once M4 region authority has
+            // flipped the 512x512 region to the new style, exact 64x64 pages can
+            // rapidly sharpen the viewport without mixed-style patchwork.
+            pageBudget = Math.max(8, governor.texturePageBudget(true) * 2);
+            pageBudgetNanos = Math.max(2_500_000L,
                     governor.textureUploadBudgetNanos(true));
         } else if (force) {
             // Focus/force bypasses cadence only. It must never bypass the current
@@ -1680,7 +1687,7 @@ public class MapTextureManager {
             pageBudgetNanos = governor.textureUploadBudgetNanos(false);
         }
         long pageDeadline = System.nanoTime() + pageBudgetNanos;
-        int completedBudget = styleRefresh ? Math.min(6, pageBudget)
+        int completedBudget = styleRefresh ? Math.min(12, pageBudget)
                 : force ? Math.min(6, pageBudget)
                 : isForegroundLane(effectiveLane)
                         ? Math.min(governor.hasStreamingHeadroom() ? 4 : 2,
@@ -4204,6 +4211,49 @@ public class MapTextureManager {
             styleBiomeCacheGeneration = Long.MIN_VALUE;
         }
         BlockTextureColorSampler.clearCache();
+    }
+
+    /**
+     * Retires stale-style exact 64x64 page-table entries in a 512x512 region as soon
+     * as its M4 level-0 region texture is published at the new style generation.
+     * This prevents old-style 64x64 squares from sitting on top of the newly restyled
+     * 512x512 region while exact leaves rebuild.
+     */
+    public void onRegionLodStylePublished(int regionX, int regionZ,
+            RevisionStamp newStamp) {
+        if (newStamp == null) return;
+        boolean retiredAny = false;
+        synchronized (pageCache) {
+            for (int pageZ = 0; pageZ < MapPageLayout.PAGES_PER_REGION; pageZ++) {
+                for (int pageX = 0; pageX < MapPageLayout.PAGES_PER_REGION; pageX++) {
+                    String leafKey = pageKey(regionX, regionZ, pageX, pageZ);
+                    PageTextureInfo page = pageCache.get(leafKey);
+                    if (page == null || !page.initialized) continue;
+                    if (page.publishedStamp != null
+                            && page.publishedStamp.styleGeneration()
+                                    == newStamp.styleGeneration()) {
+                        continue;
+                    }
+                    PageAddress address = new PageAddress(
+                            regionX, regionZ, pageX, pageZ);
+                    RevisionStamp keyStamp = page.publishedStamp != null
+                            ? page.publishedStamp : newStamp;
+                    GpuPageTable.MapGpuPageTableService.getInstance().remove(
+                            exactTileKey(keyStamp, address,
+                                    TileKey.VARIANT_SURFACE_EXACT));
+                    GpuPageTable.MapGpuPageTableService.getInstance().remove(
+                            exactTileKey(keyStamp, address,
+                                    TileKey.VARIANT_SURFACE_GLOW));
+                    setPageResidentIndexed(page, false);
+                    retiredAny = true;
+                }
+            }
+        }
+        if (retiredAny) {
+            MapResidencyManager.getInstance().markTopologyChanged();
+            MapResidencyManager.getInstance().markCoverageChanged(
+                    MapResidencyManager.Kind.SURFACE_EXACT);
+        }
     }
 
     public void invalidateStyle() {

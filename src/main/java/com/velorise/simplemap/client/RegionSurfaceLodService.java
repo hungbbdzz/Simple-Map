@@ -212,12 +212,17 @@ public final class RegionSurfaceLodService {
         drainCompletions();
         long now = System.nanoTime();
         long remaining = Math.max(0L, deadlineNanos - now);
-        long firstPublishDeadline = now + Math.max(120_000L, remaining / 3L);
+        boolean styleRefresh = MapOverviewTextureManager.getInstance().isStyleRefreshActive();
+        long firstPublishDeadline = styleRefresh
+                ? deadlineNanos
+                : now + Math.max(120_000L, remaining / 3L);
         // Prepared coarse coverage must be allowed onto the GPU before another
         // full-region source probe consumes the complete branch time slice.
         publishPrepared(focused, Math.min(deadlineNanos, firstPublishDeadline));
         if (System.nanoTime() < deadlineNanos) {
-            long scheduleDeadline = now + Math.max(240_000L, remaining * 2L / 3L);
+            long scheduleDeadline = styleRefresh
+                    ? deadlineNanos
+                    : now + Math.max(240_000L, remaining * 2L / 3L);
             admitVisibleRegionLoads(focused,
                     Math.min(deadlineNanos, scheduleDeadline));
             // Coarse source coverage is the first visible result. Exact-derived
@@ -268,6 +273,20 @@ public final class RegionSurfaceLodService {
             NodeRecord record = records.get(key);
             return record != null && record.prepared != null
                     && record.prepared.knownMask() != 0L;
+        }
+    }
+
+    /** True when the 512x512 M4 level-0 region is GPU-resident at the current style generation. */
+    public boolean hasCurrentStyleLevel0(int regionX, int regionZ) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null) return false;
+        RegionLodGraph.NodeKey key = new RegionLodGraph.NodeKey(
+                stamp.sessionId(), PROJECTION_SURFACE, 0, regionX, regionZ);
+        synchronized (records) {
+            NodeRecord record = records.get(key);
+            return record != null && record.initialized && record.slot >= 0
+                    && record.uploadedKnownMask != 0L
+                    && record.uploadedStyleGeneration == stamp.styleGeneration();
         }
     }
 
@@ -502,7 +521,7 @@ public final class RegionSurfaceLodService {
                 || view.lane == MapRequestLane.FULLSCREEN;
         int budget = visibleForeground
                 ? (MapOverviewTextureManager.getInstance().isStyleRefreshActive()
-                        ? 6
+                        ? 16
                         : (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
                                 ? DIRECT_SCHEDULE_FAR_FOCUSED
                                 : DIRECT_SCHEDULE_FOCUSED))
@@ -550,6 +569,10 @@ public final class RegionSurfaceLodService {
                                     && view.stamp.isCurrent(),
                             lane.executorPriority());
             if (future == null) {
+                synchronized (records) {
+                    NodeRecord record = records.get(key);
+                    if (record != null) record.lastDirectAttemptNanos = 0L;
+                }
                 graph.defer(lease);
                 continue;
             }
@@ -840,6 +863,7 @@ public final class RegionSurfaceLodService {
                     MapGpuBudgetController.UploadKind.BRANCH, uploadNanos);
             record.initialized = prepared.knownMask() != 0L;
             record.uploadedRevision = prepared.revision();
+            record.uploadedStyleGeneration = prepared.stamp().styleGeneration();
             record.uploadedKnownMask = prepared.knownMask();
             record.uploadedCompleteMask = prepared.completeMask();
             record.uploadedChildVersions = prepared.childVersionSums();
@@ -866,6 +890,10 @@ public final class RegionSurfaceLodService {
                         prepared.revision(), flags,
                         publishedRegion.sourceX(), publishedRegion.sourceY(),
                         publishedRegion.sourceSize(), publishedRegion.atlasSize());
+                if (record.key.level() == 0) {
+                    MapTextureManager.getInstance().onRegionLodStylePublished(
+                            record.key.nodeX(), record.key.nodeZ(), prepared.stamp());
+                }
             }
             String residentKey = residencyKey(record.key);
             MapResidencyManager.getInstance().register(residentKey,
@@ -1200,6 +1228,7 @@ public final class RegionSurfaceLodService {
         private PreparedBranch prepared;
         private long readyRevision;
         private long uploadedRevision;
+        private long uploadedStyleGeneration = Long.MIN_VALUE;
         private long uploadedKnownMask;
         private long uploadedCompleteMask;
         private long[] uploadedChildVersions;

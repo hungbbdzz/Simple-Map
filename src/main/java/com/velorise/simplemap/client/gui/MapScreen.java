@@ -1129,8 +1129,9 @@ public class MapScreen extends Screen {
             }
 
             boolean isCaveDim = scanFromWorldTop;
+            boolean hasCeiling = level.dimensionType().hasCeiling();
             boolean shouldEnterGround = fullView && !isCaveDim;
-            boolean underair = fullView;
+            boolean underair = fullView && !hasCeiling;
             boolean passedSolidRoof = fullView || isCaveDim;
             boolean showFlowers = MapConfig.displayFlowers;
 
@@ -2531,10 +2532,9 @@ public class MapScreen extends Screen {
                 getMapStyleMessage(),
                 button -> {
                     MapConfig.mapColorProfile = (MapConfig.mapColorProfile + 1) % MapColorProfile.NAMES.length;
+                    MapConfig.save();
                     button.setMessage(getMapStyleMessage());
-                    MapSessionManager.getInstance().bumpStyleGeneration();
-                    MapTextureManager.getInstance().invalidateStyle();
-                    CaveTextureManager.getInstance().invalidateStyle();
+                    MapManager.getInstance().reloadAllRegions();
                 }).bounds(col1X, 152, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.map_style")))
                 .build();
