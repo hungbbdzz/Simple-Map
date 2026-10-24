@@ -323,5 +323,7 @@
   "gui.simplemap.book.learn_skipped_damaged": "§eMapa aprendido, pero se omitieron %s región(es) dañada(s).",
   "gui.simplemap.book.crumbled": "§e¡El libro de mapas se convierte en polvo tras aprender todos sus secretos!",
   "gui.simplemap.book.learn_success": "§a¡Mapa aprendido correctamente! Tu mapa ha sido actualizado.",
-  "gui.simplemap.chat.click_to_open_map": "Haz clic para ver [%s, %s] en el mapa"
+  "gui.simplemap.chat.click_to_open_map": "Haz clic para ver [%s, %s] en el mapa",
+  "gui.simplemap.option.minimap_waypoints": "Puntos de referencia: %s",
+  "gui.simplemap.tooltip.minimap_waypoints": "Mostrar u ocultar los iconos de puntos de referencia en el HUD del minimapa y su borde."
 }

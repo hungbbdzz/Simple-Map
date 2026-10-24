@@ -1492,7 +1492,7 @@ public final class CaveTextureManager {
     public static final class CaveMapManager {
         private static final CaveMapManager INSTANCE = new CaveMapManager();
         private static final int MAX_COMPAT_REGIONS = 128;
-        private static final int SCDAT_MAGIC = 0x53434447; // 'SCDG' (canonical cave lighting + lava/water ceiling-penetration fix)
+        private static final int SCDAT_MAGIC = 0x53434448; // 'SCDG' (canonical cave lighting + lava/water ceiling-penetration fix)
 
         private final ExecutorService diskExecutor = Executors.newFixedThreadPool(
                 Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() - 1)), r -> {
@@ -2704,10 +2704,11 @@ public final class CaveTextureManager {
                                 underair = true;
                                 continue;
                             }
-                            // Fluids (lava seas at Nether Y<=31, underground water lakes) are never a solid rock ceiling;
-                            // Reference WorldDataReader / MapWriter: hitting any fluid when !shouldEnterGround
-                            // immediately sets underair = true and renders the fluid/floor column.
-                            if (kind == DecodedSection.KIND_WATER || kind == DecodedSection.KIND_LAVA) {
+                            // Lava seas (Nether Y<=31) and open-sky water in Layered Cave (!passedSolidRoof) set underair = true;
+                            // enclosed 100%-submerged Overworld water aquifers under a solid roof without cave air above them
+                            // are skipped in Full Cave so deeper cave networks beneath aquifers remain visible.
+                            if (kind == DecodedSection.KIND_LAVA
+                                    || (kind == DecodedSection.KIND_WATER && !isFullCave && !passedSolidRoof)) {
                                 underair = true;
                             } else if (!isFullCave && !passedSolidRoof
                                     && (kind == DecodedSection.KIND_LEAVES

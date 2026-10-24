@@ -323,5 +323,7 @@
   "gui.simplemap.book.learn_skipped_damaged": "§e地图学习完成，但已跳过 %s 个损坏的区域。",
   "gui.simplemap.book.crumbled": "§e当你领悟完其中的全部秘密后，地图册化作了尘埃！",
   "gui.simplemap.book.learn_success": "§a成功学习地图！你的地图已更新。",
-  "gui.simplemap.chat.click_to_open_map": "点击在地图上查看 [%s, %s]"
+  "gui.simplemap.chat.click_to_open_map": "点击在地图上查看 [%s, %s]",
+  "gui.simplemap.option.minimap_waypoints": "路径点：%s",
+  "gui.simplemap.tooltip.minimap_waypoints": "在小地图HUD及其边框上显示或隐藏路径点物品图标。"
 }

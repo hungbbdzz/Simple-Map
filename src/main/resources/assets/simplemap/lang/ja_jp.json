@@ -323,5 +323,7 @@
   "gui.simplemap.book.learn_skipped_damaged": "§eマップを学習しましたが、%s 個の破損した領域がスキップされました。",
   "gui.simplemap.book.crumbled": "§eすべての知識を読み取ると、地図の本は塵となって崩れ去った！",
   "gui.simplemap.book.learn_success": "§aマップの学習に成功しました！マップが更新されました。",
-  "gui.simplemap.chat.click_to_open_map": "クリックしてマップ上の [%s, %s] を表示"
+  "gui.simplemap.chat.click_to_open_map": "クリックしてマップ上の [%s, %s] を表示",
+  "gui.simplemap.option.minimap_waypoints": "ウェイポイント: %s",
+  "gui.simplemap.tooltip.minimap_waypoints": "ミニマップHUDとその枠線上のウェイポイントアイコンを表示または非表示にします。"
 }

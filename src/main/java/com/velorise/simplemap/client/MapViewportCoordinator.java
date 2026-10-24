@@ -546,23 +546,32 @@ public final class MapViewportCoordinator {
          * rebuilding an invisible alternative map in parallel. Surface catches
          * up from loaded chunks after Cave is disabled.
          */
-        if (!caveActive
-                && now - lastLoadedSurfaceHaloRun
-                        >= LOADED_SURFACE_HALO_INTERVAL_NANOS) {
+        long surfaceHaloInterval = caveActive
+                ? LOADED_SURFACE_HALO_INTERVAL_NANOS * 5L
+                : LOADED_SURFACE_HALO_INTERVAL_NANOS;
+        if (now - lastLoadedSurfaceHaloRun >= surfaceHaloInterval) {
             lastLoadedSurfaceHaloRun = now;
-            long budget = fullscreenVisible
-                    ? LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS
-                    : LOADED_SURFACE_HALO_GAME_BUDGET_NANOS;
-            ChunkScanner.getInstance().maintainLoadedSurfaceHalo(
-                    minecraft, radius, budget);
-            double centerX = minecraft.player.getX();
-            double centerZ = minecraft.player.getZ();
-            submitSurfaceDemand(
-                    centerX - radius, centerX + radius,
-                    centerZ - radius, centerZ + radius,
-                    centerX, centerZ, 1.0f,
-                    MapRequestLane.MINIMAP, false);
-            publication.requestSurface(MapRequestLane.MINIMAP, false);
+            if (!caveActive || (!fullscreenVisible && minecraft.level != null
+                    && (minecraft.level.dimensionType().hasCeiling()
+                            || !minecraft.level.dimensionType().hasSkyLight()))) {
+                long budget = caveActive
+                        ? Math.min(350_000L, LOADED_SURFACE_HALO_GAME_BUDGET_NANOS / 2L)
+                        : (fullscreenVisible
+                                ? LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS
+                                : LOADED_SURFACE_HALO_GAME_BUDGET_NANOS);
+                ChunkScanner.getInstance().maintainLoadedSurfaceHalo(
+                        minecraft, radius, budget);
+            }
+            if (!caveActive) {
+                double centerX = minecraft.player.getX();
+                double centerZ = minecraft.player.getZ();
+                submitSurfaceDemand(
+                        centerX - radius, centerX + radius,
+                        centerZ - radius, centerZ + radius,
+                        centerX, centerZ, 1.0f,
+                        MapRequestLane.MINIMAP, false);
+                publication.requestSurface(MapRequestLane.MINIMAP, false);
+            }
         }
 
         if (caveActive) {

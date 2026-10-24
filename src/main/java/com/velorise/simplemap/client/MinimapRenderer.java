@@ -2,6 +2,7 @@ package com.velorise.simplemap.client;
 import com.velorise.simplemap.client.MapManager.MapConfig;
 import com.velorise.simplemap.client.gui.MapScreen.MapConfigScreen;
 import com.velorise.simplemap.client.gui.MapScreen.MapConfigScreen.WaypointListScreen;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager;
 import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager.Waypoint;
 import com.velorise.simplemap.client.cave.*;
 import com.velorise.simplemap.client.renderer.*;
@@ -251,7 +252,13 @@ public class MinimapRenderer {
             guiGraphics.pose().popPose();
         }
 
-        // 4. Draw pin navigation marker on minimap
+        // 4. Draw waypoint item markers on minimap (projected and border-clamped like Pin)
+        if (MapConfig.waypointsVisible && MapConfig.minimapWaypointsVisible) {
+            drawWaypointsOnMinimap(guiGraphics, player, x, y, size, borderThickness,
+                    effectiveZoom, partialTick);
+        }
+
+        // 5. Draw pin navigation marker on minimap
         if (MapConfig.pinActive) {
             drawPinOnMinimap(guiGraphics, player, x, y, size, borderThickness,
                     effectiveZoom, partialTick);
@@ -431,6 +438,97 @@ public class MinimapRenderer {
         int textWidth = mc.font.width(letter);
         guiGraphics.drawString(mc.font, letter, -textWidth / 2, -4, color, true);
         guiGraphics.pose().popPose();
+    }
+
+    /**
+     * Draws waypoint item icons on the minimap HUD (staying upright when rotating
+     * and clamping to the minimap frame when off-map, just like the navigation pin).
+     */
+    private void drawWaypointsOnMinimap(GuiGraphics guiGraphics, Player player, int mx, int my,
+            int size, int borderThickness, float effectiveZoom, float partialTick) {
+        java.util.List<WaypointManager.Waypoint> waypoints = WaypointManager.getInstance()
+                .getWaypointsForDimension(
+                        MapManager.getInstance().getCurrentDimensionResourceId());
+        if (waypoints == null || waypoints.isEmpty()) return;
+
+        double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
+        double playerX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX()) * dimScale;
+        double playerZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ()) * dimScale;
+        double zoom = effectiveZoom;
+
+        float cx = mx + size / 2.0f;
+        float cy = my + size / 2.0f;
+        MinimapFramebufferRenderer framebuffer = MinimapFramebufferRenderer.getInstance();
+
+        double cos = 1.0;
+        double sin = 0.0;
+        if (MapConfig.minimapRotate) {
+            float playerYaw = net.minecraft.util.Mth.rotLerp(partialTick,
+                    player.yRotO, player.getYRot());
+            double angleRad = Math.toRadians(-playerYaw - 180.0f);
+            cos = Math.cos(angleRad);
+            sin = Math.sin(angleRad);
+        }
+
+        float maxCircleRadius = size / 2.0f + borderThickness / 2.0f;
+        float squareLimit = size / 2.0f + borderThickness / 2.0f;
+
+        for (WaypointManager.Waypoint wp : waypoints) {
+            if (wp == null) continue;
+            double worldDX = wp.x - playerX;
+            double worldDZ = wp.z - playerZ;
+
+            MinimapFramebufferRenderer.HudPoint wpPoint = framebuffer.projectWorldToHud(wp.x, wp.z);
+            float scrDX;
+            float scrDZ;
+            if (wpPoint != null) {
+                scrDX = wpPoint.x() - cx;
+                scrDZ = wpPoint.y() - cy;
+            } else {
+                scrDX = (float) ((worldDX * cos - worldDZ * sin) * zoom);
+                scrDZ = (float) ((worldDX * sin + worldDZ * cos) * zoom);
+            }
+            float dist2D = (float) Math.sqrt(scrDX * scrDX + scrDZ * scrDZ);
+
+            float iconX;
+            float iconZ;
+            boolean offMap = false;
+            if (MapConfig.minimapCircle) {
+                if (dist2D <= maxCircleRadius || dist2D <= 0.0001f) {
+                    iconX = cx + scrDX;
+                    iconZ = cy + scrDZ;
+                } else {
+                    iconX = cx + (scrDX / dist2D) * maxCircleRadius;
+                    iconZ = cy + (scrDZ / dist2D) * maxCircleRadius;
+                    offMap = true;
+                }
+            } else {
+                if (Math.abs(scrDX) <= squareLimit && Math.abs(scrDZ) <= squareLimit) {
+                    iconX = cx + scrDX;
+                    iconZ = cy + scrDZ;
+                } else {
+                    float maxVal = Math.max(Math.abs(scrDX), Math.abs(scrDZ));
+                    float t = maxVal > 0.0001f ? squareLimit / maxVal : 0.0f;
+                    iconX = maxVal > 0.0001f ? cx + scrDX * t : cx;
+                    iconZ = maxVal > 0.0001f ? cy + scrDZ * t : cy;
+                    offMap = true;
+                }
+            }
+
+            float iconScale = Math.max(0.25f, Math.min(1.25f, 0.10f * MapConfig.waypointScale * wp.scale));
+            if (offMap) {
+                iconScale *= 0.85f;
+            }
+            net.minecraft.world.item.ItemStack iconStack =
+                    MapRenderer.getInstance().resolveWaypointIconStack(wp);
+
+            guiGraphics.pose().pushPose();
+            guiGraphics.pose().translate(iconX, iconZ, 0.0f);
+            guiGraphics.pose().scale(iconScale, iconScale, 1.0f);
+            guiGraphics.renderFakeItem(iconStack, -8, -8);
+            guiGraphics.pose().popPose();
+        }
+        guiGraphics.flush();
     }
 
     /**

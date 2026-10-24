@@ -208,7 +208,7 @@ public class MapRenderer {
         return drawMapInternal(guiGraphics, 0, 0, width, height, centerX, centerZ,
                 renderPixelsPerBlock, drawPlayer, rotateWithPlayer, true, 0.0, 0.0,
                 partialTick, false, false, fixedOverlayScale, policyPixelsPerBlock,
-                policyPixelsPerBlock, true, false);
+                policyPixelsPerBlock, false, false);
     }
 
     /**
@@ -747,19 +747,17 @@ public class MapRenderer {
             double mouseWorldX, double mouseWorldZ, float partialTick,
             float fixedOverlayScale, boolean drawPinContent,
             boolean drawPlayer) {
-        // 6.5. Draw waypoints for the current dimension if enabled
-        if (MapConfig.waypointsVisible) {
+        // 6.5. Draw waypoints for the current dimension on the fullscreen map if enabled
+        // (Minimap waypoints are rendered in screen space by MinimapRenderer like Pin)
+        if (MapConfig.waypointsVisible && !isMinimap) {
             java.util.List<WaypointManager.Waypoint> waypoints = WaypointManager.getInstance()
                     .getWaypointsForDimension(
                             MapManager.getInstance().getCurrentDimensionResourceId());
             for (WaypointManager.Waypoint wp : waypoints) {
-                boolean isHovered = false;
-                if (!isMinimap) {
-                    double hoverRadius = waypointHitRadiusWorld(wp, scale);
-                    isHovered = Math.abs(mouseWorldX - wp.x) <= hoverRadius
-                            && Math.abs(mouseWorldZ - wp.z) <= hoverRadius;
-                }
-                drawWaypointMarker(guiGraphics, wp, scale, isMinimap, isHovered);
+                double hoverRadius = waypointHitRadiusWorld(wp, scale);
+                boolean isHovered = Math.abs(mouseWorldX - wp.x) <= hoverRadius
+                        && Math.abs(mouseWorldZ - wp.z) <= hoverRadius;
+                drawWaypointMarker(guiGraphics, wp, scale, false, isHovered);
             }
         }
 
@@ -3248,24 +3246,7 @@ public class MapRenderer {
                 / safeMapScale;
         poseStack.scale(markerScale, markerScale, 1.0f);
 
-        // Resolve old preset icons and new item icons through one shared path so
-        // the map and Waypoint Manager always display the same symbol.
-        String itemID = WaypointManager.resolveIconItemId(wp);
-
-        net.minecraft.world.item.ItemStack iconStack = waypointItemStacks.get(itemID);
-        if (iconStack == null) {
-            try {
-                net.minecraft.world.item.Item item =
-                        net.minecraft.core.registries.BuiltInRegistries.ITEM.get(
-                                ResourceLocation.parse(itemID));
-                iconStack = item != null && item != net.minecraft.world.item.Items.AIR
-                        ? new net.minecraft.world.item.ItemStack(item)
-                        : fallbackWaypointStack;
-            } catch (RuntimeException invalidIdentifier) {
-                iconStack = fallbackWaypointStack;
-            }
-            waypointItemStacks.put(itemID, iconStack);
-        }
+        net.minecraft.world.item.ItemStack iconStack = resolveWaypointIconStack(wp);
         // Draw item centered (ItemStack is 16x16px, so we offset by -8).
         guiGraphics.renderFakeItem(iconStack, -8, -8);
 
@@ -3281,6 +3262,25 @@ public class MapRenderer {
         }
 
         poseStack.popPose();
+    }
+
+    public net.minecraft.world.item.ItemStack resolveWaypointIconStack(Waypoint wp) {
+        String itemID = WaypointManager.resolveIconItemId(wp);
+        net.minecraft.world.item.ItemStack iconStack = waypointItemStacks.get(itemID);
+        if (iconStack == null) {
+            try {
+                net.minecraft.world.item.Item item =
+                        net.minecraft.core.registries.BuiltInRegistries.ITEM.get(
+                                ResourceLocation.parse(itemID));
+                iconStack = item != null && item != net.minecraft.world.item.Items.AIR
+                        ? new net.minecraft.world.item.ItemStack(item)
+                        : fallbackWaypointStack;
+            } catch (RuntimeException invalidIdentifier) {
+                iconStack = fallbackWaypointStack;
+            }
+            waypointItemStacks.put(itemID, iconStack);
+        }
+        return iconStack;
     }
 
     public static double waypointHitRadiusWorld(Waypoint waypoint,
