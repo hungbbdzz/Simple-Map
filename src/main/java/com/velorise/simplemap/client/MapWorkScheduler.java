@@ -2395,9 +2395,11 @@ public static final class MapTextureBuildWorker {
                 if ((updateSubtiles & (1 << subtile)) == 0) continue;
                 int color = pageStyled[i];
                 int level = pageLight == null ? 0 : pageLight[i] & 0xFF;
+                float globalLight = level <= 0 ? 0.0f : (9.0f + Math.min(15, level)) / 24.0f;
+                float normalizedGlow = Math.max(0.0f, (globalLight - 0.375f) / 0.625f);
                 int alpha = color == 0 || level == 0 ? 0
                         : Math.min(255, Math.round(
-                                (float) Math.pow(level / 15.0f, 1.65f) * 255.0f));
+                                (float) Math.pow(normalizedGlow, 1.35f) * 240.0f));
                 int warm = tintTowardWarmLight(color, level);
                 pageGlow[i] = (warm & 0x00FFFFFF) | (alpha << 24);
             }
@@ -2518,9 +2520,11 @@ public static final class MapTextureBuildWorker {
                         if ((updateSubtiles & (1 << subtile)) == 0) continue;
                         int color = styled[index];
                         int level = smoothed == null ? 0 : smoothed[index] & 0xFF;
+                        float globalLight = level <= 0 ? 0.0f : (9.0f + Math.min(15, level)) / 24.0f;
+                        float normalizedGlow = Math.max(0.0f, (globalLight - 0.375f) / 0.625f);
                         int alpha = color == 0 || level == 0 ? 0
                                 : Math.min(255, Math.round((float) Math.pow(
-                                        level / 15.0f, 1.65f) * 255.0f));
+                                        normalizedGlow, 1.35f) * 240.0f));
                         int warm = tintTowardWarmLight(color, level);
                         glow[index] = (warm & 0x00FFFFFF) | (alpha << 24);
                     }

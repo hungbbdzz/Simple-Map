@@ -632,6 +632,12 @@ public class MapManager {
         return region.getTint(blockX & 511, blockZ & 511);
     }
 
+    public String getBiomeId(int blockX, int blockZ) {
+        Region region = getRegion(blockX >> 9, blockZ >> 9, false);
+        if (region == null || !region.isLoaded()) return null;
+        return region.getBiomeId(blockX & 511, blockZ & 511);
+    }
+
     /** O(1) chunk-completion probe used by the chunk-granular live writer. */
     public boolean isChunkSurfaceComplete(int chunkX, int chunkZ) {
         int blockX = chunkX << 4;
@@ -1583,6 +1589,22 @@ public class MapManager {
             lock.lock();
             try {
                 return tints[pixelZ * 512 + pixelX];
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public String getBiomeId(int pixelX, int pixelZ) {
+            lock.lock();
+            try {
+                long packed = pixels[pixelZ * 512 + pixelX];
+                if (MapBlockData.isEmpty(packed)) return null;
+                int index = MapBlockData.biomeId(packed) & 0xFF;
+                if (index == (MapBlockData.NO_BIOME & 0xFF)
+                        || index < 0 || index >= biomePalette.size()) {
+                    return null;
+                }
+                return biomePalette.get(index);
             } finally {
                 lock.unlock();
             }

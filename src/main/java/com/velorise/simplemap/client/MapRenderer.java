@@ -253,6 +253,16 @@ public class MapRenderer {
 
             double halfW = (width / 2.0) / scale;
             double halfH = (height / 2.0) / scale;
+            boolean caveMode = CaveMode.isActive(mc);
+            boolean fullCaveView = caveMode && CaveMode.isFullView(mc);
+            int caveLayerY = caveMode ? CaveMode.getLayerY(mc) : Integer.MIN_VALUE;
+            CachedPlan activePlan = fullscreenOffscreenPlan != null
+                    ? fullscreenOffscreenPlan : fullscreenPlan;
+            if (activePlan != null) {
+                drawLoadingIndicators(guiGraphics,
+                        activePlan.plan().pendingRegions(), scale,
+                        caveMode, fullCaveView, caveLayerY);
+            }
             drawMapOverlays(guiGraphics, mc, poseStack,
                     centerX - halfW, centerX + halfW,
                     centerZ - halfH, centerZ + halfH,
@@ -687,9 +697,10 @@ public class MapRenderer {
                     RenderSystem.disableBlend();
                 }
             }
-            if (!isMinimap) {
+            if (drawOverlayContent && !isMinimap) {
                 drawLoadingIndicators(guiGraphics,
-                        cachedPlan.plan().pendingRegions(), activePolicyScale);
+                        cachedPlan.plan().pendingRegions(), scale,
+                        caveMode, fullCaveView, caveLayerY);
             }
             if (fallbackPlan != null) renderStats.accept(fallbackPlan.plan().result());
             renderStats.accept(cachedPlan.plan().result());
@@ -2978,7 +2989,8 @@ public class MapRenderer {
      * normal views use one region, and far views group 2x2 or 4x4 regions.
      */
     private void drawLoadingIndicators(GuiGraphics guiGraphics,
-            long[] pendingRegions, float mapScale) {
+            long[] pendingRegions, float mapScale,
+            boolean caveMode, boolean fullCaveView, int caveLayerY) {
         if (pendingRegions == null || pendingRegions.length == 0
                 || mapScale <= 0.0f) return;
         int cellBlocks = 512;
@@ -2992,6 +3004,9 @@ public class MapRenderer {
             long packed = pendingRegions[pendingIndex];
             int rx = (int) (packed >> 32);
             int rz = (int) packed;
+            if (!isRegionStillPending(rx, rz, caveMode, fullCaveView, caveLayerY)) {
+                continue;
+            }
             int regionX = rx * 512;
             int regionZ = rz * 512;
             int cellX = Math.floorDiv(regionX, cellBlocks) * cellBlocks;
@@ -3008,6 +3023,32 @@ public class MapRenderer {
                     cellZ + cellBlocks * 0.5,
                     mapScale);
         }
+    }
+
+    private boolean isRegionStillPending(int rx, int rz,
+            boolean caveMode, boolean fullCaveView, int caveLayerY) {
+        if (caveMode) {
+            int targetLayer = fullCaveView ? Integer.MIN_VALUE : caveLayerY;
+            if (CaveTextureManager.getInstance()
+                    .hasResidentCoverageForRegion(targetLayer, rx, rz)) {
+                return false;
+            }
+            return CaveMapManager.getInstance().isRegionPending(targetLayer, rx, rz);
+        }
+        MapTextureManager surfaceTextures = MapTextureManager.getInstance();
+        if (surfaceTextures.hasAnyPageTexture(rx, rz)) return false;
+        MapOverviewTextureManager overviewTextures =
+                MapOverviewTextureManager.getInstance();
+        if (overviewTextures.peekRegionSurfaceBranch(0, rx, rz) != null
+                || overviewTextures.peekSurfaceBranch(3, rx, rz) != null) {
+            return false;
+        }
+        MapManager manager = MapManager.getInstance();
+        MapManager.Region loadedRegion = manager.getRegion(rx, rz, false);
+        if (loadedRegion != null && loadedRegion.isLoaded()) {
+            return loadedRegion.hasAnyData();
+        }
+        return manager.hasRegionFile(rx, rz);
     }
 
     private int appendUniqueLoadingCell(long packed, int count) {
@@ -3029,25 +3070,22 @@ public class MapRenderer {
         PoseStack pose = guiGraphics.pose();
         pose.pushPose();
         pose.translate(worldX, worldZ, 20.0);
-        float inverseScale = 1.0f / mapScale;
+        float safeScale = Math.max(0.0001f, Math.abs(mapScale));
+        float inverseScale = 1.0f / safeScale;
         pose.scale(inverseScale, inverseScale, 1.0f);
 
         long now = System.currentTimeMillis();
-        int period = 2000;
-        int maxSpokes = 3;
+        int period = 1000;
         float baseRotation = (float) ((now % period) / (double) period * 360.0);
-        int visibleSpokes = 1 + (int) ((now % (maxSpokes * period)) / period);
+        pose.mulPose(Axis.ZP.rotationDegrees(baseRotation));
 
-        int innerR = 8;
-        int spokeLength = 16;
-        int spokeThick = 4;
+        int orbitRadius = 4;
+        int color = 0xD8E2E6EC;
 
-        for (int i = 0; i < visibleSpokes; i++) {
+        for (int i = 0; i < 3; i++) {
             pose.pushPose();
-            float spokeAngle = baseRotation + i * (360.0f / maxSpokes);
-            pose.mulPose(Axis.ZP.rotationDegrees(spokeAngle));
-            int color = 0xCCD8D8D8;
-            guiGraphics.fill(innerR, -spokeThick / 2, innerR + spokeLength, (spokeThick + 1) / 2, color);
+            pose.mulPose(Axis.ZP.rotationDegrees(i * 120.0f));
+            guiGraphics.fill(orbitRadius - 1, -1, orbitRadius + 1, 1, color);
             pose.popPose();
         }
 

@@ -752,7 +752,7 @@ public final class SurfaceColorizer {
             return Math.max(0.0f, Math.min(1.0f, v));
         }
 
-        public static final int BLEND_RADIUS = 1;
+        public static final int BLEND_RADIUS = 2;
         private static final int SIZE = 512;
 
         public static int blendGrass(long[] pixelData,
@@ -763,7 +763,7 @@ public final class SurfaceColorizer {
         public static int blendGrass(long[] pixelData,
                 java.util.function.IntFunction<net.minecraft.world.level.biome.Biome> biomeLookup, int px, int pz,
                 int width, int height) {
-            return blend(pixelData, biomeLookup, px, pz, width, height, false,
+            return blend(pixelData, biomeLookup, px, pz, width, height, true,
                     BiomeColors::getGrassColor);
         }
 
@@ -775,7 +775,7 @@ public final class SurfaceColorizer {
         public static int blendFoliage(long[] pixelData,
                 java.util.function.IntFunction<net.minecraft.world.level.biome.Biome> biomeLookup, int px, int pz,
                 int width, int height) {
-            return blend(pixelData, biomeLookup, px, pz, width, height, false,
+            return blend(pixelData, biomeLookup, px, pz, width, height, true,
                     BiomeColors::getFoliageColor);
         }
 

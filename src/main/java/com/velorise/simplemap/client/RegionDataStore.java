@@ -445,6 +445,7 @@ public final class RegionDataStore {
                 // authority path before treating them as current completion.
                 invalidateLegacyFluidCompletion(pixels, completeChunks);
             }
+            repairChunkBorderBiomeSeams(pixels, biomePalette, completeChunks);
             return new StoredRegion(pixels, tints, biomePalette, blockPalette,
                     completeChunks);
         }
@@ -484,6 +485,129 @@ public final class RegionDataStore {
      * chunks transactionally. PASS123 uses this v6 migration to retire water rows
      * captured while disk and live Surface writers could race each other.
      */
+    /**
+     * Repairs 16x16 chunk-border {@code minecraft:plains} seams in existing
+     * {@code .smdat} region files that were captured while a neighbour chunk was
+     * unloaded on the client (causing {@code ClientLevel.getUncachedNoiseBiome} to
+     * inject {@code Biomes.PLAINS} along the 2-4 block chunk border in Warm Ocean,
+     * Savanna, etc.).
+     */
+    private static int repairChunkBorderBiomeSeams(long[] pixels,
+            String[] biomePalette, long[] completeChunks) {
+        if (pixels == null || pixels.length != PIXEL_COUNT
+                || biomePalette == null || biomePalette.length <= 1) {
+            return 0;
+        }
+        int plainsIdx = -1;
+        for (int i = 0; i < biomePalette.length; i++) {
+            if ("minecraft:plains".equals(biomePalette[i])) {
+                plainsIdx = i;
+                break;
+            }
+        }
+        if (plainsIdx < 0) return 0;
+
+        int chunksPerAxis = SurfaceChunkCoverage.CHUNKS_PER_AXIS;
+        boolean[] chunkCoreHasPlains = new boolean[chunksPerAxis * chunksPerAxis];
+        boolean[] chunkCoreHasNonPlains = new boolean[chunksPerAxis * chunksPerAxis];
+
+        for (int cz = 0; cz < chunksPerAxis; cz++) {
+            int baseZ = cz << 4;
+            for (int cx = 0; cx < chunksPerAxis; cx++) {
+                int baseX = cx << 4;
+                int cIdx = (cz << 5) | cx;
+                boolean hasPlains = false;
+                boolean hasOther = false;
+                for (int lz = 4; lz <= 11; lz++) {
+                    int row = (baseZ + lz) * REGION_SIZE + baseX;
+                    for (int lx = 4; lx <= 11; lx++) {
+                        long packed = pixels[row + lx];
+                        if (MapBlockData.isEmpty(packed)) continue;
+                        int bId = MapBlockData.biomeId(packed) & 0xFF;
+                        if (bId == plainsIdx) hasPlains = true;
+                        else if (bId != (MapBlockData.NO_BIOME & 0xFF)) hasOther = true;
+                    }
+                }
+                chunkCoreHasPlains[cIdx] = hasPlains;
+                chunkCoreHasNonPlains[cIdx] = hasOther;
+            }
+        }
+
+        int repairedChunks = 0;
+        for (int cz = 0; cz < chunksPerAxis; cz++) {
+            int baseZ = cz << 4;
+            for (int cx = 0; cx < chunksPerAxis; cx++) {
+                int cIdx = (cz << 5) | cx;
+                if (chunkCoreHasPlains[cIdx] || !chunkCoreHasNonPlains[cIdx]) continue;
+                int baseX = cx << 4;
+                boolean chunkRepaired = false;
+
+                for (int lz = 0; lz < 16; lz++) {
+                    int row = (baseZ + lz) * REGION_SIZE + baseX;
+                    for (int lx = 0; lx < 16; lx++) {
+                        if (lx >= 4 && lx <= 11 && lz >= 4 && lz <= 11) continue;
+                        long packed = pixels[row + lx];
+                        if (MapBlockData.isEmpty(packed)) continue;
+                        int bId = MapBlockData.biomeId(packed) & 0xFF;
+                        if (bId != plainsIdx) continue;
+
+                        int adjCx = lx < 4 ? cx - 1 : (lx > 11 ? cx + 1 : cx);
+                        int adjCz = lz < 4 ? cz - 1 : (lz > 11 ? cz + 1 : cz);
+                        if (adjCx >= 0 && adjCx < chunksPerAxis
+                                && adjCz >= 0 && adjCz < chunksPerAxis) {
+                            if (chunkCoreHasPlains[(adjCz << 5) | adjCx]) continue;
+                        }
+                        if (adjCx != cx && cx >= 0 && cx < chunksPerAxis
+                                && adjCz >= 0 && adjCz < chunksPerAxis
+                                && chunkCoreHasPlains[(adjCz << 5) | cx]) {
+                            continue;
+                        }
+                        if (adjCz != cz && adjCx >= 0 && adjCx < chunksPerAxis
+                                && cz >= 0 && cz < chunksPerAxis
+                                && chunkCoreHasPlains[(cz << 5) | adjCx]) {
+                            continue;
+                        }
+
+                        int innerX = Math.max(4, Math.min(11, lx));
+                        int innerZ = Math.max(4, Math.min(11, lz));
+                        long innerPacked = pixels[(baseZ + innerZ) * REGION_SIZE + baseX + innerX];
+                        byte replacementBiome = MapBlockData.biomeId(innerPacked);
+                        if ((replacementBiome & 0xFF) == plainsIdx
+                                || replacementBiome == MapBlockData.NO_BIOME) {
+                            // Search the 8x8 core for any valid non-plains biome
+                            searchCore:
+                            for (int sz = 4; sz <= 11; sz++) {
+                                int sRow = (baseZ + sz) * REGION_SIZE + baseX;
+                                for (int sx = 4; sx <= 11; sx++) {
+                                    long sp = pixels[sRow + sx];
+                                    if (MapBlockData.isEmpty(sp)) continue;
+                                    byte sb = MapBlockData.biomeId(sp);
+                                    if ((sb & 0xFF) != plainsIdx && sb != MapBlockData.NO_BIOME) {
+                                        replacementBiome = sb;
+                                        break searchCore;
+                                    }
+                                }
+                            }
+                        }
+                        if ((replacementBiome & 0xFF) != plainsIdx
+                                && replacementBiome != MapBlockData.NO_BIOME) {
+                            pixels[row + lx] = MapBlockData.withBiomeId(packed, replacementBiome);
+                            chunkRepaired = true;
+                        }
+                    }
+                }
+                if (chunkRepaired) {
+                    repairedChunks++;
+                    if (completeChunks != null
+                            && completeChunks.length == COMPLETE_CHUNK_WORDS) {
+                        SurfaceChunkCoverage.clearComplete(completeChunks, cIdx);
+                    }
+                }
+            }
+        }
+        return repairedChunks;
+    }
+
     private static int invalidateLegacyFluidCompletion(long[] pixels,
             long[] completeChunks) {
         if (pixels == null || pixels.length != PIXEL_COUNT
