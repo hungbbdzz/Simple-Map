@@ -602,13 +602,36 @@ public final class CaveTextureManager {
 
     public boolean hasBranchData(int layerY, int level, int nodeX, int nodeZ,
             MapRequestLane lane) {
+        int band = layerY == Integer.MIN_VALUE
+                ? Integer.MIN_VALUE
+                : CaveMode.CaveLayerBand.key(CaveMode.CaveLayerBand.CaveView.LAYERED, layerY);
+        BranchKey key = new BranchKey(band, level, nodeX, nodeZ);
+        synchronized (branchPages) {
+            BranchEntry entry = branchPages.get(key);
+            if (entry != null && !entry.dirty) {
+                return entry.hasContent;
+            }
+        }
         int pageSpan = MapViewportCoordinator.MapLodPolicy.pageSpanForBranch(level);
         int firstPageX = nodeX * pageSpan;
         int firstPageZ = nodeZ * pageSpan;
         int rx = Math.floorDiv(firstPageX, 8);
         int rz = Math.floorDiv(firstPageZ, 8);
         CaveMapManager cmm = CaveMapManager.getInstance();
-        return cmm.hasRegionFile(layerY, rx, rz) || cmm.isRegionLoaded(layerY, rx, rz);
+        CaveMapManager.CaveRegion region = cmm.getRegion(layerY, rx, rz, false);
+        if (region != null && region.isLoaded()) {
+            if (!region.hasContent()) return false;
+            if (level <= 3) {
+                int localPageX = Math.floorMod(firstPageX, 8);
+                int localPageZ = Math.floorMod(firstPageZ, 8);
+                return region.hasNodeContent(localPageX, localPageZ, Math.min(8, pageSpan));
+            }
+            return true;
+        }
+        if (lane == MapRequestLane.MINIMAP) {
+            return false;
+        }
+        return cmm.hasRegionFile(layerY, rx, rz);
     }
 
     public boolean hasResidentPageInNode(int layerY, int level,
@@ -1575,8 +1598,8 @@ public final class CaveTextureManager {
         }
 
         public static final short NO_SURFACE = CaveRegion.NO_SURFACE;
-        public static final int EPOCH = 10;
-        public static final int LOD_BRANCH_VERSION = 19;
+        public static final int EPOCH = 11;
+        public static final int LOD_BRANCH_VERSION = 20;
 
         public long getLayerGeneration() {
             return layerGeneration.get();
@@ -2040,6 +2063,7 @@ public final class CaveTextureManager {
                         heights[i] = tempHeights[i];
                     }
                 }
+                region.recomputePageContentMaskLocked();
                 region.markHasContent();
                 if (anvilSliced) {
                     region.setAnvilSliced(true);
@@ -2250,6 +2274,7 @@ public final class CaveTextureManager {
                         }
                     }
                     if (modified) {
+                        region.recomputePageContentMaskLocked();
                         region.markHasContent();
                         region.setDirty(true);
                     }
@@ -2300,7 +2325,8 @@ public final class CaveTextureManager {
             }
 
             boolean isCaveDim = isCaveDimension(level);
-            boolean hasSkyLight = level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling();
+            boolean hasCeiling = level.dimensionType().hasCeiling();
+            boolean hasSkyLight = level.dimensionType().hasSkyLight() && !hasCeiling;
             boolean chunkHadContent = false;
 
             int basePx = cx << 4;
@@ -2315,7 +2341,7 @@ public final class CaveTextureManager {
                     int regIdx = rowOffset + pxInRegion;
 
                     boolean shouldEnterGround = isFullCave && !isCaveDim;
-                    boolean underair = isFullCave;
+                    boolean underair = isFullCave && !hasCeiling;
                     boolean passedSolidRoof = isFullCave || isCaveDim;
 
                     for (int y = scanMaximum; y >= scanMinimum; y--) {
@@ -3273,7 +3299,9 @@ public final class CaveTextureManager {
         }
 
         private static boolean isCaveDimension(Level level) {
-            return level != null && (level.dimension() == Level.NETHER || !level.dimensionType().hasSkyLight());
+            return level != null && (level.dimension() == Level.NETHER
+                    || level.dimensionType().hasCeiling()
+                    || !level.dimensionType().hasSkyLight());
         }
 
         private void saveAllDirtyRegions() {
@@ -3452,6 +3480,7 @@ public final class CaveTextureManager {
             private volatile boolean exactSnapshot;
             private volatile boolean closed;
             private volatile boolean hasContent;
+            private volatile long pageContentMask;
             private volatile boolean dirty;
             private volatile boolean anvilSliced;
             private volatile int writtenAnvilLayerY = Integer.MAX_VALUE;
@@ -3492,6 +3521,46 @@ public final class CaveTextureManager {
             public boolean hasExactSnapshot() { return exactSnapshot && !closed; }
             public boolean hasContent() { return hasContent && !closed; }
             public boolean hasSavedContent() { return hasContent; }
+
+            public boolean hasNodeContent(int firstLocalPageX, int firstLocalPageZ, int pageSpan) {
+                if (!hasContent || closed) return false;
+                long mask = pageContentMask;
+                if (mask == 0L) return false;
+                int endX = Math.min(8, Math.max(0, firstLocalPageX) + Math.max(1, pageSpan));
+                int endZ = Math.min(8, Math.max(0, firstLocalPageZ) + Math.max(1, pageSpan));
+                for (int pz = Math.max(0, firstLocalPageZ); pz < endZ; pz++) {
+                    for (int px = Math.max(0, firstLocalPageX); px < endX; px++) {
+                        if ((mask & (1L << ((pz << 3) | px))) != 0L) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+
+            void recomputePageContentMaskLocked() {
+                long mask = 0L;
+                for (int pageZ = 0; pageZ < 8; pageZ++) {
+                    int baseZ = pageZ << 6;
+                    for (int pageX = 0; pageX < 8; pageX++) {
+                        int baseX = pageX << 6;
+                        boolean pageHas = false;
+                        for (int dz = 0; dz < 64 && !pageHas; dz++) {
+                            int row = (baseZ + dz) * 512 + baseX;
+                            for (int dx = 0; dx < 64; dx++) {
+                                if (pixels[row + dx] != 0) {
+                                    pageHas = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (pageHas) {
+                            mask |= (1L << ((pageZ << 3) | pageX));
+                        }
+                    }
+                }
+                pageContentMask = mask;
+            }
             public boolean isDirty() { return dirty && !closed; }
             public void setDirty(boolean dirty) { this.dirty = dirty; }
             public void markLoaded() { if (!closed) loaded = true; }
@@ -3560,7 +3629,8 @@ public final class CaveTextureManager {
                 try {
                     if (!closed) {
                         System.arraycopy(source, 0, pixels, 0, Math.min(source.length, pixels.length));
-                        hasContent = true;
+                        recomputePageContentMaskLocked();
+                        hasContent = pageContentMask != 0L;
                         loaded = true;
                     }
                 } finally {
@@ -3577,15 +3647,20 @@ public final class CaveTextureManager {
                 try {
                     if (closed) return;
                     int length = Math.min(source.length, pixels.length);
+                    long mask = pageContentMask;
                     for (int i = 0; i < length; i++) {
                         if (!livePixels.get(i) && pixels[i] == 0 && source[i] != 0) {
                             pixels[i] = source[i];
                             if (sourceHeights != null && i < sourceHeights.length) {
                                 heights[i] = sourceHeights[i];
                             }
+                            int px = i & 511;
+                            int pz = i >>> 9;
+                            mask |= (1L << (((pz >> 6) << 3) | (px >> 6)));
                             hasContent = true;
                         }
                     }
+                    pageContentMask = mask;
                 } finally {
                     lock.unlock();
                 }
@@ -3660,6 +3735,7 @@ public final class CaveTextureManager {
                     writtenChunkLayerY[chunkIdx] = encodedLayer;
                     if (chunkHasContent) {
                         hasContent = true;
+                        pageContentMask |= (1L << (((czInRegion >> 2) << 3) | (cxInRegion >> 2)));
                     }
                     loaded = true;
                     if (anyChanged) {
@@ -3700,6 +3776,7 @@ public final class CaveTextureManager {
                     if (abgrColor != 0) {
                         hasContent = true;
                         loaded = true;
+                        pageContentMask |= (1L << (((pz >> 6) << 3) | (px >> 6)));
                     }
                     boolean colorChanged = pixels[index] != abgrColor;
                     boolean heightChanged = heights[index] != clampedHeight;
