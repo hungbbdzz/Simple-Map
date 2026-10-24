@@ -824,7 +824,7 @@ public class MapRenderer {
                     double distanceZ = MapConfig.pinWorldZ - playerZ;
                     int distanceBlocks = (int) Math.floor(Math.sqrt(
                             distanceX * distanceX + distanceZ * distanceZ));
-                    String distanceText = distanceBlocks + " blocks";
+                    String distanceText = net.minecraft.network.chat.Component.translatable("gui.simplemap.distance.blocks", distanceBlocks).getString();
                     int textWidth = mc.font.width(distanceText);
                     int labelY = 6;
                     poseStack.translate(0.0F, 0.0F, 1.0F);

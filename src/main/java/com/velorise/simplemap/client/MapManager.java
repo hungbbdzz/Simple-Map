@@ -525,11 +525,22 @@ public class MapManager {
         return currentDimensionHasSavedData;
     }
 
+    private static String translateOrFallback(String key, String fallback) {
+        try {
+            net.minecraft.locale.Language lang = net.minecraft.locale.Language.getInstance();
+            if (lang != null && lang.has(key)) {
+                return Component.translatable(key).getString();
+            }
+        } catch (Throwable ignored) {
+        }
+        return fallback;
+    }
+
     public static String displayDimensionName(String resourceId) {
         String canonical = canonicalDimensionId(resourceId);
-        if (canonical.equals("minecraft:overworld")) return "Overworld";
-        if (canonical.equals("minecraft:the_nether")) return "Nether";
-        if (canonical.equals("minecraft:the_end")) return "The End";
+        if (canonical.equals("minecraft:overworld")) return translateOrFallback("gui.simplemap.dim.overworld", "Overworld");
+        if (canonical.equals("minecraft:the_nether")) return translateOrFallback("gui.simplemap.dim.the_nether", "Nether");
+        if (canonical.equals("minecraft:the_end")) return translateOrFallback("gui.simplemap.dim.the_end", "The End");
         int colon = canonical.indexOf(':');
         String namespace = colon >= 0 ? canonical.substring(0, colon) : "minecraft";
         String path = colon >= 0 ? canonical.substring(colon + 1) : canonical;
@@ -2659,8 +2670,7 @@ public class MapManager {
                 return false;
             }
             if (!canTeleport(minecraft)) {
-                minecraft.player.sendSystemMessage(Component.literal(
-                        "Teleport requires Creative, Spectator, or permission level 2."));
+                minecraft.player.sendSystemMessage(Component.translatable("gui.simplemap.msg.teleport_permission"));
                 return false;
             }
 
@@ -2668,8 +2678,7 @@ public class MapManager {
             String targetDimension = manager.resolveDimensionResourceId(dimension);
             net.minecraft.resources.ResourceLocation targetId = net.minecraft.resources.ResourceLocation.tryParse(targetDimension);
             if (targetId == null) {
-                minecraft.player.sendSystemMessage(Component.literal(
-                        "Invalid target dimension: " + targetDimension));
+                minecraft.player.sendSystemMessage(Component.translatable("gui.simplemap.msg.invalid_dimension", targetDimension));
                 return false;
             }
 

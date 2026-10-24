@@ -201,8 +201,7 @@ public final class ClientNetworkHandler {
             MapTextureManager.getInstance().clearCache();
             Minecraft minecraft = Minecraft.getInstance();
             if (minecraft.player != null) {
-                minecraft.player.sendSystemMessage(Component.literal(
-                        "§aMap learned successfully! Your map has been updated."));
+                minecraft.player.sendSystemMessage(Component.translatable("gui.simplemap.book.learn_success"));
             }
         });
     }

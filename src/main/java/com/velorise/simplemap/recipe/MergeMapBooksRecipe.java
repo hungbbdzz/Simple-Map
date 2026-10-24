@@ -50,7 +50,7 @@ public class MergeMapBooksRecipe extends CustomRecipe {
         tag.putBoolean("PendingMerge", true);
         result.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
         
-        result.set(DataComponents.CUSTOM_NAME, Component.literal("§6Merged Map Book"));
+        result.set(DataComponents.CUSTOM_NAME, Component.translatable("item.simplemap.merged_book_map"));
         return result;
     }
 

@@ -131,7 +131,7 @@ public final class NetworkHandler {
                 return;
             }
             if (!requestedId.isEmpty() && isBookMergePending(player, requestedId)) {
-                player.sendSystemMessage(Component.literal("§eThis merged map book is still being prepared."));
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.merge_pending"));
                 return;
             }
             player.getCooldowns().addCooldown(held.getItem(), 120);
@@ -153,7 +153,7 @@ public final class NetworkHandler {
                     || !session.dimensionFolder.equals(dimensionFolder(player))) {
                 ACTIVE_SAVES.remove(sessionKey(session.bookId, session.playerId), session);
                 if (!session.dimensionFolder.equals(dimensionFolder(player))) {
-                    player.sendSystemMessage(Component.literal("§eMap-book saving stopped because you changed dimension."));
+                    player.sendSystemMessage(Component.translatable("gui.simplemap.book.save_stopped_dim"));
                 }
                 return;
             }
@@ -236,7 +236,7 @@ public final class NetworkHandler {
                         session.nextIndex++;
                     }
                     if (!finalAccepted) {
-                        player.sendSystemMessage(Component.literal("§eSkipped one damaged map region while saving."));
+                        player.sendSystemMessage(Component.translatable("gui.simplemap.book.save_skipped_damaged"));
                     }
                     requestNextSaveRegion(player, session);
                 });
@@ -257,9 +257,9 @@ public final class NetworkHandler {
             tag.putString("OwnerName", player.getName().getString());
             writtenBook.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
             writtenBook.set(DataComponents.CUSTOM_NAME,
-                    Component.literal("§6Map Book of " + player.getName().getString()));
+                    Component.translatable("item.simplemap.book_map_of", player.getName().getString()));
             player.setItemInHand(hand, writtenBook);
-            player.sendSystemMessage(Component.literal("§aMap successfully saved to the book!"));
+            player.sendSystemMessage(Component.translatable("gui.simplemap.book.save_success"));
             sendToPlayer(player, new SaveBookCompletePayload(session.bookId));
             return;
         }
@@ -270,7 +270,7 @@ public final class NetworkHandler {
             tag.putString("OwnerUUID", player.getUUID().toString());
             tag.putString("OwnerName", player.getName().getString());
             held.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
-            player.sendSystemMessage(Component.literal("§aMap successfully updated in the book!"));
+            player.sendSystemMessage(Component.translatable("gui.simplemap.book.update_success"));
             sendToPlayer(player, new SaveBookCompletePayload(session.bookId));
         }
     }
@@ -292,7 +292,7 @@ public final class NetworkHandler {
                 return;
             }
             if (isBookMergePending(player, payload.bookId())) {
-                player.sendSystemMessage(Component.literal("§eThis merged map book is still being prepared."));
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.merge_pending"));
                 return;
             }
 
@@ -312,13 +312,13 @@ public final class NetworkHandler {
                 }
             }
             if (!directory.isDirectory()) {
-                player.sendSystemMessage(Component.literal("§cThis book has no map data for the current dimension!"));
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_data_dim"));
                 return;
             }
 
             File[] files = directory.listFiles((dir, name) -> isValidRegionName(name));
             if (files == null || files.length == 0) {
-                player.sendSystemMessage(Component.literal("§cThis book contains no usable map regions here."));
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_usable_regions"));
                 return;
             }
             Arrays.sort(files, Comparator.comparing(File::getName));
@@ -337,7 +337,7 @@ public final class NetworkHandler {
                     || !session.dimensionFolder.equals(dimensionFolder(player))) {
                 ACTIVE_LEARNS.remove(key, session);
                 if (!session.dimensionFolder.equals(dimensionFolder(player))) {
-                    player.sendSystemMessage(Component.literal("§eMap-book learning stopped because you changed dimension."));
+                    player.sendSystemMessage(Component.translatable("gui.simplemap.book.learn_stopped_dim"));
                 }
                 return;
             }
@@ -345,15 +345,13 @@ public final class NetworkHandler {
             if (session.nextIndex >= session.regionFiles.size()) {
                 ACTIVE_LEARNS.remove(key, session);
                 if (session.successfulRegions <= 0) {
-                    player.sendSystemMessage(Component.literal(
-                            "§cNo map regions could be learned from this book."));
+                    player.sendSystemMessage(Component.translatable("gui.simplemap.book.learn_none"));
                     return;
                 }
                 consumeLearnedBookIfNeeded(player, session.bookId);
                 if (session.failedRegions > 0) {
-                    player.sendSystemMessage(Component.literal(
-                            "§eMap learned, but " + session.failedRegions
-                                    + " damaged region(s) were skipped."));
+                    player.sendSystemMessage(Component.translatable(
+                            "gui.simplemap.book.learn_skipped_damaged", session.failedRegions));
                 }
                 sendToPlayer(player, new LearnBookCompletePayload(session.bookId));
                 return;
@@ -458,8 +456,7 @@ public final class NetworkHandler {
             if (tag.contains("OwnerUUID")
                     && !player.getUUID().toString().equals(tag.getString("OwnerUUID"))) {
                 stack.shrink(1);
-                player.sendSystemMessage(Component.literal(
-                        "§eThe map book crumbles to dust as you finish learning its secrets!"));
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.crumbled"));
                 player.level().playSound(null, player.getX(), player.getY(), player.getZ(),
                         net.minecraft.sounds.SoundEvents.ITEM_BREAK,
                         net.minecraft.sounds.SoundSource.PLAYERS, 1.0f, 1.0f);

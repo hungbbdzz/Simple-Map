@@ -286,7 +286,7 @@ public class SimpleMap {
                     result.set(net.minecraft.core.component.DataComponents.CUSTOM_DATA,
                             net.minecraft.world.item.component.CustomData.of(tag));
                     result.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME,
-                            Component.literal("§6Merged Map Book"));
+                            Component.translatable("item.simplemap.merged_book_map"));
 
                     UUID playerId = player.getUUID();
                     MAP_BOOK_MERGE_POOL.execute(() -> {
@@ -307,11 +307,11 @@ public class SimpleMap {
                         server.execute(() -> {
                             var online = server.getPlayerList().getPlayer(playerId);
                             if (online != null) {
-                                online.sendSystemMessage(Component.literal(emptySources
-                                        ? "§eMerged Map Book is ready, but both source books had no stored data."
+                                online.sendSystemMessage(Component.translatable(emptySources
+                                        ? "gui.simplemap.book.merge_ready_empty"
                                         : failures == 0
-                                                ? "§aMerged Map Book is ready."
-                                                : "§eMerged Map Book is ready, but some damaged regions were skipped."));
+                                                ? "gui.simplemap.book.merge_ready"
+                                                : "gui.simplemap.book.merge_ready_skipped"));
                             }
                         });
                     });
