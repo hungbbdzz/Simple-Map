@@ -648,8 +648,11 @@ public class MapManager {
 
     public MapBlockData getBlockData(int blockX, int blockZ) {
         Region region = getRegion(blockX >> 9, blockZ >> 9, false);
-        if (region == null || !region.isLoaded()) return null;
-        return region.getBlockData(blockX & 511, blockZ & 511);
+        if (region != null && region.isLoaded()) {
+            MapBlockData data = region.getBlockData(blockX & 511, blockZ & 511);
+            if (data != null && !data.isEmpty()) return data;
+        }
+        return SurfaceRegionSourceDatabase.getInstance().getBlockData(blockX, blockZ);
     }
 
     /**
@@ -659,8 +662,11 @@ public class MapManager {
      */
     public long getPackedBlockData(int blockX, int blockZ) {
         Region region = getRegion(blockX >> 9, blockZ >> 9, false);
-        if (region == null || !region.isLoaded()) return MapBlockData.EMPTY_PACKED;
-        return region.getPackedBlockData(blockX & 511, blockZ & 511);
+        if (region != null && region.isLoaded()) {
+            long packed = region.getPackedBlockData(blockX & 511, blockZ & 511);
+            if (!MapBlockData.isEmpty(packed)) return packed;
+        }
+        return SurfaceRegionSourceDatabase.getInstance().getPackedBlockData(blockX, blockZ);
     }
 
     public int getSurfaceTint(int blockX, int blockZ) {
@@ -669,10 +675,22 @@ public class MapManager {
         return region.getTint(blockX & 511, blockZ & 511);
     }
 
+    public String getBlockId(int blockX, int blockZ) {
+        Region region = getRegion(blockX >> 9, blockZ >> 9, false);
+        if (region != null && region.isLoaded()) {
+            String blockId = region.getBlockId(blockX & 511, blockZ & 511);
+            if (blockId != null && !blockId.isBlank()) return blockId;
+        }
+        return SurfaceRegionSourceDatabase.getInstance().getBlockId(blockX, blockZ);
+    }
+
     public String getBiomeId(int blockX, int blockZ) {
         Region region = getRegion(blockX >> 9, blockZ >> 9, false);
-        if (region == null || !region.isLoaded()) return null;
-        return region.getBiomeId(blockX & 511, blockZ & 511);
+        if (region != null && region.isLoaded()) {
+            String biomeId = region.getBiomeId(blockX & 511, blockZ & 511);
+            if (biomeId != null && !biomeId.isBlank()) return biomeId;
+        }
+        return SurfaceRegionSourceDatabase.getInstance().getBiomeId(blockX, blockZ);
     }
 
     /** O(1) chunk-completion probe used by the chunk-granular live writer. */
@@ -1647,6 +1665,21 @@ public class MapManager {
             lock.lock();
             try {
                 return tints[pixelZ * 512 + pixelX];
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public String getBlockId(int pixelX, int pixelZ) {
+            lock.lock();
+            try {
+                long packed = pixels[pixelZ * 512 + pixelX];
+                if (MapBlockData.isEmpty(packed)) return null;
+                int index = MapBlockData.blockId(packed) & 0xFFFF;
+                if (index < 0 || index >= blockPalette.size()) {
+                    return null;
+                }
+                return blockPalette.get(index);
             } finally {
                 lock.unlock();
             }

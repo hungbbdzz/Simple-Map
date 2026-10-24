@@ -297,6 +297,50 @@ public final class SurfaceRegionSourceDatabase {
         }
     }
 
+    public long getPackedBlockData(int blockX, int blockZ) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null) return MapBlockData.EMPTY_PACKED;
+        int regionX = blockX >> 9;
+        int regionZ = blockZ >> 9;
+        SurfaceRegionSource source;
+        synchronized (sources) {
+            source = sources.get(new SourceKey(stamp.sessionId(), regionX, regionZ));
+        }
+        if (source == null) return MapBlockData.EMPTY_PACKED;
+        return source.getPackedBlockData(blockX & 511, blockZ & 511);
+    }
+
+    public MapBlockData getBlockData(int blockX, int blockZ) {
+        long packed = getPackedBlockData(blockX, blockZ);
+        return MapBlockData.isEmpty(packed) ? null : MapBlockData.unpack(packed);
+    }
+
+    public String getBlockId(int blockX, int blockZ) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null) return null;
+        int regionX = blockX >> 9;
+        int regionZ = blockZ >> 9;
+        SurfaceRegionSource source;
+        synchronized (sources) {
+            source = sources.get(new SourceKey(stamp.sessionId(), regionX, regionZ));
+        }
+        if (source == null) return null;
+        return source.getBlockId(blockX & 511, blockZ & 511);
+    }
+
+    public String getBiomeId(int blockX, int blockZ) {
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp == null) return null;
+        int regionX = blockX >> 9;
+        int regionZ = blockZ >> 9;
+        SurfaceRegionSource source;
+        synchronized (sources) {
+            source = sources.get(new SourceKey(stamp.sessionId(), regionX, regionZ));
+        }
+        if (source == null) return null;
+        return source.getBiomeId(blockX & 511, blockZ & 511);
+    }
+
     /**
      * Clean retained 16x16 source chunks currently available to one exact leaf.
      * The live minimap uses this instead of consulting MapManager.Region.

@@ -1102,6 +1102,8 @@ public class ChunkScanner {
         short[] caveHeights = scratch.caveHeights;
         int[] caveColors = scratch.caveColors;
         byte[] caveFlags = scratch.caveFlags;
+        String[] caveBlockIds = scratch.caveBlockIds;
+        String[] caveBiomeIds = scratch.caveBiomeIds;
         LevelChunk loadedChunk = mc.level.getChunk(chunkX, chunkZ);
         if (loadedChunk == null) return false;
         int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
@@ -1112,6 +1114,8 @@ public class ChunkScanner {
             long packed = getCavePixel(mc.level, loadedChunk, blockX, layerY, blockZ, fullView);
             caveHeights[p] = (short) cavePixelY(packed);
             caveColors[p] = cavePixelColor(packed);
+            caveBlockIds[p] = scratch.lastCaveBlockId;
+            caveBiomeIds[p] = scratch.lastCaveBiomeId;
             byte flags = 0;
             if (cavePixelIsFluid(packed)) flags |= 1;
             if (cavePixelIsLeaves(packed)) flags |= 2;
@@ -1125,6 +1129,8 @@ public class ChunkScanner {
             if (rawColor == 0 || surfaceY == CaveRegion.NO_SURFACE) {
                 caveColors[p] = 0;
                 caveHeights[p] = CaveRegion.NO_SURFACE;
+                caveBlockIds[p] = "";
+                caveBiomeIds[p] = "";
                 continue;
             }
             int blockX = (chunkX << 4) + (p & 15);
@@ -1136,7 +1142,7 @@ public class ChunkScanner {
             float shade = isFluid ? 1.0f : calculateFastCaveShade(mc.level, caveHeights, chunkX, chunkZ, p, surfaceY, layerY, fullView);
             caveColors[p] = CaveTextureManager.styleCavePixel(rawColor, shade, blockX, blockZ, surfaceY, isFluid, isLeaves, isGlowing);
         }
-        CaveMapManager.getInstance().setChunkPixels(targetLayer, chunkX, chunkZ, caveColors, caveHeights);
+        CaveMapManager.getInstance().setChunkPixels(targetLayer, chunkX, chunkZ, caveColors, caveHeights, caveBlockIds, caveBiomeIds);
         urgentChunkCursors.remove(key);
         return true;
     }
@@ -1851,13 +1857,16 @@ public class ChunkScanner {
 
     private void scanCavePixelIfLoaded(Level level, LevelChunk chunk, int blockX, int layerY, int blockZ, boolean fullView) {
         if (chunk == null) return;
+        ScanScratch scratch = scanScratch.get();
         long pixel = getCavePixel(level, chunk, blockX, layerY, blockZ, fullView);
+        String caveBlockId = scratch.lastCaveBlockId;
+        String caveBiomeId = scratch.lastCaveBiomeId;
 
         int surfaceY = cavePixelY(pixel);
         int rawColor = cavePixelColor(pixel);
         int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
         if (rawColor == 0 || surfaceY == CaveRegion.NO_SURFACE) {
-            CaveMapManager.getInstance().setPixel(targetLayer, blockX, blockZ, 0, CaveRegion.NO_SURFACE, false);
+            CaveMapManager.getInstance().setPixel(targetLayer, blockX, blockZ, 0, CaveRegion.NO_SURFACE, false, null, null);
             return;
         }
         boolean isFluid = cavePixelIsFluid(pixel);
@@ -1865,7 +1874,7 @@ public class ChunkScanner {
         boolean isGlowing = cavePixelIsGlowing(pixel);
         float shade = isFluid ? 1.0f : calculateCaveTerrainShade(level, blockX, blockZ, layerY, fullView, surfaceY);
         int displayedColor = CaveTextureManager.styleCavePixel(rawColor, shade, blockX, blockZ, surfaceY, isFluid, isLeaves, isGlowing);
-        CaveMapManager.getInstance().setPixel(targetLayer, blockX, blockZ, displayedColor, surfaceY, true);
+        CaveMapManager.getInstance().setPixel(targetLayer, blockX, blockZ, displayedColor, surfaceY, true, caveBlockId, caveBiomeId);
     }
 
     private long getCavePixel(Level level, int blockX, int layerY, int blockZ, boolean fullView) {
@@ -1916,6 +1925,8 @@ public class ChunkScanner {
         if (scanMaximum < scanMinimum) return packCavePixel(0, CaveRegion.NO_SURFACE, false, false);
 
         ScanScratch scratch = scanScratch.get();
+        scratch.lastCaveBlockId = "";
+        scratch.lastCaveBiomeId = "";
         BlockPos.MutableBlockPos probePos = scratch.position(0, blockX, scanMaximum, blockZ);
         BlockPos.MutableBlockPos colorPos = scratch.position(1, blockX, scanMaximum, blockZ);
         BlockPos.MutableBlockPos lightPos = scratch.position(2, blockX, scanMaximum, blockZ);
@@ -2031,6 +2042,8 @@ public class ChunkScanner {
                 int skyLight = exposedToSky
                         ? 15
                         : (hasSkyLight && !fullView ? level.getBrightness(LightLayer.SKY, lightPos) : 0);
+                scratch.lastCaveBlockId = visualClassifier.info(colorState).blockId();
+                scratch.lastCaveBiomeId = resolveSurfaceBiomeId(level, chunk, colorPos, scratch);
                 int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(floorY);
                 return packCavePixel(
                         CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, false),
@@ -2051,6 +2064,8 @@ public class ChunkScanner {
                         : (exposedToSky
                                 ? 15
                                 : (hasSkyLight && !fullView ? level.getBrightness(LightLayer.SKY, lightPos) : 0));
+                scratch.lastCaveBlockId = visualClassifier.info(state).blockId();
+                scratch.lastCaveBiomeId = resolveSurfaceBiomeId(level, chunk, colorPos, scratch);
                 int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(y);
                 return packCavePixel(
                         CaveTextureManager.applyCaveLighting(baseColor, blockLight, skyLight, shadeOffset, isGlowing),
@@ -2093,6 +2108,8 @@ public class ChunkScanner {
                                     ? Math.max(level.getBrightness(LightLayer.SKY, lightPos),
                                             level.getBrightness(LightLayer.SKY, colorPos))
                                     : 0));
+            scratch.lastCaveBlockId = visualClassifier.info(state).blockId();
+            scratch.lastCaveBiomeId = resolveSurfaceBiomeId(level, chunk, colorPos, scratch);
             int effectiveY = (shortBlock && y > minimumY) ? (y - 1) : y;
             int shadeOffset = CaveTextureManager.computeCaveVerticalOffset(effectiveY);
             return packCavePixel(
@@ -3048,8 +3065,10 @@ public class ChunkScanner {
                     }
                 }
             }
-            if ((biomeId == null || ("minecraft:plains".equals(biomeId) && (nx != 0 || nz != 0)))
-                    && ownChunk != null) {
+            boolean isNetherDim = level.dimension() == Level.NETHER || level.dimensionType().hasCeiling();
+            boolean isEndDim = level.dimension() == Level.END;
+            boolean invalidPlains = "minecraft:plains".equals(biomeId) && (isNetherDim || isEndDim || nx != 0 || nz != 0);
+            if ((biomeId == null || invalidPlains) && ownChunk != null) {
                 Holder<Biome> ownHolder = ownChunk.getNoiseBiome(
                         blockX >> 2, blockY >> 2, blockZ >> 2);
                 if (ownHolder != null) {
@@ -3068,9 +3087,20 @@ public class ChunkScanner {
                     }
                 }
             }
+            if ("minecraft:plains".equals(biomeId) && (isNetherDim || isEndDim)) {
+                biomeId = isNetherDim ? "minecraft:nether_wastes" : "minecraft:the_end";
+            }
         } catch (Exception ignored) {
         }
-        if (biomeId == null) biomeId = "minecraft:plains";
+        if (biomeId == null) {
+            if (level.dimension() == Level.NETHER || level.dimensionType().hasCeiling()) {
+                biomeId = "minecraft:nether_wastes";
+            } else if (level.dimension() == Level.END) {
+                biomeId = "minecraft:the_end";
+            } else {
+                biomeId = "minecraft:plains";
+            }
+        }
         if (interiorQuart && !clampedBorder) {
             scratch.putSurfaceBiome(key, biomeId);
         }
@@ -3431,6 +3461,10 @@ public class ChunkScanner {
         private final short[] caveHeights = new short[256];
         private final int[] caveColors = new int[256];
         private final byte[] caveFlags = new byte[256];
+        private final String[] caveBlockIds = new String[256];
+        private final String[] caveBiomeIds = new String[256];
+        private String lastCaveBlockId = "";
+        private String lastCaveBiomeId = "";
         private final SurfaceColumnSample surfaceSample = new SurfaceColumnSample();
         private final SurfaceTopSample surfaceTop = new SurfaceTopSample();
         private final byte[] lightLevels = new byte[256];
