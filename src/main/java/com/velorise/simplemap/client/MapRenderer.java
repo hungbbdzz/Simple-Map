@@ -763,11 +763,12 @@ public class MapRenderer {
         // destination backwards. Pan/zoom/offscreen clipping therefore never
         // chooses new guide positions, while player movement still updates the
         // navigation path as expected.
+        double crossDimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
         if (drawPinContent && MapConfig.pinActive) {
             double routePlayerX = net.minecraft.util.Mth.lerp(partialTick,
-                    mc.player.xo, mc.player.getX());
+                    mc.player.xo, mc.player.getX()) * crossDimScale;
             double routePlayerZ = net.minecraft.util.Mth.lerp(partialTick,
-                    mc.player.zo, mc.player.getZ());
+                    mc.player.zo, mc.player.getZ()) * crossDimScale;
             PinNavigation.Route route = PinNavigation.currentRoute(
                     routePlayerX, routePlayerZ);
             if (route != null) {
@@ -816,9 +817,9 @@ public class MapRenderer {
                  */
                 if (!isMinimap) {
                     double playerX = net.minecraft.util.Mth.lerp(partialTick,
-                            mc.player.xo, mc.player.getX());
+                            mc.player.xo, mc.player.getX()) * crossDimScale;
                     double playerZ = net.minecraft.util.Mth.lerp(partialTick,
-                            mc.player.zo, mc.player.getZ());
+                            mc.player.zo, mc.player.getZ()) * crossDimScale;
                     double distanceX = MapConfig.pinWorldX - playerX;
                     double distanceZ = MapConfig.pinWorldZ - playerZ;
                     int distanceBlocks = (int) Math.floor(Math.sqrt(
@@ -837,10 +838,10 @@ public class MapRenderer {
             }
         }
 
-        // 7. Render player marker if enabled
+        // 7. Render player marker if enabled (automatically scaled by cross-dimension ratio!)
         if (drawPlayer) {
-            double playerX = net.minecraft.util.Mth.lerp(partialTick, mc.player.xo, mc.player.getX());
-            double playerZ = net.minecraft.util.Mth.lerp(partialTick, mc.player.zo, mc.player.getZ());
+            double playerX = net.minecraft.util.Mth.lerp(partialTick, mc.player.xo, mc.player.getX()) * crossDimScale;
+            double playerZ = net.minecraft.util.Mth.lerp(partialTick, mc.player.zo, mc.player.getZ()) * crossDimScale;
             float playerYaw = net.minecraft.util.Mth.rotLerp(partialTick, mc.player.yRotO, mc.player.getYRot())
                     + 180.0f;
 

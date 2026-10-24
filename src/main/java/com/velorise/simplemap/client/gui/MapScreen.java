@@ -133,9 +133,13 @@ public class MapScreen extends Screen {
     public MapScreen() {
         super(Component.translatable("gui.simplemap.world_map"));
         Minecraft mc = Minecraft.getInstance();
+        MapManager manager = MapManager.getInstance();
+        String override = manager.getViewDimensionOverride();
+        this.selectedDimension = (override != null && !override.isBlank()) ? override : "LIVE";
         if (mc.player != null) {
-            this.centerX = mc.player.getX();
-            this.centerZ = mc.player.getZ();
+            double dimRatio = manager.getCrossDimensionCoordinateScale();
+            this.centerX = mc.player.getX() * dimRatio;
+            this.centerZ = mc.player.getZ() * dimRatio;
         }
     }
 
@@ -241,8 +245,9 @@ public class MapScreen extends Screen {
         refreshMapButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.REFRESH, button -> {
             if (this.minecraft != null && this.minecraft.player != null) {
                 if (Screen.hasShiftDown()) {
-                    this.centerX = this.minecraft.player.getX();
-                    this.centerZ = this.minecraft.player.getZ();
+                    double dimRatio = MapManager.getInstance().getCrossDimensionCoordinateScale();
+                    this.centerX = this.minecraft.player.getX() * dimRatio;
+                    this.centerZ = this.minecraft.player.getZ() * dimRatio;
                     this.scale = DEFAULT_MAP_SCALE;
                     cancelMotionAndOpenAnimation();
                     return;
@@ -625,7 +630,7 @@ public class MapScreen extends Screen {
                 guiGraphics,
                 vx, vy, vw, vh,
                 centerX, centerZ, currentRenderScale,
-                MapManager.getInstance().isViewingLiveDimension(),
+                true,
                 false,
                 false, mouseWorldX, mouseWorldZ,
                 partialTick, false
@@ -634,7 +639,7 @@ public class MapScreen extends Screen {
             MapRenderer.getInstance().drawFullscreenOverlays(
                     guiGraphics, vx, vy, vw, vh,
                     centerX, centerZ, currentRenderScale,
-                    MapManager.getInstance().isViewingLiveDimension(),
+                    true,
                     mouseWorldX, mouseWorldZ, partialTick);
         }
 
@@ -1876,10 +1881,9 @@ public class MapScreen extends Screen {
 
     @Override
     public void onClose() {
-        if (this.minecraft != null && !"LIVE".equals(selectedDimension)) {
-            MapManager.getInstance().returnToLiveDimension(this.minecraft);
-            selectedDimension = "LIVE";
-        }
+        // Retain the selected dimension in MapManager when closing MapScreen so
+        // the Minimap can display the chosen dimension with proportional coordinate scaling
+        // (1:8 Nether <-> Overworld), just like cross-dimension scaling!
         MapViewportCoordinator.getInstance().closeFullscreen();
         FullscreenMapFramebufferRenderer.getInstance().destroy();
         super.onClose();

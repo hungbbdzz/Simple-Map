@@ -174,11 +174,25 @@ public final class CaveMode {
         // remote map view is different: its explicit override may use manual Cave.
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
         if (hasManualTopY(mc)) return true;
-        if (mc.level.dimensionType().hasCeiling() || !mc.level.dimensionType().hasSkyLight()) {
+        DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
+        boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
+        boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();
+        if (viewedHasCeiling || !viewedHasSkyLight) {
             return true;
         }
-        // Remote AUTO has no player-local roof context and remains Surface.
-        if (!acceptsLive) return false;
+        // Remote AUTO in an open-sky dimension (like Overworld):
+        // if the user explicitly chose FULL cave mode (or LAYERED cave mode while viewing remotely),
+        // honor that selection so remote Cave/Full Cave views work seamlessly!
+        if (!acceptsLive) {
+            CaveType explicit = CAVE_TYPES.get(dimensionKey(mc));
+            if (explicit == null) {
+                String stored = MapConfig.caveDimensionModes.get(dimensionKey(mc));
+                if (stored != null) {
+                    try { explicit = CaveType.valueOf(stored); } catch (IllegalArgumentException ignored) {}
+                }
+            }
+            return explicit == CaveType.FULL || explicit == CaveType.LAYERED;
+        }
         return updateAutomaticDetection(mc);
     }
 
@@ -197,7 +211,10 @@ public final class CaveMode {
         boolean acceptsLive = manager.acceptsLiveLevel(mc.level);
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
         if (hasManualTopY(mc)) return true;
-        if (mc.level.dimensionType().hasCeiling() || !mc.level.dimensionType().hasSkyLight()) {
+        DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
+        boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
+        boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();
+        if (viewedHasCeiling || !viewedHasSkyLight) {
             return true;
         }
         if (!acceptsLive) return false;

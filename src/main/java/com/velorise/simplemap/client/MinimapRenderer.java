@@ -39,6 +39,7 @@ public class MinimapRenderer {
     private int cachedCoordinateX = Integer.MIN_VALUE;
     private int cachedCoordinateY = Integer.MIN_VALUE;
     private int cachedCoordinateZ = Integer.MIN_VALUE;
+    private String cachedCoordinateDim = "";
     private String cachedCoordinates = "";
     private static final long CAVE_ZOOM_ANIMATION_NANOS = 1_000_000_000L;
     private static final float CAVE_ZOOM_MULTIPLIER = 1.55f;
@@ -159,8 +160,9 @@ public class MinimapRenderer {
 
         int borderThickness = Math.max(2, size / 32);
         int tHalf = Math.max(1, borderThickness / 2);
-        double interpX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX());
-        double interpZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
+        double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
+        double interpX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX()) * dimScale;
+        double interpZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ()) * dimScale;
         MinimapService.getInstance()
                 .update(interpX, interpZ, effectiveZoom);
         // Retained rendering can reuse the same texture for many visual frames,
@@ -261,12 +263,25 @@ public class MinimapRenderer {
         int x = (int) Math.floor(player.getX());
         int y = (int) Math.floor(player.getY());
         int z = (int) Math.floor(player.getZ());
+        MapManager manager = MapManager.getInstance();
+        String viewDim = manager.isViewingLiveDimension() ? "LIVE" : manager.getCurrentDimensionResourceId();
         if (x == cachedCoordinateX && y == cachedCoordinateY
-                && z == cachedCoordinateZ) return cachedCoordinates;
+                && z == cachedCoordinateZ && viewDim.equals(cachedCoordinateDim)) {
+            return cachedCoordinates;
+        }
         cachedCoordinateX = x;
         cachedCoordinateY = y;
         cachedCoordinateZ = z;
-        cachedCoordinates = x + ", " + y + ", " + z;
+        cachedCoordinateDim = viewDim;
+        if (manager.isViewingLiveDimension()) {
+            cachedCoordinates = x + ", " + y + ", " + z;
+        } else {
+            double dimScale = manager.getCrossDimensionCoordinateScale();
+            int mappedX = (int) Math.floor(player.getX() * dimScale);
+            int mappedZ = (int) Math.floor(player.getZ() * dimScale);
+            String dimLabel = MapManager.displayDimensionName(viewDim);
+            cachedCoordinates = x + ", " + y + ", " + z + " (" + dimLabel + ": " + mappedX + ", " + mappedZ + ")";
+        }
         return cachedCoordinates;
     }
 
@@ -423,8 +438,9 @@ public class MinimapRenderer {
      */
     private void drawPinOnMinimap(GuiGraphics guiGraphics, Player player, int mx, int my,
             int size, int borderThickness, float effectiveZoom, float partialTick) {
-        double playerX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX());
-        double playerZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ());
+        double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
+        double playerX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX()) * dimScale;
+        double playerZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ()) * dimScale;
         double zoom = effectiveZoom;
 
         float cx = mx + size / 2.0f;
