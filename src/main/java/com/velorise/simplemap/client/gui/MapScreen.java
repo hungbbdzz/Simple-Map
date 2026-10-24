@@ -97,6 +97,7 @@ public class MapScreen extends Screen {
     private int cachedPlayerTextX = Integer.MIN_VALUE;
     private int cachedPlayerTextY = Integer.MIN_VALUE;
     private int cachedPlayerTextZ = Integer.MIN_VALUE;
+    private String cachedPlayerLang = "";
     private String cachedPlayerText = "";
     private int cachedZoomTextKey = Integer.MIN_VALUE;
     private String cachedZoomText = "";
@@ -296,9 +297,7 @@ public class MapScreen extends Screen {
                         : 0.0;
                 caveLayerSlider = new CaveLayerSlider(0, 0, 156, 18,
                         minimumY, maximumY, initialValue);
-                caveLayerSlider.setTooltip(Tooltip.create(Component.literal(
-                        "Cave Top Y\nAUTO follows the player's current underground band."
-                                + "\nDrag right to select a fixed cave layer.")));
+                caveLayerSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cave_top_y")));
                 this.addRenderableWidget(caveLayerSlider);
             }
             updateCaveControlLayout();
@@ -328,28 +327,27 @@ public class MapScreen extends Screen {
     }
 
     private void updateToolbarTooltips() {
-        if (minimapConfigButton != null) minimapConfigButton.setTooltip(Tooltip.create(Component.literal(
-                "Simple Map Settings\nConfigure minimap, coordinates, colors and scanning.")));
-        if (waypointListButton != null) waypointListButton.setTooltip(Tooltip.create(Component.literal(
-                "Waypoint Manager (Key: U)\nManage, edit, teleport and track waypoints.")));
-        if (waypointsToggleButton != null) waypointsToggleButton.setTooltip(Tooltip.create(Component.literal(
-                "Waypoint Visibility: " + (MapConfig.waypointsVisible ? "ON" : "OFF")
-                        + "\nClick to show or hide all waypoint markers.")));
-        if (refreshMapButton != null) refreshMapButton.setTooltip(Tooltip.create(Component.literal(
-                "Refresh Visible Map\nRescan nearby chunks currently loaded by Minecraft."
-                        + "\nShift-click: center on player and reset zoom.")));
-        if (nightModeButton != null) nightModeButton.setTooltip(Tooltip.create(Component.literal(
-                "Map Brightness: " + getNightModeMessage().getString()
-                        + "\nCycle DAY / AUTO / NIGHT rendering.")));
-        if (dimensionSwitchButton != null) dimensionSwitchButton.setTooltip(Tooltip.create(Component.literal(
-                "Dimension: " + getDimensionName(selectedDimension))));
+        if (minimapConfigButton != null) minimapConfigButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.settings_button")));
+        if (waypointListButton != null) waypointListButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.waypoint_manager_button")));
+        if (waypointsToggleButton != null) waypointsToggleButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.waypoint_visibility",
+                        Component.translatable(MapConfig.waypointsVisible ? "gui.simplemap.value.on" : "gui.simplemap.value.off"))));
+        if (refreshMapButton != null) refreshMapButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.refresh_map")));
+        if (nightModeButton != null) nightModeButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.map_brightness", getNightModeMessage())));
+        if (dimensionSwitchButton != null) dimensionSwitchButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.dimension_switch", getDimensionName(selectedDimension))));
         updateCaveTooltip();
     }
 
     private String getDimensionName(String dim) {
         if ("LIVE".equals(dim)) {
             String live = MapManager.getInstance().getLiveDimensionResourceId();
-            return "Current (" + MapManager.displayDimensionName(live) + ")";
+            return Component.translatable("gui.simplemap.dimension.current",
+                    MapManager.displayDimensionName(live)).getString();
         }
         return MapManager.displayDimensionName(dim);
     }
@@ -429,13 +427,13 @@ public class MapScreen extends Screen {
     private void updateCaveTooltip() {
         if (caveLayerModeButton == null) return;
         String detail = switch (CaveMode.getCaveType(this.minecraft)) {
-            case OFF -> "Surface map only";
-            case LAYERED -> "Cave map at the selected Top Y";
-            case FULL -> "Full cave projection using the same AUTO/manual cave start";
+            case OFF -> Component.translatable("gui.simplemap.cave.detail.off").getString();
+            case LAYERED -> Component.translatable("gui.simplemap.cave.detail.layered").getString();
+            case FULL -> Component.translatable("gui.simplemap.cave.detail.full").getString();
         };
         String permission = MapConfig.getEffectiveCaveMapMode() == 0
-                ? "\nCave maps are disabled by the server or local setting."
-                : "\nClick to cycle OFF, CAVE and FULL.";
+                ? "\n" + Component.translatable("gui.simplemap.cave.permission.disabled").getString()
+                : "\n" + Component.translatable("gui.simplemap.cave.permission.enabled").getString();
         caveLayerModeButton.setTooltip(Tooltip.create(Component.literal(
                 getCaveLayerModeMessage().getString() + "\n" + detail + permission)));
     }
@@ -475,26 +473,27 @@ public class MapScreen extends Screen {
     }
 
     private Component getWaypointsToggleMessage() {
-        return Component.literal("WP: " + (MapConfig.waypointsVisible ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.waypoints_short",
+                Component.translatable(MapConfig.waypointsVisible ? "gui.simplemap.value.on" : "gui.simplemap.value.off"));
     }
 
     private Component getNightModeMessage() {
-        String mode = switch (MapConfig.minimapNightMode) {
-            case 1 -> "AUTO";
-            case 2 -> "ON";
-            default -> "OFF";
+        Component mode = switch (MapConfig.minimapNightMode) {
+            case 1 -> Component.translatable("gui.simplemap.value.auto");
+            case 2 -> Component.translatable("gui.simplemap.value.on");
+            default -> Component.translatable("gui.simplemap.value.off");
         };
-        String label = CaveMode.isActive(this.minecraft) ? "Cave light: " : "Night: ";
-        return Component.literal(label + mode);
+        return Component.translatable(
+                CaveMode.isActive(this.minecraft) ? "gui.simplemap.cave_light" : "gui.simplemap.night_mode",
+                mode);
     }
 
     private Component getCaveLayerModeMessage() {
-        String type = switch (CaveMode.getCaveType(this.minecraft)) {
-            case OFF -> "OFF";
-            case LAYERED -> "CAVE";
-            case FULL -> "FULL";
+        return switch (CaveMode.getCaveType(this.minecraft)) {
+            case OFF -> Component.translatable("gui.simplemap.cave_mode.off");
+            case LAYERED -> Component.translatable("gui.simplemap.cave_mode.cave");
+            case FULL -> Component.translatable("gui.simplemap.cave_mode.full");
         };
-        return Component.literal(type);
     }
 
     private void cancelMotionAndOpenAnimation() {
@@ -570,10 +569,10 @@ public class MapScreen extends Screen {
             drawToolbarBackground(guiGraphics);
             drawCaveControlBackground(guiGraphics);
             super.render(guiGraphics, mouseX, mouseY, partialTick);
-            String title = "MAP LOCKED";
-            String subtitle = MapManager.getInstance().hasLearnedMap()
-                ? "You must hold a Learned Map Book in your inventory to view the map."
-                : "You must craft and learn a Map Book to unlock the world map.";
+            String title = Component.translatable("gui.simplemap.map_locked.title").getString();
+            String subtitle = Component.translatable(MapManager.getInstance().hasLearnedMap()
+                ? "gui.simplemap.map_locked.hold_book"
+                : "gui.simplemap.map_locked.craft_book").getString();
             int tw1 = this.font.width(title);
             int tw2 = this.font.width(subtitle);
             guiGraphics.drawString(this.font, title, (this.width - tw1) / 2, this.height / 2 - 20, 0xFF5555, false);
@@ -638,10 +637,9 @@ public class MapScreen extends Screen {
 
         if (!MapManager.getInstance().isViewingLiveDimension()
                 && !MapManager.getInstance().hasSavedDataForCurrentDimension()) {
-            String message = "No saved map data — visit "
-                    + MapManager.displayDimensionName(
-                            MapManager.getInstance().getCurrentDimensionResourceId())
-                    + " first";
+            String message = Component.translatable("gui.simplemap.no_saved_data",
+                    MapManager.displayDimensionName(
+                            MapManager.getInstance().getCurrentDimensionResourceId())).getString();
             int textWidth = this.font.width(message);
             guiGraphics.fill((this.width - textWidth) / 2 - 6, this.height / 2 - 8,
                     (this.width + textWidth) / 2 + 6, this.height / 2 + 8, 0xB0000000);
@@ -865,10 +863,12 @@ public class MapScreen extends Screen {
         int x = (int) Math.floor(this.minecraft.player.getX());
         int y = (int) Math.floor(this.minecraft.player.getY());
         int z = (int) Math.floor(this.minecraft.player.getZ());
+        String lang = this.minecraft.getLanguageManager() != null
+                ? this.minecraft.getLanguageManager().getSelected() : "";
         if (x == cachedPlayerTextX && y == cachedPlayerTextY
-                && z == cachedPlayerTextZ) return cachedPlayerText;
+                && z == cachedPlayerTextZ && lang.equals(cachedPlayerLang)) return cachedPlayerText;
         overlayTextBuilder.setLength(0);
-        overlayTextBuilder.append("Player X: ");
+        overlayTextBuilder.append(Component.translatable("gui.simplemap.player_x_prefix").getString());
         appendGroupedInteger(overlayTextBuilder, x);
         overlayTextBuilder.append(" | Y: ");
         appendGroupedInteger(overlayTextBuilder, y);
@@ -877,6 +877,7 @@ public class MapScreen extends Screen {
         cachedPlayerTextX = x;
         cachedPlayerTextY = y;
         cachedPlayerTextZ = z;
+        cachedPlayerLang = lang;
         cachedPlayerText = overlayTextBuilder.toString();
         return cachedPlayerText;
     }
@@ -1298,33 +1299,55 @@ public class MapScreen extends Screen {
         return result.toString();
     }
 
+    private int getPopupMenuWidth() {
+        Component opt1 = clickedWaypoint != null
+                ? Component.translatable("gui.simplemap.popup.delete_waypoint")
+                : Component.translatable("gui.simplemap.add_waypoint");
+        Component opt2 = Component.translatable("gui.simplemap.teleport_here");
+        Component opt3 = Component.translatable("gui.simplemap.popup.share_location");
+        int maxW = Math.max(this.font.width(opt1), Math.max(this.font.width(opt2), this.font.width(opt3)));
+        if (clickedWaypoint != null) {
+            boolean isCurrentlyFollowing = MapConfig.pinActive &&
+                    Math.abs(MapConfig.pinWorldX - clickedWaypoint.x) < 0.01 &&
+                    Math.abs(MapConfig.pinWorldZ - clickedWaypoint.z) < 0.01;
+            Component opt4 = isCurrentlyFollowing
+                    ? Component.translatable("gui.simplemap.popup.stop_following")
+                    : Component.translatable("gui.simplemap.popup.follow_waypoint");
+            maxW = Math.max(maxW, this.font.width(opt4));
+        }
+        return Math.max(100, maxW + 14);
+    }
+
     private void drawPopupMenu(GuiGraphics guiGraphics, int mouseX, int mouseY) {
         guiGraphics.pose().pushPose();
         guiGraphics.pose().translate(0, 0, 100); // Draw on top of everything
 
+        int menuWidth = getPopupMenuWidth();
         int menuHeight = clickedWaypoint != null ? 80 : 60;
         // Background box
-        guiGraphics.fill((int)popupX, (int)popupY, (int)popupX + 100, (int)popupY + menuHeight, 0xFF121212);
-        guiGraphics.renderOutline((int)popupX, (int)popupY, 100, menuHeight, 0xFF3C3C3C);
+        guiGraphics.fill((int)popupX, (int)popupY, (int)popupX + menuWidth, (int)popupY + menuHeight, 0xFF121212);
+        guiGraphics.renderOutline((int)popupX, (int)popupY, menuWidth, menuHeight, 0xFF3C3C3C);
 
         // Option 1: Delete Waypoint or Add Waypoint
-        boolean hoverOpt1 = mouseX >= popupX && mouseX <= popupX + 100 && mouseY >= popupY && mouseY <= popupY + 20;
-        guiGraphics.fill((int)popupX + 1, (int)popupY + 1, (int)popupX + 99, (int)popupY + 19, hoverOpt1 ? 0xFF2D3033 : 0x00000000);
-        String opt1Text = clickedWaypoint != null ? "Delete Waypoint" : "Add Waypoint";
+        boolean hoverOpt1 = mouseX >= popupX && mouseX <= popupX + menuWidth && mouseY >= popupY && mouseY <= popupY + 20;
+        guiGraphics.fill((int)popupX + 1, (int)popupY + 1, (int)popupX + menuWidth - 1, (int)popupY + 19, hoverOpt1 ? 0xFF2D3033 : 0x00000000);
+        Component opt1Text = clickedWaypoint != null
+                ? Component.translatable("gui.simplemap.popup.delete_waypoint")
+                : Component.translatable("gui.simplemap.add_waypoint");
         guiGraphics.drawString(this.font, opt1Text, (int)popupX + 6, (int)popupY + 6, 0xFFFFFF, false);
 
         // Option 2: Teleport Here
-        boolean hoverOpt2 = mouseX >= popupX && mouseX <= popupX + 100 && mouseY >= popupY + 20 && mouseY <= popupY + 40;
+        boolean hoverOpt2 = mouseX >= popupX && mouseX <= popupX + menuWidth && mouseY >= popupY + 20 && mouseY <= popupY + 40;
         boolean canTeleport = MapTeleportController.canTeleport(this.minecraft);
-        guiGraphics.fill((int)popupX + 1, (int)popupY + 21, (int)popupX + 99, (int)popupY + 39, hoverOpt2 && canTeleport ? 0xFF2D3033 : 0x00000000);
+        guiGraphics.fill((int)popupX + 1, (int)popupY + 21, (int)popupX + menuWidth - 1, (int)popupY + 39, hoverOpt2 && canTeleport ? 0xFF2D3033 : 0x00000000);
         guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.teleport_here"), (int)popupX + 6, (int)popupY + 26, canTeleport ? 0xFFFFFF : 0x777777, false);
 
         // Option 3: share the inspected location through a pre-filled chat message.
-        boolean hoverOpt3 = mouseX >= popupX && mouseX <= popupX + 100
+        boolean hoverOpt3 = mouseX >= popupX && mouseX <= popupX + menuWidth
                 && mouseY >= popupY + 40 && mouseY <= popupY + 60;
-        guiGraphics.fill((int) popupX + 1, (int) popupY + 41, (int) popupX + 99, (int) popupY + 59,
+        guiGraphics.fill((int) popupX + 1, (int) popupY + 41, (int) popupX + menuWidth - 1, (int) popupY + 59,
                 hoverOpt3 ? 0xFF2D3033 : 0x00000000);
-        guiGraphics.drawString(this.font, "Share Location", (int) popupX + 6, (int) popupY + 46,
+        guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.popup.share_location"), (int) popupX + 6, (int) popupY + 46,
                 0xFFFFFF, false);
 
         // Option 4: Follow Waypoint (Only for existing waypoints)
@@ -1332,11 +1355,13 @@ public class MapScreen extends Screen {
             boolean isCurrentlyFollowing = MapConfig.pinActive &&
                 Math.abs(MapConfig.pinWorldX - clickedWaypoint.x) < 0.01 &&
                 Math.abs(MapConfig.pinWorldZ - clickedWaypoint.z) < 0.01;
-            boolean hoverOpt4 = mouseX >= popupX && mouseX <= popupX + 100
+            boolean hoverOpt4 = mouseX >= popupX && mouseX <= popupX + menuWidth
                     && mouseY >= popupY + 60 && mouseY <= popupY + 80;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 61, (int)popupX + 99, (int)popupY + 79,
+            guiGraphics.fill((int)popupX + 1, (int)popupY + 61, (int)popupX + menuWidth - 1, (int)popupY + 79,
                     hoverOpt4 ? 0xFF2D3033 : 0x00000000);
-            String opt4Text = isCurrentlyFollowing ? "Stop Following" : "Follow Waypoint";
+            Component opt4Text = isCurrentlyFollowing
+                    ? Component.translatable("gui.simplemap.popup.stop_following")
+                    : Component.translatable("gui.simplemap.popup.follow_waypoint");
             guiGraphics.drawString(this.font, opt4Text, (int)popupX + 6, (int)popupY + 66, 0xFFFFFF, false);
         }
 
@@ -1435,10 +1460,10 @@ public class MapScreen extends Screen {
             if (isInside(mouseX, mouseY,
                     panelLeft, panelTop, panelRight, panelBottom)) {
                 net.minecraft.world.entity.player.Player player = this.minecraft.player;
-                String shareText = "I am at coordinates ["
-                        + (int) Math.floor(player.getX()) + ", "
-                        + (int) Math.floor(player.getY()) + ", "
-                        + (int) Math.floor(player.getZ()) + "]";
+                String shareText = Component.translatable("gui.simplemap.share_player_coords",
+                        (int) Math.floor(player.getX()),
+                        (int) Math.floor(player.getY()),
+                        (int) Math.floor(player.getZ())).getString();
                 // Copy to Clipboard
                 this.minecraft.keyboardHandler.setClipboard(shareText);
                 player.sendSystemMessage(Component.translatable("gui.simplemap.coords_copied"));
@@ -1452,8 +1477,9 @@ public class MapScreen extends Screen {
 
         // 1. If context menu is open, handle its options first
         if (isPopupMenuOpen) {
+            int menuWidth = getPopupMenuWidth();
             int menuHeight = clickedWaypoint != null ? 80 : 60;
-            if (mouseX >= popupX && mouseX <= popupX + 100 && mouseY >= popupY && mouseY <= popupY + menuHeight) {
+            if (mouseX >= popupX && mouseX <= popupX + menuWidth && mouseY >= popupY && mouseY <= popupY + menuHeight) {
                 // Determine option clicked
                 if (mouseY < popupY + 20) {
                     if (clickedWaypoint != null) {
@@ -1754,15 +1780,29 @@ public class MapScreen extends Screen {
         @Override
         protected void updateMessage() {
             boolean fullCave = CaveMode.getCaveType(Minecraft.getInstance()) == CaveMode.CaveType.FULL;
-            String label;
+            Component label;
             if (fullCave) {
-                if (isAutoSelection()) label = dragging ? "Full Cave (AUTO)" : "Full Cave: AUTO";
-                else label = (dragging ? "Full Cave (Y: " : "Full Cave (Top Y: ") + selectedY() + ")";
+                if (isAutoSelection()) {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.full_auto_drag"
+                            : "gui.simplemap.cave_slider.full_auto");
+                } else {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.full_y_drag"
+                            : "gui.simplemap.cave_slider.full_y", selectedY());
+                }
             } else {
-                if (isAutoSelection()) label = dragging ? "Preview: AUTO" : "Top Y: AUTO";
-                else label = (dragging ? "Preview Y: " : "Top Y: ") + selectedY();
+                if (isAutoSelection()) {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.layer_auto_drag"
+                            : "gui.simplemap.cave_slider.layer_auto");
+                } else {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.layer_y_drag"
+                            : "gui.simplemap.cave_slider.layer_y", selectedY());
+                }
             }
-            setMessage(Component.literal(label));
+            setMessage(label);
         }
 
         @Override
@@ -2217,10 +2257,10 @@ public class MapScreen extends Screen {
                         syncIntegratedServerConfig();
                         button.setMessage(getServerRequireBookMessage(false, false));
                     }).bounds((this.width - btnWidth) / 2, this.height / 2 - 30, btnWidth, btnHeight)
-                    .tooltip(Tooltip.create(Component.literal(
+                    .tooltip(Tooltip.create(Component.translatable(
                             remoteServer && !remoteExtension
-                                    ? "Map Books require the Simple Map server extension."
-                                    : "Require a learned Map Book before the map can open.")))
+                                    ? "gui.simplemap.tooltip.server_book_ext_required"
+                                    : "gui.simplemap.tooltip.server_book")))
                     .build();
             requireBookButton.active = !remoteServer;
             this.addRenderableWidget(requireBookButton);
@@ -2246,10 +2286,7 @@ public class MapScreen extends Screen {
                         syncIntegratedServerConfig();
                         button.setMessage(getServerCaveModeMessage(false, false));
                     }).bounds((this.width - btnWidth) / 2, this.height / 2, btnWidth, btnHeight)
-                    .tooltip(Tooltip.create(Component.literal(
-                            "Cave visibility; may feel like cheating.\n"
-                                    + "OFF: surface only · AUTO: underground\n"
-                                    + "ON: auto plus manual layers")))
+                    .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.server_cave_scan")))
                     .build();
             caveScanButton.active = !remoteExtension;
             this.addRenderableWidget(caveScanButton);
@@ -2279,7 +2316,7 @@ public class MapScreen extends Screen {
         int tabW = Math.max(38, (panelWidth - 8 - tabSpacing * 3) / 4);
 
         tabMapButton = Button.builder(
-                Component.literal(activeTab == 0 ? "§6§lMap" : "Map"),
+                getTabButtonLabel(0, "gui.simplemap.tab.map.name"),
                 button -> {
                     activeTab = 0;
                     updateTabButtons();
@@ -2290,7 +2327,7 @@ public class MapScreen extends Screen {
         this.addRenderableWidget(tabMapButton);
 
         tabCoordsButton = Button.builder(
-                Component.literal(activeTab == 1 ? "§6§lCoords" : "Coords"),
+                getTabButtonLabel(1, "gui.simplemap.tab.coords.name"),
                 button -> {
                     activeTab = 1;
                     updateTabButtons();
@@ -2301,7 +2338,7 @@ public class MapScreen extends Screen {
         this.addRenderableWidget(tabCoordsButton);
 
         tabColorsButton = Button.builder(
-                Component.literal(activeTab == 2 ? "§6§lColors" : "Colors"),
+                getTabButtonLabel(2, "gui.simplemap.tab.colors.name"),
                 button -> {
                     activeTab = 2;
                     updateTabButtons();
@@ -2312,7 +2349,7 @@ public class MapScreen extends Screen {
         this.addRenderableWidget(tabColorsButton);
 
         tabSystemButton = Button.builder(
-                Component.literal(activeTab == 3 ? "§6§lSystem" : "System"),
+                getTabButtonLabel(3, "gui.simplemap.tab.system.name"),
                 button -> {
                     activeTab = 3;
                     updateTabButtons();
@@ -2336,7 +2373,7 @@ public class MapScreen extends Screen {
                     MapConfig.minimapEnabled = !MapConfig.minimapEnabled;
                     button.setMessage(getToggleMessage());
                 }).bounds(col1X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Show or hide the minimap HUD without disabling map recording.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_toggle")))
                 .build();
         this.addRenderableWidget(minimapToggleButton);
 
@@ -2344,10 +2381,9 @@ public class MapScreen extends Screen {
         minimapSizeSlider = new SimpleSlider(
                 col2X, 52, colW, 20,
                 initialSizeVal,
-                val -> String.format("Size: %dpx", 16 + (int) (val * (150 - 16))),
+                val -> Component.translatable("gui.simplemap.option.size", 16 + (int) (val * (150 - 16))).getString(),
                 val -> MapConfig.minimapSize = 16 + (int) (val * (150 - 16)));
-        minimapSizeSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes the minimap's on-screen size. Drag the preview to reposition it.")));
+        minimapSizeSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_size")));
         this.addRenderableWidget(minimapSizeSlider);
 
         // Row 2 (y = 77)
@@ -2357,7 +2393,7 @@ public class MapScreen extends Screen {
                     MapConfig.minimapCircle = !MapConfig.minimapCircle;
                     button.setMessage(getShapeMessage());
                 }).bounds(col1X, 77, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Switch between a square and circular minimap frame.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_shape")))
                 .build();
         this.addRenderableWidget(minimapShapeButton);
 
@@ -2370,8 +2406,7 @@ public class MapScreen extends Screen {
                         MapConfig.MINIMUM_ZOOM_SCALE + val * (2.0 - MapConfig.MINIMUM_ZOOM_SCALE)),
                 val -> MapConfig.minimapZoom = (float) (MapConfig.MINIMUM_ZOOM_SCALE
                         + val * (2.0 - MapConfig.MINIMUM_ZOOM_SCALE)));
-        minimapZoomSlider.setTooltip(Tooltip.create(Component.literal(
-                "Controls how much world area fits inside the minimap.")));
+        minimapZoomSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_zoom")));
         this.addRenderableWidget(minimapZoomSlider);
 
         // Row 3 (y = 102)
@@ -2381,8 +2416,7 @@ public class MapScreen extends Screen {
                     MapConfig.minimapRotate = !MapConfig.minimapRotate;
                     button.setMessage(getRotateMessage());
                 }).bounds(col1X, 102, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "ROTATING follows player direction. NORTH UP keeps north fixed at the top.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.north_lock")))
                 .build();
         this.addRenderableWidget(minimapRotateButton);
 
@@ -2390,10 +2424,10 @@ public class MapScreen extends Screen {
         pointerScaleSlider = new SimpleSlider(
                 col2X, 102, colW, 20,
                 initialPointerScaleVal,
-                val -> String.format("Pointer: %.2fx", 0.1 + val * (1.0 - 0.1)),
+                val -> Component.translatable("gui.simplemap.option.pointer_scale",
+                        String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (1.0 - 0.1))).getString(),
                 val -> MapConfig.playerMarkerScale = (float) (0.1 + val * (1.0 - 0.1)));
-        pointerScaleSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes the size of the player marker at the center of the minimap.")));
+        pointerScaleSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pointer_scale")));
         this.addRenderableWidget(pointerScaleSlider);
 
         // Row 4 (y = 127)
@@ -2403,8 +2437,7 @@ public class MapScreen extends Screen {
                     MapConfig.playerMarkerMode = (MapConfig.playerMarkerMode + 1) % 2;
                     button.setMessage(getPointerModeMessage());
                 }).bounds(col1X, 127, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Choose either a compact direction arrow or the player head skin.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pointer_mode")))
                 .build();
         this.addRenderableWidget(pointerModeButton);
 
@@ -2412,13 +2445,13 @@ public class MapScreen extends Screen {
         pinScaleSlider = new SimpleSlider(
                 col2X, 127, colW, 20,
                 initialPinScaleVal,
-                val -> String.format("Pin: %.2fx", 0.1 + val * (1.0 - 0.1)),
+                val -> Component.translatable("gui.simplemap.option.pin_scale",
+                        String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (1.0 - 0.1))).getString(),
                 val -> {
                     MapConfig.pinScale = (float) (0.1 + val * (1.0 - 0.1));
                     MapConfig.save();
                 });
-        pinScaleSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes the size of the temporary navigation pin and its map marker.")));
+        pinScaleSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pin_scale")));
         this.addRenderableWidget(pinScaleSlider);
 
         // ==================== SHARED COLOR EDITOR ====================
@@ -2429,8 +2462,7 @@ public class MapScreen extends Screen {
                     button.setMessage(getColorTargetMessage());
                     syncSharedColorInput();
                 }).bounds(col1X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Select which HUD element receives the edited color.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.color_target")))
                 .build();
         this.addRenderableWidget(colorTargetButton);
 
@@ -2440,8 +2472,7 @@ public class MapScreen extends Screen {
                     setSelectedTargetColor(nextPresetColor(getSelectedTargetColor()));
                     syncSharedColorInput();
                 }).bounds(col2X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Cycle through built-in readable colors for the selected target.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.color_preset")))
                 .build();
         this.addRenderableWidget(presetColorButton);
 
@@ -2449,21 +2480,19 @@ public class MapScreen extends Screen {
         int colorInputWidth = Math.max(72, gridWidth - saveButtonWidth - columnGap);
         int saveButtonX = col1X + colorInputWidth + columnGap;
         sharedColorInput = new EditBox(this.font, col1X, 77, colorInputWidth, 20,
-                Component.literal("Shared hex color"));
+                Component.translatable("gui.simplemap.narration.shared_hex_color"));
         sharedColorInput.setMaxLength(9);
         sharedColorInput.setValue(MapColorProfile.formatColor(getSelectedTargetColor()));
         sharedColorInput.setHint(Component.literal("#RRGGBB"));
         sharedColorInput.setResponder(this::previewSharedColor);
-        sharedColorInput.setTooltip(Tooltip.create(Component.literal(
-                "Enter #RRGGBB or #AARRGGBB. Valid input previews immediately.")));
+        sharedColorInput.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.shared_color_input")));
         this.addRenderableWidget(sharedColorInput);
 
         savePaletteColorButton = Button.builder(
                 Component.translatable("gui.simplemap.save"),
                 button -> saveSharedColor())
                 .bounds(saveButtonX, 77, saveButtonWidth, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Save the current color to the reusable palette below.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.save_palette_color")))
                 .build();
         this.addRenderableWidget(savePaletteColorButton);
 
@@ -2480,12 +2509,11 @@ public class MapScreen extends Screen {
 
         // Row 5, col 2 (y = 152)
         customBlockColorsButton = Button.builder(
-                Component.literal("Block Overrides: " + MapConfig.blockColorOverrides.size()),
+                Component.translatable("gui.simplemap.option.block_overrides", MapConfig.blockColorOverrides.size()),
                 b -> {
                     if (this.minecraft != null) this.minecraft.setScreen(new BlockColorManagerScreen(this));
                 }).bounds(col1X, 166, gridWidth, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Search, edit, reset or remove per-block map colors.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.block_overrides")))
                 .build();
         this.addRenderableWidget(customBlockColorsButton);
 
@@ -2495,7 +2523,7 @@ public class MapScreen extends Screen {
                     MapConfig.compassLettersVisible = !MapConfig.compassLettersVisible;
                     button.setMessage(getCompassLettersMessage());
                 }).bounds(col2X, 152, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Show N, E, S and W around the minimap frame.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.compass_labels")))
                 .build();
         this.addRenderableWidget(compassLettersToggleButton);
 
@@ -2504,10 +2532,11 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.mapColorProfile = (MapConfig.mapColorProfile + 1) % MapColorProfile.NAMES.length;
                     button.setMessage(getMapStyleMessage());
-                    MapConfig.save();
-                    MapManager.getInstance().reloadAllRegions();
+                    MapSessionManager.getInstance().bumpStyleGeneration();
+                    MapTextureManager.getInstance().invalidateStyle();
+                    CaveTextureManager.getInstance().invalidateStyle();
                 }).bounds(col1X, 152, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Cycle the overall map color profile.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.map_style")))
                 .build();
         this.addRenderableWidget(mapStyleButton);
 
@@ -2517,8 +2546,7 @@ public class MapScreen extends Screen {
                     MapConfig.showMinimapInScreens = !MapConfig.showMinimapInScreens;
                     button.setMessage(getShowInScreensMessage());
                 }).bounds(col1X, 177, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Keep the minimap visible while inventory, containers, chat or pause screens are open.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.show_in_screens")))
                 .build();
         this.addRenderableWidget(showInScreensButton);
 
@@ -2529,7 +2557,7 @@ public class MapScreen extends Screen {
                     MapConfig.coordsEnabled = !MapConfig.coordsEnabled;
                     button.setMessage(getCoordsToggleMessage());
                 }).bounds(col1X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal("Show the movable player coordinate overlay.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.coordinates")))
                 .build();
         this.addRenderableWidget(coordsToggleButton);
 
@@ -2537,10 +2565,10 @@ public class MapScreen extends Screen {
         coordsScaleSlider = new SimpleSlider(
                 col2X, 52, colW, 20,
                 initialCoordsScaleVal,
-                val -> String.format("Coords: %.2fx", 0.1 + val * (2.0 - 0.1)),
+                val -> Component.translatable("gui.simplemap.option.coords_scale",
+                        String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (2.0 - 0.1))).getString(),
                 val -> MapConfig.coordsScale = (float) (0.1 + val * (2.0 - 0.1)));
-        coordsScaleSlider.setTooltip(Tooltip.create(Component.literal(
-                "Changes coordinate text size. Drag the preview text to reposition it.")));
+        coordsScaleSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.coords_scale")));
         this.addRenderableWidget(coordsScaleSlider);
 
         cursorBiomeButton = Button.builder(
@@ -2550,8 +2578,7 @@ public class MapScreen extends Screen {
                     MapConfig.save();
                     button.setMessage(getCursorBiomeMessage());
                 }).bounds(col1X, 77, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Show the live biome name below cursor coordinates when the chunk is loaded.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cursor_biome")))
                 .build();
         this.addRenderableWidget(cursorBiomeButton);
 
@@ -2562,8 +2589,7 @@ public class MapScreen extends Screen {
                     MapConfig.save();
                     button.setMessage(getCursorBlockMessage());
                 }).bounds(col2X, 77, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Show the block under the cursor between the coordinate and biome readouts.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cursor_block")))
                 .build();
         this.addRenderableWidget(cursorBlockButton);
 
@@ -2576,9 +2602,7 @@ public class MapScreen extends Screen {
                     MapConfig.save();
                     button.setMessage(getMapRevealModeMessage());
                 }).bounds(col1X, 52, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Chunk-stream mapping completes loaded chunks by priority.\n"
-                                + "The legacy random DOTS pipeline has been removed.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.mapping_mode")))
                 .build();
         this.addRenderableWidget(mapRevealModeButton);
 
@@ -2589,8 +2613,7 @@ public class MapScreen extends Screen {
                     MapConfig.save();
                     button.setMessage(getAutoClearPinMessage());
                 }).bounds(col1X, 102, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Automatically remove the temporary navigation pin within 5 blocks of it.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.auto_clear_pin")))
                 .build();
         this.addRenderableWidget(autoClearPinButton);
 
@@ -2609,10 +2632,7 @@ public class MapScreen extends Screen {
                                 ? "AUTO" : String.valueOf(chunks));
                     }
                 });
-        scanSlider.setTooltip(Tooltip.create(Component.literal(
-                "Loaded chunk-column scan budget per client tick.\n"
-                        + "Higher values fill surface and cave layers faster but use more CPU.\n"
-                        + "AUTO uses the frame-time deadline and scans as fast as the client can safely sustain.")));
+        scanSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.scan_slider")));
         this.addRenderableWidget(scanSlider);
 
         alwaysRescanButton = Button.builder(
@@ -2622,23 +2642,18 @@ public class MapScreen extends Screen {
                     MapConfig.save();
                     button.setMessage(getAlwaysRescanMessage());
                 }).bounds(col1X, 77, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Continuously rescan loaded client chunks.\n"
-                        + "OFF (Default): Scans explored blocks once for max performance.\n"
-                        + "ON: Keeps re-scanning live loaded chunks to pick up world changes.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.rescan_loaded")))
                 .build();
         this.addRenderableWidget(alwaysRescanButton);
 
         scanInputBox = new EditBox(this.font,
                 col2X, 77, colW - 1, 20,
-                Component.literal("Scan points"));
+                Component.translatable("gui.simplemap.narration.scan_points"));
         scanInputBox.setMaxLength(6);
         scanInputBox.setValue(initialChunks >= SCAN_CHUNK_MAX
                 ? "AUTO" : String.valueOf(initialChunks));
-        scanInputBox.setHint(Component.literal("4-389/AUTO"));
-        scanInputBox.setTooltip(Tooltip.create(Component.literal(
-                "Approximate 16x16 chunks processed per tick.\n"
-                        + "AUTO/MAX is recommended for modern systems.")));
+        scanInputBox.setHint(Component.translatable("gui.simplemap.hint.scan_input"));
+        scanInputBox.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.scan_input")));
         scanInputBox.setResponder(text -> {
             String normalized = text.trim();
             if (normalized.equalsIgnoreCase("AUTO") || normalized.equalsIgnoreCase("MAX")) {
@@ -2672,8 +2687,7 @@ public class MapScreen extends Screen {
                     b.setMessage(getFastFullscreenMessage());
                     MapConfig.save();
                 }).bounds(col2X, 152, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Temporarily gives the open full map a larger bounded scan/upload budget.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.fast_fullscreen")))
                 .build();
         this.addRenderableWidget(fastFullscreenButton);
 
@@ -2685,8 +2699,7 @@ public class MapScreen extends Screen {
                     if (deathWaypointLimitButton != null) deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
                     MapConfig.save();
                 }).bounds(col1X, 177, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Create a local waypoint at the player's position on death.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.death_points")))
                 .build();
         this.addRenderableWidget(deathWaypointButton);
 
@@ -2703,8 +2716,7 @@ public class MapScreen extends Screen {
                     b.setMessage(getDeathWaypointLimitMessage());
                     MapConfig.save();
                 }).bounds(col2X, 177, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Maximum retained death waypoints per dimension.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.death_limit")))
                 .build();
         deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
         this.addRenderableWidget(deathWaypointLimitButton);
@@ -2713,10 +2725,7 @@ public class MapScreen extends Screen {
                 Component.translatable("gui.simplemap.restore_defaults"),
                 button -> openResetConfirmation())
                 .bounds(col1X, 202, gridWidth, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Restore HUD, color, performance and waypoint preferences."
-                                + "\nA confirmation screen appears first."
-                                + "\nWaypoints, explored map data and block overrides are kept.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.restore_defaults")))
                 .build();
         this.addRenderableWidget(resetToDefaultButton);
 
@@ -2724,11 +2733,9 @@ public class MapScreen extends Screen {
                 Component.translatable("gui.simplemap.reload_regions"),
                 button -> {
                     MapManager.getInstance().reloadAllRegions();
-                    button.setMessage(Component.literal("Reloading..."));
+                    button.setMessage(Component.translatable("gui.simplemap.reloading"));
                 }).bounds(col2X, 102, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Re-color and reload all saved map regions in the background.\n"
-                        + "The current image stays visible until each replacement is ready.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.reload_regions")))
                 .build();
         this.addRenderableWidget(reloadAllRegionsButton);
 
@@ -2739,8 +2746,7 @@ public class MapScreen extends Screen {
                     button.setMessage(getDisplayFlowersMessage());
                     refreshLoadedMapData();
                 }).bounds(col1X, 127, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "Draw small flower blocks on the map. Disabling can reduce visual noise.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.map_flowers")))
                 .build();
         this.addRenderableWidget(displayFlowersButton);
 
@@ -2751,9 +2757,7 @@ public class MapScreen extends Screen {
                     button.setMessage(getBlockColourModeMessage());
                     refreshLoadedMapData();
                 }).bounds(col2X, 127, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "ACCURATE uses registered block and biome colours.\n"
-                                + "VANILLA uses Minecraft map colours.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.block_colors")))
                 .build();
         this.addRenderableWidget(blockColourModeButton);
 
@@ -2764,9 +2768,7 @@ public class MapScreen extends Screen {
                     button.setMessage(getTerrainSlopesMessage());
                     refreshLoadedMapData();
                 }).bounds(col1X, 152, colW, 20)
-                .tooltip(Tooltip.create(Component.literal(
-                        "OFF is flat · 2D uses gentle relief.\n"
-                                + "3D uses stronger multi-direction slope shading.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.terrain_shading")))
                 .build();
         this.addRenderableWidget(terrainSlopesButton);
 
@@ -2778,7 +2780,7 @@ public class MapScreen extends Screen {
                     if (this.minecraft != null)
                         this.minecraft.setScreen(this.parent);
                 }).bounds(col1X, this.height - 30, gridWidth, 20)
-                .tooltip(Tooltip.create(Component.literal("Save settings and return to the full map.")))
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.done_settings")))
                 .build();
         this.addRenderableWidget(doneButton);
 
@@ -2795,10 +2797,10 @@ public class MapScreen extends Screen {
             if (this.minecraft != null) {
                 this.minecraft.setScreen(this);
             }
-        }, Component.literal("Restore Simple Map Defaults?"),
-                Component.literal("This restores HUD, colors, scanning and waypoint preferences. "
-                        + "Saved palette colors, block overrides, waypoints and explored map data are preserved."),
-                Component.literal("Restore"), Component.translatable("gui.simplemap.cancel")));
+        }, Component.translatable("gui.simplemap.confirm_restore.title"),
+                Component.translatable("gui.simplemap.confirm_restore.message"),
+                Component.translatable("gui.simplemap.confirm_restore.confirm"),
+                Component.translatable("gui.simplemap.cancel")));
     }
 
     private void applyDefaultPreferences() {
@@ -2811,17 +2813,23 @@ public class MapScreen extends Screen {
         CaveMapManager.getInstance().deactivate();
         ChunkScanner.getInstance().reset();
         MapManager.getInstance().reloadAllRegions();
+        CaveTextureManager.getInstance().invalidateStyle();
+    }
+
+    private Component getTabButtonLabel(int tabIndex, String key) {
+        String label = Component.translatable(key).getString();
+        return Component.literal(activeTab == tabIndex ? "§6§l" + label : label);
     }
 
     private void updateTabButtons() {
         if (tabMapButton != null)
-            tabMapButton.setMessage(Component.literal(activeTab == 0 ? "§6§lMap" : "Map"));
+            tabMapButton.setMessage(getTabButtonLabel(0, "gui.simplemap.tab.map.name"));
         if (tabCoordsButton != null)
-            tabCoordsButton.setMessage(Component.literal(activeTab == 1 ? "§6§lCoords" : "Coords"));
+            tabCoordsButton.setMessage(getTabButtonLabel(1, "gui.simplemap.tab.coords.name"));
         if (tabColorsButton != null)
-            tabColorsButton.setMessage(Component.literal(activeTab == 2 ? "§6§lColors" : "Colors"));
+            tabColorsButton.setMessage(getTabButtonLabel(2, "gui.simplemap.tab.colors.name"));
         if (tabSystemButton != null)
-            tabSystemButton.setMessage(Component.literal(activeTab == 3 ? "§6§lSystem" : "System"));
+            tabSystemButton.setMessage(getTabButtonLabel(3, "gui.simplemap.tab.system.name"));
     }
 
     private void updateWidgetVisibility() {
@@ -2863,8 +2871,8 @@ public class MapScreen extends Screen {
             savePaletteColorButton.visible = showColors;
         if (customBlockColorsButton != null) {
             customBlockColorsButton.visible = showColors;
-            customBlockColorsButton.setMessage(Component.literal(
-                    "Block Overrides: " + MapConfig.blockColorOverrides.size()));
+            customBlockColorsButton.setMessage(Component.translatable(
+                    "gui.simplemap.option.block_overrides", MapConfig.blockColorOverrides.size()));
         }
         refreshPaletteButtons();
         if (compassLettersToggleButton != null)
@@ -2913,57 +2921,89 @@ public class MapScreen extends Screen {
         }
     }
 
+    private static Component onOffComponent(boolean value) {
+        return Component.translatable(value ? "gui.simplemap.value.on" : "gui.simplemap.value.off");
+    }
+
     private Component getToggleMessage() {
-        return Component.literal("Minimap: " + (MapConfig.minimapEnabled ? "ENABLED" : "DISABLED"));
+        return Component.translatable("gui.simplemap.option.minimap",
+                Component.translatable(MapConfig.minimapEnabled
+                        ? "gui.simplemap.value.enabled"
+                        : "gui.simplemap.value.disabled"));
     }
 
     private Component getRotateMessage() {
-        return Component.literal("North Lock: " + (MapConfig.minimapRotate ? "OFF" : "ON"));
+        return Component.translatable("gui.simplemap.option.north_lock",
+                onOffComponent(!MapConfig.minimapRotate));
     }
 
     private Component getShapeMessage() {
-        return Component.literal("Shape: " + (MapConfig.minimapCircle ? "CIRCLE" : "SQUARE"));
+        return Component.translatable("gui.simplemap.option.shape",
+                Component.translatable(MapConfig.minimapCircle
+                        ? "gui.simplemap.value.circle"
+                        : "gui.simplemap.value.square"));
     }
 
     private Component getCoordsToggleMessage() {
-        return Component.literal("Coordinates: " + (MapConfig.coordsEnabled ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.coordinates",
+                onOffComponent(MapConfig.coordsEnabled));
     }
 
     private Component getDeathWaypointMessage() {
-        return Component.literal("Death Points: " + (MapConfig.createDeathWaypoint ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.death_points",
+                onOffComponent(MapConfig.createDeathWaypoint));
     }
 
     private Component getDeathWaypointLimitMessage() {
-        return Component.literal("Death Limit: " + MapConfig.maxDeathWaypoints);
+        return Component.translatable("gui.simplemap.option.death_limit", MapConfig.maxDeathWaypoints);
     }
 
     private Component getAutoClearPinMessage() {
-        return Component.literal("Auto-Clear Pin: " + (MapConfig.autoClearPin ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.auto_clear_pin",
+                onOffComponent(MapConfig.autoClearPin));
     }
 
     private Component getPointerModeMessage() {
-        return Component.literal("Marker: " + (MapConfig.playerMarkerMode == 1 ? "ARROW" : "SKIN"));
+        return Component.translatable("gui.simplemap.option.marker",
+                Component.translatable(MapConfig.playerMarkerMode == 1
+                        ? "gui.simplemap.value.arrow"
+                        : "gui.simplemap.value.skin"));
     }
 
     private Component getCompassLettersMessage() {
-        return Component.literal("Compass Labels: " + (MapConfig.compassLettersVisible ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.compass_labels",
+                onOffComponent(MapConfig.compassLettersVisible));
     }
 
     private Component getShowInScreensMessage() {
-        return Component.literal("Show in Screens: " + (MapConfig.showMinimapInScreens ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.show_in_screens",
+                onOffComponent(MapConfig.showMinimapInScreens));
     }
 
     private Component getMapStyleMessage() {
         int index = Math.max(0, Math.min(MapColorProfile.NAMES.length - 1, MapConfig.mapColorProfile));
-        return Component.literal("Style: " + MapColorProfile.NAMES[index]);
+        Component styleName = switch (index) {
+            case 1 -> Component.translatable("gui.simplemap.style.vibrant");
+            case 2 -> Component.translatable("gui.simplemap.style.natural");
+            case 3 -> Component.translatable("gui.simplemap.style.contrast");
+            default -> Component.translatable("gui.simplemap.style.balanced");
+        };
+        return Component.translatable("gui.simplemap.option.style", styleName);
     }
 
     private Component getColorTargetMessage() {
-        return Component.literal("Edit Color: " + COLOR_TARGET_NAMES[selectedColorTarget]);
+        Component targetName = switch (selectedColorTarget) {
+            case 1 -> Component.translatable("gui.simplemap.color_target.ring");
+            case 2 -> Component.translatable("gui.simplemap.color_target.compass");
+            case 3 -> Component.translatable("gui.simplemap.color_target.coords");
+            default -> Component.translatable("gui.simplemap.color_target.arrow");
+        };
+        return Component.translatable("gui.simplemap.option.edit_color", targetName);
     }
 
     private Component getSelectedPresetMessage() {
-        return Component.literal("Color: " + getPresetColorName(getSelectedTargetColor()));
+        return Component.translatable("gui.simplemap.option.color_preset",
+                getPresetColorName(getSelectedTargetColor()));
     }
 
     private int getSelectedTargetColor() {
@@ -3044,18 +3084,33 @@ public class MapScreen extends Screen {
 
     private String getPresetColorName(int color) {
         for (int i = 0; i < MapConfig.POINTER_COLORS.length; i++) {
-            if (color == MapConfig.POINTER_COLORS[i]) return MapConfig.POINTER_COLOR_NAMES[i];
+            if (color == MapConfig.POINTER_COLORS[i]) {
+                return switch (i) {
+                    case 0 -> Component.translatable("gui.simplemap.color.cyan").getString();
+                    case 1 -> Component.translatable("gui.simplemap.color.green").getString();
+                    case 2 -> Component.translatable("gui.simplemap.color.red").getString();
+                    case 3 -> Component.translatable("gui.simplemap.color.yellow").getString();
+                    case 4 -> Component.translatable("gui.simplemap.color.purple").getString();
+                    case 5 -> Component.translatable("gui.simplemap.color.orange").getString();
+                    case 6 -> Component.translatable("gui.simplemap.color.white").getString();
+                    case 7 -> Component.translatable("gui.simplemap.color.rainbow").getString();
+                    default -> MapConfig.POINTER_COLOR_NAMES[i];
+                };
+            }
         }
-        return "Custom";
+        return Component.translatable("gui.simplemap.color.custom").getString();
     }
 
     private Component getFastFullscreenMessage() {
-        return Component.literal("Loading: "
-                + (MapConfig.fastFullscreenLoading ? "FAST" : "BALANCED"));
+        return Component.translatable("gui.simplemap.option.loading",
+                Component.translatable(MapConfig.fastFullscreenLoading
+                        ? "gui.simplemap.value.fast"
+                        : "gui.simplemap.value.balanced"));
     }
 
     private Component getAlwaysRescanMessage() {
-        return Component.literal("Rescan Loaded: " + (MapConfig.alwaysRescanExplored ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.rescan_loaded",
+                onOffComponent(MapConfig.alwaysRescanExplored));
     }
 
     private static int pointsToChunkBudget(int points) {
@@ -3075,41 +3130,54 @@ public class MapScreen extends Screen {
     }
 
     private static String formatScanBudget(int chunks) {
-        return chunks >= SCAN_CHUNK_MAX ? "Scan: AUTO" : "Scan: " + chunks + " chunks/t";
+        return chunks >= SCAN_CHUNK_MAX
+                ? Component.translatable("gui.simplemap.option.scan_auto").getString()
+                : Component.translatable("gui.simplemap.option.scan_chunks", chunks).getString();
     }
 
     private Component getMapRevealModeMessage() {
-        return Component.literal("Mapping: STREAM");
+        return Component.translatable("gui.simplemap.option.mapping_mode",
+                Component.translatable("gui.simplemap.value.stream"));
     }
 
     private Component getDisplayFlowersMessage() {
-        return Component.literal("Map Flowers: " + (MapConfig.displayFlowers ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.map_flowers",
+                onOffComponent(MapConfig.displayFlowers));
     }
 
     private Component getBlockColourModeMessage() {
-        return Component.literal("Block Colors: " + (MapConfig.blockColourMode == 1 ? "VANILLA" : "ACCURATE"));
+        return Component.translatable("gui.simplemap.option.block_colors",
+                Component.translatable(MapConfig.blockColourMode == 1
+                        ? "gui.simplemap.value.vanilla"
+                        : "gui.simplemap.value.accurate"));
     }
 
     private Component getTerrainSlopesMessage() {
-        String mode = switch (MapConfig.terrainSlopes) {
-            case 0 -> "OFF";
-            case 1 -> "2D";
-            default -> "3D";
+        Component mode = switch (MapConfig.terrainSlopes) {
+            case 0 -> Component.translatable("gui.simplemap.value.off");
+            case 1 -> Component.translatable("gui.simplemap.value.2d");
+            default -> Component.translatable("gui.simplemap.value.3d");
         };
-        return Component.literal("Terrain Shading: " + mode);
+        return Component.translatable("gui.simplemap.option.terrain_shading", mode);
     }
 
     private Component getCursorBiomeMessage() {
-        return Component.literal("Cursor Biome: " + (MapConfig.cursorBiomeEnabled ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.cursor_biome",
+                onOffComponent(MapConfig.cursorBiomeEnabled));
     }
 
     private Component getCursorBlockMessage() {
-        return Component.literal("Cursor Block: " + (MapConfig.cursorBlockEnabled ? "ON" : "OFF"));
+        return Component.translatable("gui.simplemap.option.cursor_block",
+                onOffComponent(MapConfig.cursorBlockEnabled));
     }
 
     private void refreshLoadedMapData() {
         MapConfig.save();
         MapManager.getInstance().reloadAllRegions();
+        if (this.minecraft == null || this.minecraft.player == null) return;
+        ChunkScanner.getInstance().requestRefresh(this.minecraft);
+        MapTextureManager.getInstance().invalidateStyle();
+        CaveTextureManager.getInstance().invalidateStyle();
     }
 
     private boolean isRemoteServerSession() {
@@ -3129,24 +3197,33 @@ public class MapScreen extends Screen {
 
     private Component getServerRequireBookMessage(boolean remoteServer, boolean remoteExtension) {
         if (remoteServer && !remoteExtension) {
-            return Component.literal("Book: SERVER MOD REQUIRED");
+            return Component.translatable("gui.simplemap.server.book_mod_required");
         }
         boolean enabled = remoteServer ? MapConfig.serverRequireMapBook : ServerConfig.requireMapBook;
-        return Component.literal("Book: " + (enabled ? "REQUIRED" : "OPTIONAL")
-                + (remoteServer ? " · SERVER" : ""));
+        Component val = Component.translatable(enabled
+                ? "gui.simplemap.value.required"
+                : "gui.simplemap.value.optional");
+        String suffix = remoteServer
+                ? Component.translatable("gui.simplemap.server.suffix_server").getString()
+                : "";
+        return Component.translatable("gui.simplemap.server.book", val, suffix);
     }
 
     private Component getServerCaveModeMessage(boolean remoteServer, boolean remoteExtension) {
         int mode = remoteServer
                 ? (remoteExtension ? MapConfig.serverCaveMapMode : MapConfig.localCaveMapMode)
                 : ServerConfig.caveMapMode;
-        String name = switch (mode) {
-            case 1 -> "AUTO";
-            case 2 -> "ON";
-            default -> "OFF";
+        Component name = switch (mode) {
+            case 1 -> Component.translatable("gui.simplemap.value.auto");
+            case 2 -> Component.translatable("gui.simplemap.value.on");
+            default -> Component.translatable("gui.simplemap.value.off");
         };
-        String authority = remoteServer ? (remoteExtension ? " · SERVER" : " · LOCAL") : "";
-        return Component.literal("Cave Scan: " + name + authority);
+        String authority = remoteServer
+                ? Component.translatable(remoteExtension
+                        ? "gui.simplemap.server.suffix_server"
+                        : "gui.simplemap.server.suffix_local").getString()
+                : "";
+        return Component.translatable("gui.simplemap.server.cave_scan", name, authority);
     }
 
     @Override
@@ -3169,8 +3246,8 @@ public class MapScreen extends Screen {
             int panelTop = (this.height - panelHeight) / 2 - 10;
             guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + panelHeight, 0xA818191C);
             guiGraphics.renderOutline(panelLeft, panelTop, panelWidth, panelHeight, 0xB8666A70);
-            guiGraphics.drawCenteredString(this.font, "Simple Map · Server", this.width / 2, panelTop + 16,
-                    0xFFF2F2F2);
+            guiGraphics.drawCenteredString(this.font, Component.translatable("gui.simplemap.server_settings_title"),
+                    this.width / 2, panelTop + 16, 0xFFF2F2F2);
             super.render(guiGraphics, mouseX, mouseY, partialTick);
             return;
         }
@@ -3336,7 +3413,7 @@ public class MapScreen extends Screen {
             int borderColor = isHovered || selectedMinimap ? 0xFF00C8FF : 0xFF666666;
             guiGraphics.fill(x, y, x + size, y + size, 0x55000000);
             guiGraphics.renderOutline(x, y, size, size, borderColor);
-            String text = "Minimap Disabled";
+            String text = Component.translatable("gui.simplemap.preview.minimap_disabled").getString();
             guiGraphics.drawString(this.font, text, x + (size - this.font.width(text)) / 2, y + (size - 9) / 2,
                     0xAAAAAA, false);
         }
@@ -3383,7 +3460,7 @@ public class MapScreen extends Screen {
                 guiGraphics.renderOutline(cx - 4, cy - 3, textWidth + 8, textHeight + 6, borderColor);
             }
         } else {
-            String text = "Coords Disabled";
+            String text = Component.translatable("gui.simplemap.preview.coords_disabled").getString();
             int rawWidth = this.font.width(text);
             int placeholderW = (int) (rawWidth * MapConfig.coordsScale);
             int placeholderH = (int) (9 * MapConfig.coordsScale);
@@ -3417,9 +3494,9 @@ public class MapScreen extends Screen {
         }
 
         if (activeTab == 2) {
-            String paletteLabel = MapConfig.savedColors.isEmpty()
-                    ? "Save a color to reuse it"
-                    : "Saved colors (Shift-click removes)";
+            String paletteLabel = Component.translatable(MapConfig.savedColors.isEmpty()
+                    ? "gui.simplemap.palette.empty_hint"
+                    : "gui.simplemap.palette.saved_hint").getString();
             guiGraphics.drawString(this.font, paletteLabel, panelLeft + 6,
                     PALETTE_LABEL_Y, 0xFFB0B0B0, false);
         }
@@ -3431,10 +3508,10 @@ public class MapScreen extends Screen {
         int panelCenterX = doneButton.getX() + doneButton.getWidth() / 2;
         int hintY = doneButton.getY() - 18;
 
-        String hint = activeTab == 2 ? "Choose target, then apply a saved color"
+        String hint = activeTab == 2 ? Component.translatable("gui.simplemap.hint.color_tab").getString()
                 : ((selectedMinimap || selectedCoords)
-                        ? "Drag to move, click outside to save"
-                        : (activeTab <= 1 ? "Click & Drag" : ""));
+                        ? Component.translatable("gui.simplemap.hint.drag_move").getString()
+                        : (activeTab <= 1 ? Component.translatable("gui.simplemap.hint.click_drag").getString() : ""));
         if (!hint.isEmpty()) {
             guiGraphics.drawCenteredString(this.font, hint, panelCenterX, hintY, 0x808080);
         }
@@ -3451,7 +3528,8 @@ public class MapScreen extends Screen {
             int x = minimapPosition[0];
             int y = minimapPosition[1];
 
-            String coords = MapConfig.coordsEnabled ? "0, 80, 0" : "Coords Disabled";
+            String coords = MapConfig.coordsEnabled ? "0, 80, 0"
+                    : Component.translatable("gui.simplemap.preview.coords_disabled").getString();
             if (MapConfig.coordsEnabled && this.minecraft != null && this.minecraft.player != null) {
                 coords = String.format("%d, %d, %d",
                         (int) Math.floor(this.minecraft.player.getX()),
@@ -3564,16 +3642,15 @@ public class MapScreen extends Screen {
         private int color;
 
         ColorSwatchButton(int x, int y, int width, int height, int slot) {
-            super(x, y, width, height, Component.literal("Saved color"));
+            super(x, y, width, height, Component.translatable("gui.simplemap.palette.saved_color"));
             this.slot = slot;
         }
 
         void setColor(int color) {
             this.color = color;
             String formatted = MapColorProfile.formatColor(color);
-            setMessage(Component.literal("Use " + formatted));
-            setTooltip(Tooltip.create(Component.literal(
-                    formatted + "\nClick: apply to selected target\nShift-click: remove from saved colors")));
+            setMessage(Component.translatable("gui.simplemap.palette.use_color", formatted));
+            setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.palette_swatch", formatted)));
         }
 
         @Override
@@ -3708,10 +3785,10 @@ public class MapScreen extends Screen {
         }
 
         int letterColor = MapRenderer.getInstance().getActualPointerColor(MapConfig.compassLetterColor);
-        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleN, "N", letterColor, isCircle);
-        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleE, "E", letterColor, isCircle);
-        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleS, "S", letterColor, isCircle);
-        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleW, "W", letterColor, isCircle);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleN, Component.translatable("gui.simplemap.compass.n").getString(), letterColor, isCircle);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleE, Component.translatable("gui.simplemap.compass.e").getString(), letterColor, isCircle);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleS, Component.translatable("gui.simplemap.compass.s").getString(), letterColor, isCircle);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleW, Component.translatable("gui.simplemap.compass.w").getString(), letterColor, isCircle);
     }
 
     private void drawDirectionLetterHelper(GuiGraphics guiGraphics, Minecraft mc, float cx, float cy, float limit,
@@ -3789,7 +3866,7 @@ public class MapScreen extends Screen {
             int left = panelLeft();
             int top = panelTop();
             search = new EditBox(font, left, top + 24, 300, 20, Component.translatable("gui.simplemap.search_blocks"));
-            search.setHint(Component.literal("Search registry ID..."));
+            search.setHint(Component.translatable("gui.simplemap.hint.search_registry_id"));
             search.setResponder(value -> {
                 page = 0;
                 rebuildRows();
@@ -3822,7 +3899,7 @@ public class MapScreen extends Screen {
                 java.util.Map.Entry<String, Integer> entry = filtered.get(start + row);
                 String id = entry.getKey();
                 int y = top + 52 + row * 23;
-                addRenderableWidget(Button.builder(Component.literal("Edit"), b -> edit(id))
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.edit"), b -> edit(id))
                         .bounds(left + 306, y, 52, 20).build());
                 addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.reset"), b -> {
                     MapColorProfile.resetBlockOverride(id);
@@ -3836,7 +3913,7 @@ public class MapScreen extends Screen {
             addRenderableWidget(Button.builder(Component.literal(">"), b -> {
                 if ((page + 1) * ROWS < filtered.size()) { page++; rebuildRows(); }
             }).bounds(left + 42, top + 241, 36, 20).build());
-            addRenderableWidget(Button.builder(Component.literal(confirmClear ? "Confirm Clear All" : "Clear All"), b -> {
+            addRenderableWidget(Button.builder(Component.translatable(confirmClear ? "gui.simplemap.confirm_clear_all" : "gui.simplemap.clear_all"), b -> {
                 if (!confirmClear) {
                     confirmClear = true;
                     rebuildRows();
@@ -3850,7 +3927,12 @@ public class MapScreen extends Screen {
 
         private void edit(String blockId) {
             int automatic = MapTextureManager.getInstance().resolveAutomaticBlockColor(blockId);
-            if (minecraft != null) minecraft.setScreen(new BlockColorScreen(this, blockId, blockId, 0, 0, automatic));
+            String displayName = blockId;
+            ResourceLocation loc = ResourceLocation.tryParse(blockId);
+            if (loc != null && BuiltInRegistries.BLOCK.containsKey(loc)) {
+                displayName = BuiltInRegistries.BLOCK.get(loc).getName().getString();
+            }
+            if (minecraft != null) minecraft.setScreen(new BlockColorScreen(this, blockId, displayName, 0, 0, automatic));
         }
 
         @Override
@@ -3876,7 +3958,8 @@ public class MapScreen extends Screen {
                 graphics.drawString(font, entry.getKey(), left + 25, y + 6, 0xFFE0E0E0, false);
             }
             int pages = Math.max(1, (filtered.size() + ROWS - 1) / ROWS);
-            graphics.drawString(font, "Overrides: " + filtered.size() + "  Page " + (page + 1) + "/" + pages,
+            graphics.drawString(font,
+                    Component.translatable("gui.simplemap.block_colors.page_info", filtered.size(), page + 1, pages),
                     left + 88, top + 247, 0xFF9A9A9A, false);
             super.render(graphics, mouseX, mouseY, partialTick);
         }
@@ -3919,7 +4002,7 @@ public class MapScreen extends Screen {
 
             public BlockColorScreen(Screen parent, String blockId, String blockName,
                     int blockX, int blockZ, int automaticColor) {
-                super(Component.literal("Block Color"));
+                super(Component.translatable("gui.simplemap.block_color_editor_title"));
                 this.parent = parent;
                 this.blockId = blockId;
                 this.blockName = blockName;
@@ -3934,7 +4017,7 @@ public class MapScreen extends Screen {
                 int top = Math.max(14, this.height / 2 - 90);
                 int currentColor = MapConfig.blockColorOverrides.getOrDefault(blockId, automaticColor);
 
-                colorInput = new EditBox(this.font, left, top + 48, 160, 20, Component.literal("Block hex color"));
+                colorInput = new EditBox(this.font, left, top + 48, 160, 20, Component.translatable("gui.simplemap.narration.block_hex_color"));
                 colorInput.setMaxLength(9);
                 colorInput.setValue(MapColorProfile.formatColor(currentColor));
                 colorInput.setHint(Component.literal("#RRGGBB"));
@@ -3949,7 +4032,7 @@ public class MapScreen extends Screen {
                 addRenderableWidget(colorInput);
                 addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.save"), button -> saveOverride())
                         .bounds(left + 166, top + 48, 74, 20).build());
-                addRenderableWidget(Button.builder(Component.literal("Automatic"), button -> resetOverride())
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.automatic"), button -> resetOverride())
                         .bounds(left, top + 128, 116, 20).build());
                 addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.cancel"), button -> closeToParent())
                         .bounds(left + 124, top + 128, 116, 20).build());
@@ -4016,7 +4099,9 @@ public class MapScreen extends Screen {
                 guiGraphics.drawCenteredString(this.font, blockName, this.width / 2, top + 10, 0xFFFFFFFF);
                 guiGraphics.drawCenteredString(this.font, blockId, this.width / 2, top + 23, 0xFF9A9A9A);
                 guiGraphics.drawString(this.font,
-                        MapConfig.savedColors.isEmpty() ? "Enter a color" : "Saved palette",
+                        Component.translatable(MapConfig.savedColors.isEmpty()
+                                ? "gui.simplemap.block_color.enter_color"
+                                : "gui.simplemap.block_color.saved_palette"),
                         left + 6, top + 63, 0xFF9A9A9A, false);
 
                 int previewColor = automaticColor;
@@ -4037,7 +4122,7 @@ public class MapScreen extends Screen {
                 private final int color;
 
                 PaletteSwatch(int x, int y, int width, int height, int slot, int color) {
-                    super(x, y, width, height, Component.literal("Use " + MapColorProfile.formatColor(color)));
+                    super(x, y, width, height, Component.translatable("gui.simplemap.palette.use_color", MapColorProfile.formatColor(color)));
                     this.slot = slot;
                     this.color = color;
                 }
@@ -4139,7 +4224,13 @@ public class MapScreen extends Screen {
         int leftX = panelLeft + 8;
         int fieldWidth = panelWidth - 16;
 
-        String[] tabs = { "All", "Over", "Nether", "End", "Mod" };
+        String[] tabs = {
+            Component.translatable("gui.simplemap.waypoint_tab.all").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.overworld").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.nether").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.end").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.modded").getString()
+        };
         int tabGap = 2;
         int tabWidth = Math.max(28, (fieldWidth - tabGap * (tabs.length - 1)) / tabs.length);
         int tabY = panelTop + 21;
@@ -4189,7 +4280,13 @@ public class MapScreen extends Screen {
     }
 
     private void updateTabLabels() {
-        String[] tabs = { "All", "Over", "Nether", "End", "Mod" };
+        String[] tabs = {
+            Component.translatable("gui.simplemap.waypoint_tab.all").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.overworld").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.nether").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.end").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.modded").getString()
+        };
         for (int index = 0; index < tabButtons.size(); index++) {
             tabButtons.get(index).setMessage(Component.literal(
                     index == selectedTab ? "§b" + tabs[index] : tabs[index]));
@@ -4867,7 +4964,7 @@ public class MapScreen extends Screen {
             int top = panelTop + 22;
 
             nameInput = new EditBox(this.font, leftX, top, fieldWidth, 18,
-                    Component.literal("Waypoint name"));
+                    Component.translatable("gui.simplemap.narration.waypoint_name"));
             nameInput.setMaxLength(64);
             nameInput.setValue(draftName);
             nameInput.setHint(Component.literal(defaultName()));
@@ -4876,11 +4973,11 @@ public class MapScreen extends Screen {
             int coordinateY = top + 28;
             int coordinateGap = 4;
             int coordinateWidth = (fieldWidth - coordinateGap * 2) / 3;
-            xInput = coordinateBox(leftX, coordinateY, coordinateWidth, draftX, "X coordinate");
+            xInput = coordinateBox(leftX, coordinateY, coordinateWidth, draftX, "gui.simplemap.narration.x_coord");
             yInput = coordinateBox(leftX + coordinateWidth + coordinateGap, coordinateY,
-                    coordinateWidth, draftY, "Y coordinate");
+                    coordinateWidth, draftY, "gui.simplemap.narration.y_coord");
             zInput = coordinateBox(leftX + (coordinateWidth + coordinateGap) * 2,
-                    coordinateY, coordinateWidth, draftZ, "Z coordinate");
+                    coordinateY, coordinateWidth, draftZ, "gui.simplemap.narration.z_coord");
 
             int halfButton = (fieldWidth - 4) / 2;
             int row3Y = top + 50;
@@ -4891,23 +4988,30 @@ public class MapScreen extends Screen {
             double sliderValue = (waypointScale - 0.5) / 1.5;
             localScaleSlider = new SimpleSlider(leftX + halfButton + 4, row3Y, halfButton, 18,
                     Math.max(0.0, Math.min(1.0, sliderValue)),
-                    value -> String.format(Locale.ROOT, "Size: %.1fx", 0.5 + value * 1.5),
+                    value -> Component.translatable("gui.simplemap.waypoint.size_slider",
+                            String.format(Locale.ROOT, "%.1f", 0.5 + value * 1.5)).getString(),
                     value -> waypointScale = (float) (0.5 + value * 1.5));
             addRenderableWidget(localScaleSlider);
 
             int row4Y = top + 71;
-            addRenderableWidget(Button.builder(Component.literal("Player Pos"), button -> usePlayerPosition())
+            addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.waypoint.player_pos"), button -> usePlayerPosition())
                     .bounds(leftX, row4Y, halfButton, 18).build());
-            addRenderableWidget(Button.builder(Component.literal("Pick on Map"), button -> openMapPicker())
+            addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.waypoint.pick_on_map"), button -> openMapPicker())
                     .bounds(leftX + halfButton + 4, row4Y, halfButton, 18).build());
 
-            String[] tabNames = { "Mine", "Fight", "Move", "Food", "Find" };
+            String[] tabKeys = {
+                    "gui.simplemap.icon_tab.mine",
+                    "gui.simplemap.icon_tab.fight",
+                    "gui.simplemap.icon_tab.move",
+                    "gui.simplemap.icon_tab.food",
+                    "gui.simplemap.icon_tab.find"
+            };
             int tabGap = 2;
             int tabWidth = Math.max(28, (fieldWidth - tabGap * 4) / 5);
             int tabY = top + 93;
-            for (int index = 0; index < tabNames.length; index++) {
+            for (int index = 0; index < tabKeys.length; index++) {
                 final int tab = index;
-                Button button = Button.builder(Component.literal(tabNames[index]), b -> setTab(tab))
+                Button button = Button.builder(Component.translatable(tabKeys[index]), b -> setTab(tab))
                         .bounds(leftX + index * (tabWidth + tabGap), tabY, tabWidth, 16).build();
                 tabButtons.add(button);
                 addRenderableWidget(button);
@@ -4920,9 +5024,9 @@ public class MapScreen extends Screen {
             addItemGroupButtons(FOOD_ITEMS, 3, leftX, iconStartY, fieldWidth);
 
             searchBox = new EditBox(this.font, leftX, iconStartY, fieldWidth, 16,
-                    Component.literal("Search waypoint icon"));
+                    Component.translatable("gui.simplemap.narration.search_waypoint_icon"));
             searchBox.setMaxLength(48);
-            searchBox.setHint(Component.literal("Search item id..."));
+            searchBox.setHint(Component.translatable("gui.simplemap.hint.search_item_id"));
             searchBox.setResponder(value -> updateSearchResults());
             addRenderableWidget(searchBox);
 
@@ -4946,15 +5050,15 @@ public class MapScreen extends Screen {
             int bottomY = panelTop + panelHeight - 23;
             addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.cancel"), button -> onClose())
                     .bounds(leftX, bottomY, halfButton, 18).build());
-            addRenderableWidget(Button.builder(Component.literal(original == null ? "Add" : "Save"),
+            addRenderableWidget(Button.builder(Component.translatable(original == null ? "gui.simplemap.add" : "gui.simplemap.save"),
                     button -> saveWaypoint())
                     .bounds(leftX + halfButton + 4, bottomY, halfButton, 18).build());
 
             updateTabVisibility();
         }
 
-        private EditBox coordinateBox(int x, int y, int width, double value, String narration) {
-            EditBox box = new EditBox(this.font, x, y, width, 18, Component.literal(narration));
+        private EditBox coordinateBox(int x, int y, int width, double value, String narrationKey) {
+            EditBox box = new EditBox(this.font, x, y, width, 18, Component.translatable(narrationKey));
             box.setMaxLength(18);
             box.setValue(formatCoordinate(value));
             addRenderableWidget(box);
@@ -4970,11 +5074,12 @@ public class MapScreen extends Screen {
 
         private String defaultName() {
             int count = WaypointManager.getInstance().getWaypointsForDimension(draftDimension).size() + 1;
-            return "Waypoint " + count;
+            return Component.translatable("gui.simplemap.waypoint.default_name", count).getString();
         }
 
         private Component dimensionLabel() {
-            return Component.literal("Dim: " + MapManager.displayDimensionName(draftDimension));
+            return Component.translatable("gui.simplemap.waypoint.dim_label",
+                    MapManager.displayDimensionName(draftDimension));
         }
 
         private void cycleDimension() {
@@ -5084,7 +5189,8 @@ public class MapScreen extends Screen {
                 }
                 return value;
             } catch (RuntimeException exception) {
-                throw new IllegalArgumentException(axis + " must be a valid world coordinate");
+                throw new IllegalArgumentException(
+                        Component.translatable("gui.simplemap.waypoint.invalid_coord", axis).getString());
             }
         }
 
@@ -5101,7 +5207,7 @@ public class MapScreen extends Screen {
             if (original == null) {
                 WaypointManager.getInstance().addWaypoint(replacement);
             } else if (!WaypointManager.getInstance().updateWaypoint(original, replacement)) {
-                validationMessage = "Waypoint no longer exists";
+                validationMessage = Component.translatable("gui.simplemap.waypoint.not_found").getString();
                 return;
             }
             if (trackedOriginal) {
@@ -5140,13 +5246,13 @@ public class MapScreen extends Screen {
         private void updateTabVisibility() {
             for (int index = 0; index < tabButtons.size(); index++) {
                 Button button = tabButtons.get(index);
-                String plain = switch (index) {
-                    case 0 -> "Mine";
-                    case 1 -> "Fight";
-                    case 2 -> "Move";
-                    case 3 -> "Food";
-                    default -> "Find";
-                };
+                String plain = Component.translatable(switch (index) {
+                    case 0 -> "gui.simplemap.icon_tab.mine";
+                    case 1 -> "gui.simplemap.icon_tab.fight";
+                    case 2 -> "gui.simplemap.icon_tab.move";
+                    case 3 -> "gui.simplemap.icon_tab.food";
+                    default -> "gui.simplemap.icon_tab.find";
+                }).getString();
                 button.setMessage(Component.literal(index == activeTab ? "§b" + plain : plain));
             }
             for (ItemIconButton button : iconButtons) button.visible = button.tab == activeTab;
@@ -5304,7 +5410,7 @@ public class MapScreen extends Screen {
             guiGraphics.drawCenteredString(font, mapPreview, markerScreenX, labelY, 0xFFFFFFFF);
 
             // Subtle map interaction hint at top of the open map area
-            String mapHint = "Click map: set X/Z · Drag: pan · Scroll: zoom";
+            String mapHint = Component.translatable("gui.simplemap.waypoint.map_hint").getString();
             int hintW = font.width(mapHint);
             int hintX = (int) Math.round(anchorScreenX) - hintW / 2;
             guiGraphics.fill(hintX - 5, 6, hintX + hintW + 5, 19, 0x680C0E12);
@@ -5440,7 +5546,7 @@ public class MapScreen extends Screen {
 
             public WaypointMapPickerScreen(AddWaypointScreen parent, double centerX,
                     double centerZ) {
-                super(Component.literal("Pick Waypoint Location"));
+                super(Component.translatable("gui.simplemap.waypoint.picker_title"));
                 this.parent = parent;
                 this.centerX = centerX;
                 this.centerZ = centerZ;
@@ -5472,7 +5578,7 @@ public class MapScreen extends Screen {
                         MapManager.getInstance().isViewingLiveDimension(), false, false,
                         mouseWorldX, mouseWorldZ, partialTick, false);
 
-                String instruction = "Click a block to use its X/Z · Drag to pan · Scroll to zoom";
+                String instruction = Component.translatable("gui.simplemap.waypoint.picker_instruction").getString();
                 int instructionWidth = font.width(instruction);
                 int boxLeft = (width - instructionWidth) / 2 - 7;
                 guiGraphics.fill(boxLeft, 7, boxLeft + instructionWidth + 14, 25, 0xD0101010);

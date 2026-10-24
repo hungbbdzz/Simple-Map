@@ -52,12 +52,11 @@ public final class SimpleMapClientMod {
         }
         List<String> regionNames = MapManager.getInstance().getKnownRegionNamesForBook(4096);
         if (regionNames.isEmpty()) {
-            player.sendSystemMessage(Component.literal("§cYou haven't explored any map regions to save!"));
+            player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_regions_to_save"));
             return;
         }
 
-        player.sendSystemMessage(Component.literal(
-                "§bPreparing to save " + regionNames.size() + " map regions to the book..."));
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.preparing_save", regionNames.size()));
         if (ClientNetworkHandler.sendToServer(
                 new InitSaveBookPayload(regionNames, hand == InteractionHand.MAIN_HAND, ""))) {
             player.getCooldowns().addCooldown(cooldownItem, 120);
@@ -69,7 +68,7 @@ public final class SimpleMapClientMod {
         CustomData customData = stack.get(DataComponents.CUSTOM_DATA);
         CompoundTag tag = customData != null ? customData.copyTag() : null;
         if (tag == null || !tag.contains("MapBookID")) {
-            player.sendSystemMessage(Component.literal("§cThis map book is invalid or contains no data!"));
+            player.sendSystemMessage(Component.translatable("gui.simplemap.book.invalid"));
             return;
         }
 
@@ -78,8 +77,7 @@ public final class SimpleMapClientMod {
             boolean isOwner = !tag.contains("OwnerUUID")
                     || tag.getString("OwnerUUID").equals(player.getUUID().toString());
             if (!isOwner) {
-                player.sendSystemMessage(Component.literal(
-                        "§cYou cannot update a map book that you do not own!"));
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.not_owner"));
                 return;
             }
             updateBook(player, hand, bookId, cooldownItem);
@@ -99,8 +97,7 @@ public final class SimpleMapClientMod {
             return;
         }
 
-        player.sendSystemMessage(Component.literal(
-                "§bReading map book and syncing exploration data..."));
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.reading"));
         if (ClientNetworkHandler.sendToServer(new RequestLearnBookPayload(bookId))) {
             player.getCooldowns().addCooldown(cooldownItem, 120);
         }
@@ -113,12 +110,11 @@ public final class SimpleMapClientMod {
         }
         List<String> regionNames = MapManager.getInstance().getKnownRegionNamesForBook(4096);
         if (regionNames.isEmpty()) {
-            player.sendSystemMessage(Component.literal("§cYou haven't explored any map regions to save!"));
+            player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_regions_to_save"));
             return;
         }
 
-        player.sendSystemMessage(Component.literal(
-                "§bPreparing to update " + regionNames.size() + " map regions to the book..."));
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.preparing_update", regionNames.size()));
         if (ClientNetworkHandler.sendToServer(
                 new InitSaveBookPayload(regionNames, hand == InteractionHand.MAIN_HAND, bookId))) {
             player.getCooldowns().addCooldown(cooldownItem, 120);
@@ -126,8 +122,7 @@ public final class SimpleMapClientMod {
     }
 
     private static void unavailable(Player player) {
-        player.sendSystemMessage(Component.literal(
-                "§eMap Books require Simple Map on the server. Your local minimap still works."));
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.server_required"));
     }
 
     /** Centralized, side-safe actions used by configurable key mappings. */
@@ -150,13 +145,15 @@ public final class SimpleMapClientMod {
         public static void toggleMinimap(Minecraft mc) {
             MapConfig.minimapEnabled = !MapConfig.minimapEnabled;
             MapConfig.save();
-            notify(mc, "Minimap: " + onOff(MapConfig.minimapEnabled));
+            notify(mc, Component.translatable("gui.simplemap.msg.minimap_toggle", onOff(MapConfig.minimapEnabled)));
         }
 
         public static void toggleNorthLock(Minecraft mc) {
             MapConfig.minimapRotate = !MapConfig.minimapRotate;
             MapConfig.save();
-            notify(mc, MapConfig.minimapRotate ? "Minimap: ROTATING" : "Minimap: NORTH LOCKED");
+            notify(mc, Component.translatable(MapConfig.minimapRotate
+                    ? "gui.simplemap.msg.minimap_rotating"
+                    : "gui.simplemap.msg.minimap_north_locked"));
         }
 
         public static void zoomIn(Minecraft mc) {
@@ -181,20 +178,20 @@ public final class SimpleMapClientMod {
         public static void cycleNightMode(Minecraft mc) {
             MapConfig.minimapNightMode = (MapConfig.minimapNightMode + 1) % 3;
             MapConfig.save();
-            String mode = switch (MapConfig.minimapNightMode) {
-                case 1 -> "AUTO";
-                case 2 -> "ON";
-                default -> "OFF";
+            Component mode = switch (MapConfig.minimapNightMode) {
+                case 1 -> Component.translatable("gui.simplemap.value.auto");
+                case 2 -> Component.translatable("gui.simplemap.value.on");
+                default -> Component.translatable("gui.simplemap.value.off");
             };
-            notify(mc, "Map brightness: " + mode);
+            notify(mc, Component.translatable("gui.simplemap.msg.map_brightness", mode));
         }
 
         public static void cycleCaveMode(Minecraft mc) {
             if (!ready(mc)) return;
             if (MapConfig.getEffectiveCaveMapMode() == 0) {
-                notify(mc, MapConfig.serverExtensionAvailable
-                    ? "Cave map: disabled by server"
-                    : "Cave map: disabled in local settings");
+                notify(mc, Component.translatable(MapConfig.serverExtensionAvailable
+                    ? "gui.simplemap.msg.cave_disabled_server"
+                    : "gui.simplemap.msg.cave_disabled_local"));
                 return;
             }
             CaveMode.cycleCaveType(mc);
@@ -206,41 +203,43 @@ public final class SimpleMapClientMod {
                 case FULL -> ChunkScanner.getInstance()
                         .requestImmediateCaveLayerRefresh(mc);
             }
-            notify(mc, "Cave map: " + switch (type) {
-                case OFF -> "OFF";
-                case LAYERED -> "CAVE";
-                case FULL -> "FULL";
-            });
+            notify(mc, Component.translatable("gui.simplemap.msg.cave_mode", switch (type) {
+                case OFF -> Component.translatable("gui.simplemap.cave_mode.off");
+                case LAYERED -> Component.translatable("gui.simplemap.cave_mode.cave");
+                case FULL -> Component.translatable("gui.simplemap.cave_mode.full");
+            }));
         }
 
         public static void toggleWaypoints(Minecraft mc) {
             MapConfig.waypointsVisible = !MapConfig.waypointsVisible;
             MapConfig.save();
-            notify(mc, "Waypoints: " + onOff(MapConfig.waypointsVisible));
+            notify(mc, Component.translatable("gui.simplemap.msg.waypoints_toggle", onOff(MapConfig.waypointsVisible)));
         }
 
         public static void toggleCoordinates(Minecraft mc) {
             MapConfig.coordsEnabled = !MapConfig.coordsEnabled;
             MapConfig.save();
-            notify(mc, "Coordinates: " + onOff(MapConfig.coordsEnabled));
+            notify(mc, Component.translatable("gui.simplemap.msg.coordinates_toggle", onOff(MapConfig.coordsEnabled)));
         }
 
         public static void toggleShape(Minecraft mc) {
             MapConfig.minimapCircle = !MapConfig.minimapCircle;
             MapConfig.save();
-            notify(mc, MapConfig.minimapCircle ? "Minimap shape: CIRCLE" : "Minimap shape: SQUARE");
+            notify(mc, Component.translatable("gui.simplemap.msg.minimap_shape",
+                    Component.translatable(MapConfig.minimapCircle ? "gui.simplemap.value.circle" : "gui.simplemap.value.square")));
         }
 
         public static void toggleScreenVisibility(Minecraft mc) {
             MapConfig.showMinimapInScreens = !MapConfig.showMinimapInScreens;
             MapConfig.save();
-            notify(mc, "Minimap in menus: " + onOff(MapConfig.showMinimapInScreens));
+            notify(mc, Component.translatable("gui.simplemap.msg.minimap_in_menus", onOff(MapConfig.showMinimapInScreens)));
         }
 
         public static void toggleFastFullscreenLoading(Minecraft mc) {
             MapConfig.fastFullscreenLoading = !MapConfig.fastFullscreenLoading;
             MapConfig.save();
-            notify(mc, "Full map loading: " + (MapConfig.fastFullscreenLoading ? "FAST" : "BALANCED"));
+            notify(mc, Component.translatable("gui.simplemap.msg.full_map_loading",
+                    Component.translatable(MapConfig.fastFullscreenLoading ? "gui.simplemap.value.fast" : "gui.simplemap.value.balanced")));
         }
 
         public static void addWaypointAtPlayer(Minecraft mc) {
@@ -260,7 +259,7 @@ public final class SimpleMapClientMod {
         }
 
         public static void openSettings(Minecraft mc) {
-            mc.setScreen(new MapConfigScreen(mc.screen));
+            mc.setScreen(new MapConfigScreen(mc.screen instanceof MapScreen ? mc.screen : new MapScreen()));
         }
 
         public static void refreshVisibleMap(Minecraft mc) {
@@ -271,48 +270,49 @@ public final class SimpleMapClientMod {
             } else {
                 MapTextureManager.getInstance().uploadDirtyTextures(true);
             }
-            notify(mc, "Visible map refresh requested");
+            notify(mc, Component.translatable("gui.simplemap.msg.refresh_requested"));
         }
 
         public static void clearNavigationPin(Minecraft mc) {
             if (!MapConfig.pinActive) {
-                notify(mc, "Navigation pin: none");
+                notify(mc, Component.translatable("gui.simplemap.msg.pin_none"));
                 return;
             }
             PinNavigation.clear();
             MapManager.getInstance().savePin();
-            notify(mc, "Navigation pin cleared");
+            notify(mc, Component.translatable("gui.simplemap.msg.pin_cleared"));
         }
 
         public static void toggleCompass(Minecraft mc) {
             MapConfig.compassLettersVisible = !MapConfig.compassLettersVisible;
             MapConfig.save();
-            notify(mc, "Compass letters: " + onOff(MapConfig.compassLettersVisible));
+            notify(mc, Component.translatable("gui.simplemap.msg.compass_letters", onOff(MapConfig.compassLettersVisible)));
         }
 
         public static void toggleCursorBiome(Minecraft mc) {
             MapConfig.cursorBiomeEnabled = !MapConfig.cursorBiomeEnabled;
             MapConfig.save();
-            notify(mc, "Cursor biome: " + onOff(MapConfig.cursorBiomeEnabled));
+            notify(mc, Component.translatable("gui.simplemap.msg.cursor_biome", onOff(MapConfig.cursorBiomeEnabled)));
         }
 
         public static void cycleColorMode(Minecraft mc) {
             MapConfig.blockColourMode = (MapConfig.blockColourMode + 1) % 2;
             invalidateMapStyle();
             MapConfig.save();
-            notify(mc, "Map colors: " + (MapConfig.blockColourMode == 0 ? "ACCURATE" : "VANILLA"));
+            notify(mc, Component.translatable("gui.simplemap.msg.map_colors",
+                    Component.translatable(MapConfig.blockColourMode == 0 ? "gui.simplemap.value.accurate" : "gui.simplemap.value.vanilla")));
         }
 
         public static void cycleTerrainMode(Minecraft mc) {
             MapConfig.terrainSlopes = (MapConfig.terrainSlopes + 1) % 3;
             invalidateMapStyle();
             MapConfig.save();
-            String mode = switch (MapConfig.terrainSlopes) {
-                case 1 -> "2D";
-                case 2 -> "3D";
-                default -> "OFF";
+            Component mode = switch (MapConfig.terrainSlopes) {
+                case 1 -> Component.translatable("gui.simplemap.value.2d");
+                case 2 -> Component.translatable("gui.simplemap.value.3d");
+                default -> Component.translatable("gui.simplemap.value.off");
             };
-            notify(mc, "Terrain relief: " + mode);
+            notify(mc, Component.translatable("gui.simplemap.msg.terrain_relief", mode));
         }
 
         private static void invalidateMapStyle() {
@@ -325,13 +325,19 @@ public final class SimpleMapClientMod {
             return mc != null && mc.player != null && mc.level != null;
         }
 
-        private static String onOff(boolean value) {
-            return value ? "ON" : "OFF";
+        private static Component onOff(boolean value) {
+            return Component.translatable(value ? "gui.simplemap.value.on" : "gui.simplemap.value.off");
         }
 
         private static void notify(Minecraft mc, String text) {
             if (mc != null && mc.player != null) {
                 mc.player.displayClientMessage(Component.literal(text), true);
+            }
+        }
+
+        private static void notify(Minecraft mc, Component message) {
+            if (mc != null && mc.player != null) {
+                mc.player.displayClientMessage(message, true);
             }
         }
     }

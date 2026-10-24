@@ -426,8 +426,8 @@ public final class PinNavigation {
             if (!removed) break;
         }
         if (waypoints.size() >= MAX_WAYPOINTS) return;
-        String name = String.format(Locale.ROOT, "Death (%d, %d, %d)",
-                (int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z));
+        String name = Component.translatable("gui.simplemap.waypoint.death_name",
+                (int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z)).getString();
         waypoints.add(new Waypoint(name, x, y, z, -1, "minecraft:recovery_compass", 1.0f,
                 targetDimension, true));
         rebuildSnapshotsLocked();
@@ -506,13 +506,14 @@ public final class PinNavigation {
                         (int) Math.floor(y), blockZ)
                 : String.format(Locale.ROOT, "[%d, ?, %d]", blockX, blockZ);
         String place = label == null || label.isBlank()
-                ? "Location" : "Waypoint \"" + label.trim() + "\"";
-        String text = place + " at " + coordinates + " in "
-                + MapManager.displayDimensionName(dimension);
+                ? Component.translatable("gui.simplemap.share.location").getString()
+                : Component.translatable("gui.simplemap.share.waypoint", label.trim()).getString();
+        String text = Component.translatable("gui.simplemap.share.format",
+                place, coordinates, MapManager.displayDimensionName(dimension)).getString();
         minecraft.keyboardHandler.setClipboard(text);
         if (minecraft.player != null) {
             minecraft.player.displayClientMessage(
-                    Component.literal("Location copied; press Enter to share."), true);
+                    Component.translatable("gui.simplemap.msg.location_copied"), true);
         }
         MapViewportCoordinator.getInstance().closeFullscreen();
         minecraft.setScreen(new ChatScreen(text));

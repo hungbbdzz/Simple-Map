@@ -409,10 +409,10 @@ public class MinimapRenderer {
         }
 
         int letterColor = MapRenderer.getInstance().getActualPointerColor(MapConfig.compassLetterColor);
-        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleN, "N", letterColor, isCircle);
-        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleE, "E", letterColor, isCircle);
-        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleS, "S", letterColor, isCircle);
-        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleW, "W", letterColor, isCircle);
+        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleN, net.minecraft.network.chat.Component.translatable("gui.simplemap.compass.n").getString(), letterColor, isCircle);
+        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleE, net.minecraft.network.chat.Component.translatable("gui.simplemap.compass.e").getString(), letterColor, isCircle);
+        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleS, net.minecraft.network.chat.Component.translatable("gui.simplemap.compass.s").getString(), letterColor, isCircle);
+        drawDirectionLetter(guiGraphics, mc, cx, cy, limit, angleW, net.minecraft.network.chat.Component.translatable("gui.simplemap.compass.w").getString(), letterColor, isCircle);
     }
 
     private void drawDirectionLetter(GuiGraphics guiGraphics, Minecraft mc, float cx, float cy, float limit,
@@ -585,7 +585,8 @@ public class MinimapRenderer {
         String label;
         if (dist3D >= 1000) {
             long tenths = Math.round(dist3D / 100.0);
-            label = (tenths / 10) + "." + Math.abs(tenths % 10) + "k blocks";
+            label = net.minecraft.network.chat.Component.translatable("gui.simplemap.distance.k_blocks",
+                    (tenths / 10) + "." + Math.abs(tenths % 10)).getString();
         } else {
             label = (int) dist3D + "m";
         }

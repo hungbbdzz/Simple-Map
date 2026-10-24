@@ -28,8 +28,7 @@ public class MapBookItem extends Item {
 
         if (tag == null || !tag.contains("MapBookID")) {
             if (!level.isClientSide) {
-                player.sendSystemMessage(Component.literal(
-                        "§cThis map book is invalid or contains no data!"));
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.invalid"));
             }
             return InteractionResultHolder.fail(stack);
         }
@@ -46,17 +45,17 @@ public class MapBookItem extends Item {
         CustomData customData = stack.get(DataComponents.CUSTOM_DATA);
         CompoundTag tag = customData != null ? customData.copyTag() : null;
         if (tag == null || !tag.contains("MapBookID")) {
-            tooltipComponents.add(Component.literal("§cNo Data"));
+            tooltipComponents.add(Component.translatable("item.simplemap.book_map.no_data"));
             return;
         }
 
         String bookId = tag.getString("MapBookID");
-        tooltipComponents.add(Component.literal("§7Map ID: §f"
-                + bookId.substring(0, Math.min(8, bookId.length())) + "..."));
+        tooltipComponents.add(Component.translatable("item.simplemap.book_map.map_id",
+                bookId.substring(0, Math.min(8, bookId.length())) + "..."));
         if (tag.contains("OwnerName")) {
-            tooltipComponents.add(Component.literal("§7Owner: §e" + tag.getString("OwnerName")));
+            tooltipComponents.add(Component.translatable("item.simplemap.book_map.owner", tag.getString("OwnerName")));
         }
-        tooltipComponents.add(Component.literal("§aRight-click: open or learn map."));
-        tooltipComponents.add(Component.literal("§6Shift + Right-click: update an owned map."));
+        tooltipComponents.add(Component.translatable("item.simplemap.book_map.right_click_hint"));
+        tooltipComponents.add(Component.translatable("item.simplemap.book_map.shift_right_click_hint"));
     }
 }
