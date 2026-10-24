@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Simple Map 設定\nミニマップ、座標、色、スキャンを設定します。",
   "gui.simplemap.tooltip.waypoint_manager_button": "ウェイポイント管理 (キー: U)\nウェイポイントの管理、編集、テレポート、追跡を行います。",
   "gui.simplemap.tooltip.waypoint_visibility": "ウェイポイント表示: %s\nクリックして全マーカーの表示/非表示を切り替えます。",
-  "gui.simplemap.tooltip.refresh_map": "表示中のマップを更新\n読み込み済みの周辺チャンクを再スキャンします。\nShift+クリック: プレイヤー中心に戻しズームをリセット。",
+  "gui.simplemap.tooltip.refresh_map": "表示中のマップを更新\n現在Minecraftによって読み込まれている近くのチャンクを再スキャンします。\nShift+クリック: 現在のディメンションに戻り、プレイヤーを中心に配置してズームをリセット。",
   "gui.simplemap.tooltip.map_brightness": "マップの明るさ: %s\n昼 / 自動 / 夜 の描画を切り替えます。",
   "gui.simplemap.tooltip.dimension_switch": "ディメンション: %s",
   "gui.simplemap.tooltip.cave_top_y": "洞窟の上限高度 (Top Y)\n自動はプレイヤーの現在地下層に追従します。\n右にドラッグすると固定の洞窟層を選択します。",

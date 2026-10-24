@@ -236,9 +236,10 @@ public final class CaveTextureManager {
 
     public void markRegionTextureDirty(int layerY, int rx, int rz) {
         CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(layerY, rx, rz, false);
-        if (region == null || !region.hasContent()) {
+        if (region == null) {
             return;
         }
+        boolean regionHasContent = region.hasContent();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
         int firstGlobalX = rx << 3;
         int firstGlobalZ = rz << 3;
@@ -259,7 +260,7 @@ public final class CaveTextureManager {
                     if (existing != null) {
                         existing.dirty = true;
                         dirtyPageKeys.add(key);
-                    } else if (allowLeafPrecreate && minPx != Integer.MIN_VALUE
+                    } else if (regionHasContent && allowLeafPrecreate && minPx != Integer.MIN_VALUE
                             && gpx >= minPx - 1 && gpx <= maxPx + 1
                             && gpz >= minPz - 1 && gpz <= maxPz + 1
                             && Math.abs(gpx - fpx) <= 12 && Math.abs(gpz - fpz) <= 12) {
@@ -272,9 +273,11 @@ public final class CaveTextureManager {
         }
         synchronized (branchPages) {
             BranchKey k3 = new BranchKey(band, 3, rx, rz);
-            BranchEntry l3 = branchPages.computeIfAbsent(k3, BranchEntry::new);
-            l3.dirty = true;
-            dirtyBranchKeys.add(k3);
+            BranchEntry l3 = regionHasContent ? branchPages.computeIfAbsent(k3, BranchEntry::new) : branchPages.get(k3);
+            if (l3 != null) {
+                l3.dirty = true;
+                dirtyBranchKeys.add(k3);
+            }
 
             int baseNodeX2 = rx * 2;
             int baseNodeZ2 = rz * 2;
@@ -1062,6 +1065,12 @@ public final class CaveTextureManager {
         entry.knownMask = knownMask;
         entry.completeMask = completeMask;
         if (!hasContent) {
+            if (entry.slot != -1) {
+                atlas.releaseSlot(entry.slot);
+                entry.slot = -1;
+                MapMemoryBudgetPolicy.MapResidencyManager.getInstance().markTopologyChanged();
+                contentRevision.incrementAndGet();
+            }
             entry.dirty = false;
             return false;
         }
@@ -1093,6 +1102,13 @@ public final class CaveTextureManager {
         }
         CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(requestedLayer, rx, rz, false);
         if (region == null || !region.hasContent()) {
+            entry.hasContent = false;
+            if (entry.slot != -1) {
+                atlas.releaseSlot(entry.slot);
+                entry.slot = -1;
+                MapMemoryBudgetPolicy.MapResidencyManager.getInstance().markTopologyChanged();
+                contentRevision.incrementAndGet();
+            }
             entry.dirty = false;
             return false;
         }
@@ -1124,6 +1140,12 @@ public final class CaveTextureManager {
 
         entry.hasContent = hasContent;
         if (!hasContent) {
+            if (entry.slot != -1) {
+                atlas.releaseSlot(entry.slot);
+                entry.slot = -1;
+                MapMemoryBudgetPolicy.MapResidencyManager.getInstance().markTopologyChanged();
+                contentRevision.incrementAndGet();
+            }
             entry.dirty = false;
             return false;
         }
@@ -1470,7 +1492,7 @@ public final class CaveTextureManager {
     public static final class CaveMapManager {
         private static final CaveMapManager INSTANCE = new CaveMapManager();
         private static final int MAX_COMPAT_REGIONS = 128;
-        private static final int SCDAT_MAGIC = 0x53434446; // 'SCDF' (dimension + full non-tinted biome palette unified cave archive)
+        private static final int SCDAT_MAGIC = 0x53434447; // 'SCDG' (canonical cave lighting + lava/water ceiling-penetration fix)
 
         private final ExecutorService diskExecutor = Executors.newFixedThreadPool(
                 Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() - 1)), r -> {
@@ -1784,7 +1806,7 @@ public final class CaveTextureManager {
             if (region != null) {
                 boolean changed = region.setChunkPixels(cxInRegion, czInRegion, chunkColors, chunkHeights,
                         chunkBlockIds, chunkBiomeIds, layerY);
-                if (changed || region.hasContent()) {
+                if (changed) {
                     markPageDirty(layerY, chunkX >> 2, chunkZ >> 2);
                 }
             }
@@ -1896,6 +1918,11 @@ public final class CaveTextureManager {
             }
             if (cachedScdat) return true;
 
+            return hasMcaFile(rx, rz);
+        }
+
+        public boolean hasMcaFile(int rx, int rz) {
+            String dimId = currentDimensionId();
             String mcaKey = dimId + ":" + rx + "," + rz;
             Boolean cachedMca = mcaExistsCache.get(mcaKey);
             if (cachedMca != null) return cachedMca;
@@ -2677,12 +2704,17 @@ public final class CaveTextureManager {
                                 underair = true;
                                 continue;
                             }
-                            // In Layered Cave, if scanMaximum starts inside open-sky surface foliage/trees
-                            // (no solid roof above), treat it as open air immediately so tree canopies are never cut off.
-                            if (!isFullCave && !passedSolidRoof
+                            // Fluids (lava seas at Nether Y<=31, underground water lakes) are never a solid rock ceiling;
+                            // Reference WorldDataReader / MapWriter: hitting any fluid when !shouldEnterGround
+                            // immediately sets underair = true and renders the fluid/floor column.
+                            if (kind == DecodedSection.KIND_WATER || kind == DecodedSection.KIND_LAVA) {
+                                underair = true;
+                            } else if (!isFullCave && !passedSolidRoof
                                     && (kind == DecodedSection.KIND_LEAVES
                                             || kind == DecodedSection.KIND_PASSABLE_SOLID
                                             || kind == DecodedSection.KIND_THIN_FLOOR)) {
+                                // In Layered Cave, if scanMaximum starts inside open-sky surface foliage/trees
+                                // (no solid roof above), treat it as open air immediately so tree canopies are never cut off.
                                 underair = true;
                             } else {
                                 passedSolidRoof = true;
@@ -3591,33 +3623,16 @@ public final class CaveTextureManager {
                 }
                 return 0xFF000000 | (b0 << 16) | (g0 << 8) | r0;
             }
-            int nightMode = MapConfig.minimapNightMode; // 0 = DAY/BRIGHT, 1 = AUTO, 2 = NIGHT/DARK
+            // Canonical cave pixel lighting: never bake MapConfig.minimapNightMode into CPU or .scdat pixels,
+            // so loaded chunks (ChunkScanner) and unloaded .mca/.scdat chunks have 100% identical base brightness,
+            // and cycling Map Brightness never requires reloading or re-slicing regions.
             int clampedBlock = Math.max(0, Math.min(15, blockLight));
             int clampedSky = Math.max(0, Math.min(15, skyLight));
-            if (clampedSky >= 15 && clampedBlock <= 4 && nightMode == 0) {
-                // Open-sky surface layer in LAYERED mode during Day mode:
-                // preserve 100% of Surface mode's natural brightness.
-                return abgr;
-            }
-            int adjustedSky = nightMode == 2 ? Math.round(clampedSky * 0.28f) : clampedSky;
-            int effectiveLight = Math.max(clampedBlock, adjustedSky);
+            int effectiveLight = Math.max(clampedBlock, clampedSky);
             float standardBlockBrightness = (9.0f + effectiveLight) / 24.0f;
             float heightShade = Math.max(0.92f, Math.min(1.05f, 1.0f + verticalOffset * 0.016f));
-            float lightCurve;
-            float minFloor;
-            if (nightMode == 0) {
-                // Day / Bright mode: lift dark cave rock so unlit passages are bright and easy to read
-                lightCurve = 0.56f + 0.46f * standardBlockBrightness;
-                minFloor = 0.72f;
-            } else if (nightMode == 2) {
-                // Night / Dark mode: darken unlit rock while keeping block-lit areas at 100% full brightness
-                lightCurve = 0.10f + 0.90f * standardBlockBrightness;
-                minFloor = 0.30f;
-            } else {
-                // Auto mode: balanced reference cave legibility curve
-                lightCurve = 0.22f + 0.78f * standardBlockBrightness;
-                minFloor = 0.48f;
-            }
+            float lightCurve = 0.32f + 0.68f * standardBlockBrightness;
+            float minFloor = 0.56f;
             float brightness = Math.max(minFloor, Math.min(1.06f, lightCurve * heightShade));
 
             int red = Math.round(r0 * brightness);
@@ -3728,11 +3743,13 @@ public final class CaveTextureManager {
                         if (needsSlice && asyncTarget.markAnvilSlicing()) {
                             try {
                                 sliceAnvilRegion(asyncTarget, requestedLayer, rx, rz);
-                                if (asyncTarget.hasContent() && asyncTarget.isAnvilSliced()
+                                if (asyncTarget.isAnvilSliced()
                                         && (requestedLayer == Integer.MIN_VALUE
                                                 || asyncTarget.getWrittenAnvilLayerY() == requestedLayer)) {
-                                    asyncTarget.setDirty(false);
-                                    saveRegionToDisk(asyncTarget, band, rx, rz);
+                                    if (asyncTarget.hasContent()) {
+                                        asyncTarget.setDirty(false);
+                                        saveRegionToDisk(asyncTarget, band, rx, rz);
+                                    }
                                     if (asyncTarget.dimensionResourceId.equals(currentDimensionId()) && !asyncTarget.isClosed()) {
                                         CaveTextureManager.getInstance().markRegionTextureDirty(requestedLayer, rx, rz);
                                     }

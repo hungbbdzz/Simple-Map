@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "簡易地圖設定\n設定小地圖、座標、顏色與區塊掃描。",
   "gui.simplemap.tooltip.waypoint_manager_button": "路徑點管理器 (按鍵: U)\n管理、編輯、傳送與追蹤路徑點。",
   "gui.simplemap.tooltip.waypoint_visibility": "路徑點可見度: %s\n點擊以顯示或隱藏所有路徑點標記。",
-  "gui.simplemap.tooltip.refresh_map": "重新整理可見地圖\n重新掃描目前載入的周圍區塊。\nShift+點擊：置中於玩家並重設縮放。",
+  "gui.simplemap.tooltip.refresh_map": "重新整理可見地圖\n重新掃描目前由Minecraft載入的附近區塊。\nShift-點擊：返回當前維度，置中於玩家並重設縮放。",
   "gui.simplemap.tooltip.map_brightness": "地圖亮度: %s\n切換 白天 / 自動 / 夜間 渲染模式。",
   "gui.simplemap.tooltip.dimension_switch": "維度: %s",
   "gui.simplemap.tooltip.cave_top_y": "洞穴頂部高度 (Top Y)\n自動模式會跟隨玩家目前所在的地下層。\n向右拖曳可選擇固定的洞穴層高。",

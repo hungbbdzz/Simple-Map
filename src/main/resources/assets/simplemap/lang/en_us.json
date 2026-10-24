@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Simple Map Settings\nConfigure minimap, coordinates, colors and scanning.",
   "gui.simplemap.tooltip.waypoint_manager_button": "Waypoint Manager (Key: U)\nManage, edit, teleport and track waypoints.",
   "gui.simplemap.tooltip.waypoint_visibility": "Waypoint Visibility: %s\nClick to show or hide all waypoint markers.",
-  "gui.simplemap.tooltip.refresh_map": "Refresh Visible Map\nRescan nearby chunks currently loaded by Minecraft.\nShift-click: center on player and reset zoom.",
+  "gui.simplemap.tooltip.refresh_map": "Refresh Visible Map\nRescan nearby chunks currently loaded by Minecraft.\nShift-click: return to current dimension, center on player and reset zoom.",
   "gui.simplemap.tooltip.map_brightness": "Map Brightness: %s\nCycle DAY / AUTO / NIGHT rendering.",
   "gui.simplemap.tooltip.dimension_switch": "Dimension: %s",
   "gui.simplemap.tooltip.cave_top_y": "Cave Top Y\nAUTO follows the player's current underground band.\nDrag right to select a fixed cave layer.",

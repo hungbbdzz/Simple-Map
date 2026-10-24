@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Simple Map 설정\n미니맵, 좌표, 색상 및 스캔을 설정합니다.",
   "gui.simplemap.tooltip.waypoint_manager_button": "웨이포인트 관리자 (키: U)\n웨이포인트 관리, 편집, 순간이동 및 추적을 수행합니다.",
   "gui.simplemap.tooltip.waypoint_visibility": "웨이포인트 표시: %s\n클릭하여 모든 마커를 표시하거나 숨깁니다.",
-  "gui.simplemap.tooltip.refresh_map": "현재 보이는 지도 새로고침\n로드된 주변 청크를 다시 스캔합니다.\nShift+클릭: 플레이어 중심으로 이동 및 줌 초기화.",
+  "gui.simplemap.tooltip.refresh_map": "표시된 맵 새로고침\n마인크래프트에 로드된 주변 청크를 다시 스캔합니다.\nShift-클릭: 현재 차원으로 복귀하고 플레이어 중심으로 이동 및 줌 초기화.",
   "gui.simplemap.tooltip.map_brightness": "지도 밝기: %s\n낮 / 자동 / 밤 렌더링을 전환합니다.",
   "gui.simplemap.tooltip.dimension_switch": "차원: %s",
   "gui.simplemap.tooltip.cave_top_y": "동굴 상단 Y (Top Y)\n자동은 플레이어의 현재 지하 층을 따라갑니다.\n오른쪽으로 드래그하여 고정된 동굴 층을 선택하세요.",

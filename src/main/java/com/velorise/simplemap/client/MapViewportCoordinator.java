@@ -767,8 +767,9 @@ public final class MapViewportCoordinator {
             processed++;
 
             boolean alreadySliced = layers.isRegionAnvilSlicedAtLayer(layerY, rx, rz);
+            boolean hasMca = layers.hasMcaFile(rx, rz);
             boolean warmExactTexture = alreadySliced
-                    || (layers.isRegionLoaded(layerY, rx, rz)
+                    || (!hasMca && layers.isRegionLoaded(layerY, rx, rz)
                             && (textures.peekRegionTexture(layerY, rx, rz) != null
                                     || textures.hasAnyPageTexture(layerY, rx, rz)));
             if (warmExactTexture) {

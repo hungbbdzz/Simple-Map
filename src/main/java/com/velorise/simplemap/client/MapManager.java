@@ -955,6 +955,15 @@ public class MapManager {
         return coords;
     }
 
+    /**
+     * Lightweight visual refresh when cycling Map Brightness (Day / Auto / Night).
+     * Never invalidates SurfaceLodTree, disk caches, or region textures.
+     */
+    public void onNightModeChanged() {
+        com.velorise.simplemap.client.renderer.FullscreenMapFramebufferRenderer.getInstance().invalidate();
+        com.velorise.simplemap.client.renderer.MinimapFramebufferRenderer.getInstance().invalidate();
+    }
+
     public void reloadAllRegions() {
         MapSessionManager.getInstance().bumpStyleGeneration();
         MapTextureManager.getInstance().clearDerivedColorCaches();
