@@ -40,8 +40,10 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
+import net.neoforged.neoforge.client.event.ClientChatReceivedEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
 import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
 import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.client.event.ScreenEvent;
@@ -602,6 +604,214 @@ public class SimpleMap {
             MinimapRenderer.getInstance().onWorldLeave();
             MapArchitectureCoordinator.getInstance().onWorldLeave();
             wasPlayerDead = false;
+        }
+
+        private static final java.util.regex.Pattern CHAT_COORDINATE_PATTERN =
+                java.util.regex.Pattern.compile(
+                        "(\\[\\s*(?:[xX]\\s*[:=]\\s*)?(-?\\d{1,7})\\s*(?:,\\s*|\\s+)(?:(?:[yY]\\s*[:=]\\s*)?(-?\\d{1,4}|\\?|~)\\s*(?:,\\s*|\\s+))?(?:[zZ]\\s*[:=]\\s*)?(-?\\d{1,7})\\s*\\])"
+                        + "|(?i:\\b[xX]\\s*[:=]\\s*(-?\\d{1,7})\\s*(?:,\\s*|\\s+)(?:[yY]\\s*[:=]\\s*(-?\\d{1,4}|\\?|~)\\s*(?:,\\s*|\\s+))?[zZ]\\s*[:=]\\s*(-?\\d{1,7})\\b)"
+                        + "|(?<![\\d.,-])((-?\\d{1,7})\\s*,\\s*(-?\\d{1,4}|\\?)\\s*,\\s*(-?\\d{1,7}))(?![\\d.,-])");
+
+        @SubscribeEvent
+        public static void onClientChatReceived(ClientChatReceivedEvent event) {
+            Component original = event.getMessage();
+            if (original == null) return;
+            Component enhanced = enhanceChatCoordinates(original);
+            if (enhanced != null) {
+                event.setMessage(enhanced);
+            }
+        }
+
+        @SubscribeEvent
+        public static void onChatMouseClicked(ScreenEvent.MouseButtonPressed.Pre event) {
+            if (event.getButton() != 0) return;
+            if (!(event.getScreen() instanceof net.minecraft.client.gui.screens.ChatScreen)) return;
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.gui == null || mc.gui.getChat() == null) return;
+            net.minecraft.network.chat.Style style = mc.gui.getChat()
+                    .getClickedComponentStyleAt(event.getMouseX(), event.getMouseY());
+            if (style == null || style.getClickEvent() == null) return;
+            net.minecraft.network.chat.ClickEvent click = style.getClickEvent();
+            if (click.getAction() == net.minecraft.network.chat.ClickEvent.Action.RUN_COMMAND
+                    && click.getValue() != null
+                    && click.getValue().startsWith("/simplemap_view ")) {
+                if (handleSimpleMapViewCommand(click.getValue())) {
+                    event.setCanceled(true);
+                }
+            }
+        }
+
+        @SubscribeEvent
+        public static void onRegisterClientCommands(RegisterClientCommandsEvent event) {
+            event.getDispatcher().register(
+                    net.minecraft.commands.Commands.literal("simplemap_view")
+                            .then(net.minecraft.commands.Commands.argument(
+                                    "args", com.mojang.brigadier.arguments.StringArgumentType.greedyString())
+                                    .executes(ctx -> {
+                                        String raw = com.mojang.brigadier.arguments.StringArgumentType
+                                                .getString(ctx, "args");
+                                        handleSimpleMapViewCommand("/simplemap_view " + raw);
+                                        return 1;
+                                    })));
+        }
+
+        private static boolean handleSimpleMapViewCommand(String command) {
+            if (command == null) return false;
+            String trimmed = command.trim();
+            if (trimmed.startsWith("/")) trimmed = trimmed.substring(1);
+            String[] parts = trimmed.split("\\s+");
+            if (parts.length < 4 || !"simplemap_view".equals(parts[0])) return false;
+            try {
+                int x = Integer.parseInt(parts[1]);
+                int z = Integer.parseInt(parts[3]);
+                String dim = parts.length >= 5 ? parts[4] : "";
+                Minecraft mc = Minecraft.getInstance();
+                if (mc.player == null || !SimpleMap.isMapUnlocked(mc.player)) return false;
+                mc.execute(() -> {
+                    MapScreen mapScreen = mc.screen instanceof MapScreen existing
+                            ? existing : new MapScreen();
+                    mc.setScreen(mapScreen);
+                    mapScreen.focusOnCoordinates(x + 0.5, z + 0.5, dim);
+                });
+                return true;
+            } catch (NumberFormatException ignored) {
+                return false;
+            }
+        }
+
+        private static String inferDimensionFromChatMessage(String fullText) {
+            if (fullText == null || fullText.isEmpty()) return "";
+            String lower = fullText.toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("minecraft:the_nether")
+                    || lower.contains("(the nether)")
+                    || lower.contains("(nether)")
+                    || lower.contains("(địa ngục)")
+                    || lower.contains("(下界)")
+                    || lower.contains("(地獄)")
+                    || lower.contains("(ネザー)")
+                    || lower.contains("(네더)")) {
+                return "minecraft:the_nether";
+            }
+            if (lower.contains("minecraft:the_end")
+                    || lower.contains("(the end)")
+                    || lower.contains("(end)")
+                    || lower.contains("(kết thúc)")
+                    || lower.contains("(末地)")
+                    || lower.contains("(終界)")
+                    || lower.contains("(ジ・エンド)")
+                    || lower.contains("(엔드)")) {
+                return "minecraft:the_end";
+            }
+            if (lower.contains("minecraft:overworld")
+                    || lower.contains("(overworld)")
+                    || lower.contains("(thế giới thực)")
+                    || lower.contains("(主世界)")
+                    || lower.contains("(オーバーワールド)")
+                    || lower.contains("(오버월드)")) {
+                return "minecraft:overworld";
+            }
+            String overworldLocal = MapManager.displayDimensionName("minecraft:overworld")
+                    .toLowerCase(java.util.Locale.ROOT);
+            String netherLocal = MapManager.displayDimensionName("minecraft:the_nether")
+                    .toLowerCase(java.util.Locale.ROOT);
+            String endLocal = MapManager.displayDimensionName("minecraft:the_end")
+                    .toLowerCase(java.util.Locale.ROOT);
+            if (!netherLocal.isEmpty() && lower.contains("(" + netherLocal + ")")) {
+                return "minecraft:the_nether";
+            }
+            if (!endLocal.isEmpty() && lower.contains("(" + endLocal + ")")) {
+                return "minecraft:the_end";
+            }
+            if (!overworldLocal.isEmpty() && lower.contains("(" + overworldLocal + ")")) {
+                return "minecraft:overworld";
+            }
+            return "";
+        }
+
+        private static Component enhanceChatCoordinates(Component message) {
+            String fullPlain = message.getString();
+            if (fullPlain == null || fullPlain.isEmpty()) return null;
+            if (!CHAT_COORDINATE_PATTERN.matcher(fullPlain).find()) return null;
+
+            String inferredDim = inferDimensionFromChatMessage(fullPlain);
+            net.minecraft.network.chat.MutableComponent root = Component.empty();
+            boolean[] changed = { false };
+
+            message.visit((style, segment) -> {
+                if (segment == null || segment.isEmpty()) {
+                    return java.util.Optional.empty();
+                }
+                if (style.getClickEvent() != null) {
+                    root.append(Component.literal(segment).withStyle(style));
+                    return java.util.Optional.empty();
+                }
+                java.util.regex.Matcher matcher = CHAT_COORDINATE_PATTERN.matcher(segment);
+                int lastEnd = 0;
+                boolean foundInSegment = false;
+                while (matcher.find()) {
+                    String xStr;
+                    String yStr;
+                    String zStr;
+                    if (matcher.group(1) != null) {
+                        xStr = matcher.group(2);
+                        yStr = matcher.group(3);
+                        zStr = matcher.group(4);
+                    } else if (matcher.group(5) != null) {
+                        xStr = matcher.group(5);
+                        yStr = matcher.group(6);
+                        zStr = matcher.group(7);
+                    } else {
+                        xStr = matcher.group(9);
+                        yStr = matcher.group(10);
+                        zStr = matcher.group(11);
+                    }
+                    int xVal;
+                    int zVal;
+                    int yVal = 64;
+                    try {
+                        xVal = Integer.parseInt(xStr);
+                        zVal = Integer.parseInt(zStr);
+                        if (Math.abs(xVal) > 30_000_000 || Math.abs(zVal) > 30_000_000) {
+                            continue;
+                        }
+                        if (yStr != null && !yStr.equals("?") && !yStr.equals("~")) {
+                            yVal = Integer.parseInt(yStr);
+                            if (yVal < -2048 || yVal > 2048) continue;
+                        }
+                    } catch (NumberFormatException ex) {
+                        continue;
+                    }
+                    foundInSegment = true;
+                    changed[0] = true;
+                    if (matcher.start() > lastEnd) {
+                        root.append(Component.literal(
+                                segment.substring(lastEnd, matcher.start())).withStyle(style));
+                    }
+                    String matchedText = matcher.group(0);
+                    String cmd = "/simplemap_view " + xVal + " " + yVal + " " + zVal
+                            + (inferredDim.isEmpty() ? "" : (" " + inferredDim));
+                    Component hoverTooltip = Component.translatable(
+                            "gui.simplemap.chat.click_to_open_map", xVal, zVal)
+                            .withStyle(net.minecraft.ChatFormatting.AQUA);
+                    net.minecraft.network.chat.Style linkStyle = style
+                            .withColor(net.minecraft.ChatFormatting.AQUA)
+                            .withUnderlined(true)
+                            .withClickEvent(new net.minecraft.network.chat.ClickEvent(
+                                    net.minecraft.network.chat.ClickEvent.Action.RUN_COMMAND, cmd))
+                            .withHoverEvent(new net.minecraft.network.chat.HoverEvent(
+                                    net.minecraft.network.chat.HoverEvent.Action.SHOW_TEXT, hoverTooltip));
+                    root.append(Component.literal(matchedText).withStyle(linkStyle));
+                    lastEnd = matcher.end();
+                }
+                if (!foundInSegment) {
+                    root.append(Component.literal(segment).withStyle(style));
+                } else if (lastEnd < segment.length()) {
+                    root.append(Component.literal(segment.substring(lastEnd)).withStyle(style));
+                }
+                return java.util.Optional.empty();
+            }, net.minecraft.network.chat.Style.EMPTY);
+
+            return changed[0] ? root : null;
         }
     }
 

@@ -322,5 +322,6 @@
   "gui.simplemap.book.learn_none": "§cИз этой книги не удалось изучить ни одного региона карты.",
   "gui.simplemap.book.learn_skipped_damaged": "§eКарта изучена, но повреждённых регионов пропущено: %s.",
   "gui.simplemap.book.crumbled": "§eКнига карт рассыпается в прах, когда вы постигаете все её тайны!",
-  "gui.simplemap.book.learn_success": "§aКарта успешно изучена! Ваша карта обновлена."
+  "gui.simplemap.book.learn_success": "§aКарта успешно изучена! Ваша карта обновлена.",
+  "gui.simplemap.chat.click_to_open_map": "Нажмите, чтобы показать [%s, %s] на карте"
 }

@@ -322,5 +322,6 @@
   "gui.simplemap.book.learn_none": "§cAus diesem Buch konnten keine Kartenregionen erlernt werden.",
   "gui.simplemap.book.learn_skipped_damaged": "§eKarte erlernt, aber %s beschädigte Region(en) wurden übersprungen.",
   "gui.simplemap.book.crumbled": "§eDas Kartenbuch zerfällt zu Staub, nachdem du seine Geheimnisse erlernt hast!",
-  "gui.simplemap.book.learn_success": "§aKarte erfolgreich erlernt! Deine Karte wurde aktualisiert."
+  "gui.simplemap.book.learn_success": "§aKarte erfolgreich erlernt! Deine Karte wurde aktualisiert.",
+  "gui.simplemap.chat.click_to_open_map": "Klicken, um [%s, %s] auf der Karte anzuzeigen"
 }

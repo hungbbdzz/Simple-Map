@@ -322,5 +322,6 @@
   "gui.simplemap.book.learn_none": "§cKhông thể học được vùng bản đồ nào từ cuốn sách này.",
   "gui.simplemap.book.learn_skipped_damaged": "§eĐã học bản đồ, nhưng %s vùng bị lỗi đã được bỏ qua.",
   "gui.simplemap.book.crumbled": "§eCuốn sách bản đồ tan thành cát bụi sau khi bạn lĩnh hội hết bí mật bên trong!",
-  "gui.simplemap.book.learn_success": "§aHọc bản đồ thành công! Bản đồ của bạn đã được cập nhật."
+  "gui.simplemap.book.learn_success": "§aHọc bản đồ thành công! Bản đồ của bạn đã được cập nhật.",
+  "gui.simplemap.chat.click_to_open_map": "Nhấn để mở bản đồ tại tọa độ [%s, %s]"
 }

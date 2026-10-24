@@ -1470,7 +1470,7 @@ public final class CaveTextureManager {
     public static final class CaveMapManager {
         private static final CaveMapManager INSTANCE = new CaveMapManager();
         private static final int MAX_COMPAT_REGIONS = 128;
-        private static final int SCDAT_MAGIC = 0x53434445; // 'SCDE' (dimension + block/biome palette unified cave archive)
+        private static final int SCDAT_MAGIC = 0x53434446; // 'SCDF' (dimension + full non-tinted biome palette unified cave archive)
 
         private final ExecutorService diskExecutor = Executors.newFixedThreadPool(
                 Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() - 1)), r -> {

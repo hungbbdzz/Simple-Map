@@ -568,6 +568,55 @@ public class MapTextureManager {
     }
 
     /**
+     * Checks whether the exact 64x64 page and any 2-block halo neighbours touched
+     * by a chunk are already resident on the GPU with full subtile coverage and an
+     * up-to-date revision. When a retained source region is re-warmed from a loaded
+     * MapManager.Region without any new live scan or block mutation, skipping
+     * redundant page revision increments prevents background page rebuild churn and
+     * light-layer flicker.
+     */
+    public boolean isChunkAndHaloResidentAndCurrent(int chunkX, int chunkZ) {
+        int dependencyRadius = MapPageLayout.PAGE_HALO;
+        int minBlockX = (chunkX << 4) - dependencyRadius;
+        int maxBlockX = (chunkX << 4) + 15 + dependencyRadius;
+        int minBlockZ = (chunkZ << 4) - dependencyRadius;
+        int maxBlockZ = (chunkZ << 4) + 15 + dependencyRadius;
+        int minGlobalPageX = Math.floorDiv(minBlockX, MapPageLayout.PAGE_SIZE);
+        int maxGlobalPageX = Math.floorDiv(maxBlockX, MapPageLayout.PAGE_SIZE);
+        int minGlobalPageZ = Math.floorDiv(minBlockZ, MapPageLayout.PAGE_SIZE);
+        int maxGlobalPageZ = Math.floorDiv(maxBlockZ, MapPageLayout.PAGE_SIZE);
+        for (int globalPageZ = minGlobalPageZ;
+                globalPageZ <= maxGlobalPageZ; globalPageZ++) {
+            int regionZ = MapPageLayout.regionFromGlobalPage(globalPageZ);
+            int pageZ = MapPageLayout.localPage(globalPageZ);
+            for (int globalPageX = minGlobalPageX;
+                    globalPageX <= maxGlobalPageX; globalPageX++) {
+                int regionX = MapPageLayout.regionFromGlobalPage(globalPageX);
+                int pageX = MapPageLayout.localPage(globalPageX);
+                int requiredMask = subtileMaskForWorldRect(globalPageX,
+                        globalPageZ, minBlockX, minBlockZ,
+                        maxBlockX, maxBlockZ);
+                if (requiredMask == 0) continue;
+                String leafKey = pageKey(regionX, regionZ, pageX, pageZ);
+                long currentRevision;
+                synchronized (dirtyTextures) {
+                    if (dirtyPages.contains(leafKey)) return false;
+                    currentRevision = pageRevisions.getOrDefault(leafKey, 0L);
+                }
+                synchronized (pageCache) {
+                    PageTextureInfo page = pageCache.get(leafKey);
+                    if (page == null || !page.initialized || page.atlasSlot < 0
+                            || page.uploadedRevision < currentRevision
+                            || (page.completeSubtileMask & requiredMask) != requiredMask) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
      * Invalidates the exact leaf touched by a complete 16x16 chunk transaction,
      * plus only the pages intersecting the two-block relief/tint halo. This is the
      * chunk-granular counterpart of {@link #markPageDirtyForBlock(int, int)} and

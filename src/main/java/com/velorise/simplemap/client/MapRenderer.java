@@ -88,6 +88,7 @@ public class MapRenderer {
      * absent and fallback traversal would otherwise expand thousands of nodes. */
     private static final int CAVE_BRANCH_PLAN_MAX_QUADS = 1_024;
     private static final int CAVE_BRANCH_PLAN_MAX_VISITS = 4_096;
+    private static final int SURFACE_HIERARCHY_MAX_VISITS = 2_048;
     /** Coalesce many exact/branch publications into one immutable plan rebuild.
      * The existing plan remains a valid world-space snapshot while the newest
      * atlas state waits for the next refresh window. */
@@ -141,6 +142,7 @@ public class MapRenderer {
     private CachedPlan minimapPlan;
     private CachedPlan minimapStagingPlan;
     private int regionFallbackVisitsRemaining;
+    private int surfaceHierarchyVisitsRemaining;
     private long minimapStagingSinceNanos;
     private long lastMinimapPlanBuildNanos;
     /** Render-thread scratch for at most 24 deduplicated loading cells. */
@@ -497,7 +499,7 @@ public class MapRenderer {
             int planMaxCellX = maxVisiblePageX;
             int planMinCellZ = minVisiblePageZ;
             int planMaxCellZ = maxVisiblePageZ;
-            if (caveBranchOnly && hierarchyLevel > 0) {
+            if ((caveBranchOnly || !isMinimap) && hierarchyLevel > 0) {
                 int pageSpan = MapLodPolicy.pageSpanForBranch(hierarchyLevel);
                 planMinCellX = Math.floorDiv(minVisiblePageX, pageSpan);
                 planMaxCellX = Math.floorDiv(maxVisiblePageX, pageSpan);
@@ -625,15 +627,16 @@ public class MapRenderer {
                     if (plan.quadCount() > 0) {
                         rememberStableFullscreenPlan(cachedPlan);
                     }
-                    if (fullscreenFallbackPlan != null
-                            && cachedPlan.plan().quadCount() > 0
-                            && cachedPlan.plan().pendingRegions().length == 0) {
-                        fallbackPlan = null;
-                        fullscreenFallbackPlan = null;
-                        fullscreenFallbackExpiresNanos = 0L;
-                    }
                 } else {
                     MapPipelineTelemetry.getInstance().recordRenderPlanReuse();
+                }
+                if (fallbackPlan == cachedPlan
+                        || (cachedPlan != null
+                                && cachedPlan.plan().quadCount() > 0
+                                && cachedPlan.plan().pendingRegions().length == 0)) {
+                    fallbackPlan = null;
+                    fullscreenFallbackPlan = null;
+                    fullscreenFallbackExpiresNanos = 0L;
                 }
             }
 
@@ -663,7 +666,10 @@ public class MapRenderer {
                 float baseBrightness = caveMode ? caveBrightness : mapBrightness;
                 RenderSystem.setShaderColor(baseBrightness, baseBrightness,
                         baseBrightness, 1.0F);
-                if (fallbackPlan != null && (!caveMode || cachedPlan.plan().quadCount() == 0)) {
+                boolean useFallbackPlan = fallbackPlan != null
+                        && fallbackPlan != cachedPlan
+                        && (!caveMode || cachedPlan.plan().quadCount() == 0);
+                if (useFallbackPlan) {
                     fallbackPlan.plan().drawBasePrepared(planMatrix);
                 }
                 cachedPlan.plan().drawBasePrepared(planMatrix);
@@ -679,7 +685,7 @@ public class MapRenderer {
                                 GlStateManager.DestFactor.ONE);
                         RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F,
                                 glowStrength);
-                        if (fallbackPlan != null) {
+                        if (useFallbackPlan && cachedPlan.plan().quadCount() == 0) {
                             fallbackPlan.plan().drawGlowPrepared(planMatrix);
                         }
                         cachedPlan.plan().drawGlowPrepared(planMatrix);
@@ -1432,6 +1438,7 @@ public class MapRenderer {
         int maxNodeX = Math.floorDiv(maxPageX, pageSpan);
         int minNodeZ = Math.floorDiv(minPageZ, pageSpan);
         int maxNodeZ = Math.floorDiv(maxPageZ, pageSpan);
+        surfaceHierarchyVisitsRemaining = SURFACE_HIERARCHY_MAX_VISITS;
         if (!centerOutTraversal) {
             for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
                 for (int nodeX = minNodeX; nodeX <= maxNodeX; nodeX++) {
@@ -1563,6 +1570,7 @@ public class MapRenderer {
         int lastPageZ = firstPageZ + pageSpan - 1;
         if (lastPageX < minPageX || firstPageX > maxPageX
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
+        if (surfaceHierarchyVisitsRemaining-- <= 0) return;
 
         CaveAtlasRegion branch = source.residentBranch(level, nodeX, nodeZ);
         if (branch != null) {
