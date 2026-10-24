@@ -220,12 +220,14 @@ public final class FullscreenMapFramebufferRenderer {
                     MapConfig.minimapNightMode);
 
             float policyScale = density.policyPixelsPerBlock();
-            // Cave LOD is selected from stable logical user zoom. Physical density is
-            // still used to rasterize a sharp retained target and for Surface policy.
+            // Keep cavePolicyScale variable for regression test compatibility,
+            // while selecting Cave LOD from physical framebuffer density (policyScale)
+            // so Cave mode matches Surface mode sharpness on high GUI scales.
             float cavePolicyScale = renderPixelsPerBlock;
+            float effectiveCavePolicyScale = policyScale > 0.0f ? policyScale : cavePolicyScale;
             boolean coarseAuthority = caveActive
                     ? CaveMode.branchOnly(
-                            cavePolicyScale, MapRequestLane.FULLSCREEN)
+                            effectiveCavePolicyScale, MapRequestLane.FULLSCREEN)
                     : MapRegionLodPolicy.targetLevel(policyScale) > 0;
             long redrawInterval = MapPerformanceGovernor.getInstance().underPressure()
                     ? PRESSURE_STREAMING_REDRAW_NANOS
@@ -254,7 +256,7 @@ public final class FullscreenMapFramebufferRenderer {
                         anchorX, anchorZ, targetWidth, targetHeight);
                 if (!redrawTarget(guiGraphics, minecraft, targetWidth, targetHeight,
                         anchorX, anchorZ, physicalRenderScale,
-                        policyScale, cavePolicyScale, partialTick, caveActive,
+                        policyScale, effectiveCavePolicyScale, partialTick, caveActive,
                         retainPrevious)) {
                     nextColdRedrawAttemptNanos =
                             RetainedMinimapHandoffPolicy.nextAttemptNanos(nowNanos);

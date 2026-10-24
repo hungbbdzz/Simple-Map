@@ -339,12 +339,14 @@ public final class CaveMode {
         if (previous != type || !type.name().equals(previousStored)) {
             modeRevision++;
             beginTransition();
-            CaveView nextView = switch (type) {
-                case LAYERED -> CaveView.LAYERED;
-                case FULL -> CaveView.FULL;
-                case OFF -> null;
-            };
-            CaveTextureManager.getInstance().clearCache();
+            if (type == CaveType.FULL) {
+                CaveMapManager.getInstance().setActiveLayer(Integer.MIN_VALUE);
+                CaveTextureManager.getInstance().onLayerActivated(Integer.MIN_VALUE);
+            } else if (type == CaveType.LAYERED) {
+                int layerY = getLayerY(mc);
+                CaveMapManager.getInstance().setActiveLayer(layerY);
+                CaveTextureManager.getInstance().onLayerActivated(layerY);
+            }
             MapConfig.save();
         }
         if (type == CaveType.OFF) {
@@ -711,7 +713,34 @@ public final class CaveMode {
      * Used by both live chunk scanning ({@link ChunkScanner}) and Anvil {@code .mca}
      * slicing ({@link CaveTextureManager}) so both pipelines produce identical results.
      */
-    public static boolean isUndergroundSolidRoof(BlockGetter level, BlockPos pos, BlockState state) {
+    private static final byte STATE_FLAG_SOLID_ROOF = 1;
+    private static final byte STATE_FLAG_OPEN_HIDE_FLOWERS = 2;
+    private static final byte STATE_FLAG_OPEN_SHOW_FLOWERS = 4;
+    private static final byte STATE_FLAG_SHORT_FLOOR = 8;
+    private static final java.util.concurrent.ConcurrentHashMap<BlockState, Byte> CAVE_STATE_FLAGS_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>(2048);
+
+    private static byte resolveCaveStateFlags(BlockState state) {
+        Byte cached = CAVE_STATE_FLAGS_CACHE.get(state);
+        if (cached != null) return cached;
+        byte flags = 0;
+        if (computeUndergroundSolidRoof(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, state)) {
+            flags |= STATE_FLAG_SOLID_ROOF;
+        }
+        if (computeCaveOpenOrInvisible(state, false)) {
+            flags |= STATE_FLAG_OPEN_HIDE_FLOWERS;
+        }
+        if (computeCaveOpenOrInvisible(state, true)) {
+            flags |= STATE_FLAG_OPEN_SHOW_FLOWERS;
+        }
+        if (computeShortFloorBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, state)) {
+            flags |= STATE_FLAG_SHORT_FLOOR;
+        }
+        CAVE_STATE_FLAGS_CACHE.put(state, flags);
+        return flags;
+    }
+
+    private static boolean computeUndergroundSolidRoof(BlockGetter level, BlockPos pos, BlockState state) {
         if (state == null || state.isAir() || !state.getFluidState().isEmpty()) {
             return false;
         }
@@ -757,16 +786,17 @@ public final class CaveMode {
                 || !CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state);
     }
 
-    public static boolean isUndergroundSolidRoof(BlockState state) {
-        return isUndergroundSolidRoof(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, state);
+    public static boolean isUndergroundSolidRoof(BlockGetter level, BlockPos pos, BlockState state) {
+        if (state == null || state.isAir()) return false;
+        return (resolveCaveStateFlags(state) & STATE_FLAG_SOLID_ROOF) != 0;
     }
 
-    /**
-     * Returns true if {@code state} should be treated as open air / invisible decoration
-     * during cave column traversal (setting {@code underair = true} and passing through
-     * to expose the floor beneath).
-     */
-    public static boolean isCaveOpenOrInvisible(BlockState state, boolean showFlowers) {
+    public static boolean isUndergroundSolidRoof(BlockState state) {
+        if (state == null || state.isAir()) return false;
+        return (resolveCaveStateFlags(state) & STATE_FLAG_SOLID_ROOF) != 0;
+    }
+
+    private static boolean computeCaveOpenOrInvisible(BlockState state, boolean showFlowers) {
         if (state == null || state.isAir()) return true;
         if (!state.getFluidState().isEmpty()) return false;
         if (state.is(Blocks.BARRIER) || state.is(Blocks.LIGHT)
@@ -798,14 +828,35 @@ public final class CaveMode {
     }
 
     /**
+     * Returns true if {@code state} should be treated as open air / invisible decoration
+     * during cave column traversal (setting {@code underair = true} and passing through
+     * to expose the floor beneath). Cached in O(1) per BlockState.
+     */
+    public static boolean isCaveOpenOrInvisible(BlockState state, boolean showFlowers) {
+        if (state == null || state.isAir()) return true;
+        byte mask = showFlowers ? STATE_FLAG_OPEN_SHOW_FLOWERS : STATE_FLAG_OPEN_HIDE_FLOWERS;
+        return (resolveCaveStateFlags(state) & mask) != 0;
+    }
+
+    private static boolean computeShortFloorBlock(BlockGetter level, BlockPos pos, BlockState state) {
+        if (state == null || state.isAir() || !state.getFluidState().isEmpty()) return false;
+        if (CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state)) return true;
+        return CAVE_STATE_CLASSIFIER.collisionTop(level, pos, state) < 0.25f;
+    }
+
+    /**
      * Returns true if {@code state} is a low-profile/thin floor block (carpet, rail,
      * redstone wire, snow layer, pressure plate, repeater, glow lichen, etc.) whose
      * effective height for slope shading should be adjusted by -1 (short-block logic).
      */
     public static boolean isShortFloorBlock(BlockGetter level, BlockPos pos, BlockState state) {
-        if (state == null || state.isAir() || !state.getFluidState().isEmpty()) return false;
-        if (CAVE_STATE_CLASSIFIER.isCollisionEmpty(level, pos, state)) return true;
-        return CAVE_STATE_CLASSIFIER.collisionTop(level, pos, state) < 0.25f;
+        if (state == null || state.isAir()) return false;
+        return (resolveCaveStateFlags(state) & STATE_FLAG_SHORT_FLOOR) != 0;
+    }
+
+    public static boolean isShortFloorBlock(BlockState state) {
+        if (state == null || state.isAir()) return false;
+        return (resolveCaveStateFlags(state) & STATE_FLAG_SHORT_FLOOR) != 0;
     }
 
     private record CaveContext(boolean covered, int suggestedTopY, int confidence) {

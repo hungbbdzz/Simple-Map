@@ -190,7 +190,7 @@ public class MapRenderer {
                 Minecraft.getInstance().getWindow().getGuiScale());
         drawMapInternal(guiGraphics, viewportX, viewportY, width, height, centerX, centerZ, scale,
                 drawPlayer, rotateWithPlayer, isMinimap, mouseWorldX, mouseWorldZ, partialTick,
-                cachedOnly, true, 1.0f, policyScale, scale, true, true);
+                cachedOnly, true, 1.0f, policyScale, policyScale, true, true);
     }
 
     /**
@@ -284,10 +284,10 @@ public class MapRenderer {
         try {
 
         boolean caveMode = CaveMode.isActive(mc);
-        // Surface raster policy follows physical framebuffer density. Cave hierarchy
-        // follows the user's logical map zoom, matching the texture-level choice
-        // and the tick-side CaveScreenSpacePolicy mailbox.
-        float activePolicyScale = caveMode ? cavePolicyScale : policyScale;
+        // Both Surface and Cave hierarchy follow physical framebuffer density
+        // (policyScale = logicalScale * guiScale) so Cave mode retains full
+        // L0/L1/L2 sharpness at small zoom levels just like Surface mode.
+        float activePolicyScale = policyScale > 0.0f ? policyScale : cavePolicyScale;
         boolean fullCaveView = caveMode && CaveMode.isFullView(mc);
         int caveLayerY = caveMode ? CaveMode.getLayerY(mc) : Integer.MIN_VALUE;
         // Renderer is strictly cache-only. Scans, IO, CPU builds and GPU
@@ -1683,6 +1683,10 @@ public class MapRenderer {
                     int pageZ = firstPageZ + childZ;
                     if (pageX < minPageX || pageX > maxPageX
                             || pageZ < minPageZ || pageZ > maxPageZ) continue;
+                    if (branch != null && branch.childComplete(childIndex) && scale < 0.35f) {
+                        markPageDrawn(drawnRegions, pageX, pageZ);
+                        continue;
+                    }
                     if (collectCaveLeaf(builder, source, pageX, pageZ, scale,
                             drawnRegions)) continue;
                     if (branch != null && branch.childComplete(childIndex)) {
@@ -1697,9 +1701,7 @@ public class MapRenderer {
                 int childIndex = childZ * 2 + childX;
                 int childNodeX = nodeX * 2 + childX;
                 int childNodeZ = nodeZ * 2 + childZ;
-                if (branch != null && branch.childComplete(childIndex)
-                        && !source.hasResidentPageInNode(level - 1,
-                                childNodeX, childNodeZ)) continue;
+                if (branch != null && branch.childComplete(childIndex)) continue;
                 collectCaveNode(builder, source, level - 1,
                         childNodeX, childNodeZ, scale, false,
                         minPageX, maxPageX, minPageZ, maxPageZ, drawnRegions,

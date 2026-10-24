@@ -25,7 +25,7 @@ import java.nio.ByteBuffer;
 public final class CaveAtlasPboUploader implements AutoCloseable {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final int PBO_RING_SIZE = 3;
-    private static final int PBO_MIN_UPLOAD_BYTES = 64 * 1024;
+    private static final int PBO_MIN_UPLOAD_BYTES = 4 * 1024;
     private static final boolean VALIDATE_GL =
             Boolean.getBoolean("simplemap.validateCaveGl");
 

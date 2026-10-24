@@ -111,6 +111,7 @@ public final class CaveTextureManager {
     private volatile int maxVisiblePageX = Integer.MAX_VALUE;
     private volatile int minVisiblePageZ = Integer.MIN_VALUE;
     private volatile int maxVisiblePageZ = Integer.MAX_VALUE;
+    private volatile float preferredCaveScale = 1.0f;
 
     private final int[][] uploadBuffers = new int[CaveTextureAtlas.LOD_COUNT][];
 
@@ -150,6 +151,10 @@ public final class CaveTextureManager {
 
     public static int resolveCaveBlockBaseColor(BlockState state, int grassTint, int foliageTint) {
         return CaveMapManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint);
+    }
+
+    public static boolean requiresCaveBiomeTint(BlockState state) {
+        return CaveMapManager.requiresCaveBiomeTint(state);
     }
 
     /**
@@ -230,6 +235,9 @@ public final class CaveTextureManager {
         int maxPx = maxVisiblePageX;
         int minPz = minVisiblePageZ;
         int maxPz = maxVisiblePageZ;
+        int fpx = focusPageX;
+        int fpz = focusPageZ;
+        boolean allowLeafPrecreate = preferredCaveScale >= 0.35f;
         synchronized (pages) {
             for (int pz = 0; pz < 8; pz++) {
                 for (int px = 0; px < 8; px++) {
@@ -237,11 +245,14 @@ public final class CaveTextureManager {
                     int gpz = firstGlobalZ + pz;
                     PageKey key = new PageKey(band, gpx, gpz);
                     PageEntry existing = pages.get(key);
-                    boolean nearViewport = (minPx == Integer.MIN_VALUE)
-                            || (gpx >= minPx - 2 && gpx <= maxPx + 2
-                                    && gpz >= minPz - 2 && gpz <= maxPz + 2);
-                    if (existing != null || nearViewport) {
-                        PageEntry entry = existing != null ? existing : pages.computeIfAbsent(key, PageEntry::new);
+                    if (existing != null) {
+                        existing.dirty = true;
+                        dirtyPageKeys.add(key);
+                    } else if (allowLeafPrecreate && minPx != Integer.MIN_VALUE
+                            && gpx >= minPx - 1 && gpx <= maxPx + 1
+                            && gpz >= minPz - 1 && gpz <= maxPz + 1
+                            && Math.abs(gpx - fpx) <= 12 && Math.abs(gpz - fpz) <= 12) {
+                        PageEntry entry = pages.computeIfAbsent(key, PageEntry::new);
                         entry.dirty = true;
                         dirtyPageKeys.add(key);
                     }
@@ -307,6 +318,7 @@ public final class CaveTextureManager {
             double minZ, double maxZ, float scale,
             double focusX, double focusZ, MapRequestLane lane) {
         if (activeLayerY != layerY) onLayerActivated(layerY);
+        this.preferredCaveScale = Math.max(0.01f, scale);
         this.focusPageX = (int) Math.floor(focusX / CaveTextureAtlas.PAGE_SIZE);
         this.focusPageZ = (int) Math.floor(focusZ / CaveTextureAtlas.PAGE_SIZE);
         this.minVisiblePageX = (int) Math.floor(Math.min(minX, maxX) / CaveTextureAtlas.PAGE_SIZE);
@@ -402,7 +414,7 @@ public final class CaveTextureManager {
         }
 
         if (entry.slot < 0 || !entry.hasContent) return null;
-        return atlas.region(entry.slot, scale);
+        return atlas.region(entry.slot, 1.0f);
     }
 
     public PageSelection peekFallbackPage(int layerY, int rx, int rz,
@@ -443,7 +455,7 @@ public final class CaveTextureManager {
             }
         }
         if (entry != null && entry.slot >= 0 && entry.hasContent) {
-            CaveAtlasRegion reg = atlas.region(entry.slot, scale);
+            CaveAtlasRegion reg = atlas.region(entry.slot, 1.0f);
             if (reg != null) {
                 return new PageSelection(reg, pageTileKey(representativeLayerY, globalPageX, globalPageZ, scale, lane));
             }
@@ -574,23 +586,20 @@ public final class CaveTextureManager {
             }
         }
 
-        // 3. Check if CaveMapManager has data for any region in this node
-        int minRx = Math.floorDiv(firstPageX, MapPageLayout.PAGES_PER_REGION);
-        int maxRx = Math.floorDiv(lastPageX, MapPageLayout.PAGES_PER_REGION);
-        int minRz = Math.floorDiv(firstPageZ, MapPageLayout.PAGES_PER_REGION);
-        int maxRz = Math.floorDiv(lastPageZ, MapPageLayout.PAGES_PER_REGION);
-
-        CaveMapManager cmm = CaveMapManager.getInstance();
-        for (int rz = minRz; rz <= maxRz; rz++) {
-            for (int rx = minRx; rx <= maxRx; rx++) {
-                CaveMapManager.CaveRegion region = cmm.getRegion(layerY, rx, rz, false);
-                if (region != null && region.hasContent()) {
-                    return true;
-                }
-                if (previousLayerY != Integer.MIN_VALUE && CaveMode.isTransitionActive()) {
-                    CaveMapManager.CaveRegion prevRegion = cmm.getRegion(previousLayerY, rx, rz, false);
-                    if (prevRegion != null && prevRegion.hasContent()) {
-                        return true;
+        // 3. Check GPU-resident child branch pages (L1..L(level-1))
+        synchronized (branchPages) {
+            for (int childLevel = level - 1; childLevel >= 1; childLevel--) {
+                int childSpan = MapViewportCoordinator.MapLodPolicy.pageSpanForBranch(childLevel);
+                int minNodeX = Math.floorDiv(firstPageX, childSpan);
+                int maxNodeX = Math.floorDiv(lastPageX, childSpan);
+                int minNodeZ = Math.floorDiv(firstPageZ, childSpan);
+                int maxNodeZ = Math.floorDiv(lastPageZ, childSpan);
+                for (int nz = minNodeZ; nz <= maxNodeZ; nz++) {
+                    for (int nx = minNodeX; nx <= maxNodeX; nx++) {
+                        BranchEntry bEntry = branchPages.get(new BranchKey(band, childLevel, nx, nz));
+                        if (bEntry != null && bEntry.slot >= 0 && bEntry.hasContent) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -860,7 +869,7 @@ public final class CaveTextureManager {
         int localStartX = (firstPageX & 7) * 64;
         int localStartZ = (firstPageZ & 7) * 64;
         int step = pageSpan;
-        int sampleStep = Math.max(1, step >> 1);
+        int totalSamples = Math.max(1, step * step);
         boolean hasContent = false;
 
         region.lock();
@@ -870,36 +879,55 @@ public final class CaveTextureManager {
                 int dstRow = y * 64;
                 for (int x = 0; x < 64; x++) {
                     int srcX = localStartX + x * step;
-                    int red = 0;
-                    int green = 0;
-                    int blue = 0;
+                    long weightedRed = 0L;
+                    long weightedGreen = 0L;
+                    long weightedBlue = 0L;
+                    long totalWeight = 0L;
                     int count = 0;
-                    int maxAlpha = 0;
-                    for (int dy = 0; dy < step; dy += sampleStep) {
+                    int maxLum = 0;
+                    for (int dy = 0; dy < step; dy++) {
                         int currentY = srcY + dy;
                         if (currentY >= 512) break;
                         int off = currentY * 512 + srcX;
-                        for (int dx = 0; dx < step; dx += sampleStep) {
+                        for (int dx = 0; dx < step; dx++) {
                             int currentX = srcX + dx;
                             if (currentX >= 512) break;
                             int c = regionPixels[off + dx];
                             int a = (c >>> 24) & 0xFF;
                             if (a != 0 && c != 0) {
-                                red += c & 0xFF;
-                                green += (c >>> 8) & 0xFF;
-                                blue += (c >>> 16) & 0xFF;
-                                if (a > maxAlpha) maxAlpha = a;
+                                int r = c & 0xFF;
+                                int g = (c >>> 8) & 0xFF;
+                                int b = (c >>> 16) & 0xFF;
+                                int lum = Math.max(r, Math.max(g, b));
+                                if (lum > maxLum) maxLum = lum;
+                                int w = 48 + lum;
+                                weightedRed += (long) r * w;
+                                weightedGreen += (long) g * w;
+                                weightedBlue += (long) b * w;
+                                totalWeight += w;
                                 count++;
                             }
                         }
                     }
                     int color = 0;
-                    if (count > 0) {
-                        color = (maxAlpha << 24)
-                                | ((blue / count) << 16)
-                                | ((green / count) << 8)
-                                | (red / count);
-                        hasContent = true;
+                    if (count > 0 && totalWeight > 0L) {
+                        int avgR = (int) (weightedRed / totalWeight);
+                        int avgG = (int) (weightedGreen / totalWeight);
+                        int avgB = (int) (weightedBlue / totalWeight);
+                        if (count < totalSamples) {
+                            float rawCoverage = (float) count / (float) totalSamples;
+                            float coverage = (float) Math.pow(rawCoverage, 0.52);
+                            if (maxLum > 180) {
+                                coverage = Math.min(1.0f, coverage * 1.25f);
+                            }
+                            avgR = Math.min(255, Math.round(avgR * coverage));
+                            avgG = Math.min(255, Math.round(avgG * coverage));
+                            avgB = Math.min(255, Math.round(avgB * coverage));
+                        }
+                        if ((avgR | avgG | avgB) != 0) {
+                            color = 0xFF000000 | (avgB << 16) | (avgG << 8) | avgR;
+                            hasContent = true;
+                        }
                     }
                     uploadBuffers[0][dstRow + x] = color;
                 }
@@ -924,16 +952,10 @@ public final class CaveTextureManager {
             entry.slot = slot;
         }
 
-        for (int lod = 1; lod < CaveTextureAtlas.LOD_COUNT; lod++) {
-            downsample(uploadBuffers[lod - 1], CaveTextureAtlas.lodSize(lod - 1),
-                    uploadBuffers[lod], CaveTextureAtlas.lodSize(lod));
-        }
-
-        for (int lod = 0; lod < CaveTextureAtlas.LOD_COUNT; lod++) {
-            int size = CaveTextureAtlas.lodSize(lod);
-            atlas.upload(entry.slot, lod, uploadBuffers[lod],
-                    new CaveTextureAtlas.DirtyRect(0, 0, size - 1, size - 1));
-        }
+        // Branch textures (L1, L2, L3) are always sampled at lod 0 (64x64).
+        int branchSize = CaveTextureAtlas.lodSize(0);
+        atlas.upload(entry.slot, 0, uploadBuffers[0],
+                new CaveTextureAtlas.DirtyRect(0, 0, branchSize - 1, branchSize - 1));
 
         entry.dirty = false;
         return true;
@@ -992,12 +1014,15 @@ public final class CaveTextureManager {
             entry.slot = slot;
         }
 
-        for (int lod = 1; lod < CaveTextureAtlas.LOD_COUNT; lod++) {
+        // Exact L0 pages sample lod 0 (64x64) with hardware GL_LINEAR + 1px gutter;
+        // coarser zooms use L1..L3 branch nodes. Uploading only lod 0 cuts GL transfers in half.
+        int maxLeafLod = 1;
+        for (int lod = 1; lod < maxLeafLod; lod++) {
             downsample(uploadBuffers[lod - 1], CaveTextureAtlas.lodSize(lod - 1),
                     uploadBuffers[lod], CaveTextureAtlas.lodSize(lod));
         }
 
-        for (int lod = 0; lod < CaveTextureAtlas.LOD_COUNT; lod++) {
+        for (int lod = 0; lod < maxLeafLod; lod++) {
             int size = CaveTextureAtlas.lodSize(lod);
             atlas.upload(entry.slot, lod, uploadBuffers[lod],
                     new CaveTextureAtlas.DirtyRect(0, 0, size - 1, size - 1));
@@ -1059,6 +1084,7 @@ public final class CaveTextureManager {
             oldestPage.dirty = false;
             synchronized (pages) {
                 dirtyPageKeys.remove(oldestPage.key);
+                pages.remove(oldestPage.key, oldestPage);
             }
         } else if (oldestBranch != null && oldestBranch.slot != -1) {
             atlas.releaseSlot(oldestBranch.slot);
@@ -1066,6 +1092,7 @@ public final class CaveTextureManager {
             oldestBranch.dirty = false;
             synchronized (branchPages) {
                 dirtyBranchKeys.remove(oldestBranch.key);
+                branchPages.remove(oldestBranch.key, oldestBranch);
             }
         }
     }
@@ -1101,7 +1128,12 @@ public final class CaveTextureManager {
             colored++;
         }
         if (colored == 0) return 0;
-        return (alpha << 24) | ((int) (blue / colored) << 16) | ((int) (green / colored) << 8) | (int) (red / colored);
+        float coverage = colored == 4 ? 1.0f : (float) Math.pow(colored * 0.25, 0.52);
+        int r = Math.min(255, Math.round((red / (float) colored) * coverage));
+        int g = Math.min(255, Math.round((green / (float) colored) * coverage));
+        int b = Math.min(255, Math.round((blue / (float) colored) * coverage));
+        if ((r | g | b) == 0) return 0;
+        return (alpha << 24) | (b << 16) | (g << 8) | r;
     }
 
     public record PageSelection(CaveAtlasRegion region, TileKey tileKey) {
@@ -1299,6 +1331,8 @@ public final class CaveTextureManager {
         private final Map<String, Boolean> scdatExistsCache = new ConcurrentHashMap<>();
         private static final Map<String, Integer> BLOCK_UNTINTED_ARGB_CACHE = new ConcurrentHashMap<>();
         private static final Map<String, Byte> BLOCK_TINT_KIND_CACHE = new ConcurrentHashMap<>();
+        private static final Map<String, Byte> BLOCK_KIND_CACHE = new ConcurrentHashMap<>();
+        private static final Map<String, Byte> BLOCK_EMISSION_CACHE = new ConcurrentHashMap<>();
         private static final Map<String, int[]> BIOME_TINT_CACHE = new ConcurrentHashMap<>();
         private static volatile int cachedColourMode = -1;
 
@@ -1320,6 +1354,7 @@ public final class CaveTextureManager {
             final byte[] kinds = new byte[512 * 512];
             final int[] loadPixels = new int[512 * 512];
             final short[] loadHeights = new short[512 * 512];
+            final byte[] ioByteBuffer = new byte[65536];
             byte[] chunkDataBuffer = new byte[65536];
         }
         private static final ThreadLocal<AnvilSliceBuffers> SLICE_BUFFERS = ThreadLocal.withInitial(AnvilSliceBuffers::new);
@@ -1327,6 +1362,8 @@ public final class CaveTextureManager {
         public static void clearColorCache() {
             BLOCK_UNTINTED_ARGB_CACHE.clear();
             BLOCK_TINT_KIND_CACHE.clear();
+            BLOCK_KIND_CACHE.clear();
+            BLOCK_EMISSION_CACHE.clear();
             BIOME_TINT_CACHE.clear();
         }
 
@@ -1604,8 +1641,29 @@ public final class CaveTextureManager {
             return region != null && (region.isLoaded() || region.hasContent());
         }
 
+        private final AtomicBoolean asyncSaveRunning = new AtomicBoolean(false);
+
         public void tickSave() {
-            saveAllDirtyRegions();
+            if (!asyncSaveRunning.compareAndSet(false, true)) return;
+            diskExecutor.execute(() -> {
+                try {
+                    List<CaveRegion> dirtySnapshot = new ArrayList<>();
+                    synchronized (regions) {
+                        for (RegionHolder holder : regions.values()) {
+                            if (holder.region.isDirty() && holder.region.hasContent()) {
+                                holder.region.setDirty(false);
+                                dirtySnapshot.add(holder.region);
+                                if (dirtySnapshot.size() >= 2) break;
+                            }
+                        }
+                    }
+                    for (CaveRegion reg : dirtySnapshot) {
+                        saveRegionToDisk(reg, reg.band, reg.rx, reg.rz);
+                    }
+                } finally {
+                    asyncSaveRunning.set(false);
+                }
+            });
         }
 
         public synchronized void flushAndClear() {
@@ -1630,11 +1688,7 @@ public final class CaveTextureManager {
         }
 
         public synchronized void deactivate() {
-            saveAllDirtyRegions();
-            deferProjectionCompletions();
-            activeLayerY = Integer.MIN_VALUE;
-            clearCompatRegions();
-            layerGeneration.incrementAndGet();
+            diskExecutor.execute(this::saveAllDirtyRegions);
         }
 
         public File getRegionDiskFile(int layerY, int rx, int rz) {
@@ -1646,32 +1700,65 @@ public final class CaveTextureManager {
         }
 
         private void saveRegionToDisk(CaveRegion region, int layerY, int rx, int rz) {
-            if (region == null || !region.hasContent()) return;
+            if (region == null || !region.hasSavedContent()) return;
             int band = (layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY));
             File file = getRegionDiskFile(band, rx, rz);
             if (file == null) return;
             File parent = file.getParentFile();
             if (parent != null && !parent.exists()) parent.mkdirs();
             File temp = new File(parent, file.getName() + ".tmp");
-            try (DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(new GZIPOutputStream(new FileOutputStream(temp))))) {
+
+            AnvilSliceBuffers buffers = SLICE_BUFFERS.get();
+            int[] snapPixels = buffers.loadPixels;
+            short[] snapHeights = buffers.loadHeights;
+            byte[] ioBuf = buffers.ioByteBuffer;
+            boolean anvilSliced;
+            int writtenLayerY;
+
+            // Snapshot arrays under region.lock() in < 0.15 ms so GZIP compression
+            // never holds region.lock() or blocks Render-thread texture uploads.
+            region.lock();
+            try {
+                System.arraycopy(region.getPixelsDirect(), 0, snapPixels, 0, 512 * 512);
+                System.arraycopy(region.getHeightsDirect(), 0, snapHeights, 0, 512 * 512);
+                anvilSliced = region.hasAnvilSliceFlag();
+                writtenLayerY = region.getWrittenAnvilLayerY();
+            } finally {
+                region.unlock();
+            }
+
+            try (DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(new GZIPOutputStream(new FileOutputStream(temp), 32768), 32768))) {
                 dos.writeInt(SCDAT_MAGIC);
                 dos.writeInt(band);
                 dos.writeInt(rx);
                 dos.writeInt(rz);
-                dos.writeBoolean(region.isAnvilSliced());
-                dos.writeInt(region.getWrittenAnvilLayerY());
-                int[] pixels = region.getPixelsDirect();
-                short[] heights = region.getHeightsDirect();
-                region.lock();
-                try {
-                    for (int p : pixels) {
-                        dos.writeInt(p);
+                dos.writeBoolean(anvilSliced);
+                dos.writeInt(writtenLayerY);
+
+                int idx = 0;
+                while (idx < 512 * 512) {
+                    int count = Math.min(16384, (512 * 512) - idx);
+                    int bPos = 0;
+                    for (int i = 0; i < count; i++) {
+                        int p = snapPixels[idx++];
+                        ioBuf[bPos++] = (byte) (p >>> 24);
+                        ioBuf[bPos++] = (byte) (p >>> 16);
+                        ioBuf[bPos++] = (byte) (p >>> 8);
+                        ioBuf[bPos++] = (byte) p;
                     }
-                    for (short h : heights) {
-                        dos.writeShort(h);
+                    dos.write(ioBuf, 0, bPos);
+                }
+
+                idx = 0;
+                while (idx < 512 * 512) {
+                    int count = Math.min(32768, (512 * 512) - idx);
+                    int bPos = 0;
+                    for (int i = 0; i < count; i++) {
+                        short h = snapHeights[idx++];
+                        ioBuf[bPos++] = (byte) (h >>> 8);
+                        ioBuf[bPos++] = (byte) h;
                     }
-                } finally {
-                    region.unlock();
+                    dos.write(ioBuf, 0, bPos);
                 }
                 dos.flush();
             } catch (Throwable t) {
@@ -1692,10 +1779,11 @@ public final class CaveTextureManager {
             AnvilSliceBuffers buffers = SLICE_BUFFERS.get();
             int[] tempPixels = buffers.loadPixels;
             short[] tempHeights = buffers.loadHeights;
+            byte[] ioBuf = buffers.ioByteBuffer;
             boolean anvilSliced;
             int savedAnvilLayerY;
             boolean hasContent = false;
-            try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new GZIPInputStream(new FileInputStream(file))))) {
+            try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new GZIPInputStream(new FileInputStream(file), 32768), 32768))) {
                 int magic = dis.readInt();
                 if (magic != SCDAT_MAGIC) return false;
                 int savedLayer = dis.readInt();
@@ -1705,13 +1793,33 @@ public final class CaveTextureManager {
                 if (savedRx != rx || savedRz != rz) return false;
                 anvilSliced = dis.readBoolean();
                 savedAnvilLayerY = dis.readInt();
-                for (int i = 0; i < 512 * 512; i++) {
-                    int c = dis.readInt();
-                    tempPixels[i] = c;
-                    if (c != 0) hasContent = true;
+
+                int idx = 0;
+                while (idx < 512 * 512) {
+                    int count = Math.min(16384, (512 * 512) - idx);
+                    dis.readFully(ioBuf, 0, count * 4);
+                    int bPos = 0;
+                    for (int i = 0; i < count; i++) {
+                        int c = ((ioBuf[bPos] & 0xFF) << 24)
+                                | ((ioBuf[bPos + 1] & 0xFF) << 16)
+                                | ((ioBuf[bPos + 2] & 0xFF) << 8)
+                                | (ioBuf[bPos + 3] & 0xFF);
+                        bPos += 4;
+                        tempPixels[idx++] = c;
+                        if (c != 0) hasContent = true;
+                    }
                 }
-                for (int i = 0; i < 512 * 512; i++) {
-                    tempHeights[i] = dis.readShort();
+
+                idx = 0;
+                while (idx < 512 * 512) {
+                    int count = Math.min(32768, (512 * 512) - idx);
+                    dis.readFully(ioBuf, 0, count * 2);
+                    int bPos = 0;
+                    for (int i = 0; i < count; i++) {
+                        short h = (short) (((ioBuf[bPos] & 0xFF) << 8) | (ioBuf[bPos + 1] & 0xFF));
+                        bPos += 2;
+                        tempHeights[idx++] = h;
+                    }
                 }
             } catch (Throwable t) {
                 return false;
@@ -1790,7 +1898,12 @@ public final class CaveTextureManager {
             File mcaDir = getMcaDirectory();
             if (mcaDir == null) return;
             File mcaFile = new File(mcaDir, "r." + rx + "." + rz + ".mca");
-            if (!mcaFile.exists() || mcaFile.length() < 8192) return;
+            if (!mcaFile.exists() || mcaFile.length() < 8192) {
+                region.setAnvilSliced(true);
+                region.setWrittenAnvilLayerY(layerY);
+                region.markExactSnapshotLoaded();
+                return;
+            }
 
             try (RandomAccessFile raf = new RandomAccessFile(mcaFile, "r")) {
                 byte[] header = new byte[4096];
@@ -1885,7 +1998,12 @@ public final class CaveTextureManager {
                     }
                 }
 
-                if (!hasAnyChunk) return;
+                if (!hasAnyChunk) {
+                    region.setAnvilSliced(true);
+                    region.setWrittenAnvilLayerY(layerY);
+                    region.markExactSnapshotLoaded();
+                    return;
+                }
 
                 int[] regPixels = region.getPixelsDirect();
                 short[] regHeights = region.getHeightsDirect();
@@ -1953,20 +2071,28 @@ public final class CaveTextureManager {
             int scanMaximum = isFullCave ? dimensionCeilingCap : Math.min(dimensionCeilingCap, CaveMode.getScanMaximum(level, layerY));
             int scanMinimum = isFullCave ? level.getMinBuildHeight() : CaveMode.getScanMinimum(level, layerY);
             if (scanMaximum < scanMinimum) return false;
-            int minSecY = level.getMinBuildHeight() >> 4;
+            int minSecY = Math.max(level.getMinBuildHeight(), scanMinimum - 16) >> 4;
             int maxSecY = Math.min(maxBuildY, scanMaximum + 1) >> 4;
             int secSpan = maxSecY - minSecY + 1;
-            DecodedSection[] sectionArray = (secSpan > 0 && secSpan <= 64) ? new DecodedSection[secSpan] : null;
+            if (secSpan <= 0 || secSpan > 64) return false;
+            CompoundTag[] rawSectionTags = new CompoundTag[secSpan];
+            DecodedSection[] sectionArray = new DecodedSection[secSpan];
+            boolean[] sectionDecoded = new boolean[secSpan];
+            int highestPresentSecY = Integer.MIN_VALUE;
 
             for (int i = 0; i < sections.size(); i++) {
                 CompoundTag secTag = sections.getCompound(i);
                 int secY = secTag.getByte("Y");
                 if (secY >= minSecY && secY <= maxSecY) {
-                    DecodedSection ds = DecodedSection.decode(secTag, level);
-                    if (ds != null && sectionArray != null) {
-                        sectionArray[secY - minSecY] = ds;
+                    rawSectionTags[secY - minSecY] = secTag;
+                    if (secY > highestPresentSecY) {
+                        highestPresentSecY = secY;
                     }
                 }
+            }
+            if (highestPresentSecY == Integer.MIN_VALUE) return false;
+            if (isFullCave) {
+                scanMaximum = Math.min(scanMaximum, (highestPresentSecY << 4) + 15);
             }
 
             boolean isCaveDim = isCaveDimension(level);
@@ -1991,8 +2117,47 @@ public final class CaveTextureManager {
                     for (int y = scanMaximum; y >= scanMinimum; y--) {
                         int secY = y >> 4;
                         int secIdx = secY - minSecY;
-                        DecodedSection sec = (sectionArray != null && secIdx >= 0 && secIdx < secSpan) ? sectionArray[secIdx] : null;
-                        int kind = sec == null ? DecodedSection.KIND_AIR : sec.getKind(lx, y & 15, lz);
+                        DecodedSection sec = null;
+                        if (secIdx >= 0 && secIdx < secSpan) {
+                            if (!sectionDecoded[secIdx]) {
+                                sectionDecoded[secIdx] = true;
+                                CompoundTag rawTag = rawSectionTags[secIdx];
+                                if (rawTag != null) {
+                                    sectionArray[secIdx] = DecodedSection.decode(rawTag, level);
+                                }
+                            }
+                            sec = sectionArray[secIdx];
+                        }
+                        if (sec == null || (sec.singleBlock && sec.paletteKinds[0] == DecodedSection.KIND_AIR)) {
+                            if (!shouldEnterGround) {
+                                underair = true;
+                            }
+                            int secBottom = secY << 4;
+                            if (y > secBottom) {
+                                y = Math.max(secBottom, scanMinimum);
+                            }
+                            continue;
+                        }
+                        if (sec.singleBlock && sec.paletteKinds[0] == DecodedSection.KIND_SOLID_GROUND) {
+                            if (shouldEnterGround) {
+                                shouldEnterGround = false;
+                                underair = false;
+                                passedSolidRoof = true;
+                                int secBottom = secY << 4;
+                                if (y > secBottom) {
+                                    y = Math.max(secBottom, scanMinimum);
+                                }
+                                continue;
+                            } else if (!underair) {
+                                passedSolidRoof = true;
+                                int secBottom = secY << 4;
+                                if (y > secBottom) {
+                                    y = Math.max(secBottom, scanMinimum);
+                                }
+                                continue;
+                            }
+                        }
+                        int kind = sec.getKind(lx, y & 15, lz);
 
                         // 1. In Full Cave, skip surface water, leaves, trees, glass roofs, and giant mushrooms
                         // until entering the first real underground solid terrain block (KIND_SOLID_GROUND).
@@ -2035,7 +2200,7 @@ public final class CaveTextureManager {
 
                         // 4. Water column inside cave or surface layer (underair == true): resolve down to basin floor.
                         if (kind == DecodedSection.KIND_WATER) {
-                            resolveWaterColumn(sectionArray, minSecY, secSpan, lx, lz, y, maxBuildY, worldMinY,
+                            resolveWaterColumn(sectionArray, rawSectionTags, sectionDecoded, level, minSecY, secSpan, lx, lz, y, maxBuildY, scanMinimum,
                                     exposedToSky, regionHeights, regionRawColors, regionKinds, regIdx);
                             chunkHadContent = true;
                             break;
@@ -2058,7 +2223,7 @@ public final class CaveTextureManager {
                             int belowKind = DecodedSection.KIND_AIR;
                             if (belowY >= worldMinY) {
                                 int bSecIdx = (belowY >> 4) - minSecY;
-                                DecodedSection bSec = (sectionArray != null && bSecIdx >= 0 && bSecIdx < secSpan) ? sectionArray[bSecIdx] : null;
+                                DecodedSection bSec = getOrDecodeSection(sectionArray, rawSectionTags, sectionDecoded, bSecIdx, secSpan, level);
                                 belowKind = (bSec == null) ? DecodedSection.KIND_AIR : bSec.getKind(lx, belowY & 15, lz);
                             }
                             if (belowKind == DecodedSection.KIND_AIR || belowKind == DecodedSection.KIND_INVISIBLE_PASS) {
@@ -2110,7 +2275,21 @@ public final class CaveTextureManager {
             return chunkHadContent;
         }
 
-        private static void resolveWaterColumn(DecodedSection[] sectionArray, int minSecY, int secSpan, int lx, int lz,
+        private static DecodedSection getOrDecodeSection(DecodedSection[] sectionArray, CompoundTag[] rawSectionTags,
+                boolean[] sectionDecoded, int secIdx, int secSpan, Level level) {
+            if (sectionArray == null || secIdx < 0 || secIdx >= secSpan) return null;
+            if (!sectionDecoded[secIdx]) {
+                sectionDecoded[secIdx] = true;
+                CompoundTag raw = rawSectionTags[secIdx];
+                if (raw != null) {
+                    sectionArray[secIdx] = DecodedSection.decode(raw, level);
+                }
+            }
+            return sectionArray[secIdx];
+        }
+
+        private static void resolveWaterColumn(DecodedSection[] sectionArray, CompoundTag[] rawSectionTags,
+                boolean[] sectionDecoded, Level level, int minSecY, int secSpan, int lx, int lz,
                 int waterSurfaceY, int maxBuildY, int scanMinimum, boolean exposedToSky,
                 short[] regionHeights, int[] regionRawColors, byte[] regionKinds, int regIdx) {
             int floorY = CaveRegion.NO_SURFACE;
@@ -2118,13 +2297,13 @@ public final class CaveTextureManager {
             int depth = 1;
 
             int surfSecIdx = (waterSurfaceY >> 4) - minSecY;
-            DecodedSection surfSec = (sectionArray != null && surfSecIdx >= 0 && surfSecIdx < secSpan) ? sectionArray[surfSecIdx] : null;
+            DecodedSection surfSec = getOrDecodeSection(sectionArray, rawSectionTags, sectionDecoded, surfSecIdx, secSpan, level);
             int waterTintArgb = surfSec != null ? surfSec.getWaterTint(lx, waterSurfaceY & 15, lz) : DEFAULT_WATER_TINT;
 
             for (int wy = waterSurfaceY - 1; wy >= scanMinimum; wy--) {
                 int wSecY = wy >> 4;
                 int wSecIdx = wSecY - minSecY;
-                DecodedSection wSec = (sectionArray != null && wSecIdx >= 0 && wSecIdx < secSpan) ? sectionArray[wSecIdx] : null;
+                DecodedSection wSec = getOrDecodeSection(sectionArray, rawSectionTags, sectionDecoded, wSecIdx, secSpan, level);
                 int wk = (wSec == null) ? DecodedSection.KIND_AIR : wSec.getKind(lx, wy & 15, lz);
                 if (wk == DecodedSection.KIND_WATER) {
                     depth++;
@@ -2287,7 +2466,48 @@ public final class CaveTextureManager {
                     }
                 }
 
-                // Decode 4x4x4 section biome palette
+                int[] untintedArgb = new int[size];
+                byte[] tintKinds = new byte[size];
+                byte[] kinds = new byte[size];
+                byte[] emissions = new byte[size];
+                boolean needsBiomes = false;
+                for (int i = 0; i < size; i++) {
+                    String name = pal.getCompound(i).getString("Name");
+                    if (name.equals("minecraft:air") || name.equals("minecraft:cave_air") || name.equals("minecraft:void_air")) {
+                        kinds[i] = KIND_AIR;
+                        untintedArgb[i] = 0;
+                        tintKinds[i] = TINT_NONE;
+                        emissions[i] = 0;
+                    } else if (name.equals("minecraft:water") || name.equals("minecraft:bubble_column")) {
+                        kinds[i] = KIND_WATER;
+                        untintedArgb[i] = DEFAULT_WATER_TINT;
+                        tintKinds[i] = TINT_NONE;
+                        emissions[i] = 0;
+                        needsBiomes = true;
+                    } else if (name.equals("minecraft:lava") || name.equals("minecraft:fire") || name.equals("minecraft:soul_fire")) {
+                        kinds[i] = KIND_LAVA;
+                        untintedArgb[i] = resolveUntintedBlockArgb(name, null, null);
+                        tintKinds[i] = TINT_NONE;
+                        emissions[i] = 15;
+                    } else {
+                        byte classifiedKind = classifyBlockNameKind(name);
+                        kinds[i] = classifiedKind;
+                        if (classifiedKind == KIND_INVISIBLE_PASS) {
+                            untintedArgb[i] = 0;
+                            tintKinds[i] = TINT_NONE;
+                        } else {
+                            untintedArgb[i] = resolveUntintedBlockArgb(name, null, null);
+                            byte tk = resolveBlockTintKind(name, null, null);
+                            tintKinds[i] = tk;
+                            if (tk != TINT_NONE) {
+                                needsBiomes = true;
+                            }
+                        }
+                        emissions[i] = resolveBlockNameEmission(name);
+                    }
+                }
+
+                // Decode 4x4x4 section biome palette only when the section contains biome-tinted blocks or water
                 int[] bGrass = null;
                 int[] bFoliage = null;
                 int[] bWater = null;
@@ -2296,7 +2516,7 @@ public final class CaveTextureManager {
                 int bPerLong = 1;
                 long bMask = 0L;
                 boolean singleBio = true;
-                if (secTag.contains("biomes", Tag.TAG_COMPOUND)) {
+                if (needsBiomes && secTag.contains("biomes", Tag.TAG_COMPOUND)) {
                     CompoundTag bioTag = secTag.getCompound("biomes");
                     if (bioTag.contains("palette", Tag.TAG_LIST)) {
                         ListTag bioPal = bioTag.getList("palette", Tag.TAG_STRING);
@@ -2330,41 +2550,6 @@ public final class CaveTextureManager {
                     bWater = new int[]{ DEFAULT_WATER_TINT };
                 }
 
-                int[] untintedArgb = new int[size];
-                byte[] tintKinds = new byte[size];
-                byte[] kinds = new byte[size];
-                byte[] emissions = new byte[size];
-                for (int i = 0; i < size; i++) {
-                    String name = pal.getCompound(i).getString("Name");
-                    if (name.equals("minecraft:air") || name.equals("minecraft:cave_air") || name.equals("minecraft:void_air")) {
-                        kinds[i] = KIND_AIR;
-                        untintedArgb[i] = 0;
-                        tintKinds[i] = TINT_NONE;
-                        emissions[i] = 0;
-                    } else if (name.equals("minecraft:water") || name.equals("minecraft:bubble_column")) {
-                        kinds[i] = KIND_WATER;
-                        untintedArgb[i] = DEFAULT_WATER_TINT;
-                        tintKinds[i] = TINT_NONE;
-                        emissions[i] = 0;
-                    } else if (name.equals("minecraft:lava") || name.equals("minecraft:fire") || name.equals("minecraft:soul_fire")) {
-                        kinds[i] = KIND_LAVA;
-                        untintedArgb[i] = resolveUntintedBlockArgb(name, null, null);
-                        tintKinds[i] = TINT_NONE;
-                        emissions[i] = 15;
-                    } else {
-                        byte classifiedKind = classifyBlockNameKind(name);
-                        kinds[i] = classifiedKind;
-                        if (classifiedKind == KIND_INVISIBLE_PASS) {
-                            untintedArgb[i] = 0;
-                            tintKinds[i] = TINT_NONE;
-                        } else {
-                            untintedArgb[i] = resolveUntintedBlockArgb(name, null, null);
-                            tintKinds[i] = resolveBlockTintKind(name, null, null);
-                        }
-                        emissions[i] = resolveBlockNameEmission(name);
-                    }
-                }
-
                 if (size == 1) {
                     return new DecodedSection(untintedArgb, tintKinds, kinds, emissions, blockLight, skyLight,
                             null, 0, 0, 0L, true, bGrass, bFoliage, bWater, bData, bBits, bPerLong, bMask, singleBio);
@@ -2380,6 +2565,15 @@ public final class CaveTextureManager {
             }
 
             private static byte classifyBlockNameKind(String name) {
+                String cacheKey = MapConfig.displayFlowers ? name : (name + "#nf");
+                Byte cached = BLOCK_KIND_CACHE.get(cacheKey);
+                if (cached != null) return cached;
+                byte resolved = computeBlockNameKind(name);
+                BLOCK_KIND_CACHE.put(cacheKey, resolved);
+                return resolved;
+            }
+
+            private static byte computeBlockNameKind(String name) {
                 try {
                     ResourceLocation rl = ResourceLocation.tryParse(name);
                     if (rl != null) {
@@ -2395,7 +2589,7 @@ public final class CaveTextureManager {
                             if (state.is(BlockTags.LEAVES)) {
                                 return KIND_LEAVES;
                             }
-                            if (CaveMode.isShortFloorBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, state)) {
+                            if (CaveMode.isShortFloorBlock(state)) {
                                 return KIND_THIN_FLOOR;
                             }
                             if (CaveMode.isUndergroundSolidRoof(state)) {
@@ -2411,6 +2605,14 @@ public final class CaveTextureManager {
             }
 
             private static byte resolveBlockNameEmission(String name) {
+                Byte cached = BLOCK_EMISSION_CACHE.get(name);
+                if (cached != null) return cached;
+                byte resolved = computeBlockNameEmission(name);
+                BLOCK_EMISSION_CACHE.put(name, resolved);
+                return resolved;
+            }
+
+            private static byte computeBlockNameEmission(String name) {
                 try {
                     ResourceLocation rl = ResourceLocation.tryParse(name);
                     if (rl != null) {
@@ -2499,6 +2701,13 @@ public final class CaveTextureManager {
                 int b = skyLight[byteIdx] & 0xFF;
                 return (blockIdx & 1) == 0 ? (b & 0x0F) : (b >>> 4);
             }
+        }
+
+        public static boolean requiresCaveBiomeTint(BlockState state) {
+            if (state == null || state.isAir() || MapConfig.blockColourMode != 0) return false;
+            SurfaceColorizer.MapVisualClassifier.VisualInfo visual =
+                    SurfaceColorizer.MapVisualClassifier.getInstance().info(state);
+            return resolveBlockTintKind(visual.blockId(), state, visual) != TINT_NONE;
         }
 
         public static int resolveCaveBlockBaseColor(BlockState state) {
@@ -2805,14 +3014,21 @@ public final class CaveTextureManager {
         }
 
         private void saveAllDirtyRegions() {
+            List<CaveRegion> dirtySnapshot = new ArrayList<>();
             synchronized (regions) {
                 for (RegionHolder holder : regions.values()) {
                     if (holder.region.isDirty() && holder.region.hasContent()) {
                         holder.region.setDirty(false);
-                        saveRegionToDisk(holder.region, holder.region.band, holder.region.rx, holder.region.rz);
+                        dirtySnapshot.add(holder.region);
                     }
                 }
             }
+            if (dirtySnapshot.isEmpty()) return;
+            diskExecutor.execute(() -> {
+                for (CaveRegion reg : dirtySnapshot) {
+                    saveRegionToDisk(reg, reg.band, reg.rx, reg.rz);
+                }
+            });
         }
 
         private CaveRegion materialize(int layerY, int rx, int rz, boolean createIfMissing) {
@@ -2830,6 +3046,9 @@ public final class CaveTextureManager {
                     target = holder.region;
                 } else {
                     if (!createIfMissing) return null;
+                    if (allowAnvilSlice && !hasRegionFile(layerY, rx, rz)) {
+                        return null;
+                    }
                     target = new CaveRegion(rx, rz, band, layerGeneration.get());
                     regions.put(key, new RegionHolder(target, 0L));
                     trimCompatRegions();
@@ -2876,6 +3095,7 @@ public final class CaveTextureManager {
                                 if (asyncTarget.hasContent() && asyncTarget.isAnvilSliced()
                                         && (requestedLayer == Integer.MIN_VALUE
                                                 || asyncTarget.getWrittenAnvilLayerY() == requestedLayer)) {
+                                    asyncTarget.setDirty(false);
                                     saveRegionToDisk(asyncTarget, band, rx, rz);
                                     CaveTextureManager.getInstance().markRegionTextureDirty(requestedLayer, rx, rz);
                                 }
@@ -3008,8 +3228,9 @@ public final class CaveTextureManager {
             public void markDiskChecked() { this.diskChecked = true; }
             public boolean hasExactSnapshot() { return exactSnapshot && !closed; }
             public boolean hasContent() { return hasContent && !closed; }
+            public boolean hasSavedContent() { return hasContent; }
             public boolean isDirty() { return dirty && !closed; }
-            public void setDirty(boolean dirty) { if (!closed) this.dirty = dirty; }
+            public void setDirty(boolean dirty) { this.dirty = dirty; }
             public void markLoaded() { if (!closed) loaded = true; }
             public void markExactSnapshotLoaded() {
                 if (!closed) {
@@ -3018,6 +3239,7 @@ public final class CaveTextureManager {
                 }
             }
             public boolean isAnvilSliced() { return anvilSliced && !closed; }
+            public boolean hasAnvilSliceFlag() { return anvilSliced; }
             public void setAnvilSliced(boolean sliced) { if (!closed) this.anvilSliced = sliced; }
             public int getWrittenAnvilLayerY() { return writtenAnvilLayerY; }
             public void setWrittenAnvilLayerY(int layerY) { this.writtenAnvilLayerY = layerY; }
