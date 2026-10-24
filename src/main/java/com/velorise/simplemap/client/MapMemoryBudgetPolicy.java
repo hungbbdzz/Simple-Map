@@ -1069,7 +1069,7 @@ public static final class MapMemoryLeaseManager {
     static {
         long heap = Runtime.getRuntime().maxMemory();
         put(Category.PENDING_SOURCE,
-                bounded(heap / 48L, 24L << 20, 128L << 20));
+                bounded(heap / 24L, 64L << 20, 256L << 20));
         put(Category.PENDING_PROJECTION,
                 bounded(heap / 40L, 24L << 20, 160L << 20));
         put(Category.PENDING_LOD,

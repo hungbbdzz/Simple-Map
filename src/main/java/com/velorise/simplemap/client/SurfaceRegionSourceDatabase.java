@@ -41,7 +41,7 @@ public final class SurfaceRegionSourceDatabase {
     private static final SurfaceRegionSourceDatabase INSTANCE =
             new SurfaceRegionSourceDatabase();
 
-    private static final int MAX_SOURCE_REGIONS = 24;
+    private static final int MAX_SOURCE_REGIONS = 64;
     private static final int MAX_CAPTURE_REGIONS = 4;
     // Chunk completion wakes the affected capture immediately. Keep only a slow
     // safety retry for unchanged partial windows; rebuilding the same incomplete
@@ -198,6 +198,11 @@ public final class SurfaceRegionSourceDatabase {
      */
     private void wakeExactPageForRetainedChunk(RevisionStamp stamp, SourceKey key,
             int localChunkX, int localChunkZ) {
+        wakeExactPageForRetainedChunk(stamp, key, localChunkX, localChunkZ, false);
+    }
+
+    private void wakeExactPageForRetainedChunk(RevisionStamp stamp, SourceKey key,
+            int localChunkX, int localChunkZ, boolean forceDirty) {
         int localPageX = localChunkX >>> 2;
         int localPageZ = localChunkZ >>> 2;
         pageWarmRetryAfterNanos.remove(new PageWarmKey(
@@ -207,9 +212,13 @@ public final class SurfaceRegionSourceDatabase {
                 + localChunkX;
         int worldChunkZ = key.regionZ() * SurfaceRegionSource.CHUNKS_PER_AXIS
                 + localChunkZ;
-        MapTextureManager.getInstance().markPageDirtyForChunk(
-                worldChunkX, worldChunkZ);
-        MapTextureManager.getInstance().wakeRegionCaptureForChunk(
+        MapTextureManager textureManager = MapTextureManager.getInstance();
+        if (forceDirty || !textureManager.isChunkAndHaloResidentAndCurrent(
+                worldChunkX, worldChunkZ)) {
+            textureManager.markPageDirtyForChunk(
+                    worldChunkX, worldChunkZ);
+        }
+        textureManager.wakeRegionCaptureForChunk(
                 worldChunkX, worldChunkZ);
     }
 
@@ -276,7 +285,7 @@ public final class SurfaceRegionSourceDatabase {
          * cache replay and saved-world reconstruction all converge through this path.
          * dirtyPageQueued coalesces the harmless duplicate from the live scanner.
          */
-        wakeExactPageForRetainedChunk(stamp, key, localChunkX, localChunkZ);
+        wakeExactPageForRetainedChunk(stamp, key, localChunkX, localChunkZ, true);
         if (!leafWasReady && source.leafSourceReady(localPageX, localPageZ)) {
             Minecraft minecraft = Minecraft.getInstance();
             Runnable wakeLod = () -> RegionSurfaceLodService.getInstance()

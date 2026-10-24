@@ -703,6 +703,8 @@ public final class MinimapFramebufferRenderer {
         compositionYaw = yaw;
         compositionValid = true;
 
+        boolean cullWasEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+        RenderSystem.disableCull();
         guiGraphics.pose().pushPose();
         try {
             guiGraphics.pose().translate(x + size * 0.5f,
@@ -715,6 +717,7 @@ public final class MinimapFramebufferRenderer {
             Matrix4f matrix = guiGraphics.pose().last().pose();
             RenderSystem.enableBlend();
             RenderSystem.defaultBlendFunc();
+            RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
             RenderSystem.setShader(GameRenderer::getPositionTexShader);
             RenderSystem.setShaderTexture(0, frontTarget.getColorTextureId());
             if (MapConfig.minimapCircle) {
@@ -740,9 +743,10 @@ public final class MinimapFramebufferRenderer {
                     float tv0 = vCenter + (y0 * invHalf) * vHalf;
                     float tu1 = uCenter + (x1 * invHalf) * uHalf;
                     float tv1 = vCenter + (y1 * invHalf) * vHalf;
+                    // Counter-clockwise in NDC (where GUI +Y points down) so front-face culling never discards the fan.
                     buffer.addVertex(matrix, 0.0f, 0.0f, 0.0f).setUv(uCenter, vCenter);
-                    buffer.addVertex(matrix, x0, y0, 0.0f).setUv(tu0, tv0);
                     buffer.addVertex(matrix, x1, y1, 0.0f).setUv(tu1, tv1);
+                    buffer.addVertex(matrix, x0, y0, 0.0f).setUv(tu0, tv0);
                 }
                 BufferUploader.drawWithShader(buffer.buildOrThrow());
             } else {
@@ -758,6 +762,8 @@ public final class MinimapFramebufferRenderer {
         } finally {
             guiGraphics.pose().popPose();
             guiGraphics.disableScissor();
+            if (cullWasEnabled) RenderSystem.enableCull();
+            else RenderSystem.disableCull();
         }
     }
 }

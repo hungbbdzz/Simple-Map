@@ -623,10 +623,10 @@ public class MinimapRenderer {
             float x2 = cx + radius * cos2;
             float y2 = cy + radius * sin2;
 
-            // Degenerate Quad (4 vertices representing a triangle)
+            // Degenerate Quad (4 vertices representing a CCW triangle in GUI NDC)
             consumer.addVertex(matrix, cx, cy, 0.0f).setColor(r, g, b, a);
-            consumer.addVertex(matrix, x1, y1, 0.0f).setColor(r, g, b, a);
             consumer.addVertex(matrix, x2, y2, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, x1, y1, 0.0f).setColor(r, g, b, a);
             consumer.addVertex(matrix, cx, cy, 0.0f).setColor(r, g, b, a);
         }
     }
@@ -654,10 +654,12 @@ public class MinimapRenderer {
             float sin2 = numSegments == CIRCLE_SEGMENTS
                     ? CIRCLE_SIN[i + 1] : (float) Math.sin((i + 1) * angleStep);
 
-            consumer.addVertex(matrix, cx + r1 * cos1, cy + r1 * sin1, 0.0f).setColor(r, g, b, a);
-            consumer.addVertex(matrix, cx + r1 * cos2, cy + r1 * sin2, 0.0f).setColor(r, g, b, a);
-            consumer.addVertex(matrix, cx + r2 * cos2, cy + r2 * sin2, 0.0f).setColor(r, g, b, a);
-            consumer.addVertex(matrix, cx + r2 * cos1, cy + r2 * sin1, 0.0f).setColor(r, g, b, a);
+            float innerR = Math.min(r1, r2);
+            float outerR = Math.max(r1, r2);
+            consumer.addVertex(matrix, cx + innerR * cos1, cy + innerR * sin1, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + innerR * cos2, cy + innerR * sin2, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + outerR * cos2, cy + outerR * sin2, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + outerR * cos1, cy + outerR * sin1, 0.0f).setColor(r, g, b, a);
         }
     }
 

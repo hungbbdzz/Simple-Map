@@ -113,6 +113,10 @@ public class MapScreen extends Screen {
     private String cachedBiomeDimension = "";
     private long cachedBiomeCaveRevision = Long.MIN_VALUE;
     private String cachedBiomeText;
+    private boolean hasFocusedCoordinateOverride;
+    private double focusedCoordinateX;
+    private double focusedCoordinateZ;
+    private long focusedCoordinateUntilNanos;
     private final CaveStateClassifier caveStateClassifier = CaveStateClassifier.getInstance();
     private final MapVisualClassifier visualClassifier = MapVisualClassifier.getInstance();
 
@@ -148,6 +152,7 @@ public class MapScreen extends Screen {
     /** Opens the requested waypoint's dimension and places it at map centre. */
     public void focusOnWaypoint(WaypointManager.Waypoint waypoint) {
         if (waypoint == null || this.minecraft == null) return;
+        hasFocusedCoordinateOverride = true;
         MapManager manager = MapManager.getInstance();
         String target = manager.resolveDimensionResourceId(waypoint.dimension);
         if (target.equals(manager.getLiveDimensionResourceId())) {
@@ -161,6 +166,35 @@ public class MapScreen extends Screen {
         centerZ = waypoint.z;
         scale = Math.max(getMinimumStableScale(), 0.75f);
         currentRenderScale = scale;
+        cancelMotionAndOpenAnimation();
+        cursorCacheValid = false;
+        isPopupMenuOpen = false;
+        updateToolbarTooltips();
+    }
+
+    /** Centers the fullscreen map on a clicked chat coordinate and highlights the target block. */
+    public void focusOnCoordinates(double targetX, double targetZ, String targetDimension) {
+        hasFocusedCoordinateOverride = true;
+        MapManager manager = MapManager.getInstance();
+        if (targetDimension != null && !targetDimension.isBlank()) {
+            String target = manager.resolveDimensionResourceId(targetDimension);
+            if (target.equals(manager.getLiveDimensionResourceId())) {
+                selectedDimension = "LIVE";
+                if (this.minecraft != null) {
+                    manager.returnToLiveDimension(this.minecraft);
+                }
+            } else {
+                selectedDimension = target;
+                manager.switchToDimension(target);
+            }
+        }
+        centerX = targetX;
+        centerZ = targetZ;
+        scale = Math.max(getMinimumStableScale(), Math.max(scale, 1.25f));
+        currentRenderScale = scale;
+        focusedCoordinateX = targetX;
+        focusedCoordinateZ = targetZ;
+        focusedCoordinateUntilNanos = System.nanoTime() + 6_000_000_000L;
         cancelMotionAndOpenAnimation();
         cursorCacheValid = false;
         isPopupMenuOpen = false;
@@ -204,7 +238,7 @@ public class MapScreen extends Screen {
             }
             MapManager.getInstance().updateWorldAndDimension(this.minecraft);
         }
-        if (this.width > 0) {
+        if (this.width > 0 && !this.hasFocusedCoordinateOverride) {
             this.scale = Math.max(getMinimumStableScale(), (this.width - 2) / 1000.0f);
             this.currentRenderScale = this.scale;
         }
@@ -647,6 +681,25 @@ public class MapScreen extends Screen {
                     0xFFB8B8B8, false);
         }
 
+        // Highlight target coordinate when opened from a clickable chat coordinate
+        if (frameNow < focusedCoordinateUntilNanos) {
+            float screenTargetX = (float) (vx + vw * 0.5 + (focusedCoordinateX - centerX) * currentRenderScale);
+            float screenTargetY = (float) (vy + vh * 0.5 + (focusedCoordinateZ - centerZ) * currentRenderScale);
+            if (screenTargetX >= vx && screenTargetX <= vx + vw
+                    && screenTargetY >= vy && screenTargetY <= vy + vh) {
+                float remSec = (focusedCoordinateUntilNanos - frameNow) / 1_000_000_000.0f;
+                float pulse = 0.5f + 0.5f * (float) Math.sin((6.0f - remSec) * 6.5f);
+                float ringR = 7.0f + pulse * 4.5f;
+                int alpha = Math.min(255, (int) (Math.min(1.0f, remSec * 1.2f) * 235.0f));
+                int ringColor = (alpha << 24) | 0x00E5FF;
+                int shadowColor = (Math.min(255, alpha / 2) << 24);
+                drawCircleRing(guiGraphics, screenTargetX, screenTargetY, ringR - 1.5f, ringR + 1.5f, 48, shadowColor);
+                drawCircleRing(guiGraphics, screenTargetX, screenTargetY, ringR - 0.75f, ringR + 0.75f, 48, ringColor);
+                drawSolidCircleHelper(guiGraphics, screenTargetX, screenTargetY, 2.2f, 24, ringColor, 0.0f);
+                guiGraphics.flush();
+            }
+        }
+
         // Draw GUI widgets (buttons)
         drawToolbarBackground(guiGraphics);
         drawCaveControlBackground(guiGraphics);
@@ -658,6 +711,65 @@ public class MapScreen extends Screen {
         // Draw the custom context menu if open
         if (isPopupMenuOpen) {
             drawPopupMenu(guiGraphics, mouseX, mouseY);
+        }
+    }
+
+    static void drawSolidCircleHelper(GuiGraphics guiGraphics, float cx, float cy, float radius, int numSegments,
+            int color, float z) {
+        float a = ((color >> 24) & 0xFF) / 255.0f;
+        float r = ((color >> 16) & 0xFF) / 255.0f;
+        float g = ((color >> 8) & 0xFF) / 255.0f;
+        float b = (color & 0xFF) / 255.0f;
+
+        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
+        net.minecraft.client.renderer.MultiBufferSource bufferSource = guiGraphics.bufferSource();
+        com.mojang.blaze3d.vertex.VertexConsumer consumer = bufferSource
+                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
+
+        double angleStep = 2.0 * Math.PI / numSegments;
+        for (int i = 0; i < numSegments; i++) {
+            double angle1 = i * angleStep;
+            double angle2 = (i + 1) * angleStep;
+
+            float x1 = (float) (cx + radius * Math.cos(angle1));
+            float y1 = (float) (cy + radius * Math.sin(angle1));
+            float x2 = (float) (cx + radius * Math.cos(angle2));
+            float y2 = (float) (cy + radius * Math.sin(angle2));
+
+            // Degenerate Quad (4 vertices representing a CCW triangle in GUI NDC) at Z = z
+            consumer.addVertex(matrix, cx, cy, z).setColor(r, g, b, a);
+            consumer.addVertex(matrix, x2, y2, z).setColor(r, g, b, a);
+            consumer.addVertex(matrix, x1, y1, z).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx, cy, z).setColor(r, g, b, a);
+        }
+    }
+
+    static void drawCircleRing(GuiGraphics guiGraphics, float cx, float cy, float r1, float r2, int numSegments,
+            int color) {
+        float a = ((color >> 24) & 0xFF) / 255.0f;
+        float r = ((color >> 16) & 0xFF) / 255.0f;
+        float g = ((color >> 8) & 0xFF) / 255.0f;
+        float b = (color & 0xFF) / 255.0f;
+
+        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
+        net.minecraft.client.renderer.MultiBufferSource bufferSource = guiGraphics.bufferSource();
+        com.mojang.blaze3d.vertex.VertexConsumer consumer = bufferSource
+                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
+
+        double angleStep = 2.0 * Math.PI / numSegments;
+        for (int i = 0; i < numSegments; i++) {
+            double angle1 = i * angleStep;
+            double angle2 = (i + 1) * angleStep;
+
+            float cos1 = (float) Math.cos(angle1);
+            float sin1 = (float) Math.sin(angle1);
+            float cos2 = (float) Math.cos(angle2);
+            float sin2 = (float) Math.sin(angle2);
+
+            consumer.addVertex(matrix, cx + r1 * cos1, cy + r1 * sin1, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + r1 * cos2, cy + r1 * sin2, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + r2 * cos2, cy + r2 * sin2, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + r2 * cos1, cy + r2 * sin1, 0.0f).setColor(r, g, b, a);
         }
     }
 
@@ -937,6 +1049,38 @@ public class MapScreen extends Screen {
         return "minecraft:nether_wastes";
     }
 
+    private String resolveSingleplayerGeneratorBiomeId(String currentDim, int x, int y, int z) {
+        if (this.minecraft == null) return null;
+        var server = this.minecraft.getSingleplayerServer();
+        if (server == null) return null;
+        try {
+            net.minecraft.resources.ResourceLocation dimLoc =
+                    net.minecraft.resources.ResourceLocation.tryParse(currentDim);
+            if (dimLoc == null) return null;
+            net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> levelKey =
+                    net.minecraft.resources.ResourceKey.create(
+                            net.minecraft.core.registries.Registries.DIMENSION, dimLoc);
+            net.minecraft.server.level.ServerLevel serverLevel = server.getLevel(levelKey);
+            if (serverLevel == null) return null;
+            var chunkSource = serverLevel.getChunkSource();
+            var biomeSource = chunkSource.getGenerator().getBiomeSource();
+            var sampler = chunkSource.randomState().sampler();
+            if (biomeSource == null || sampler == null) return null;
+            net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> holder =
+                    serverLevel.getBiomeManager()
+                            .withDifferentSource((qx, qy, qz) ->
+                                    biomeSource.getNoiseBiome(qx, qy, qz, sampler))
+                            .getBiome(new net.minecraft.core.BlockPos(x, y, z));
+            if (holder != null) {
+                return holder.unwrapKey()
+                        .map(k -> k.location().toString())
+                        .orElse(null);
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     private String resolveCursorBiomeText(int x, int y, int z, boolean chunkLoaded) {
         MapManager mapManager = MapManager.getInstance();
         String currentDim = mapManager.getCurrentDimensionResourceId();
@@ -968,19 +1112,23 @@ public class MapScreen extends Screen {
                 if (localZ < 2 && !this.minecraft.level.hasChunk(chunkX, chunkZ - 1)) {
                     sampleZ = (chunkZ << 4) + 2;
                 } else if (localZ > 13 && !this.minecraft.level.hasChunk(chunkX, chunkZ + 1)) {
-                    sampleZ = (chunkZ << 4) + 13;
+                    sampleZ = (chunkX << 4) + 13;
                 }
                 net.minecraft.core.BlockPos biomePos = new net.minecraft.core.BlockPos(sampleX, y, sampleZ);
                 resolvedId = this.minecraft.level.getBiome(biomePos).unwrapKey()
                         .map(key -> key.location().toString())
                         .orElse(null);
-                if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                if ("minecraft:plains".equals(resolvedId)
+                        || isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
                     net.minecraft.world.level.chunk.LevelChunk chunk = this.minecraft.level.getChunk(chunkX, chunkZ);
                     if (chunk != null) {
-                        resolvedId = chunk.getNoiseBiome(sampleX >> 2, y >> 2, sampleZ >> 2)
+                        String ownNoiseBiome = chunk.getNoiseBiome(sampleX >> 2, y >> 2, sampleZ >> 2)
                                 .unwrapKey()
                                 .map(key -> key.location().toString())
                                 .orElse(null);
+                        if (ownNoiseBiome != null && !ownNoiseBiome.isBlank()) {
+                            resolvedId = ownNoiseBiome;
+                        }
                     }
                     if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
                         resolvedId = null;
@@ -1002,24 +1150,46 @@ public class MapScreen extends Screen {
             }
         }
 
-        if (resolvedId == null || resolvedId.isBlank()) {
-            resolvedId = mapManager.getBiomeId(x, z);
-            if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
-                resolvedId = null;
+        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+            String surfaceBiome = mapManager.getBiomeId(x, z);
+            if (surfaceBiome != null && !surfaceBiome.isBlank()
+                    && !isInvalidPlainsForDimension(surfaceBiome, isNether, isEnd)) {
+                if (resolvedId == null || resolvedId.isBlank()
+                        || !"minecraft:plains".equals(surfaceBiome)) {
+                    resolvedId = surfaceBiome;
+                }
             }
         }
 
-        if ((resolvedId == null || resolvedId.isBlank()) && !caveActive) {
-            int regionX = x >> 9;
-            int regionZ = z >> 9;
-            if (mapManager.hasRegionFile(regionX, regionZ)
-                    && !mapManager.isRegionLoadedInCache(regionX, regionZ)) {
-                mapManager.getRegion(regionX, regionZ, true);
-                MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
+        int regionX = x >> 9;
+        int regionZ = z >> 9;
+        if ((resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId))
+                && mapManager.hasRegionFile(regionX, regionZ)
+                && !mapManager.isRegionLoadedInCache(regionX, regionZ)) {
+            mapManager.getRegion(regionX, regionZ, true);
+            MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
+        }
+
+        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+            String caveBiome = CaveMapManager.getInstance().getBiomeId(
+                    caveActive ? targetLayer : Integer.MIN_VALUE, x, z);
+            if (caveBiome != null && !caveBiome.isBlank()
+                    && !isInvalidPlainsForDimension(caveBiome, isNether, isEnd)) {
+                if (resolvedId == null || resolvedId.isBlank()
+                        || !"minecraft:plains".equals(caveBiome)) {
+                    resolvedId = caveBiome;
+                }
             }
-            resolvedId = CaveMapManager.getInstance().getBiomeId(Integer.MIN_VALUE, x, z);
-            if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
-                resolvedId = null;
+        }
+
+        // In Singleplayer / LAN host, query the integrated server's thread-safe noise
+        // BiomeSource + BiomeManager zoom math whenever the cached region was evicted,
+        // not yet loaded, or had an older render-border "minecraft:plains" fallback baked in.
+        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+            String generatorBiome = resolveSingleplayerGeneratorBiomeId(currentDim, x, y, z);
+            if (generatorBiome != null && !generatorBiome.isBlank()
+                    && !isInvalidPlainsForDimension(generatorBiome, isNether, isEnd)) {
+                resolvedId = generatorBiome;
             }
         }
 
@@ -3440,81 +3610,37 @@ public class MapScreen extends Screen {
             int borderThickness = Math.max(2, size / 32);
 
             if (MapConfig.minimapCircle) {
-                // CIRCULAR PREVIEW (OpenGL Stencil Masking)
                 int tHalf = Math.max(1, borderThickness / 2);
                 cx = x + radius;
                 cy = y + radius;
                 float clipRadius = radius - tHalf;
                 int circleBorderColor = isHovered || isDraggingMinimap || selectedMinimap
-                        ? 0xFF00C8FF : MapConfig.minimapRingColor;
+                        ? 0xFF00C8FF : 0xE0000000;
 
-                // Ensure stencil buffer is enabled on the main framebuffer
-                if (this.minecraft != null) {
-                    this.minecraft.getMainRenderTarget().enableStencil();
-                }
-                boolean depthTestWasEnabled = org.lwjgl.opengl.GL11.glIsEnabled(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-
-                // 1. Enable stencil test and clear stencil buffer
-                org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-                org.lwjgl.opengl.GL11.glStencilMask(0xFF); // Enable writes for clearing!
-                org.lwjgl.opengl.GL11.glClear(org.lwjgl.opengl.GL11.GL_STENCIL_BUFFER_BIT);
-
-                // 2. Configure stencil to write 1 on circle area
-                org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_ALWAYS, 1, 0xFF);
-                org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_REPLACE, org.lwjgl.opengl.GL11.GL_REPLACE,
-                        org.lwjgl.opengl.GL11.GL_REPLACE);
-
-                // Disable color writes and depth test so the clipping circle writes purely to
-                // stencil
-                org.lwjgl.opengl.GL11.glColorMask(false, false, false, false);
-                org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-
-                // Draw circular mask using scanlines of fillFloat (precise float coordinates)
-                float maskRadius = clipRadius + 1.5f; // Overlap slightly under the border
-                for (int dy = -(int) Math.ceil(maskRadius); dy <= (int) Math.ceil(maskRadius); dy++) {
-                    float squared = maskRadius * maskRadius - dy * dy;
-                    if (squared < 0.0f) continue;
-                    float dx = (float) Math.sqrt(squared);
-                    fillFloat(guiGraphics, cx - dx, cy + dy, cx + dx, cy + dy + 1.0f, 0xFFFFFFFF);
-                }
-
-                // Flush the stencil write while color mask and depth test are disabled
+                drawSolidCircleHelper(guiGraphics, cx, cy, radius, 64, 0xFF080A0C, 0.0f);
                 guiGraphics.flush();
 
-                // Restore color mask
-                org.lwjgl.opengl.GL11.glColorMask(true, true, true, true);
-
-                // 3. Configure stencil to only draw inside the circle (where stencil is 1)
-                org.lwjgl.opengl.GL11.glStencilFunc(org.lwjgl.opengl.GL11.GL_EQUAL, 1, 0xFF);
-                org.lwjgl.opengl.GL11.glStencilOp(org.lwjgl.opengl.GL11.GL_KEEP, org.lwjgl.opengl.GL11.GL_KEEP,
-                        org.lwjgl.opengl.GL11.GL_KEEP);
-                org.lwjgl.opengl.GL11.glStencilMask(0x00);
-
-                // Draw the map preview directly (it will be clipped to the circle!)
                 if (this.minecraft != null && this.minecraft.player != null) {
+                    double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
                     double interpX = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.xo,
-                            this.minecraft.player.getX());
+                            this.minecraft.player.getX()) * dimScale;
                     double interpZ = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.zo,
-                            this.minecraft.player.getZ());
-                    MapRenderer.getInstance().drawMap(
-                            guiGraphics, x, y, size, size,
-                            interpX, interpZ,
-                            MapConfig.minimapZoom,
-                            true, true, true, 0, 0,
-                            partialTick);
+                            this.minecraft.player.getZ()) * dimScale;
+                    boolean rendered = MinimapFramebufferRenderer.getInstance().render(
+                            guiGraphics, x, y, size, interpX, interpZ,
+                            MapConfig.minimapZoom, MapConfig.minimapRotate, partialTick);
+                    if (!rendered) {
+                        MapRenderer.getInstance().drawMap(
+                                guiGraphics, x, y, size, size,
+                                interpX, interpZ,
+                                MapConfig.minimapZoom,
+                                false, MapConfig.minimapRotate, true, 0, 0,
+                                partialTick);
+                    }
+                    MapRenderer.getInstance().drawMinimapPlayerOverlay(
+                            guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
                 }
 
-                // Flush map preview draw call
-                guiGraphics.flush();
-
-                // 4. Disable stencil test
-                org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL11.GL_STENCIL_TEST);
-                org.lwjgl.opengl.GL11.glStencilMask(0xFF);
-                if (depthTestWasEnabled) {
-                    org.lwjgl.opengl.GL11.glEnable(org.lwjgl.opengl.GL11.GL_DEPTH_TEST);
-                }
-
-                // 5. Draw the sleek thin bezel overlay (borders) always on top using vector rings
                 float ringWidth = Math.max(1.5f, size / 72.0f);
                 float innerRingR = radius - 0.5f;
                 float outerRingR = innerRingR + ringWidth;
@@ -3522,19 +3648,13 @@ public class MapScreen extends Screen {
                 drawCircleRing(guiGraphics, cx, cy, innerRingR, outerRingR, 64, MapConfig.minimapRingColor);
                 drawCircleRing(guiGraphics, cx, cy, outerRingR, outerRingR + 0.75f, 64, circleBorderColor);
 
-                // Dragging highlight overlay
                 if (isHovered || isDraggingMinimap || selectedMinimap) {
-                    // Draw a semi-transparent circular overlay on top using the batched circle
-                    // helper
                     drawSolidCircleHelper(guiGraphics, cx, cy, clipRadius, 64, 0x4400C8FF, 0.3f);
                 }
-
-                // Flush bezel mask and highlight overlay
                 guiGraphics.flush();
 
-                // 4. Draw directions
                 if (this.minecraft != null && this.minecraft.player != null) {
-                    drawCompassDirectionsHelper(guiGraphics, this.minecraft, cx, cy, radius, borderThickness,
+                    drawCompassDirectionsHelper(guiGraphics, this.minecraft, cx, cy, radius, ringWidth,
                             this.minecraft.player, true, partialTick);
                 }
             } else {
@@ -3545,16 +3665,24 @@ public class MapScreen extends Screen {
                 guiGraphics.fill(x + size, y, x + size + 1, y + size, borderColor);
 
                 if (this.minecraft != null && this.minecraft.player != null) {
+                    double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
                     double interpX = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.xo,
-                            this.minecraft.player.getX());
+                            this.minecraft.player.getX()) * dimScale;
                     double interpZ = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.zo,
-                            this.minecraft.player.getZ());
-                    MapRenderer.getInstance().drawMap(
-                            guiGraphics, x, y, size, size,
-                            interpX, interpZ,
-                            MapConfig.minimapZoom,
-                            true, true, true, 0, 0,
-                            partialTick);
+                            this.minecraft.player.getZ()) * dimScale;
+                    boolean rendered = MinimapFramebufferRenderer.getInstance().render(
+                            guiGraphics, x, y, size, interpX, interpZ,
+                            MapConfig.minimapZoom, MapConfig.minimapRotate, partialTick);
+                    if (!rendered) {
+                        MapRenderer.getInstance().drawMap(
+                                guiGraphics, x, y, size, size,
+                                interpX, interpZ,
+                                MapConfig.minimapZoom,
+                                true, MapConfig.minimapRotate, true, 0, 0,
+                                partialTick);
+                    }
+                    MapRenderer.getInstance().drawMinimapPlayerOverlay(
+                            guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
                 }
 
                 // Draw directions (square)
@@ -3870,36 +3998,6 @@ public class MapScreen extends Screen {
         }
     }
 
-    private void drawSolidCircleHelper(GuiGraphics guiGraphics, float cx, float cy, float radius, int numSegments,
-            int color, float z) {
-        float a = ((color >> 24) & 0xFF) / 255.0f;
-        float r = ((color >> 16) & 0xFF) / 255.0f;
-        float g = ((color >> 8) & 0xFF) / 255.0f;
-        float b = (color & 0xFF) / 255.0f;
-
-        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
-        net.minecraft.client.renderer.MultiBufferSource bufferSource = guiGraphics.bufferSource();
-        com.mojang.blaze3d.vertex.VertexConsumer consumer = bufferSource
-                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
-
-        double angleStep = 2.0 * Math.PI / numSegments;
-        for (int i = 0; i < numSegments; i++) {
-            double angle1 = i * angleStep;
-            double angle2 = (i + 1) * angleStep;
-
-            float x1 = (float) (cx + radius * Math.cos(angle1));
-            float y1 = (float) (cy + radius * Math.sin(angle1));
-            float x2 = (float) (cx + radius * Math.cos(angle2));
-            float y2 = (float) (cy + radius * Math.sin(angle2));
-
-            // Degenerate Quad (4 vertices representing a triangle) at Z = z
-            consumer.addVertex(matrix, cx, cy, z).setColor(r, g, b, a);
-            consumer.addVertex(matrix, x1, y1, z).setColor(r, g, b, a);
-            consumer.addVertex(matrix, x2, y2, z).setColor(r, g, b, a);
-            consumer.addVertex(matrix, cx, cy, z).setColor(r, g, b, a);
-        }
-    }
-
     private void fillFloat(GuiGraphics guiGraphics, float minX, float minY, float maxX, float maxY, int color) {
         float a = ((color >> 24) & 0xFF) / 255.0f;
         float r = ((color >> 16) & 0xFF) / 255.0f;
@@ -3972,35 +4070,6 @@ public class MapScreen extends Screen {
         int textWidth = mc.font.width(letter);
         guiGraphics.drawString(mc.font, letter, -textWidth / 2, -4, color, true);
         guiGraphics.pose().popPose();
-    }
-
-    private void drawCircleRing(GuiGraphics guiGraphics, float cx, float cy, float r1, float r2, int numSegments,
-            int color) {
-        float a = ((color >> 24) & 0xFF) / 255.0f;
-        float r = ((color >> 16) & 0xFF) / 255.0f;
-        float g = ((color >> 8) & 0xFF) / 255.0f;
-        float b = (color & 0xFF) / 255.0f;
-
-        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
-        net.minecraft.client.renderer.MultiBufferSource bufferSource = guiGraphics.bufferSource();
-        com.mojang.blaze3d.vertex.VertexConsumer consumer = bufferSource
-                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
-
-        double angleStep = 2.0 * Math.PI / numSegments;
-        for (int i = 0; i < numSegments; i++) {
-            double angle1 = i * angleStep;
-            double angle2 = (i + 1) * angleStep;
-
-            float cos1 = (float) Math.cos(angle1);
-            float sin1 = (float) Math.sin(angle1);
-            float cos2 = (float) Math.cos(angle2);
-            float sin2 = (float) Math.sin(angle2);
-
-            consumer.addVertex(matrix, cx + r1 * cos1, cy + r1 * sin1, 0.0f).setColor(r, g, b, a);
-            consumer.addVertex(matrix, cx + r1 * cos2, cy + r1 * sin2, 0.0f).setColor(r, g, b, a);
-            consumer.addVertex(matrix, cx + r2 * cos2, cy + r2 * sin2, 0.0f).setColor(r, g, b, a);
-            consumer.addVertex(matrix, cx + r2 * cos1, cy + r2 * sin1, 0.0f).setColor(r, g, b, a);
-        }
     }
 
     /** Searchable editor for every per-block custom color override. */

@@ -3024,7 +3024,7 @@ public class ChunkScanner {
             sampleZ = (chunkZ << 4) + (nz < 0 ? 2 : 13);
             clampedBorder = true;
         }
-        if (nx != 0 && nz != 0 && !clampedBorder
+        if (nx != 0 && nz != 0
                 && readySurfaceChunk(level, chunkX + nx, chunkZ + nz) == null) {
             sampleX = (chunkX << 4) + (nx < 0 ? 2 : 13);
             sampleZ = (chunkZ << 4) + (nz < 0 ? 2 : 13);
@@ -3067,7 +3067,7 @@ public class ChunkScanner {
             }
             boolean isNetherDim = level.dimension() == Level.NETHER || level.dimensionType().hasCeiling();
             boolean isEndDim = level.dimension() == Level.END;
-            boolean invalidPlains = "minecraft:plains".equals(biomeId) && (isNetherDim || isEndDim || nx != 0 || nz != 0);
+            boolean invalidPlains = "minecraft:plains".equals(biomeId);
             if ((biomeId == null || invalidPlains) && ownChunk != null) {
                 Holder<Biome> ownHolder = ownChunk.getNoiseBiome(
                         blockX >> 2, blockY >> 2, blockZ >> 2);

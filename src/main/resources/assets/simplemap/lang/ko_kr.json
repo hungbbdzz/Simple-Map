@@ -322,5 +322,6 @@
   "gui.simplemap.book.learn_none": "§c이 책에서 학습할 수 있는 지도 구역이 없습니다.",
   "gui.simplemap.book.learn_skipped_damaged": "§e지도를 학습했지만 손상된 구역 %s개를 건너뛰었습니다.",
   "gui.simplemap.book.crumbled": "§e모든 비밀을 익히자 지도 책이 먼지가 되어 부서졌습니다!",
-  "gui.simplemap.book.learn_success": "§a지도를 성공적으로 학습했습니다! 지도가 업데이트되었습니다."
+  "gui.simplemap.book.learn_success": "§a지도를 성공적으로 학습했습니다! 지도가 업데이트되었습니다.",
+  "gui.simplemap.chat.click_to_open_map": "클릭하여 지도에서 [%s, %s] 위치 보기"
 }
