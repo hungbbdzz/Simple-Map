@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Ajustes de Simple Map\nConfigura el minimapa, coordenadas, colores y escaneo.",
   "gui.simplemap.tooltip.waypoint_manager_button": "Gestor de puntos de ruta (Tecla: U)\nGestiona, edita, teletransporta y sigue puntos de ruta.",
   "gui.simplemap.tooltip.waypoint_visibility": "Visibilidad de puntos: %s\nHaz clic para mostrar u ocultar todos los marcadores.",
-  "gui.simplemap.tooltip.refresh_map": "Actualizar mapa visible\nReescanea los chunks cercanos cargados.\nMayús + Clic: centrar en jugador y restablecer zoom.",
+  "gui.simplemap.tooltip.refresh_map": "Actualizar mapa visible\nVolver a escanear chunks cercanos cargados por Minecraft.\nShift-clic: volver a la dimensión actual, centrar en el jugador y restablecer zoom.",
   "gui.simplemap.tooltip.map_brightness": "Brillo del mapa: %s\nAlterna entre DÍA / AUTO / NOCHE.",
   "gui.simplemap.tooltip.dimension_switch": "Dimensión: %s",
   "gui.simplemap.tooltip.cave_top_y": "Altura superior de cueva (Top Y)\nAUTO sigue el nivel subterráneo actual del jugador.\nArrastra a la derecha para fijar una capa.",

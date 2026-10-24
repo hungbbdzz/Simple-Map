@@ -272,7 +272,7 @@ public class MapScreen extends Screen {
         nightModeButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.SUN, button -> {
             MapConfig.minimapNightMode = (MapConfig.minimapNightMode + 1) % 3;
             MapConfig.save();
-            MapManager.getInstance().reloadAllRegions();
+            MapManager.getInstance().onNightModeChanged();
             updateToolbarTooltips();
         });
         this.addRenderableWidget(nightModeButton);
@@ -281,11 +281,25 @@ public class MapScreen extends Screen {
         refreshMapButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.REFRESH, button -> {
             if (this.minecraft != null && this.minecraft.player != null) {
                 if (Screen.hasShiftDown()) {
-                    double dimRatio = MapManager.getInstance().getCrossDimensionCoordinateScale();
-                    this.centerX = this.minecraft.player.getX() * dimRatio;
-                    this.centerZ = this.minecraft.player.getZ() * dimRatio;
+                    MapManager manager = MapManager.getInstance();
+                    if (!"LIVE".equals(selectedDimension) || !manager.isViewingLiveDimension()) {
+                        selectedDimension = "LIVE";
+                        manager.returnToLiveDimension(this.minecraft);
+                        if (caveLayerSlider != null) {
+                            caveLayerSlider.syncBoundsFromDimension();
+                        }
+                        updateCaveControlLayout();
+                        cursorCacheValid = false;
+                        cachedBiomeText = null;
+                        isPopupMenuOpen = false;
+                        updateToolbarTooltips();
+                    }
+                    this.centerX = this.minecraft.player.getX();
+                    this.centerZ = this.minecraft.player.getZ();
                     this.scale = DEFAULT_MAP_SCALE;
+                    clampScaleForCurrentMode();
                     cancelMotionAndOpenAnimation();
+                    FullscreenMapFramebufferRenderer.getInstance().invalidate();
                     return;
                 }
                 ChunkScanner.getInstance().requestRefresh(this.minecraft);
@@ -650,12 +664,13 @@ public class MapScreen extends Screen {
                     guiGraphics, vx, vy, vw, vh, centerX, centerZ,
                     scale, currentRenderScale, partialTick, viewportInteracting);
         }
+        boolean drawPlayerInCurrentDimension = MapManager.getInstance().isViewingLiveDimension();
         if (!framebufferRendered) {
             MapRenderer.getInstance().drawMap(
                 guiGraphics,
                 vx, vy, vw, vh,
                 centerX, centerZ, currentRenderScale,
-                true,
+                drawPlayerInCurrentDimension,
                 false,
                 false, mouseWorldX, mouseWorldZ,
                 partialTick, false
@@ -664,7 +679,7 @@ public class MapScreen extends Screen {
             MapRenderer.getInstance().drawFullscreenOverlays(
                     guiGraphics, vx, vy, vw, vh,
                     centerX, centerZ, currentRenderScale,
-                    true,
+                    drawPlayerInCurrentDimension,
                     mouseWorldX, mouseWorldZ, partialTick);
         }
 
@@ -1477,7 +1492,9 @@ public class MapScreen extends Screen {
                         underair = true;
                         continue;
                     }
-                    if (!fullView && !passedSolidRoof && state.getFluidState().isEmpty()
+                    if (!state.getFluidState().isEmpty()) {
+                        underair = true;
+                    } else if (!fullView && !passedSolidRoof
                             && !CaveMode.isUndergroundSolidRoof(state)) {
                         underair = true;
                     } else {
@@ -1500,39 +1517,19 @@ public class MapScreen extends Screen {
             return null;
         }
 
-        int highestY;
-        if (scanFromWorldTop) {
-            int dimensionTopY = level.dimensionType().hasCeiling()
-                    ? Math.min(122, level.getMaxBuildHeight() - 1)
-                    : (level.getMaxBuildHeight() - 1);
-            highestY = minBuildHeight;
-            boolean foundAir = false;
-            for (int y = dimensionTopY; y >= minBuildHeight; y--) {
-                pos.setY(y);
-                net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
-                if (!foundAir) {
-                    if (state.isAir() || CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
-                        foundAir = true;
-                    }
-                } else {
-                    if (!state.isAir()
-                            && !CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)
-                            && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE) {
-                        highestY = y;
-                        break;
-                    }
-                }
-            }
-        } else {
-            int surfaceY = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE, bx, bz);
-            highestY = minBuildHeight;
-            for (int y = surfaceY; y >= minBuildHeight; y--) {
-                pos.setY(y);
-                net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
-                if (!state.isAir() && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE) {
-                    highestY = y;
-                    break;
-                }
+        int surfaceY = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE, bx, bz);
+        if (surfaceY <= minBuildHeight && scanFromWorldTop) {
+            surfaceY = level.getMaxBuildHeight() - 1;
+        }
+        int highestY = minBuildHeight;
+        for (int y = Math.min(level.getMaxBuildHeight() - 1, surfaceY); y >= minBuildHeight; y--) {
+            pos.setY(y);
+            net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+            if (!state.isAir()
+                    && !CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)
+                    && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE) {
+                highestY = y;
+                break;
             }
         }
 

@@ -521,8 +521,7 @@ public class MapRenderer {
                     minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                     planMinCellX, planMaxCellX, planMinCellZ, planMaxCellZ,
                     hierarchyLevel, caveBranchOnly,
-                    renderScaleClass, keyAttentionPageX, keyAttentionPageZ,
-                    MapConfig.minimapNightMode);
+                    renderScaleClass, keyAttentionPageX, keyAttentionPageZ);
             long nowNanos = System.nanoTime();
             CachedPlan cachedPlan;
             CachedPlan fallbackPlan = null;
@@ -769,8 +768,9 @@ public class MapRenderer {
         // destination backwards. Pan/zoom/offscreen clipping therefore never
         // chooses new guide positions, while player movement still updates the
         // navigation path as expected.
+        boolean viewingLiveDim = MapManager.getInstance().isViewingLiveDimension();
         double crossDimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
-        if (drawPinContent && MapConfig.pinActive) {
+        if (drawPinContent && MapConfig.pinActive && viewingLiveDim) {
             double routePlayerX = net.minecraft.util.Mth.lerp(partialTick,
                     mc.player.xo, mc.player.getX()) * crossDimScale;
             double routePlayerZ = net.minecraft.util.Mth.lerp(partialTick,
@@ -801,7 +801,7 @@ public class MapRenderer {
         }
 
         // 6.5. Render pin marker if active and within visible bounds
-        if (drawPinContent && MapConfig.pinActive) {
+        if (drawPinContent && MapConfig.pinActive && viewingLiveDim) {
             if (MapConfig.pinWorldX >= minX && MapConfig.pinWorldX <= maxX &&
                     MapConfig.pinWorldZ >= minZ && MapConfig.pinWorldZ <= maxZ) {
 
@@ -1332,14 +1332,12 @@ public class MapRenderer {
                         }
                     }
                 }
-                if (MapConfig.minimapNightMode != 0) {
-                    for (int pageZ = minVisiblePageZ;
-                            pageZ <= maxVisiblePageZ; pageZ++) {
-                        for (int pageX = minVisiblePageX;
-                                pageX <= maxVisiblePageX; pageX++) {
-                            collectSurfaceGlowLeaf(builder, surfaceTextures,
-                                    pageX, pageZ, pageTableCoverage);
-                        }
+                for (int pageZ = minVisiblePageZ;
+                        pageZ <= maxVisiblePageZ; pageZ++) {
+                    for (int pageX = minVisiblePageX;
+                            pageX <= maxVisiblePageX; pageX++) {
+                        collectSurfaceGlowLeaf(builder, surfaceTextures,
+                                pageX, pageZ, pageTableCoverage);
                     }
                 }
             }
@@ -3205,12 +3203,11 @@ public class MapRenderer {
     private float getCaveBrightness(Minecraft mc, float partialTick) {
         /*
          * Provide immediate visual response across all Cave modes (Layered & Full)
-         * and all dimensions when cycling Day (0) / Auto (1) / Night (2), while
-         * CaveTextureManager.applyCaveLighting() restyles the underlying tiles so
-         * glowing blocks and block-lit areas stay at 100% brightness.
+         * and all dimensions when cycling Cave light OFF (0) / AUTO (1) / ON (2)
+         * without ever reloading or re-slicing regions.
          */
         if (MapConfig.minimapNightMode == 0) return 1.0f;
-        if (MapConfig.minimapNightMode == 2) return 0.78f;
+        if (MapConfig.minimapNightMode == 2) return 0.72f;
         if (mc != null && mc.level != null
                 && mc.level.dimensionType().hasSkyLight()
                 && !mc.level.dimensionType().hasCeiling()
@@ -3221,7 +3218,7 @@ public class MapRenderer {
                 return 0.82f + 0.18f * (1.0f - skyDarken);
             }
         }
-        return 0.94f;
+        return 0.88f;
     }
 
     private static float baseAmbientBrightness(DimensionMapProfile profile) {
@@ -3571,7 +3568,7 @@ public class MapRenderer {
             int minPlanCellX, int maxPlanCellX,
             int minPlanCellZ, int maxPlanCellZ,
             int hierarchyLevel, boolean caveBranchOnly, int renderScaleClass,
-            int attentionPageX, int attentionPageZ, int nightMode) {
+            int attentionPageX, int attentionPageZ) {
     }
 
     private record StablePlanKey(String dimension, long sessionId, boolean caveMode,

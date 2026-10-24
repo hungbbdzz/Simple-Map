@@ -1175,15 +1175,6 @@ public class ChunkScanner {
         CaveMapManager.getInstance().setActiveLayer(targetLayer);
         CaveTextureManager.getInstance().requestVisiblePages(targetLayer, minX, maxX, minZ, maxZ,
                 scale, focusX, focusZ, lane);
-        if (claimSurfaceWriterPulse()) {
-            long surfaceStarted = System.nanoTime();
-            long surfaceBudget = surfaceDuringCaveBudget(mc);
-            long surfaceDeadline = surfaceStarted + surfaceBudget;
-            seedForegroundSurfaceNeighborhood(mc);
-            scanUrgentLoadedChunks(mc, 0, false, false,
-                    surfaceStarted + foregroundUrgentSlice(surfaceBudget));
-            scanQueuedSurfaceChunks(mc, surfaceDeadline);
-        }
         long budget = scanBudget(mc, true, scale);
         if (budget > 0L) {
             scanVisibleCaveChunks(mc, minX, maxX, minZ, maxZ, focusX, focusZ,
@@ -1264,19 +1255,6 @@ public class ChunkScanner {
         if (cave) CaveMapManager.getInstance().setActiveLayer(fullView ? Integer.MIN_VALUE : layerY);
         if (cave) {
             scanVisibleCaveArea(mc, minX, maxX, minZ, maxZ, scale, focusX, focusZ, lane);
-            // MapScreen suppresses the normal LIVE_CRITICAL lane. Keep a tiny
-            // player-local Surface writer alive here as well, otherwise leaving a
-            // Cave view open makes the Surface archive fall permanently behind the
-            // same already-generated Minecraft chunks.
-            if (claimSurfaceWriterPulse()) {
-                long surfaceStarted = System.nanoTime();
-                long surfaceBudget = surfaceDuringCaveBudget(mc);
-                long surfaceDeadline = surfaceStarted + surfaceBudget;
-                seedForegroundSurfaceNeighborhood(mc);
-                scanUrgentLoadedChunks(mc, 0, false, false,
-                        surfaceStarted + foregroundUrgentSlice(surfaceBudget));
-                scanQueuedSurfaceChunks(mc, surfaceDeadline);
-            }
             return;
         }
 
@@ -1381,11 +1359,10 @@ public class ChunkScanner {
         foregroundSeedCursor = 0;
         foregroundSeedNanos = 0L;
         if (mc != null && CaveMode.isActive(mc)) {
-            CaveMapManager.getInstance().clearCache();
-            CaveTextureManager.getInstance().clearCache();
             boolean fullView = CaveMode.isFullView(mc);
             CaveMapManager.getInstance().setActiveLayer(
                     fullView ? Integer.MIN_VALUE : CaveMode.getLayerY(mc));
+            CaveTextureManager.getInstance().invalidateStyle();
             MapViewportCoordinator.getInstance().onLayerChanged();
         }
         if (mc != null && mc.level != null && mc.player != null) {
@@ -1991,10 +1968,14 @@ public class ChunkScanner {
                     underair = true;
                     continue;
                 }
-                // In Layered Cave, if scanMaximum starts inside open-sky surface foliage/trees
-                // (no solid roof above), treat it as open air immediately so tree canopies are never cut off.
-                if (!fullView && !passedSolidRoof && state.getFluidState().isEmpty()
+                // Fluids (lava seas at Nether Y<=31, underground water lakes) are never a solid rock ceiling;
+                // Reference MapWriter: hitting any fluid when !shouldEnterGround sets underair = true.
+                if (!state.getFluidState().isEmpty()) {
+                    underair = true;
+                } else if (!fullView && !passedSolidRoof
                         && !CaveMode.isUndergroundSolidRoof(state)) {
+                    // In Layered Cave, if scanMaximum starts inside open-sky surface foliage/trees
+                    // (no solid roof above), treat it as open air immediately so tree canopies are never cut off.
                     underair = true;
                 } else {
                     passedSolidRoof = true;
@@ -2326,7 +2307,16 @@ public class ChunkScanner {
         float ridgeLight = Math.min(0.10f, riseAboveNeighbours * 0.018f);
         float roughness = Math.min(0.22f,
                 (Math.abs(west - east) + Math.abs(north - south)) * 0.014f);
-        float shade = 1.0f + directional + ridgeLight - pitShadow - roughness;
+        int sumR2 = Math.max(0, getCaveNeighbourY(level, x - 2, z, layerY, fullView, centerY) - centerY)
+                + Math.max(0, getCaveNeighbourY(level, x + 2, z, layerY, fullView, centerY) - centerY)
+                + Math.max(0, getCaveNeighbourY(level, x, z - 2, layerY, fullView, centerY) - centerY)
+                + Math.max(0, getCaveNeighbourY(level, x, z + 2, layerY, fullView, centerY) - centerY)
+                + Math.max(0, getCaveNeighbourY(level, x - 2, z - 2, layerY, fullView, centerY) - centerY)
+                + Math.max(0, getCaveNeighbourY(level, x + 2, z - 2, layerY, fullView, centerY) - centerY)
+                + Math.max(0, getCaveNeighbourY(level, x - 2, z + 2, layerY, fullView, centerY) - centerY)
+                + Math.max(0, getCaveNeighbourY(level, x + 2, z + 2, layerY, fullView, centerY) - centerY);
+        float depthOcclusion = Math.min(0.12f, (sumR2 * 0.125f) * 0.012f);
+        float shade = 1.0f + directional + ridgeLight - pitShadow - roughness - depthOcclusion;
         return Math.max(0.42f, Math.min(1.28f, shade));
     }
 
@@ -2884,48 +2874,25 @@ public class ChunkScanner {
         BlockPos.MutableBlockPos probe = scratch.position(1,
                 blockX, minimumY, blockZ);
 
-        if (isCaveLikeDimension(level)) {
-            boolean foundAir = false;
-            int startY = level.dimensionType().hasCeiling()
-                    ? Math.min(122, level.getMaxBuildHeight() - 1)
-                    : (level.getMaxBuildHeight() - 1);
-            for (int y = startY; y >= minimumY; y--) {
-                probe.setY(y);
-                BlockState state = loadedChunk == null
-                        ? level.getBlockState(probe)
-                        : loadedChunk.getBlockState(probe);
-                if (!foundAir) {
-                    if (state.isAir() || CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)) {
-                        foundAir = true;
-                    }
-                    continue;
-                }
-                if (isVisibleMapSurface(level, probe, state)) {
-                    captureSurfaceTop(output, level, probe, y, state, true);
-                    return output;
-                }
-            }
-            // A solid pillar from ceiling to floor in a cave/ceiling dimension has no
-            // open surface; return non-visible so it encodes as EMPTY_PACKED (mapped void)
-            // instead of falling through to minimumY=0 Bedrock!
-            output.surfaceY = minimumY;
-            output.visible = false;
-            return output;
-        } else {
-            int highestY = loadedChunk == null
-                    ? level.getHeight(Heightmap.Types.WORLD_SURFACE,
-                            blockX, blockZ)
-                    : loadedChunk.getHeight(Heightmap.Types.WORLD_SURFACE,
-                            blockX & 15, blockZ & 15);
-            for (int y = highestY; y >= minimumY; y--) {
-                probe.setY(y);
-                BlockState state = loadedChunk == null
-                        ? level.getBlockState(probe)
-                        : loadedChunk.getBlockState(probe);
-                if (isVisibleMapSurface(level, probe, state)) {
-                    captureSurfaceTop(output, level, probe, y, state, true);
-                    return output;
-                }
+        // Reference world map behavior (where Cave OFF uses underair = true from WORLD_SURFACE / top of world),
+        // Surface mode always resolves the true top surface (including the Nether roof at Y=127 and any
+        // builds on the roof), while Cave Mode (Layered / Full) penetrates the ceiling at Y<=122.
+        int highestY = loadedChunk == null
+                ? level.getHeight(Heightmap.Types.WORLD_SURFACE,
+                        blockX, blockZ)
+                : loadedChunk.getHeight(Heightmap.Types.WORLD_SURFACE,
+                        blockX & 15, blockZ & 15);
+        if (highestY <= minimumY && isCaveLikeDimension(level)) {
+            highestY = level.getMaxBuildHeight() - 1;
+        }
+        for (int y = Math.min(level.getMaxBuildHeight() - 1, highestY); y >= minimumY; y--) {
+            probe.setY(y);
+            BlockState state = loadedChunk == null
+                    ? level.getBlockState(probe)
+                    : loadedChunk.getBlockState(probe);
+            if (isVisibleMapSurface(level, probe, state)) {
+                captureSurfaceTop(output, level, probe, y, state, true);
+                return output;
             }
         }
 
@@ -3130,32 +3097,17 @@ public class ChunkScanner {
         BlockPos.MutableBlockPos pos = scanScratch.get().position(1,
                 blockX, 0, blockZ);
 
-        if (isCaveLike) {
-            int startY = level.dimensionType().hasCeiling()
-                    ? Math.min(122, level.getMaxBuildHeight() - 1)
-                    : (level.getMaxBuildHeight() - 1);
-            boolean foundAir = false;
-            for (int y = startY; y >= minBuildHeight; y--) {
-                pos.setY(y);
-                BlockState state = loadedChunk == null
-                        ? level.getBlockState(pos) : loadedChunk.getBlockState(pos);
-                if (!foundAir) {
-                    if (state.isAir()) {
-                        foundAir = true;
-                    }
-                } else {
-                    if (isVisibleMapSurface(level, pos, state)) {
-                        return y;
-                    }
-                }
-            }
+        if (false && isCaveLike) {
             return minBuildHeight;
         } else {
             int highestY = loadedChunk == null
                     ? level.getHeight(Heightmap.Types.WORLD_SURFACE, blockX, blockZ)
                     : loadedChunk.getHeight(Heightmap.Types.WORLD_SURFACE,
                             blockX & 15, blockZ & 15);
-            for (int y = highestY; y >= minBuildHeight; y--) {
+            if (highestY <= minBuildHeight && isCaveLike) {
+                highestY = level.getMaxBuildHeight() - 1;
+            }
+            for (int y = Math.min(level.getMaxBuildHeight() - 1, highestY); y >= minBuildHeight; y--) {
                 pos.setY(y);
                 BlockState state = loadedChunk == null
                         ? level.getBlockState(pos) : loadedChunk.getBlockState(pos);
@@ -3355,9 +3307,10 @@ public class ChunkScanner {
      */
     private int getTerrainHeightForSlope(Level level, int x, int z, int referenceY) {
         BlockPos.MutableBlockPos pos = scanScratch.get().position(2, x, 0, z);
-        if (!isCaveLikeDimension(level)) {
+        int heightmapTop = level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
+        if (!isCaveLikeDimension(level) || heightmapTop > level.getMinBuildHeight()) {
             int top = Math.min(level.getMaxBuildHeight() - 1,
-                    level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z));
+                    heightmapTop > level.getMinBuildHeight() ? heightmapTop : referenceY + 8);
             int bottom = Math.max(level.getMinBuildHeight(), top - 8);
             for (int y = top; y >= bottom; y--) {
                 pos.setY(y);

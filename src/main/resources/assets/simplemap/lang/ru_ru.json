@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Настройки Simple Map\nНастройка миникарты, координат, цветов и сканирования.",
   "gui.simplemap.tooltip.waypoint_manager_button": "Менеджер меток (Клавиша: U)\nУправление, изменение, телепортация и отслеживание меток.",
   "gui.simplemap.tooltip.waypoint_visibility": "Видимость меток: %s\nНажмите, чтобы показать или скрыть все метки.",
-  "gui.simplemap.tooltip.refresh_map": "Обновить видимую карту\nПовторно сканировать загруженные чанки рядом.\nShift+клик: центрировать на игроке и сбросить зум.",
+  "gui.simplemap.tooltip.refresh_map": "Обновить видимую карту\nПересканировать близлежащие чанки, загруженные Minecraft.\nShift-клик: вернуться в текущее измерение, центрировать на игроке и сбросить масштаб.",
   "gui.simplemap.tooltip.map_brightness": "Яркость карты: %s\nПереключение ДЕНЬ / АВТО / НОЧЬ.",
   "gui.simplemap.tooltip.dimension_switch": "Измерение: %s",
   "gui.simplemap.tooltip.cave_top_y": "Высота среза пещер (Top Y)\nАВТО следует за текущим подземным уровнем игрока.\nПотяните вправо для выбора фиксированного слоя.",

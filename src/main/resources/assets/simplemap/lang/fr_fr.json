@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Paramètres Simple Map\nConfigurer la minicarte, les coordonnées, les couleurs et le scan.",
   "gui.simplemap.tooltip.waypoint_manager_button": "Gestionnaire de repères (Touche : U)\nGérer, modifier, téléporter et suivre les repères.",
   "gui.simplemap.tooltip.waypoint_visibility": "Visibilité des repères : %s\nCliquer pour afficher ou masquer tous les repères.",
-  "gui.simplemap.tooltip.refresh_map": "Actualiser la carte visible\nRescanner les chunks proches chargés.\nMaj+Clic : centrer sur le joueur et réinitialiser le zoom.",
+  "gui.simplemap.tooltip.refresh_map": "Actualiser la carte visible\nRescanner les tronçons proches chargés par Minecraft.\nMaj-clic : revenir à la dimension actuelle, centrer sur le joueur et réinitialiser le zoom.",
   "gui.simplemap.tooltip.map_brightness": "Luminosité : %s\nAlterner entre JOUR / AUTO / NUIT.",
   "gui.simplemap.tooltip.dimension_switch": "Dimension : %s",
   "gui.simplemap.tooltip.cave_top_y": "Plafond des grottes (Top Y)\nAUTO suit le niveau souterrain du joueur.\nGlisser à droite pour choisir une couche fixe.",

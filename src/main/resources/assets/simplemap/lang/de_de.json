@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Simple Map Einstellungen\nMinikarte, Koordinaten, Farben und Scan konfigurieren.",
   "gui.simplemap.tooltip.waypoint_manager_button": "Wegpunkt-Manager (Taste: U)\nWegpunkte verwalten, bearbeiten, teleportieren und verfolgen.",
   "gui.simplemap.tooltip.waypoint_visibility": "Wegpunkt-Sichtbarkeit: %s\nKlicken, um alle Wegpunkte ein- oder auszublenden.",
-  "gui.simplemap.tooltip.refresh_map": "Sichtbare Karte aktualisieren\nGeladene Chunks in der Nähe neu scannen.\nUmschalt-Klick: Auf Spieler zentrieren & Zoom zurücksetzen.",
+  "gui.simplemap.tooltip.refresh_map": "Sichtbare Karte aktualisieren\nIn der Nähe geladene Chunks neu scannen.\nUmschalt-Klick: zur aktuellen Dimension zurückkehren, auf Spieler zentrieren und Zoom zurücksetzen.",
   "gui.simplemap.tooltip.map_brightness": "Kartenhelligkeit: %s\nWechselt zwischen TAG / AUTO / NACHT.",
   "gui.simplemap.tooltip.dimension_switch": "Dimension: %s",
   "gui.simplemap.tooltip.cave_top_y": "Höhlen-Oberkante (Top Y)\nAUTO folgt der aktuellen Untergrund-Ebene des Spielers.\nNach rechts ziehen, um eine feste Höhlenebene zu wählen.",

@@ -114,7 +114,7 @@
   "gui.simplemap.tooltip.settings_button": "Cài Đặt Simple Map\nTùy chỉnh minimap, tọa độ, màu sắc và quét bản đồ.",
   "gui.simplemap.tooltip.waypoint_manager_button": "Quản Lý Điểm Mốc (Phím: U)\nQuản lý, chỉnh sửa, dịch chuyển và theo dõi điểm mốc.",
   "gui.simplemap.tooltip.waypoint_visibility": "Hiển Thị Điểm Mốc: %s\nNhấp để hiện hoặc ẩn toàn bộ điểm mốc.",
-  "gui.simplemap.tooltip.refresh_map": "Làm Mới Bản Đồ\nQuét lại các chunk lân cận đang được tải.\nShift + Nhấp: căn giữa vào người chơi và đặt lại thu phóng.",
+  "gui.simplemap.tooltip.refresh_map": "Làm Mới Bản Đồ\nQuét lại các chunk lân cận đang được tải.\nShift + Nhấp: về chiều không gian hiện tại, căn giữa vào người chơi và đặt lại thu phóng.",
   "gui.simplemap.tooltip.map_brightness": "Độ Sáng Bản Đồ: %s\nChuyển chế độ sáng NGÀY / TỰ ĐỘNG / ĐÊM.",
   "gui.simplemap.tooltip.dimension_switch": "Chiều không gian: %s",
   "gui.simplemap.tooltip.cave_top_y": "Độ Cao Trần Hang (Top Y)\nTỰ ĐỘNG bám theo tầng ngầm hiện tại của người chơi.\nKéo sang phải để chọn một tầng hang cố định.",
