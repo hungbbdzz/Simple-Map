@@ -977,19 +977,15 @@ public final class SurfaceColorizer {
             if (MapConfig.blockColorOverrides.isEmpty()) return;
             MapConfig.blockColorOverrides.clear();
             MapConfig.save();
-            MapSessionManager.getInstance().bumpStyleGeneration();
-            MapTextureManager.getInstance().clearDerivedColorCaches();
-            MapTextureManager.getInstance().invalidateStyle();
+            MapManager.getInstance().reloadAllRegions();
             MapTextureManager.getInstance().uploadDirtyTextures(true);
-            requestLiveCaveRefresh();
         }
 
         private static void refreshBlockOverride(String blockId) {
             MapConfig.save();
-            MapSessionManager.getInstance().bumpStyleGeneration();
             MapTextureManager.getInstance().invalidateBlockColor(blockId);
+            MapManager.getInstance().reloadAllRegions();
             MapTextureManager.getInstance().uploadDirtyTextures(true);
-            requestLiveCaveRefresh();
         }
 
         private static void requestLiveCaveRefresh() {

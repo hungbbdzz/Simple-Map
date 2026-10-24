@@ -902,7 +902,7 @@ public final class CaveTextureManager {
     }
 
     public void invalidateStyle() {
-        CaveMapManager.clearColorCache();
+        CaveMapManager.getInstance().invalidateStyle();
         synchronized (pages) {
             for (PageEntry entry : pages.values()) {
                 entry.dirty = true;
@@ -1521,6 +1521,29 @@ public final class CaveTextureManager {
             BLOCK_KIND_CACHE.clear();
             BLOCK_EMISSION_CACHE.clear();
             BIOME_TINT_CACHE.clear();
+        }
+
+        public void invalidateStyle() {
+            clearColorCache();
+            List<CaveRegion> toReslice = new ArrayList<>();
+            int currentLayer = activeLayerY;
+            synchronized (regions) {
+                for (RegionHolder holder : regions.values()) {
+                    CaveRegion reg = holder.region;
+                    if (reg != null && !reg.isClosed()) {
+                        reg.resetForStyleRefresh();
+                        toReslice.add(reg);
+                    }
+                }
+            }
+            for (CaveRegion reg : toReslice) {
+                int targetLayer = reg.band == Integer.MIN_VALUE
+                        ? Integer.MIN_VALUE
+                        : (currentLayer != Integer.MIN_VALUE
+                                && CaveLayerBand.key(CaveView.LAYERED, currentLayer) == reg.band
+                                ? currentLayer : reg.band);
+                materialize(targetLayer, reg.rx, reg.rz, false, true);
+            }
         }
 
         /** Kiểm tra xem block có phải là khối đặc thực sự của lòng đất (làm tắt shouldEnterGround ở Full Cave). */
@@ -3516,6 +3539,20 @@ public final class CaveTextureManager {
                 lock.lock();
                 try { return Arrays.copyOf(pixels, pixels.length); }
                 finally { lock.unlock(); }
+            }
+
+            public void resetForStyleRefresh() {
+                lock.lock();
+                try {
+                    if (closed) return;
+                    livePixels.clear();
+                    liveChunks.clear();
+                    Arrays.fill(writtenChunkLayerY, UNWRITTEN_LAYER);
+                    anvilSliced = false;
+                    writtenAnvilLayerY = Integer.MAX_VALUE;
+                } finally {
+                    lock.unlock();
+                }
             }
 
             public void replacePixels(int[] source) {

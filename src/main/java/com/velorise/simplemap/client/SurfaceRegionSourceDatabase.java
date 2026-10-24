@@ -525,6 +525,22 @@ public final class SurfaceRegionSourceDatabase {
                 key -> key.sessionId() == sessionId);
     }
 
+    public void invalidateStyle() {
+        synchronized (batchProgress) {
+            batchProgress.clear();
+        }
+        resetCaptureAllowance();
+        pageWarmRetryAfterNanos.clear();
+        RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        if (stamp != null && stamp.isCurrent()) {
+            for (long packed : MapManager.getInstance().loadedRegionCoordinates()) {
+                int rx = (int) (packed >> 32);
+                int rz = (int) packed;
+                warmLoadedRegion(stamp, rx, rz, MapRequestLane.FULLSCREEN);
+            }
+        }
+    }
+
     public void clear() {
         synchronized (sources) {
             for (SurfaceRegionSource source : sources.values()) {
@@ -983,8 +999,10 @@ public final class SurfaceRegionSourceDatabase {
                             }
                         }
                         if (state == 0) missing++;
-                        else if (state == 1) dirty++;
-                        else present++;
+                        else {
+                            present++;
+                            if (state == 1) dirty++;
+                        }
                         long position = ((long) (regionZ - minRegionZ) << 24)
                                 ^ ((long) (regionX - minRegionX) << 16)
                                 ^ ((long) chunkZ << 8) ^ chunkX;

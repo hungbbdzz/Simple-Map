@@ -88,7 +88,7 @@ public class MapTextureManager {
     /** Offscreen dirty is a reconstructable revision marker, not retained work. */
     private static final long HISTORICAL_DIRTY_RETENTION_NANOS = 2_000_000_000L;
     /** Brief adaptive sweep after palette/profile changes. */
-    private static final long STYLE_REFRESH_WINDOW_MS = 2_500L;
+    private static final long STYLE_REFRESH_WINDOW_MS = 6_000L;
     /** Bounded ordered fullscreen window. Admission adapts to measured CPU pressure. */
     private static final int FULLSCREEN_ACTIVE_WINDOW_MIN = 6;
     private static final int FULLSCREEN_ACTIVE_WINDOW_MAX = 48;
@@ -1410,6 +1410,9 @@ public class MapTextureManager {
         int zoomCap = MapSurfaceDemandPolicy.exactActiveWindow(
                 scale, pressure, visiblePageCount);
         if (zoomCap <= 0) return 0;
+        if (!pressure && System.currentTimeMillis() < styleRefreshUntilMs) {
+            return Math.min(visiblePageCount, Math.max(zoomCap, FULLSCREEN_ACTIVE_WINDOW_MAX));
+        }
         if (pressure) return Math.min(FULLSCREEN_ACTIVE_WINDOW_MIN, zoomCap);
         int adaptive = MapWorkScheduler.cpuTotalCost() < 240
                 && MapWorkScheduler.cpuActiveCount() < 2
@@ -2510,19 +2513,22 @@ public class MapTextureManager {
         // A branch worker may still read the last color snapshot shared with it.
         // Detach exactly once after such a publication; between branch milestones
         // the render thread owns the retained arrays and merges subtiles in place.
-        int[] mergedColor = page.colorPixels == null
+        boolean styleGenerationChanged = page.publishedStamp != null
+                && preparedStamp != null
+                && page.publishedStamp.styleGeneration() != preparedStamp.styleGeneration();
+        int[] mergedColor = (page.colorPixels == null || styleGenerationChanged)
                 ? new int[expected]
                 : page.pixelSnapshotShared
                         ? java.util.Arrays.copyOf(page.colorPixels, expected)
                         : page.colorPixels;
-        int[] mergedGlow = page.glowPixels == null
+        int[] mergedGlow = (page.glowPixels == null || styleGenerationChanged)
                 ? new int[expected] : page.glowPixels;
-        long[] mergedRows = page.knownRows == null
+        long[] mergedRows = (page.knownRows == null || styleGenerationChanged)
                 ? new long[MapPageLayout.PAGE_SIZE] : page.knownRows;
         mergeCompleteSubtiles(mergedColor, prepared.styled(), incomingSubtiles);
         mergeCompleteSubtiles(mergedGlow, prepared.glow(), incomingSubtiles);
         mergeSubtileKnownRows(mergedRows, incomingSubtiles);
-        int previousCompleteSubtiles = page.completeSubtileMask;
+        int previousCompleteSubtiles = styleGenerationChanged ? 0 : page.completeSubtileMask;
         int mergedSubtiles = previousCompleteSubtiles | incomingSubtiles;
         int knownColumns = countKnownColumns(mergedRows);
 
@@ -4201,9 +4207,16 @@ public class MapTextureManager {
     }
 
     public void invalidateStyle() {
+        clearDerivedColorCaches();
         SurfaceLodTree.invalidatePersistentCache();
         styleRefreshUntilMs = System.currentTimeMillis() + STYLE_REFRESH_WINDOW_MS;
         lastUploadTime = 0L;
+        synchronized (pendingSurfaceBatches) {
+            batchCaptureAttemptNanos.clear();
+            batchCaptureDeferrals.clear();
+            captureClusterAttemptNanos.clear();
+            captureClusterDeferrals.clear();
+        }
         synchronized (textureCache) {
             synchronized (pageCache) {
                 synchronized (dirtyTextures) {
@@ -4214,7 +4227,15 @@ public class MapTextureManager {
                         lastDirtyNanos.put(key, now);
                         dirtyTextures.add(key);
                     }
-                    for (String leafKey : pageCache.keySet()) {
+                    for (Map.Entry<String, PageTextureInfo> entry : pageCache.entrySet()) {
+                        String leafKey = entry.getKey();
+                        PageTextureInfo page = entry.getValue();
+                        if (page != null) {
+                            page.retryAfterNanos = 0L;
+                            page.gpuRetryAfterNanos = 0L;
+                            page.residencyRetryAfterNanos = 0L;
+                            page.gpuReservationFailures = 0;
+                        }
                         pageRevisions.merge(leafKey, 1L, Long::sum);
                         dirtyPageSubtileMasks.put(leafKey,
                                 MapPageLayout.FULL_SUBTILE_MASK);

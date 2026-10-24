@@ -2504,9 +2504,8 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.mapColorProfile = (MapConfig.mapColorProfile + 1) % MapColorProfile.NAMES.length;
                     button.setMessage(getMapStyleMessage());
-                    MapSessionManager.getInstance().bumpStyleGeneration();
-                    MapTextureManager.getInstance().invalidateStyle();
-                    CaveTextureManager.getInstance().invalidateStyle();
+                    MapConfig.save();
+                    MapManager.getInstance().reloadAllRegions();
                 }).bounds(col1X, 152, colW, 20)
                 .tooltip(Tooltip.create(Component.literal("Cycle the overall map color profile.")))
                 .build();
@@ -2811,9 +2810,7 @@ public class MapScreen extends Screen {
         CaveMode.clearManualLayer();
         CaveMapManager.getInstance().deactivate();
         ChunkScanner.getInstance().reset();
-        MapSessionManager.getInstance().bumpStyleGeneration();
-        MapTextureManager.getInstance().invalidateStyle();
-        CaveTextureManager.getInstance().invalidateStyle();
+        MapManager.getInstance().reloadAllRegions();
     }
 
     private void updateTabButtons() {
@@ -3112,12 +3109,7 @@ public class MapScreen extends Screen {
 
     private void refreshLoadedMapData() {
         MapConfig.save();
-        MapSessionManager.getInstance().bumpStyleGeneration();
-        ChunkScanner.getInstance().reset();
-        if (this.minecraft == null || this.minecraft.player == null) return;
-        ChunkScanner.getInstance().requestRefresh(this.minecraft);
-        MapTextureManager.getInstance().invalidateStyle();
-        CaveTextureManager.getInstance().invalidateStyle();
+        MapManager.getInstance().reloadAllRegions();
     }
 
     private boolean isRemoteServerSession() {
@@ -4085,9 +4077,12 @@ public class MapScreen extends Screen {
     private static final String DIM_OVERWORLD = "minecraft:overworld";
     private static final String DIM_NETHER = "minecraft:the_nether";
     private static final String DIM_END = "minecraft:the_end";
-    private static final int ROW_HEIGHT = 36;
+    private static final int ROW_HEIGHT = 38;
 
     private final Screen parent;
+    private final String previousViewDimension;
+    private final boolean previousViewWasLive;
+    private boolean previousViewRestored;
     private final List<WaypointManager.Waypoint> filteredWaypoints = new ArrayList<>();
     private final List<Button> tabButtons = new ArrayList<>();
     private int selectedTab;
@@ -4095,40 +4090,79 @@ public class MapScreen extends Screen {
     private EditBox searchBox;
     private WaypointManager.Waypoint pendingDelete;
     private long pendingDeleteUntilNanos;
+    private WaypointManager.Waypoint focusedWaypoint;
+
+    private int panelLeft;
+    private int panelTop;
+    private int panelWidth;
+    private int panelHeight;
+    private double previewCenterX;
+    private double previewCenterZ;
+    private String previewDimension;
+    private float previewScale = 0.55f;
+    private boolean previewInitialized;
+    private boolean draggingMap;
+    private double dragStartX;
+    private double dragStartY;
 
     public WaypointListScreen(Screen parent) {
         super(Component.translatable("gui.simplemap.waypoint_manager_title"));
         this.parent = parent;
+        this.previousViewDimension = MapManager.getInstance().getCurrentDimensionResourceId();
+        this.previousViewWasLive = MapManager.getInstance().isViewingLiveDimension();
+        this.previewDimension = this.previousViewDimension;
     }
 
     @Override
     protected void init() {
         tabButtons.clear();
-        int centerX = width / 2;
 
-        searchBox = new EditBox(font, centerX - 130, 38, 260, 18,
-                Component.translatable("gui.simplemap.search_waypoints"));
-        searchBox.setHint(Component.literal("Search name, coordinate or dimension..."));
-        searchBox.setResponder(value -> refreshWaypoints());
-        addRenderableWidget(searchBox);
+        if (!previewInitialized) {
+            previewInitialized = true;
+            if (parent instanceof MapScreen mapScreen && mapScreen.scale > 0.05f) {
+                previewScale = mapScreen.scale;
+                previewCenterX = mapScreen.centerX;
+                previewCenterZ = mapScreen.centerZ;
+            } else if (minecraft != null && minecraft.player != null) {
+                previewScale = Math.max(0.35f, Math.min(0.85f, (this.width - 2) / 1200.0f));
+                previewCenterX = minecraft.player.getX();
+                previewCenterZ = minecraft.player.getZ();
+            }
+        }
 
-        String[] tabs = { "All", "Overworld", "Nether", "End", "Modded" };
-        int tabWidth = 72;
-        int tabGap = 3;
-        int tabStart = centerX - (tabWidth * tabs.length + tabGap * (tabs.length - 1)) / 2;
+        // Sleek, translucent left-docked glass panel matching AddWaypointScreen
+        panelWidth = Math.min(256, Math.max(220, this.width - 24));
+        panelLeft = Math.max(8, Math.min(14, this.width / 28));
+        panelTop = Math.max(8, Math.min(14, this.height / 24));
+        panelHeight = Math.max(184, this.height - panelTop * 2);
+
+        int leftX = panelLeft + 8;
+        int fieldWidth = panelWidth - 16;
+
+        String[] tabs = { "All", "Over", "Nether", "End", "Mod" };
+        int tabGap = 2;
+        int tabWidth = Math.max(28, (fieldWidth - tabGap * (tabs.length - 1)) / tabs.length);
+        int tabY = panelTop + 21;
         for (int index = 0; index < tabs.length; index++) {
             final int tab = index;
             Button button = Button.builder(Component.literal(tabs[index]), b -> setTab(tab))
-                    .bounds(tabStart + index * (tabWidth + tabGap), 13, tabWidth, 18).build();
+                    .bounds(leftX + index * (tabWidth + tabGap), tabY, tabWidth, 16).build();
             tabButtons.add(button);
             addRenderableWidget(button);
         }
 
-        int bottomY = height - 28;
+        searchBox = new EditBox(font, leftX, panelTop + 40, fieldWidth, 16,
+                Component.translatable("gui.simplemap.search_waypoints"));
+        searchBox.setHint(Component.literal("Search name, coords or dim..."));
+        searchBox.setResponder(value -> refreshWaypoints());
+        addRenderableWidget(searchBox);
+
+        int halfButton = (fieldWidth - 4) / 2;
+        int bottomY = panelTop + panelHeight - 23;
         addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.add_waypoint"), button -> openAddScreen())
-                .bounds(centerX - 126, bottomY, 120, 20).build());
+                .bounds(leftX, bottomY, halfButton, 18).build());
         addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.done"), button -> onClose())
-                .bounds(centerX + 6, bottomY, 120, 20).build());
+                .bounds(leftX + halfButton + 4, bottomY, halfButton, 18).build());
 
         refreshWaypoints();
         updateTabLabels();
@@ -4136,9 +4170,14 @@ public class MapScreen extends Screen {
 
     private void openAddScreen() {
         if (minecraft == null || minecraft.player == null) return;
-        minecraft.setScreen(new AddWaypointScreen(this,
-                minecraft.player.getX(), minecraft.player.getY(), minecraft.player.getZ(),
-                MapManager.getInstance().getLiveDimensionResourceId()));
+        double targetX = focusedWaypoint != null ? focusedWaypoint.x : minecraft.player.getX();
+        double targetY = focusedWaypoint != null && focusedWaypoint.hasY
+                ? focusedWaypoint.y : minecraft.player.getY();
+        double targetZ = focusedWaypoint != null ? focusedWaypoint.z : minecraft.player.getZ();
+        String targetDim = focusedWaypoint != null && focusedWaypoint.dimension != null
+                ? focusedWaypoint.dimension
+                : MapManager.getInstance().getLiveDimensionResourceId();
+        minecraft.setScreen(new AddWaypointScreen(this, targetX, targetY, targetZ, targetDim));
     }
 
     private void setTab(int tab) {
@@ -4150,10 +4189,10 @@ public class MapScreen extends Screen {
     }
 
     private void updateTabLabels() {
-        String[] tabs = { "All", "Overworld", "Nether", "End", "Modded" };
+        String[] tabs = { "All", "Over", "Nether", "End", "Mod" };
         for (int index = 0; index < tabButtons.size(); index++) {
             tabButtons.get(index).setMessage(Component.literal(
-                    index == selectedTab ? "[" + tabs[index] + "]" : tabs[index]));
+                    index == selectedTab ? "§b" + tabs[index] : tabs[index]));
         }
     }
 
@@ -4172,6 +4211,11 @@ public class MapScreen extends Screen {
         filteredWaypoints.sort(Comparator
                 .comparing((WaypointManager.Waypoint waypoint) -> waypoint.dimension)
                 .thenComparing(waypoint -> waypoint.name.toLowerCase(Locale.ROOT)));
+        if (focusedWaypoint != null && !filteredWaypoints.contains(focusedWaypoint)) {
+            focusedWaypoint = filteredWaypoints.isEmpty() ? null : filteredWaypoints.get(0);
+        } else if (focusedWaypoint == null && !filteredWaypoints.isEmpty()) {
+            focusedWaypoint = filteredWaypoints.get(0);
+        }
         clampScroll();
     }
 
@@ -4188,24 +4232,69 @@ public class MapScreen extends Screen {
     }
 
     private int listTop() {
-        return 63;
+        return panelTop + 60;
     }
 
     private int listBottom() {
-        return height - 35;
+        return panelTop + panelHeight - 28;
     }
 
     private int listWidth() {
-        return Math.min(650, width - 24);
+        return panelWidth - 16;
     }
 
     private int listLeft() {
-        return (width - listWidth()) / 2;
+        return panelLeft + 8;
+    }
+
+    private boolean isInsidePanel(double mouseX, double mouseY) {
+        return mouseX >= panelLeft && mouseX <= panelLeft + panelWidth
+                && mouseY >= panelTop && mouseY <= panelTop + panelHeight;
+    }
+
+    private double getMapAreaCenterX() {
+        int rightAreaLeft = panelLeft + panelWidth;
+        int rightAreaWidth = Math.max(40, this.width - rightAreaLeft);
+        return rightAreaLeft + rightAreaWidth * 0.5;
+    }
+
+    private void focusWaypointOnPreview(WaypointManager.Waypoint waypoint) {
+        if (waypoint == null) return;
+        focusedWaypoint = waypoint;
+        previewCenterX = waypoint.x;
+        previewCenterZ = waypoint.z;
+        String targetDim = MapManager.getInstance().resolveDimensionResourceId(waypoint.dimension);
+        previewDimension = targetDim;
+        ensurePreviewDimensionViewed(targetDim);
+        if (parent instanceof MapScreen mapScreen) {
+            mapScreen.centerX = waypoint.x;
+            mapScreen.centerZ = waypoint.z;
+        }
+    }
+
+    private void ensurePreviewDimensionViewed(String dimension) {
+        if (minecraft == null || dimension == null || dimension.isBlank()) return;
+        MapManager manager = MapManager.getInstance();
+        String target = manager.resolveDimensionResourceId(dimension);
+        if (target.equals(manager.getCurrentDimensionResourceId())) return;
+        if (target.equals(manager.getLiveDimensionResourceId())) {
+            manager.returnToLiveDimension(minecraft);
+        } else {
+            manager.switchToDimension(target);
+        }
+    }
+
+    private void restorePreviousMapView() {
+        if (previousViewRestored || minecraft == null) return;
+        previousViewRestored = true;
+        MapManager manager = MapManager.getInstance();
+        if (previousViewWasLive) manager.returnToLiveDimension(minecraft);
+        else if (previousViewDimension != null) manager.switchToDimension(previousViewDimension);
     }
 
     private int maximumScroll() {
         return Math.max(0, filteredWaypoints.size() * ROW_HEIGHT
-                - (listBottom() - listTop() - 2));
+                - (listBottom() - listTop() - 4));
     }
 
     private void clampScroll() {
@@ -4215,69 +4304,125 @@ public class MapScreen extends Screen {
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX,
             double scrollY) {
-        if (mouseY >= listTop() && mouseY <= listBottom()) {
-            scrollAmount -= scrollY * 22.0;
-            clampScroll();
-            return true;
+        if (isInsidePanel(mouseX, mouseY)) {
+            if (mouseY >= listTop() && mouseY <= listBottom()) {
+                scrollAmount -= scrollY * 22.0;
+                clampScroll();
+                return true;
+            }
+            return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
         }
-        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        previewScale = Math.max(0.0625f,
+                Math.min(8.0f, previewScale + (float) scrollY * 0.15f * previewScale));
+        return true;
     }
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
         if (super.mouseClicked(mouseX, mouseY, button)) return true;
+        if (!isInsidePanel(mouseX, mouseY)) {
+            if (button == 0) {
+                draggingMap = true;
+                dragStartX = mouseX;
+                dragStartY = mouseY;
+                return true;
+            } else if (button == 1 && minecraft != null) {
+                float backgroundScale = Math.max(0.0625f, previewScale);
+                double anchorScreenX = getMapAreaCenterX();
+                double anchorScreenY = this.height * 0.5;
+                double mapCenterX = previewCenterX - (anchorScreenX - this.width * 0.5) / backgroundScale;
+                double mapCenterZ = previewCenterZ - (anchorScreenY - this.height * 0.5) / backgroundScale;
+                double clickedX = Math.floor(mapCenterX + (mouseX - this.width * 0.5) / backgroundScale) + 0.5;
+                double clickedZ = Math.floor(mapCenterZ + (mouseY - this.height * 0.5) / backgroundScale) + 0.5;
+                String dim = MapManager.getInstance().getCurrentDimensionResourceId();
+                minecraft.setScreen(new AddWaypointScreen(this, clickedX, clickedZ, dim));
+                return true;
+            }
+            return false;
+        }
         if (button != 0 || mouseY < listTop() || mouseY > listBottom()) return false;
 
-        int startY = listTop() - (int) scrollAmount;
+        int left = listLeft();
+        int width = listWidth();
+        if (mouseX < left || mouseX > left + width) return false;
+
+        int startY = listTop() + 2 - (int) scrollAmount;
         for (int index = 0; index < filteredWaypoints.size(); index++) {
             int rowY = startY + index * ROW_HEIGHT;
             if (rowY + ROW_HEIGHT < listTop() || rowY > listBottom()) continue;
-            if (mouseY < rowY + 7 || mouseY > rowY + 27) continue;
+            if (mouseY < rowY || mouseY >= rowY + ROW_HEIGHT) continue;
 
             WaypointManager.Waypoint waypoint = filteredWaypoints.get(index);
-            RowActions actions = rowActions();
-            if (inside(mouseX, actions.pinX, actions.buttonWidth)) {
-                toggleTracked(waypoint);
-                return true;
+            RowActions actions = rowActions(rowY);
+            if (mouseY >= actions.buttonY && mouseY <= actions.buttonY + actions.buttonHeight) {
+                if (inside(mouseX, actions.pinX, actions.pinWidth)) {
+                    toggleTracked(waypoint);
+                    return true;
+                }
+                if (inside(mouseX, actions.editX, actions.editWidth)) {
+                    if (minecraft != null) minecraft.setScreen(new AddWaypointScreen(this, waypoint));
+                    return true;
+                }
+                if (inside(mouseX, actions.shareX, actions.shareWidth)) {
+                    share(waypoint);
+                    return true;
+                }
+                if (inside(mouseX, actions.teleportX, actions.teleportWidth)) {
+                    teleport(waypoint);
+                    return true;
+                }
+                if (inside(mouseX, actions.deleteX, actions.deleteWidth)) {
+                    confirmDelete(waypoint);
+                    return true;
+                }
             }
-            if (inside(mouseX, actions.editX, actions.buttonWidth)) {
-                if (minecraft != null) minecraft.setScreen(new AddWaypointScreen(this, waypoint));
-                return true;
-            }
-            if (inside(mouseX, actions.shareX, actions.shareWidth)) {
-                share(waypoint);
-                return true;
-            }
-            if (inside(mouseX, actions.teleportX, actions.smallButtonWidth)) {
-                teleport(waypoint);
-                return true;
-            }
-            if (inside(mouseX, actions.deleteX, actions.deleteWidth)) {
-                confirmDelete(waypoint);
-                return true;
-            }
+            focusWaypointOnPreview(waypoint);
+            return true;
         }
         return false;
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+        if (draggingMap && button == 0) {
+            previewCenterX -= dragX / Math.max(0.01f, previewScale);
+            previewCenterZ -= dragY / Math.max(0.01f, previewScale);
+            return true;
+        }
+        return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (draggingMap && button == 0) {
+            draggingMap = false;
+            return true;
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
     }
 
     private static boolean inside(double mouseX, int x, int width) {
         return mouseX >= x && mouseX <= x + width;
     }
 
-    private RowActions rowActions() {
-        int right = listLeft() + listWidth() - 9;
-        int gap = 4;
-        int deleteWidth = 48;
-        int smallWidth = 30;
-        int normalWidth = 44;
-        int shareWidth = 42;
+    private RowActions rowActions(int rowY) {
+        int right = listLeft() + listWidth() - 5;
+        int gap = 2;
+        int buttonHeight = 13;
+        int buttonY = rowY + ROW_HEIGHT - buttonHeight - 3;
+        int deleteWidth = 28;
+        int teleportWidth = 18;
+        int shareWidth = 26;
+        int editWidth = 22;
+        int pinWidth = 24;
         int deleteX = right - deleteWidth;
-        int teleportX = deleteX - gap - smallWidth;
+        int teleportX = deleteX - gap - teleportWidth;
         int shareX = teleportX - gap - shareWidth;
-        int editX = shareX - gap - normalWidth;
-        int pinX = editX - gap - normalWidth;
+        int editX = shareX - gap - editWidth;
+        int pinX = editX - gap - pinWidth;
         return new RowActions(pinX, editX, shareX, teleportX, deleteX,
-                normalWidth, shareWidth, smallWidth, deleteWidth);
+                pinWidth, editWidth, shareWidth, teleportWidth, deleteWidth,
+                buttonY, buttonHeight);
     }
 
     private void toggleTracked(WaypointManager.Waypoint waypoint) {
@@ -4293,6 +4438,7 @@ public class MapScreen extends Screen {
 
     private void openOnMap(WaypointManager.Waypoint waypoint) {
         if (minecraft == null) return;
+        previousViewRestored = true;
         MapScreen map = parent instanceof MapScreen parentMap
                 ? parentMap : new MapScreen();
         minecraft.setScreen(map);
@@ -4300,6 +4446,7 @@ public class MapScreen extends Screen {
     }
 
     private void share(WaypointManager.Waypoint waypoint) {
+        restorePreviousMapView();
         if (parent instanceof MapScreen map) {
             map.onClose();
         } else if (minecraft != null
@@ -4326,6 +4473,7 @@ public class MapScreen extends Screen {
                 : MapTeleportController.defaultTargetY(targetDimension);
         if (MapTeleportController.teleport(minecraft, targetDimension,
                 (int) Math.floor(waypoint.x), targetY, (int) Math.floor(waypoint.z))) {
+            previousViewRestored = true;
             MapManager.getInstance().returnToLiveDimension(minecraft);
             MapViewportCoordinator.getInstance().closeFullscreen();
             minecraft.setScreen(null);
@@ -4355,79 +4503,160 @@ public class MapScreen extends Screen {
             pendingDelete = null;
         }
 
+        float backgroundScale = Math.max(0.0625f, previewScale);
+        double anchorScreenX = getMapAreaCenterX();
+        double anchorScreenY = height * 0.5;
+        double mapCenterX = previewCenterX - (anchorScreenX - width * 0.5) / backgroundScale;
+        double mapCenterZ = previewCenterZ - (anchorScreenY - height * 0.5) / backgroundScale;
+        double mouseWorldX = mapCenterX + (mouseX - width * 0.5) / backgroundScale;
+        double mouseWorldZ = mapCenterZ + (mouseY - height * 0.5) / backgroundScale;
+
+        // 1. Render unobstructed live map + all waypoints in the background
+        MapRenderer.getInstance().drawMap(guiGraphics, 0, 0, width, height,
+                mapCenterX, mapCenterZ, backgroundScale,
+                MapManager.getInstance().isViewingLiveDimension(), false, false,
+                mouseWorldX, mouseWorldZ, partialTick, false);
+
         RenderSystem.disableDepthTest();
         RenderSystem.enableBlend();
         RenderSystem.defaultBlendFunc();
         RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
 
-        guiGraphics.fill(0, 0, width, height, 0xF0101010);
+        // 2. Highlight currently focused waypoint on the map
+        if (focusedWaypoint != null) {
+            int markerScreenX = (int) Math.round(width * 0.5 + (focusedWaypoint.x - mapCenterX) * backgroundScale);
+            int markerScreenY = (int) Math.round(height * 0.5 + (focusedWaypoint.z - mapCenterZ) * backgroundScale);
+            guiGraphics.renderOutline(markerScreenX - 11, markerScreenY - 11, 22, 22, 0xD000E5FF);
+            guiGraphics.renderOutline(markerScreenX - 12, markerScreenY - 12, 24, 24, 0x5500E5FF);
+        }
+
+        // 3. Subtle interaction hint at the top of the open map area
+        String mapHint = "Click row: focus · Drag map: pan · Scroll: zoom · Right-click map: +waypoint";
+        int hintW = font.width(mapHint);
+        int hintX = Math.max(panelLeft + panelWidth + 8, (int) Math.round(anchorScreenX) - hintW / 2);
+        if (hintX + hintW + 6 < width) {
+            guiGraphics.fill(hintX - 5, 6, hintX + hintW + 5, 19, 0x680C0E12);
+            guiGraphics.drawString(font, mapHint, hintX, 9, 0xFFD0D8E0, false);
+        }
+
+        // 4. Sleek translucent glass panel on the left (matching AddWaypointScreen)
+        guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
+                panelTop + panelHeight, 0x7A101318);
+        guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
+                panelTop + 18, 0x88181D24);
+        guiGraphics.renderOutline(panelLeft, panelTop, panelWidth, panelHeight, 0x984A5462);
+
+        // Header with title and waypoint count badge
+        guiGraphics.drawString(font, title, panelLeft + 8, panelTop + 5, 0xFFFFFFFF, false);
+        String countBadge = Integer.toString(filteredWaypoints.size());
+        int countW = font.width(countBadge);
+        guiGraphics.fill(panelLeft + panelWidth - countW - 12, panelTop + 3,
+                panelLeft + panelWidth - 6, panelTop + 15, 0x6600E5FF);
+        guiGraphics.drawString(font, countBadge, panelLeft + panelWidth - countW - 9,
+                panelTop + 5, 0xFFFFFFFF, false);
+
         int left = listLeft();
         int top = listTop();
         int bottom = listBottom();
-        int listWidth = listWidth();
-        guiGraphics.fill(left, top, left + listWidth, bottom, 0xFF191919);
-        guiGraphics.renderOutline(left, top, listWidth, bottom - top, 0xFF707070);
-        guiGraphics.renderOutline(left + 1, top + 1, listWidth - 2,
-                bottom - top - 2, 0xFF080808);
+        int listW = listWidth();
+        guiGraphics.fill(left, top, left + listW, bottom, 0x480A0C10);
+        guiGraphics.renderOutline(left, top, listW, bottom - top, 0x7838424E);
 
-        guiGraphics.enableScissor(left + 2, top + 2, left + listWidth - 2, bottom - 2);
-        int startY = top - (int) scrollAmount;
-        RowActions actions = rowActions();
+        guiGraphics.enableScissor(left + 1, top + 1, left + listW - 1, bottom - 1);
+        int startY = top + 2 - (int) scrollAmount;
         for (int index = 0; index < filteredWaypoints.size(); index++) {
             int rowY = startY + index * ROW_HEIGHT;
             if (rowY + ROW_HEIGHT < top || rowY > bottom) continue;
             WaypointManager.Waypoint waypoint = filteredWaypoints.get(index);
-            boolean hover = mouseX >= left && mouseX <= left + listWidth
+            boolean hover = mouseX >= left && mouseX <= left + listW
                     && mouseY >= rowY && mouseY < rowY + ROW_HEIGHT
                     && mouseY >= top && mouseY <= bottom;
-            int background = hover ? 0xFF303030 : (index % 2 == 0 ? 0xFF202020 : 0xFF252525);
-            guiGraphics.fill(left + 2, rowY + 1, left + listWidth - 2,
+            boolean focused = waypoint == focusedWaypoint;
+            int background = focused
+                    ? (hover ? 0x961E3648 : 0x82182C3C)
+                    : (hover ? 0x7A242C38 : (index % 2 == 0 ? 0x58141820 : 0x66181D26));
+            guiGraphics.fill(left + 2, rowY + 1, left + listW - 2,
                     rowY + ROW_HEIGHT - 1, background);
+            if (focused) {
+                guiGraphics.renderOutline(left + 2, rowY + 1, listW - 4,
+                        ROW_HEIGHT - 2, 0x9800E5FF);
+            }
 
-            renderWaypointIcon(guiGraphics, waypoint, left + 8, rowY + 8);
-            String name = waypoint.deathPoint ? waypoint.name + " [Death]" : waypoint.name;
-            guiGraphics.drawString(font, name, left + 34, rowY + 6, 0xFFFFFFFF, false);
+            renderWaypointIcon(guiGraphics, waypoint, left + 6, rowY + 5);
+            String rawName = waypoint.deathPoint ? waypoint.name + " [Death]" : waypoint.name;
+            String dimShort = shortDimensionLabel(waypoint.dimension);
+            int dimW = font.width(dimShort);
+            int maxNameW = Math.max(40, listW - 34 - dimW - 10);
+            String trimmedName = font.plainSubstrByWidth(rawName, maxNameW);
+            guiGraphics.drawString(font, trimmedName, left + 27, rowY + 4,
+                    waypoint.deathPoint ? 0xFFFF8A80 : 0xFFFFFFFF, false);
+            guiGraphics.drawString(font, dimShort, left + listW - dimW - 5, rowY + 4,
+                    0xFF8CA0B5, false);
+
             String yText = waypoint.hasY ? Integer.toString((int) Math.floor(waypoint.y)) : "—";
-            String coordinates = String.format(Locale.ROOT, "X %d  Y %s  Z %d  ·  %s",
-                    (int) Math.floor(waypoint.x), yText, (int) Math.floor(waypoint.z),
-                    MapManager.displayDimensionName(waypoint.dimension));
-            guiGraphics.drawString(font, coordinates, left + 34, rowY + 20,
-                    0xFFAAAAAA, false);
+            String coordinates = String.format(Locale.ROOT, "%d, %s, %d",
+                    (int) Math.floor(waypoint.x), yText, (int) Math.floor(waypoint.z));
+            RowActions actions = rowActions(rowY);
+            int maxCoordW = Math.max(30, actions.pinX - (left + 27) - 3);
+            String trimmedCoords = font.plainSubstrByWidth(coordinates, maxCoordW);
+            guiGraphics.drawString(font, trimmedCoords, left + 27, rowY + 22,
+                    0xFFA8B2BD, false);
 
-            drawCompactButton(guiGraphics, actions.pinX, rowY + 7,
-                    actions.buttonWidth, 20, isTracked(waypoint) ? "Stop" : "Follow",
-                    mouseX, mouseY);
-            drawCompactButton(guiGraphics, actions.editX, rowY + 7,
-                    actions.buttonWidth, 20, "Edit", mouseX, mouseY);
-            drawCompactButton(guiGraphics, actions.shareX, rowY + 7,
-                    actions.shareWidth, 20, "Share", mouseX, mouseY);
-            drawCompactButton(guiGraphics, actions.teleportX, rowY + 7,
-                    actions.smallButtonWidth, 20, "TP", mouseX, mouseY);
-            drawCompactButton(guiGraphics, actions.deleteX, rowY + 7,
-                    actions.deleteWidth, 20,
-                    pendingDelete == waypoint ? "Confirm" : "Delete", mouseX, mouseY);
+            boolean tracked = isTracked(waypoint);
+            drawCompactButton(guiGraphics, actions.pinX, actions.buttonY,
+                    actions.pinWidth, actions.buttonHeight,
+                    tracked ? "Stop" : "Pin", tracked ? 0x881E5E3A : 0x66242C36, mouseX, mouseY);
+            drawCompactButton(guiGraphics, actions.editX, actions.buttonY,
+                    actions.editWidth, actions.buttonHeight,
+                    "Edit", 0x66242C36, mouseX, mouseY);
+            drawCompactButton(guiGraphics, actions.shareX, actions.buttonY,
+                    actions.shareWidth, actions.buttonHeight,
+                    "Share", 0x66242C36, mouseX, mouseY);
+            drawCompactButton(guiGraphics, actions.teleportX, actions.buttonY,
+                    actions.teleportWidth, actions.buttonHeight,
+                    "TP", 0x6622384A, mouseX, mouseY);
+            boolean confirming = pendingDelete == waypoint;
+            drawCompactButton(guiGraphics, actions.deleteX, actions.buttonY,
+                    actions.deleteWidth, actions.buttonHeight,
+                    confirming ? "Sure?" : "Del",
+                    confirming ? 0xAA8B2626 : 0x663A2226, mouseX, mouseY);
         }
         guiGraphics.disableScissor();
 
+        // Thin scrollbar indicator inside the list well
+        int maxScroll = maximumScroll();
+        if (maxScroll > 0) {
+            int trackH = bottom - top - 4;
+            int thumbH = Math.max(14, (int) ((double) trackH * trackH / (trackH + maxScroll)));
+            int thumbY = top + 2 + (int) ((trackH - thumbH) * (scrollAmount / maxScroll));
+            guiGraphics.fill(left + listW - 3, thumbY, left + listW - 1, thumbY + thumbH, 0x9900E5FF);
+        }
+
         if (filteredWaypoints.isEmpty()) {
-            String empty = "No waypoints match this view";
-            guiGraphics.drawCenteredString(font, empty, width / 2,
-                    top + (bottom - top) / 2 - 4, 0xFFAAAAAA);
+            String empty = "No matching waypoints";
+            guiGraphics.drawCenteredString(font, empty, panelLeft + panelWidth / 2,
+                    top + (bottom - top) / 2 - 4, 0xFFA8B2BD);
         }
 
         super.render(guiGraphics, mouseX, mouseY, partialTick);
         RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
     }
 
+    private static String shortDimensionLabel(String dimension) {
+        if (isVanillaDimension(dimension, "overworld")) return "Overworld";
+        if (isVanillaDimension(dimension, "the_nether")) return "Nether";
+        if (isVanillaDimension(dimension, "the_end")) return "End";
+        return MapManager.displayDimensionName(dimension);
+    }
+
     private void renderWaypointIcon(GuiGraphics guiGraphics,
             WaypointManager.Waypoint waypoint, int x, int y) {
-        guiGraphics.fill(x - 2, y - 2, x + 20, y + 20, 0xFF111111);
-        guiGraphics.renderOutline(x - 2, y - 2, 22, 22, 0xFF606060);
+        guiGraphics.fill(x - 1, y - 1, x + 17, y + 17, 0x660C0F14);
+        guiGraphics.renderOutline(x - 1, y - 1, 18, 18, 0x804A5462);
         String itemId = WaypointManager.resolveIconItemId(waypoint);
         ResourceLocation location = ResourceLocation.tryParse(itemId);
         Item item = location == null ? Items.COMPASS : BuiltInRegistries.ITEM.get(location);
         if (item == null || item == Items.AIR) item = Items.COMPASS;
-        // Every waypoint icon occupies the same 16x16 slot regardless of its map scale.
         guiGraphics.renderFakeItem(new ItemStack(item), x, y);
         RenderSystem.disableDepthTest();
         RenderSystem.enableBlend();
@@ -4436,16 +4665,22 @@ public class MapScreen extends Screen {
     }
 
     private void drawCompactButton(GuiGraphics guiGraphics, int x, int y,
-            int width, int height, String text, int mouseX, int mouseY) {
+            int width, int height, String text, int baseColor, int mouseX, int mouseY) {
         boolean hover = mouseX >= x && mouseX <= x + width
                 && mouseY >= y && mouseY <= y + height;
-        int background = hover ? 0xFF555555 : 0xFF343434;
+        int background = hover ? 0x9938485C : baseColor;
         guiGraphics.fill(x, y, x + width, y + height, background);
         guiGraphics.renderOutline(x, y, width, height,
-                hover ? 0xFFFFFFFF : 0xFF707070);
-        int textWidth = font.width(text);
-        guiGraphics.drawString(font, text, x + (width - textWidth) / 2,
-                y + (height - 8) / 2, 0xFFFFFFFF, false);
+                hover ? 0xFF00E5FF : 0x805A6675);
+        guiGraphics.pose().pushPose();
+        float scale = 0.78f;
+        int textWidth = Math.round(font.width(text) * scale);
+        float drawX = x + (width - textWidth) * 0.5f;
+        float drawY = y + (height - 8 * scale) * 0.5f + 0.5f;
+        guiGraphics.pose().translate(drawX, drawY, 0.0f);
+        guiGraphics.pose().scale(scale, scale, 1.0f);
+        guiGraphics.drawString(font, text, 0, 0, 0xFFFFFFFF, false);
+        guiGraphics.pose().popPose();
     }
 
     private static boolean isVanillaDimension(String dimension, String path) {
@@ -4458,6 +4693,7 @@ public class MapScreen extends Screen {
 
     @Override
     public void onClose() {
+        restorePreviousMapView();
         if (minecraft != null) minecraft.setScreen(parent);
     }
 
@@ -4467,8 +4703,8 @@ public class MapScreen extends Screen {
     }
 
     private record RowActions(int pinX, int editX, int shareX,
-            int teleportX, int deleteX, int buttonWidth, int shareWidth,
-            int smallButtonWidth, int deleteWidth) {
+            int teleportX, int deleteX, int pinWidth, int editWidth, int shareWidth,
+            int teleportWidth, int deleteWidth, int buttonY, int buttonHeight) {
     }
 
     /**
