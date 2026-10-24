@@ -1546,7 +1546,9 @@ public class MapScreen extends Screen {
     }
 
     private float getMinimumStableScale() {
-        return MapConfig.MINIMUM_ZOOM_SCALE;
+        double guiScale = this.minecraft == null || this.minecraft.getWindow() == null
+                ? 1.0D : Math.max(1.0D, this.minecraft.getWindow().getGuiScale());
+        return Math.max(0.015625f, (float) (0.0625D / guiScale));
     }
 
     private void clampScaleForCurrentMode() {
@@ -1660,6 +1662,12 @@ public class MapScreen extends Screen {
             MapScreen.this.markViewportInteraction();
             dragging = true;
             super.onClick(mouseX, mouseY);
+        }
+
+        @Override
+        protected void onDrag(double mouseX, double mouseY, double dragX, double dragY) {
+            MapScreen.this.markViewportInteraction();
+            super.onDrag(mouseX, mouseY, dragX, dragY);
         }
 
         @Override
@@ -4952,7 +4960,7 @@ public class MapScreen extends Screen {
         }
 
         public static final class WaypointMapPickerScreen extends Screen {
-            private static final float MIN_SCALE = 0.1f;
+            private static final float MIN_SCALE = 0.015625f;
             private static final float MAX_SCALE = 12.0f;
 
             private final AddWaypointScreen parent;

@@ -57,8 +57,8 @@ public final class MapViewportCoordinator {
     private static final long LOADED_SURFACE_HALO_INTERVAL_NANOS = 50_000_000L;
     private static final long HIDDEN_CAVE_HALO_INTERVAL_NANOS = 150_000_000L;
     private static final long CAVE_ADJACENT_WARMUP_INTERVAL_NANOS = 2_000_000_000L;
-    private static final long CAVE_FULLSCREEN_SOURCE_IDLE_INTERVAL_NANOS = 8_000_000L;
-    private static final long CAVE_FULLSCREEN_SOURCE_INTERACT_INTERVAL_NANOS = 16_000_000L;
+    private static final long CAVE_FULLSCREEN_SOURCE_IDLE_INTERVAL_NANOS = 40_000_000L;
+    private static final long CAVE_FULLSCREEN_SOURCE_INTERACT_INTERVAL_NANOS = 75_000_000L;
     private static final long LOADED_SURFACE_HALO_GAME_BUDGET_NANOS = 6_000_000L;
     private static final long LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS = 5_000_000L;
     private LayerStreamState layerStream = new LayerStreamState();
@@ -447,6 +447,7 @@ public final class MapViewportCoordinator {
          * only foreground hard stop and scanVisibleCaveArea() enforces it again.
          */
         if (fullscreenCaveVisible
+                && !fullscreen.interacting
                 && MapManager.getInstance().isViewingLiveDimension()
                 && !MapActivityGate.getInstance().blocksForegroundStreaming()) {
             long caveSourceInterval = fullscreen.interacting
@@ -709,12 +710,16 @@ public final class MapViewportCoordinator {
             double schedulingFocusX = (request.minX + request.maxX) * 0.5;
             double schedulingFocusZ = (request.minZ + request.maxZ) * 0.5;
             int targetLayer = full ? Integer.MIN_VALUE : layerY;
+            double guiScale = minecraft == null || minecraft.getWindow() == null
+                    ? 1.0D : Math.max(1.0D, minecraft.getWindow().getGuiScale());
+            float physicalScale = MapLodPolicy.MapRenderScalePolicy.physicalPixelsPerBlock(
+                    request.scale, guiScale);
             CaveMapManager.getInstance().setActiveLayer(targetLayer);
             requestLayerRegions(request, targetLayer);
             CaveTextureManager.getInstance().requestVisiblePages(
                     targetLayer,
                     request.minX, request.maxX, request.minZ, request.maxZ,
-                    request.scale, schedulingFocusX, schedulingFocusZ,
+                    physicalScale, schedulingFocusX, schedulingFocusZ,
                     request.lane);
             return true;
         }
@@ -753,10 +758,10 @@ public final class MapViewportCoordinator {
             layerStream = LayerStreamState.create(dimension, layerY,
                     minRx, maxRx, minRz, maxRz, focusRx, focusRz);
         } else if (layerStream.cursor >= layerStream.regions.size()
-                && System.nanoTime() - layerStream.completedAtNanos >= 4_000_000_000L) {
+                && System.nanoTime() - layerStream.completedAtNanos >= 15_000_000_000L) {
             // A slow maintenance pass catches previously saturated IO or newly
             // written archive data without producing a visible centre-out wave
-            // every 750 ms over an already cached selected-Y layer.
+            // or allocating empty regions every few seconds.
             layerStream.cursor = 0;
         }
 
@@ -768,22 +773,26 @@ public final class MapViewportCoordinator {
             int[] region = layerStream.regions.get(layerStream.cursor++);
             int rx = region[0];
             int rz = region[1];
+            if (!layers.hasRegionFile(layerY, rx, rz)
+                    && !layers.isRegionLoaded(layerY, rx, rz)) {
+                continue;
+            }
             processed++;
 
-            layers.requestVisibleRegion(layerY, rx, rz);
             boolean alreadySliced = layers.isRegionAnvilSlicedAtLayer(layerY, rx, rz);
             boolean warmExactTexture = alreadySliced
-                    || (layers.hasRegionFile(layerY, rx, rz)
-                            && textures.peekRegionTexture(layerY, rx, rz) != null);
-            // A warm exact-layer GPU texture or already-sliced region is already the requested result.
-            if (!warmExactTexture && (layers.hasRegionFile(layerY, rx, rz)
-                    || layers.isRegionLoaded(layerY, rx, rz))) {
-                int dx = rx - layerStream.centerRx;
-                int dz = rz - layerStream.centerRz;
-                int priority = 250_000 - (dx * dx + dz * dz) * 100;
-                MapProcessor.getInstance().enqueueCaveLoad(
-                        layerY, rx, rz, Math.max(1, priority));
+                    || (layers.isRegionLoaded(layerY, rx, rz)
+                            && (textures.peekRegionTexture(layerY, rx, rz) != null
+                                    || textures.hasAnyPageTexture(layerY, rx, rz)));
+            if (warmExactTexture) {
+                continue;
             }
+            layers.requestVisibleRegion(layerY, rx, rz);
+            int dx = rx - layerStream.centerRx;
+            int dz = rz - layerStream.centerRz;
+            int priority = 250_000 - (dx * dx + dz * dz) * 100;
+            MapProcessor.getInstance().enqueueCaveLoad(
+                    layerY, rx, rz, Math.max(1, priority));
         }
         if (layerStream.cursor >= layerStream.regions.size()) {
             layerStream.completedAtNanos = System.nanoTime();
@@ -916,10 +925,18 @@ public final class MapViewportCoordinator {
             state.maxRz = maxRz;
             state.centerRx = Math.max(minRx, Math.min(maxRx, focusRx));
             state.centerRz = Math.max(minRz, Math.min(maxRz, focusRz));
+            CaveMapManager layers = CaveMapManager.getInstance();
+            int clampedMinRx = Math.max(minRx, state.centerRx - 12);
+            int clampedMaxRx = Math.min(maxRx, state.centerRx + 12);
+            int clampedMinRz = Math.max(minRz, state.centerRz - 12);
+            int clampedMaxRz = Math.min(maxRz, state.centerRz + 12);
             List<int[]> regions = new ArrayList<>();
-            for (int rx = minRx; rx <= maxRx; rx++) {
-                for (int rz = minRz; rz <= maxRz; rz++) {
-                    regions.add(new int[] { rx, rz });
+            for (int rx = clampedMinRx; rx <= clampedMaxRx; rx++) {
+                for (int rz = clampedMinRz; rz <= clampedMaxRz; rz++) {
+                    if (layers.hasRegionFile(layerY, rx, rz)
+                            || layers.isRegionLoaded(layerY, rx, rz)) {
+                        regions.add(new int[] { rx, rz });
+                    }
                 }
             }
             regions.sort(Comparator

@@ -79,9 +79,9 @@ public class ChunkScanner {
     private static final int BASE_VERTICAL_COST = 24;
     // Increase per-tick nano budgets to allow broader scanning for larger explored areas
     private static final long SURFACE_SCAN_BUDGET_NANOS = 5_000_000L;
-    private static final long CAVE_SCAN_BUDGET_NANOS = 7_000_000L;
-    private static final long MAP_SCREEN_SCAN_BUDGET_NANOS = 18_000_000L;
-    private static final long MAP_SCREEN_BALANCED_BUDGET_NANOS = 9_000_000L;
+    private static final long CAVE_SCAN_BUDGET_NANOS = 2_000_000L;
+    private static final long MAP_SCREEN_SCAN_BUDGET_NANOS = 2_800_000L;
+    private static final long MAP_SCREEN_BALANCED_BUDGET_NANOS = 2_200_000L;
     private static final int MAP_SCREEN_MAX_VISITED_PIXELS = 32_768;
     private static final int IMMEDIATE_COLUMNS_PER_TICK = 64;
     /** One-shot main-thread budget used only after committing a different Top-Y. */
@@ -1167,7 +1167,7 @@ public class ChunkScanner {
         CaveMapManager.getInstance().setActiveLayer(targetLayer);
         CaveTextureManager.getInstance().requestVisiblePages(targetLayer, minX, maxX, minZ, maxZ,
                 scale, focusX, focusZ, lane);
-        long budget = scanBudget(mc, true);
+        long budget = scanBudget(mc, true, scale);
         if (budget > 0L) {
             scanVisibleCaveChunks(mc, minX, maxX, minZ, maxZ, focusX, focusZ,
                     layerY, fullView, System.nanoTime() + budget);
@@ -1177,14 +1177,24 @@ public class ChunkScanner {
     private void scanVisibleCaveChunks(Minecraft mc, double minX, double maxX,
             double minZ, double maxZ, double focusX, double focusZ,
             int layerY, boolean fullView, long deadline) {
-        int minChunkX = ((int) Math.floor(minX)) >> 4;
-        int maxChunkX = ((int) Math.floor(maxX)) >> 4;
-        int minChunkZ = ((int) Math.floor(minZ)) >> 4;
-        int maxChunkZ = ((int) Math.floor(maxZ)) >> 4;
-        int centerChunkX = ((int) Math.floor(focusX)) >> 4;
-        int centerChunkZ = ((int) Math.floor(focusZ)) >> 4;
-        int maxRadius = Math.max(Math.max(Math.abs(centerChunkX - minChunkX), Math.abs(centerChunkX - maxChunkX)),
-                Math.max(Math.abs(centerChunkZ - minChunkZ), Math.abs(centerChunkZ - maxChunkZ)));
+        if (mc.player == null || mc.level == null) return;
+        int playerChunkX = mc.player.getBlockX() >> 4;
+        int playerChunkZ = mc.player.getBlockZ() >> 4;
+        int loadedRadius = Math.max(4, mc.options.getEffectiveRenderDistance() + 2);
+
+        int minChunkX = Math.max(((int) Math.floor(minX)) >> 4, playerChunkX - loadedRadius);
+        int maxChunkX = Math.min(((int) Math.floor(maxX)) >> 4, playerChunkX + loadedRadius);
+        int minChunkZ = Math.max(((int) Math.floor(minZ)) >> 4, playerChunkZ - loadedRadius);
+        int maxChunkZ = Math.min(((int) Math.floor(maxZ)) >> 4, playerChunkZ + loadedRadius);
+        if (minChunkX > maxChunkX || minChunkZ > maxChunkZ) {
+            return;
+        }
+
+        int centerChunkX = Math.max(minChunkX, Math.min(maxChunkX, ((int) Math.floor(focusX)) >> 4));
+        int centerChunkZ = Math.max(minChunkZ, Math.min(maxChunkZ, ((int) Math.floor(focusZ)) >> 4));
+        int maxRadius = Math.min(64, Math.max(
+                Math.max(Math.abs(centerChunkX - minChunkX), Math.abs(centerChunkX - maxChunkX)),
+                Math.max(Math.abs(centerChunkZ - minChunkZ), Math.abs(centerChunkZ - maxChunkZ))));
 
         int[] order = getRadialChunkOrder(maxRadius);
         for (int i = 0; i < order.length && System.nanoTime() < deadline; i++) {
@@ -1529,21 +1539,23 @@ public class ChunkScanner {
     }
 
     private long scanBudget(Minecraft mc, boolean cave) {
+        return scanBudget(mc, cave, 1.0f);
+    }
+
+    private long scanBudget(Minecraft mc, boolean cave, float scale) {
         MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
         if (mc.screen instanceof MapScreen) {
             long governed = cave
-                    ? governor.fullscreenCaveBudgetNanos(1.0f, MapConfig.fastFullscreenLoading)
-                    : governor.fullscreenScanBudgetNanos(1.0f, MapConfig.fastFullscreenLoading);
+                    ? governor.fullscreenCaveBudgetNanos(scale, MapConfig.fastFullscreenLoading)
+                    : governor.fullscreenScanBudgetNanos(scale, MapConfig.fastFullscreenLoading);
             return governed <= 0L ? 0L
                     : Math.min(MAP_SCREEN_SCAN_BUDGET_NANOS, governed);
         }
         long governed = governor.gameplayScanBudgetNanos(cave);
         if (governed <= 0L) return 0L;
         long base = cave ? CAVE_SCAN_BUDGET_NANOS : SURFACE_SCAN_BUDGET_NANOS;
-        // The governor budget is the aggregate client-thread deadline. Multiplying
-        // it by four silently turned a nominal 0.7-1.5 ms slice into 2.8-6 ms and
-        // made a 125 FPS (8 ms) target impossible before rendering even began.
-        return Math.min(base, Math.max(cave ? 1_500_000L : 80_000L, governed));
+        // The governor budget is the aggregate client-thread deadline.
+        return Math.min(base, Math.max(cave ? 800_000L : 80_000L, governed));
     }
 
     private int resolveSampleTarget(boolean cave) {
@@ -1842,9 +1854,9 @@ public class ChunkScanner {
         int topY = isCaveLikeDimension(level)
                 ? ceilingCap
                 : Math.max(minimumY, Math.min(ceilingCap,
-                        chunk != null
+                        (chunk != null
                                 ? chunk.getHeight(Heightmap.Types.WORLD_SURFACE, blockX & 15, blockZ & 15)
-                                : level.getHeight(Heightmap.Types.WORLD_SURFACE, blockX, blockZ)));
+                                : level.getHeight(Heightmap.Types.WORLD_SURFACE, blockX, blockZ)) + 1));
         if (topY <= minimumY) return packCavePixel(0, CaveRegion.NO_SURFACE, false, false);
         int caveMidpoint = isCaveLikeDimension(level) ? 64 : 0;
         return scanCaveColumn(level, chunk, blockX, blockZ, topY, minimumY, caveMidpoint, true);
@@ -1852,9 +1864,9 @@ public class ChunkScanner {
 
     /**
      * Unified continuous column scanner for both Layered Cave and Full Cave.
-     * Continuous column scan maintaining ground and air transitions across sections.
-     * state machine ({@code shouldEnterGround} + {@code underair}) and preserves
-     * full tree canopies, biome colors, water depth overlays, and thin floor blocks.
+     * Direct LevelChunkSection palette lookups and O(1) cached state predicates keep
+     * per-column cost sub-microsecond while preserving full tree canopies, biome colors,
+     * water depth overlays, and thin floor blocks.
      */
     private long scanCaveColumn(Level level, LevelChunk chunk, int blockX, int blockZ,
             int scanMaximum, int scanMinimum, int bandCenterY, boolean fullView) {
@@ -1868,6 +1880,8 @@ public class ChunkScanner {
 
         LevelChunkSection[] sections = chunk != null ? chunk.getSections() : null;
         int minSectionY = Math.floorDiv(minimumY, 16);
+        int localX = blockX & 15;
+        int localZ = blockZ & 15;
         boolean isCaveDim = isCaveLikeDimension(level);
         boolean hasSkyLight = level.dimensionType().hasSkyLight() && !level.dimensionType().hasCeiling();
         boolean showFlowers = MapConfig.displayFlowers;
@@ -1877,6 +1891,7 @@ public class ChunkScanner {
         boolean passedSolidRoof = fullView || isCaveDim;
 
         for (int y = scanMaximum; y >= scanMinimum; y--) {
+            BlockState state = null;
             if (sections != null) {
                 int sIdx = (y - minimumY) >> 4;
                 if (sIdx >= 0 && sIdx < sections.length) {
@@ -1891,11 +1906,13 @@ public class ChunkScanner {
                         }
                         continue;
                     }
+                    state = sec.getBlockState(localX, y & 15, localZ);
                 }
             }
-
-            probePos.setY(y);
-            BlockState state = chunk != null ? chunk.getBlockState(probePos) : level.getBlockState(probePos);
+            if (state == null) {
+                probePos.setY(y);
+                state = chunk != null ? chunk.getBlockState(probePos) : level.getBlockState(probePos);
+            }
             if (state == null || state.isAir()) {
                 if (!shouldEnterGround) {
                     underair = true;
@@ -1906,7 +1923,7 @@ public class ChunkScanner {
             // 1. Full Cave surface-skip phase: ignore surface water, leaves, trees, glass roofs,
             // giant mushrooms, and foliage until hitting the first real underground solid block.
             if (shouldEnterGround) {
-                if (isUndergroundTerrainEntry(level, probePos, state)) {
+                if (CaveMode.isUndergroundSolidRoof(state)) {
                     shouldEnterGround = false;
                     underair = false;
                     passedSolidRoof = true;
@@ -1923,7 +1940,7 @@ public class ChunkScanner {
                 // In Layered Cave, if scanMaximum starts inside open-sky surface foliage/trees
                 // (no solid roof above), treat it as open air immediately so tree canopies are never cut off.
                 if (!fullView && !passedSolidRoof && state.getFluidState().isEmpty()
-                        && !isUndergroundTerrainEntry(level, probePos, state)) {
+                        && !CaveMode.isUndergroundSolidRoof(state)) {
                     underair = true;
                 } else {
                     passedSolidRoof = true;
@@ -1991,8 +2008,9 @@ public class ChunkScanner {
             }
 
             // 6. Solid or thin floor block (carpets, rails, redstone wire, glow lichen, mineshaft planks, leaves, stone, etc.):
+            probePos.setY(y);
             boolean emissiveFeature = isOpenEmissiveFeature(level, probePos, state);
-            boolean shortBlock = CaveMode.isShortFloorBlock(level, probePos, state);
+            boolean shortBlock = CaveMode.isShortFloorBlock(state);
             if (shortBlock && !emissiveFeature && !state.is(net.minecraft.tags.BlockTags.RAILS)) {
                 if (y - 1 >= minimumY) {
                     colorPos.setY(y - 1);
@@ -2258,6 +2276,9 @@ public class ChunkScanner {
     }
 
     private int getCaveBlockColor(Level level, LevelChunk chunk, BlockPos pos, BlockState state) {
+        if (!CaveTextureManager.requiresCaveBiomeTint(state)) {
+            return CaveTextureManager.resolveCaveBlockBaseColor(state);
+        }
         net.minecraft.world.level.biome.Biome biome = resolveCaveBiome(level, chunk, pos);
         if (biome != null) {
             int grassTint = SurfaceColorizer.BiomeColors.getGrassColor(biome);
