@@ -1802,7 +1802,6 @@ public class MapRenderer {
         int px = Math.floorMod(globalPageX, MapPageLayout.PAGES_PER_REGION);
         int pz = Math.floorMod(globalPageZ, MapPageLayout.PAGES_PER_REGION);
         CaveAtlasRegion page = source.page(rx, rz, px, pz, scale);
-        TileKey pageKey = source.pageKey(globalPageX, globalPageZ, scale);
         if (page == null) {
             CaveLeafSelection fallback = source.fallbackPage(
                     rx, rz, px, pz, scale);
@@ -1811,13 +1810,16 @@ public class MapRenderer {
                         rx, rz, px, pz, MapRenderPlan.PHASE_L1_EXACT_UNDERLAY);
                 drawnRegions.add(packRegion(rx, rz));
             }
-            if (logicalExactCoverage && pageKey != null) {
-                addLogicalCavePageQuad(builder, pageKey, globalPageX,
-                        globalPageZ, phase);
+            if (logicalExactCoverage) {
+                TileKey pageKey = source.pageKey(globalPageX, globalPageZ, scale);
+                if (pageKey != null) {
+                    addLogicalCavePageQuad(builder, pageKey, globalPageX,
+                            globalPageZ, phase);
+                }
             }
             return false;
         }
-        addCavePageQuad(builder, pageKey, page, rx, rz, px, pz, phase);
+        addCavePageQuad(builder, null, page, rx, rz, px, pz, phase);
         drawnRegions.add(packRegion(rx, rz));
         return true;
     }
