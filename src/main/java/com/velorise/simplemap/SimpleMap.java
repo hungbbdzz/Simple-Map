@@ -170,9 +170,11 @@ public class SimpleMap {
             event.register(CYCLE_COLOR_MODE_KEY);
             event.register(CYCLE_TERRAIN_MODE_KEY);
             event.register(CENTER_FULL_MAP_KEY);
-            event.register(TOGGLE_DEBUG_OVERLAY_KEY);
-            event.register(TOGGLE_DEBUG_RECORDING_KEY);
-            event.register(MARK_DEBUG_ISSUE_KEY);
+            if (MapDebugRecorder.DEBUG_ENABLED) {
+                event.register(TOGGLE_DEBUG_OVERLAY_KEY);
+                event.register(TOGGLE_DEBUG_RECORDING_KEY);
+                event.register(MARK_DEBUG_ISSUE_KEY);
+            }
         }
     }
 
@@ -420,7 +422,9 @@ public class SimpleMap {
             MapObservationScheduler.getInstance().tick(mc,
                     SimpleMap.isMapUnlocked(mc.player),
                     mc.screen instanceof MapScreen);
-            MapDebugRecorder.getInstance().tick(mc);
+            if (MapDebugRecorder.DEBUG_ENABLED) {
+                MapDebugRecorder.getInstance().tick(mc);
+            }
 
             // 2.25. Create one bounded death waypoint on the transition into death.
             // Polling the local player avoids relying on loader-specific client death events.
@@ -449,13 +453,15 @@ public class SimpleMap {
             // 3. Handle configurable map actions only during normal gameplay. This
             // prevents N/L/M and zoom keys from firing while the player types in chat,
             // edits a waypoint name or uses another screen.
-            // Diagnostic controls remain available while MapScreen is open.
-            drain(ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY,
-                    () -> MapDebugRecorder.getInstance().toggleOverlay());
-            drain(ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY,
-                    () -> MapDebugRecorder.getInstance().toggleRecording(mc));
-            drain(ClientModEvents.MARK_DEBUG_ISSUE_KEY,
-                    () -> MapDebugRecorder.getInstance().markIssue(mc));
+            // Diagnostic controls are active only when -Dsimplemap.debug=true is enabled.
+            if (MapDebugRecorder.DEBUG_ENABLED) {
+                drain(ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY,
+                        () -> MapDebugRecorder.getInstance().toggleOverlay());
+                drain(ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY,
+                        () -> MapDebugRecorder.getInstance().toggleRecording(mc));
+                drain(ClientModEvents.MARK_DEBUG_ISSUE_KEY,
+                        () -> MapDebugRecorder.getInstance().markIssue(mc));
+            }
 
             if (mc.screen == null) {
                 drain(ClientModEvents.OPEN_MAP_KEY, () -> MapKeybindActions.toggleFullMap(mc));

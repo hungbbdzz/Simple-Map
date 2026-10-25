@@ -41,7 +41,7 @@ public final class SurfaceRegionSourceDatabase {
     private static final SurfaceRegionSourceDatabase INSTANCE =
             new SurfaceRegionSourceDatabase();
 
-    private static final int MAX_SOURCE_REGIONS = 64;
+    private static final int MAX_SOURCE_REGIONS = 160;
     private static final int MAX_CAPTURE_REGIONS = 4;
     // Chunk completion wakes the affected capture immediately. Keep only a slow
     // safety retry for unchanged partial windows; rebuilding the same incomplete
@@ -49,8 +49,8 @@ public final class SurfaceRegionSourceDatabase {
     private static final long UNCHANGED_PARTIAL_BACKGROUND_RETRY_NANOS = 4_000_000_000L;
     private static final long UNCHANGED_PARTIAL_FOREGROUND_RETRY_NANOS = 180_000_000L;
     private static final long CHUNK_SOURCE_BYTES = 4_608L;
-    private static final int MAX_REGION_WARM_IN_FLIGHT = 2;
-    private static final int MAX_PAGE_WARM_IN_FLIGHT = 24;
+    private static final int MAX_REGION_WARM_IN_FLIGHT = 8;
+    private static final int MAX_PAGE_WARM_IN_FLIGHT = 32;
     private static final ThreadLocal<CaptureScratch> CAPTURE_SCRATCH =
             ThreadLocal.withInitial(CaptureScratch::new);
     private final LinkedHashMap<SourceKey, SurfaceRegionSource> sources =

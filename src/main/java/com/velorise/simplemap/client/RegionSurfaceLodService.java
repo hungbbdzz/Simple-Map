@@ -48,18 +48,18 @@ public final class RegionSurfaceLodService {
             new RegionSurfaceLodService();
     private static final int MAX_LEVEL = MapRegionLodPolicy.MAX_LEVEL;
     private static final int MAX_CPU_RECORDS = 2_048;
-    private static final int DIRECT_SCHEDULE_FOCUSED = 1;
-    private static final int DIRECT_SCHEDULE_FAR_FOCUSED = 2;
-    private static final int DIRECT_SCHEDULE_BACKGROUND = 1;
+    private static final int DIRECT_SCHEDULE_FOCUSED = 6;
+    private static final int DIRECT_SCHEDULE_FAR_FOCUSED = 8;
+    private static final int DIRECT_SCHEDULE_BACKGROUND = 2;
     private static final int EXACT_LEVEL0_SCHEDULE_FOCUSED = 4;
     private static final int EXACT_LEVEL0_SCHEDULE_FAR_FOCUSED = 8;
     private static final int EXACT_LEVEL0_SCHEDULE_BACKGROUND = 1;
-    private static final int PARENT_SCHEDULE_FOCUSED = 2;
+    private static final int PARENT_SCHEDULE_FOCUSED = 4;
     private static final int PARENT_SCHEDULE_FAR_FOCUSED = 8;
-    private static final int PARENT_SCHEDULE_BACKGROUND = 1;
-    private static final int VISIBLE_REGION_LOAD_FOCUSED = 2;
-    private static final int VISIBLE_REGION_LOAD_FAR_FOCUSED = 4;
-    private static final int VISIBLE_REGION_LOAD_BACKGROUND = 1;
+    private static final int PARENT_SCHEDULE_BACKGROUND = 2;
+    private static final int VISIBLE_REGION_LOAD_FOCUSED = 8;
+    private static final int VISIBLE_REGION_LOAD_FAR_FOCUSED = 16;
+    private static final int VISIBLE_REGION_LOAD_BACKGROUND = 2;
     private static final long DIRECT_BASE_RETRY_NANOS = 350_000_000L;
     private static final long DIRECT_NULL_RETRY_NANOS = 750_000_000L;
     private static final long DIRECT_UNCHANGED_RETRY_NANOS = 1_500_000_000L;
@@ -474,7 +474,7 @@ public final class RegionSurfaceLodService {
         boolean visibleForeground = view.lane == MapRequestLane.MINIMAP
                 || view.lane == MapRequestLane.FULLSCREEN;
         int budget = visibleForeground
-                ? (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
+                ? (MapRegionLodPolicy.directProjectionEnabled(view.scale)
                         ? VISIBLE_REGION_LOAD_FAR_FOCUSED
                         : VISIBLE_REGION_LOAD_FOCUSED)
                 : VISIBLE_REGION_LOAD_BACKGROUND;
@@ -522,7 +522,7 @@ public final class RegionSurfaceLodService {
         int budget = visibleForeground
                 ? (MapOverviewTextureManager.getInstance().isStyleRefreshActive()
                         ? 16
-                        : (MapRegionLodPolicy.regionAuthorityOnly(view.scale)
+                        : (MapRegionLodPolicy.directProjectionEnabled(view.scale)
                                 ? DIRECT_SCHEDULE_FAR_FOCUSED
                                 : DIRECT_SCHEDULE_FOCUSED))
                 : DIRECT_SCHEDULE_BACKGROUND;
@@ -755,9 +755,7 @@ public final class RegionSurfaceLodService {
                 if (record == null || record.prepared == null
                         || record.prepared.knownMask() == 0L) return null;
                 PreparedBranch prepared = record.prepared;
-                if (!prepared.stamp().equals(lease.stamp())
-                        || versionSum(prepared.childVersionSums())
-                                != expected[child]) {
+                if (!prepared.stamp().equals(lease.stamp())) {
                     return null;
                 }
                 children.add(new RegionLodDeriver.ChildSnapshot(child,
@@ -820,11 +818,17 @@ public final class RegionSurfaceLodService {
                 continue;
             }
             RegionLodGraph.NodeSnapshot graphState = graph.snapshot(record.key);
+            boolean expandsCoverage = !record.initialized
+                    || record.slot < 0
+                    || (prepared.knownMask() & ~record.uploadedKnownMask) != 0L
+                    || (prepared.completeMask() & ~record.uploadedCompleteMask) != 0L;
             if (graphState == null
-                    || prepared.revision() < graphState.targetRevision()) {
+                    || (prepared.revision() < graphState.targetRevision()
+                            && !expandsCoverage)) {
                 // Do not spend GPU bandwidth on a worker result that became stale
-                // while source/style revisions advanced. Durable dirty state will
-                // re-admit a fresh build.
+                // while source/style revisions advanced unless it provides initial
+                // or broader region coverage. Durable dirty state will re-admit a
+                // fresh refinement build.
                 record.readyRevision = record.uploadedRevision;
                 continue;
             }
@@ -1713,7 +1717,8 @@ public static final class RegionLodGraph {
                 if (node == null || node.cancelled
                         || node.state != State.DIRTY
                         || node.dirtyChildMask == 0L
-                        || node.knownMask == 0L) continue;
+                        || node.knownMask == 0L
+                        || (level == 0 && node.directSeedMask != 0L)) continue;
                 Lease lease = tryBegin(key);
                 if (lease != null) leases.add(lease);
             }
@@ -1758,15 +1763,20 @@ public static final class RegionLodGraph {
         boolean current = lease.revision() == node.targetRevision
                 && Arrays.equals(lease.childVersionSums(),
                         node.childVersionSums);
+        boolean expandsCoverage = (prepared.knownMask() & ~node.knownMask) != 0L
+                || (prepared.completeMask() & ~node.completeMask) != 0L;
         if (current) {
             node.knownMask = prepared.knownMask();
             node.completeMask = prepared.completeMask();
             node.dirtyChildMask &= ~lease.dirtyChildMask();
+        } else if (expandsCoverage) {
+            node.knownMask |= prepared.knownMask();
+            node.completeMask |= prepared.completeMask();
         }
         node.state = node.dirtyChildMask == 0L
                 && node.preparedRevision >= node.targetRevision
                 ? State.PREPARED : State.DIRTY;
-        if (current) propagate(node);
+        if (current || expandsCoverage) propagate(node);
         return true;
     }
 
@@ -1775,18 +1785,28 @@ public static final class RegionLodGraph {
         NodeRecord node = nodes.get(prepared.key());
         if (node == null || node.cancelled
                 || !sameStamp(node.stamp, prepared.stamp())) return false;
-        if (prepared.revision() < node.targetRevision
-                || !Arrays.equals(prepared.childVersionSums(),
-                        node.childVersionSums)) return false;
+        boolean current = prepared.revision() >= node.targetRevision
+                && Arrays.equals(prepared.childVersionSums(),
+                        node.childVersionSums);
+        boolean expandsCoverage = !node.gpuResident
+                || (prepared.knownMask() & ~node.knownMask) != 0L
+                || (prepared.completeMask() & ~node.completeMask) != 0L;
+        if (!current && !expandsCoverage) return false;
         node.preparedRevision = Math.max(node.preparedRevision,
                 prepared.revision());
         node.publishedRevision = Math.max(node.publishedRevision,
                 prepared.revision());
-        node.knownMask = prepared.knownMask();
-        node.completeMask = prepared.completeMask();
-        node.gpuResident = prepared.knownMask() != 0L;
-        node.dirtyChildMask = 0L;
-        node.state = State.PUBLISHED;
+        if (current) {
+            node.knownMask = prepared.knownMask();
+            node.completeMask = prepared.completeMask();
+            node.dirtyChildMask = 0L;
+            node.state = State.PUBLISHED;
+        } else {
+            node.knownMask |= prepared.knownMask();
+            node.completeMask |= prepared.completeMask();
+            node.state = State.DIRTY;
+        }
+        node.gpuResident = node.knownMask != 0L;
         propagate(node);
         return true;
     }
