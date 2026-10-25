@@ -64,8 +64,12 @@ final class LodBranchDiskCache {
     private volatile boolean metadataLoaded;
     private volatile boolean metadataAuthoritative;
     private final AtomicBoolean trimScheduled = new AtomicBoolean();
+    private static final Map<String, String> SAFE_NAME_CACHE = new ConcurrentHashMap<>();
     private volatile long lastInvalidationNanos;
     private volatile String lastInvalidationRoot = "";
+    private volatile File cachedDimensionDir;
+    private volatile File cachedRootDir;
+    private volatile String cachedRootDirPath = "";
 
     private LodBranchDiskCache() {
     }
@@ -81,8 +85,8 @@ final class LodBranchDiskCache {
      */
     boolean mayContain(Key key) {
         ensureMetadataIndexAsync();
-        return !metadataLoaded || !metadataAuthoritative
-                || metadata.containsKey(key);
+        if (!metadataLoaded) return false;
+        return !metadataAuthoritative || metadata.containsKey(key);
     }
 
     Metadata metadata(Key key) {
@@ -92,20 +96,13 @@ final class LodBranchDiskCache {
 
     CompletableFuture<Snapshot> loadAsync(Key key) {
         ensureMetadataIndexAsync();
-        if (metadataLoaded && metadataAuthoritative
-                && !metadata.containsKey(key)) {
+        if (!metadataLoaded || (metadataAuthoritative && !metadata.containsKey(key))) {
             return CompletableFuture.completedFuture(null);
         }
         File file = fileFor(key);
         if (file == null) return CompletableFuture.completedFuture(null);
-        String path = file.getAbsolutePath();
+        String path = file.getPath();
         if (knownMissing.contains(path)) return CompletableFuture.completedFuture(null);
-        if (!file.isFile()) {
-            knownMissing.add(path);
-            metadata.remove(key);
-            scheduleMetadataWrite();
-            return CompletableFuture.completedFuture(null);
-        }
 
         CompletableFuture<Snapshot> existing = pendingReads.get(path);
         if (existing != null) return existing;
@@ -119,6 +116,12 @@ final class LodBranchDiskCache {
                 MapRequestLane.FULLSCREEN.priorityBase(), 6,
                 () -> requestEpoch == epoch.get(), () -> {
                     try {
+                        if (!file.isFile()) {
+                            knownMissing.add(path);
+                            metadata.remove(key);
+                            scheduleMetadataWrite();
+                            return null;
+                        }
                         long size = Files.size(file.toPath());
                         if (size <= 0 || size > MAX_FILE_BYTES) {
                             metadata.remove(key);
@@ -231,27 +234,41 @@ final class LodBranchDiskCache {
     private void ensureMetadataIndexAsync() {
         File root = rootDirectory();
         if (root == null) return;
-        String path = root.getAbsolutePath();
-        synchronized (metadataRootLock) {
-            if (!path.equals(metadataRootPath)) {
-                metadataRootPath = path;
-                metadata.clear();
-                metadataLoaded = false;
-                metadataAuthoritative = false;
-                metadataLoadScheduled.set(false);
-                metadataWriteScheduled.set(false);
-                metadataRebuildScheduled.set(false);
+        String path = cachedRootDirPath;
+        if (path.isEmpty()) path = root.getAbsolutePath();
+        if (!path.equals(metadataRootPath)) {
+            synchronized (metadataRootLock) {
+                if (!path.equals(metadataRootPath)) {
+                    metadataRootPath = path;
+                    metadata.clear();
+                    metadataLoaded = false;
+                    metadataAuthoritative = false;
+                    metadataLoadScheduled.set(false);
+                    metadataWriteScheduled.set(false);
+                    metadataRebuildScheduled.set(false);
+                }
             }
         }
         if (metadataLoaded || !metadataLoadScheduled.compareAndSet(false, true)) return;
+        final String targetPath = path;
         File index = new File(root, "index.bin");
         boolean accepted = MapWorkScheduler.tryIo(MapRequestLane.FULLSCREEN,
                 MapWorkScheduler.WorkType.DISK_READ,
                 MapRequestLane.FULLSCREEN.priorityBase(), 4,
                 () -> true, () -> {
+                    if (!root.isDirectory()) {
+                        synchronized (metadataRootLock) {
+                            if (targetPath.equals(metadataRootPath)) {
+                                metadataLoaded = true;
+                                metadataAuthoritative = true;
+                            }
+                            metadataLoadScheduled.set(false);
+                        }
+                        return;
+                    }
                     MetadataIndex loaded = readMetadataIndex(index);
                     synchronized (metadataRootLock) {
-                        if (path.equals(metadataRootPath)) {
+                        if (targetPath.equals(metadataRootPath)) {
                             for (Map.Entry<Key, Metadata> entry : loaded.entries().entrySet()) {
                                 metadata.merge(entry.getKey(), entry.getValue(), Metadata::newer);
                             }
@@ -261,13 +278,16 @@ final class LodBranchDiskCache {
                         metadataLoadScheduled.set(false);
                     }
                     if (!loaded.authoritative()) {
-                        scheduleMetadataRebuild(root, path);
+                        scheduleMetadataRebuild(root, targetPath);
                     }
                 });
         if (!accepted) metadataLoadScheduled.set(false);
     }
 
     private void resetMetadataRoot() {
+        cachedDimensionDir = null;
+        cachedRootDir = null;
+        cachedRootDirPath = "";
         synchronized (metadataRootLock) {
             metadataRootPath = "";
             metadata.clear();
@@ -523,9 +543,18 @@ final class LodBranchDiskCache {
     }
 
     private File rootDirectory() {
-        File base = baseDirectory();
-        if (base == null) return null;
-        return new File(base, "g" + generationFor(base));
+        File dimension = MapManager.getInstance().getCurrentDimensionDir();
+        if (dimension == null) return null;
+        File localRoot = cachedRootDir;
+        if (localRoot != null && dimension.equals(cachedDimensionDir)) {
+            return localRoot;
+        }
+        File base = new File(dimension, ".lod_v2");
+        File resolved = new File(base, "g" + generationFor(base));
+        cachedRootDirPath = resolved.getAbsolutePath();
+        cachedRootDir = resolved;
+        cachedDimensionDir = dimension;
+        return resolved;
     }
 
     private static File baseDirectory() {
@@ -579,7 +608,28 @@ final class LodBranchDiskCache {
     }
 
     private static String safe(String value) {
-        return value == null ? "unknown" : value.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (value == null || value.isEmpty()) return "unknown";
+        return SAFE_NAME_CACHE.computeIfAbsent(value, k -> {
+            int len = k.length();
+            StringBuilder sb = null;
+            for (int i = 0; i < len; i++) {
+                char c = k.charAt(i);
+                boolean valid = (c >= 'a' && c <= 'z')
+                        || (c >= 'A' && c <= 'Z')
+                        || (c >= '0' && c <= '9')
+                        || c == '.' || c == '_' || c == '-';
+                if (!valid) {
+                    if (sb == null) {
+                        sb = new StringBuilder(len);
+                        sb.append(k, 0, i);
+                    }
+                    sb.append('_');
+                } else if (sb != null) {
+                    sb.append(c);
+                }
+            }
+            return sb == null ? k : sb.toString();
+        });
     }
 
     private static void deleteRecursively(File file) {

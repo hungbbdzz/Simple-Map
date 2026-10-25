@@ -212,10 +212,13 @@ public final class MapViewportCoordinator {
         }
     }
 
-    /** Immediately revokes old fullscreen ownership at drag/zoom start. */
+    /**
+     * Marks fullscreen interaction without purging overlapping in-flight page builds.
+     * Disjoint camera jumps already bump the FULLSCREEN lane in submitFullscreen()
+     * when !pageRectanglesOverlap(...); preserving overlapping work during continuous
+     * pan avoids cancelling newly exposed edge pages mid-flight.
+     */
     public void beginFullscreenInteraction() {
-        fullscreenGeneration++;
-        MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
         Request request = fullscreenRequest;
         if (request != null) request.interacting = true;
         MapPerformanceGovernor.getInstance().setFullscreenState(true, true);
@@ -434,7 +437,6 @@ public final class MapViewportCoordinator {
          * only foreground hard stop and scanVisibleCaveArea() enforces it again.
          */
         if (fullscreenCaveVisible
-                && !fullscreen.interacting
                 && MapManager.getInstance().isViewingLiveDimension()
                 && !MapActivityGate.getInstance().blocksForegroundStreaming()) {
             long caveSourceInterval = fullscreen.interacting
@@ -463,15 +465,18 @@ public final class MapViewportCoordinator {
             }
         }
 
-        if (fullscreenVisible && !fullscreen.interacting
+        if (fullscreenVisible
                 && now - lastFullscreenRun >= profile.fullscreenIntervalNanos()) {
             lastFullscreenRun = now;
 
             // A static dimension has no live ClientLevel to scan. Only saved cache
             // files are streamed; this prevents Overworld blocks being written into
             // a Nether/End/modded-dimension map while browsing it remotely.
+            // Gate live world chunk scanning on !fullscreen.interacting so panning stays
+            // zero-stall while cached/already-scanned pages continue streaming into the GPU atlas.
             boolean caveVisibleNow = CaveMode.isActive(minecraft);
-            if (MapManager.getInstance().isViewingLiveDimension()
+            if (!fullscreen.interacting
+                    && MapManager.getInstance().isViewingLiveDimension()
                     && !caveVisibleNow && profile.allowVisibleScan()) {
                 double schedulingFocusX = (fullscreen.minX + fullscreen.maxX) * 0.5;
                 double schedulingFocusZ = (fullscreen.minZ + fullscreen.maxZ) * 0.5;
@@ -494,7 +499,7 @@ public final class MapViewportCoordinator {
             }
             boolean cave = CaveMode.isActive(minecraft);
             boolean full = cave && CaveMode.isFullView(minecraft);
-            boolean focus = MapConfig.fastFullscreenLoading
+            boolean focus = (MapConfig.fastFullscreenLoading || !fullscreen.interacting)
                     && MapPerformanceGovernor.getInstance()
                             .hasForegroundUploadHeadroom();
             if (full) {

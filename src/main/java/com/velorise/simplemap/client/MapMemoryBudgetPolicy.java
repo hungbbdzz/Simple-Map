@@ -214,12 +214,12 @@ public final class MapMemoryBudgetPolicy {
             long pendingUploadBudgetMiB) {
         private static Profile forBudget(int budgetMiB) {
             if (budgetMiB <= 72) {
-                return new Profile(20, 24, 14, 10, 6, 48, 12L);
+                return new Profile(24, 24, 14, 10, 6, 48, 12L);
             }
             if (budgetMiB <= 112) {
-                return new Profile(24, 36, 16, 12, 12, 96, 20L);
+                return new Profile(32, 36, 16, 12, 12, 96, 20L);
             }
-            return new Profile(32, 48, 24, 16, 24, 160, 32L);
+            return new Profile(36, 48, 24, 16, 24, 160, 32L);
         }
     }
 

@@ -73,6 +73,10 @@ public class MapScreen extends Screen {
     private static final float OPEN_ANIMATION_START_MULTIPLIER = 1.2f;
     private static final long CURSOR_CACHE_NANOS = 120_000_000L;
     private static final long VIEWPORT_INTERACTION_SETTLE_NANOS = 750_000_000L;
+    private static final long ACTIVE_PAN_SETTLE_NANOS = 65_000_000L;
+    private static final int POPUP_SCREEN_MARGIN = 6;
+    private static final int POPUP_HEADER_HEIGHT = 20;
+    private static final int POPUP_ROW_HEIGHT = 20;
     private static final double MOMENTUM_FRICTION = 7.5;
     private static final double MAX_MOMENTUM_BLOCKS_PER_SECOND = 12_000.0;
     private double centerX;
@@ -230,12 +234,8 @@ public class MapScreen extends Screen {
              * Bypass VSync only for this screen, without changing/saving the
              * player's option, and restore it from removed().
              */
-            if (!temporaryVsyncDisabled
-                    && this.minecraft.options.enableVsync().get()
-                    && this.minecraft.options.framerateLimit().get() > 60) {
-                this.minecraft.getWindow().updateVsync(false);
-                temporaryVsyncDisabled = true;
-            }
+            // Keep hardware VSync active when enabled by the user (matching smooth GuiMap standard)
+            // so fast horizontal/diagonal pans synchronize with display refresh and never tear.
             MapManager.getInstance().updateWorldAndDimension(this.minecraft);
         }
         if (this.width > 0 && !this.hasFocusedCoordinateOverride) {
@@ -1635,6 +1635,22 @@ public class MapScreen extends Screen {
         return result.toString();
     }
 
+    private String getPopupMenuHeaderText() {
+        if (clickedWaypoint != null) {
+            String rawName = clickedWaypoint.name != null && !clickedWaypoint.name.isBlank()
+                    ? clickedWaypoint.name : "Waypoint";
+            return rawName.length() > 26 ? rawName.substring(0, 24) + "..." : rawName;
+        }
+        int bx = (int) Math.floor(popupWorldX);
+        int bz = (int) Math.floor(popupWorldZ);
+        return String.format(Locale.ROOT, "X: %d, Z: %d", bx, bz);
+    }
+
+    private int getPopupMenuHeight() {
+        int rows = clickedWaypoint != null ? 5 : 3;
+        return POPUP_HEADER_HEIGHT + 1 + rows * POPUP_ROW_HEIGHT;
+    }
+
     private int getPopupMenuWidth() {
         Component optAddOrDelete = clickedWaypoint != null
                 ? Component.translatable("gui.simplemap.popup.delete_waypoint")
@@ -1653,7 +1669,39 @@ public class MapScreen extends Screen {
                     : Component.translatable("gui.simplemap.popup.follow_waypoint");
             maxW = Math.max(maxW, Math.max(this.font.width(optEdit), this.font.width(optFollow)));
         }
-        return Math.max(100, maxW + 14);
+        int headerW = this.font.width(getPopupMenuHeaderText()) + 14;
+        int desired = Math.max(116, Math.max(maxW + 18, headerW + 14));
+        if (this.width > POPUP_SCREEN_MARGIN * 2) {
+            return Math.min(desired, Math.max(100, this.width - POPUP_SCREEN_MARGIN * 2));
+        }
+        return desired;
+    }
+
+    private void clampPopupPosition(double anchorX, double anchorY) {
+        int menuWidth = getPopupMenuWidth();
+        int menuHeight = getPopupMenuHeight();
+        double targetX = anchorX;
+        double targetY = anchorY;
+        if (this.width > 0 && targetX + menuWidth + POPUP_SCREEN_MARGIN > this.width) {
+            targetX = anchorX - menuWidth - 2;
+        }
+        if (this.height > 0 && targetY + menuHeight + POPUP_SCREEN_MARGIN > this.height) {
+            targetY = anchorY - menuHeight - 2;
+        }
+        double maxAllowedX = Math.max(POPUP_SCREEN_MARGIN, this.width - menuWidth - POPUP_SCREEN_MARGIN);
+        double maxAllowedY = Math.max(POPUP_SCREEN_MARGIN, this.height - menuHeight - POPUP_SCREEN_MARGIN);
+        popupX = Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedX, targetX));
+        popupY = Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedY, targetY));
+    }
+
+    private void drawPopupMenuRow(GuiGraphics guiGraphics, int x, int rowY, int width,
+            Component label, boolean hovered, boolean enabled, int textColor, int accentColor) {
+        if (hovered && enabled) {
+            guiGraphics.fill(x + 1, rowY, x + width - 1, rowY + POPUP_ROW_HEIGHT - 1, 0xFF262B33);
+            guiGraphics.fill(x + 1, rowY + 2, x + 3, rowY + POPUP_ROW_HEIGHT - 3, accentColor);
+        }
+        guiGraphics.drawString(this.font, label, x + 8, rowY + 6,
+                enabled ? textColor : 0xFF6E737B, false);
     }
 
     private void drawPopupMenu(GuiGraphics guiGraphics, int mouseX, int mouseY) {
@@ -1661,81 +1709,77 @@ public class MapScreen extends Screen {
         guiGraphics.pose().translate(0, 0, 100); // Draw on top of everything
 
         int menuWidth = getPopupMenuWidth();
-        int menuHeight = clickedWaypoint != null ? 100 : 60;
-        // Background box
-        guiGraphics.fill((int)popupX, (int)popupY, (int)popupX + menuWidth, (int)popupY + menuHeight, 0xFF121212);
-        guiGraphics.renderOutline((int)popupX, (int)popupY, menuWidth, menuHeight, 0xFF3C3C3C);
+        int menuHeight = getPopupMenuHeight();
+        double maxAllowedX = Math.max(POPUP_SCREEN_MARGIN, this.width - menuWidth - POPUP_SCREEN_MARGIN);
+        double maxAllowedY = Math.max(POPUP_SCREEN_MARGIN, this.height - menuHeight - POPUP_SCREEN_MARGIN);
+        int x = (int) Math.round(Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedX, popupX)));
+        int y = (int) Math.round(Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedY, popupY)));
+        popupX = x;
+        popupY = y;
 
-        boolean canTeleport = MapTeleportController.canTeleport(this.minecraft);
+        // Subtle drop shadow + dark slate surface + crisp border
+        guiGraphics.fill(x + 2, y + 2, x + menuWidth + 2, y + menuHeight + 2, 0x66000000);
+        guiGraphics.fill(x, y, x + menuWidth, y + menuHeight, 0xF214171C);
+        guiGraphics.fill(x + 1, y + 1, x + menuWidth - 1, y + POPUP_HEADER_HEIGHT, 0xFF1D222A);
+        guiGraphics.fill(x + 1, y + POPUP_HEADER_HEIGHT, x + menuWidth - 1, y + POPUP_HEADER_HEIGHT + 1, 0xFF323842);
+        guiGraphics.renderOutline(x, y, menuWidth, menuHeight, 0xFF454C59);
+
+        // Header badge + title (Waypoint name or World X/Z coordinates)
+        int badgeColor = 0xFF00E5FF;
         if (clickedWaypoint != null) {
-            // Row 0: Edit Waypoint
-            boolean hoverEdit = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY && mouseY < popupY + 20;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 1, (int)popupX + menuWidth - 1, (int)popupY + 19,
-                    hoverEdit ? 0xFF2D3033 : 0x00000000);
-            guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.edit_waypoint"),
-                    (int)popupX + 6, (int)popupY + 6, 0xFFFFFF, false);
+            badgeColor = clickedWaypoint.deathPoint ? 0xFFFF5252
+                    : (clickedWaypoint.iconType == 0 ? 0xFFFF3D00
+                    : (clickedWaypoint.iconType == 1 ? 0xFF00E676
+                    : (clickedWaypoint.iconType == 2 ? 0xFF2979FF
+                    : (clickedWaypoint.iconType == 3 ? 0xFFFFD600 : 0xFFFFD54F))));
+        }
+        guiGraphics.fill(x + 6, y + 6, x + 14, y + 14, 0xFF0B0D10);
+        guiGraphics.fill(x + 7, y + 7, x + 13, y + 13, badgeColor);
+        int headerColor = clickedWaypoint != null ? 0xFFFFE082 : 0xFFB0BEC5;
+        guiGraphics.drawString(this.font, getPopupMenuHeaderText(), x + 18, y + 6, headerColor, false);
 
-            // Row 1: Delete Waypoint
-            boolean hoverDelete = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY + 20 && mouseY < popupY + 40;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 21, (int)popupX + menuWidth - 1, (int)popupY + 39,
-                    hoverDelete ? 0xFF2D3033 : 0x00000000);
-            guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.popup.delete_waypoint"),
-                    (int)popupX + 6, (int)popupY + 26, 0xFFFFFF, false);
+        int rowsStartY = y + POPUP_HEADER_HEIGHT + 1;
+        boolean insideMenuX = mouseX >= x && mouseX <= x + menuWidth;
+        boolean canTeleport = MapTeleportController.canTeleport(this.minecraft);
 
-            // Row 2: Teleport Here
-            boolean hoverTp = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY + 40 && mouseY < popupY + 60;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 41, (int)popupX + menuWidth - 1, (int)popupY + 59,
-                    hoverTp && canTeleport ? 0xFF2D3033 : 0x00000000);
-            guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.teleport_here"),
-                    (int)popupX + 6, (int)popupY + 46, canTeleport ? 0xFFFFFF : 0x777777, false);
-
-            // Row 3: Share Location
-            boolean hoverShare = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY + 60 && mouseY < popupY + 80;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 61, (int)popupX + menuWidth - 1, (int)popupY + 79,
-                    hoverShare ? 0xFF2D3033 : 0x00000000);
-            guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.popup.share_location"),
-                    (int)popupX + 6, (int)popupY + 66, 0xFFFFFF, false);
-
-            // Row 4: Follow / Stop Following Waypoint
+        if (clickedWaypoint != null) {
             boolean isCurrentlyFollowing = MapConfig.pinActive &&
                     Math.abs(MapConfig.pinWorldX - clickedWaypoint.x) < 0.01 &&
                     Math.abs(MapConfig.pinWorldZ - clickedWaypoint.z) < 0.01;
-            boolean hoverFollow = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY + 80 && mouseY <= popupY + 100;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 81, (int)popupX + menuWidth - 1, (int)popupY + 99,
-                    hoverFollow ? 0xFF2D3033 : 0x00000000);
             Component followText = isCurrentlyFollowing
                     ? Component.translatable("gui.simplemap.popup.stop_following")
                     : Component.translatable("gui.simplemap.popup.follow_waypoint");
-            guiGraphics.drawString(this.font, followText, (int)popupX + 6, (int)popupY + 86, 0xFFFFFF, false);
+
+            Component[] labels = new Component[] {
+                    Component.translatable("gui.simplemap.edit_waypoint"),
+                    Component.translatable("gui.simplemap.popup.delete_waypoint"),
+                    Component.translatable("gui.simplemap.teleport_here"),
+                    Component.translatable("gui.simplemap.popup.share_location"),
+                    followText
+            };
+            boolean[] enabled = new boolean[] { true, true, canTeleport, true, true };
+            int[] textColors = new int[] { 0xFFFFFFFF, 0xFFFF8A80, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+            int[] accents = new int[] { 0xFF00E5FF, 0xFFFF5252, 0xFF00E5FF, 0xFF00E5FF, 0xFFFFD54F };
+
+            for (int i = 0; i < labels.length; i++) {
+                int rowY = rowsStartY + i * POPUP_ROW_HEIGHT;
+                boolean hovered = insideMenuX && mouseY >= rowY && mouseY < rowY + POPUP_ROW_HEIGHT;
+                drawPopupMenuRow(guiGraphics, x, rowY, menuWidth, labels[i],
+                        hovered, enabled[i], textColors[i], accents[i]);
+            }
         } else {
-            // Row 0: Add Waypoint
-            boolean hoverOpt1 = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY && mouseY < popupY + 20;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 1, (int)popupX + menuWidth - 1, (int)popupY + 19,
-                    hoverOpt1 ? 0xFF2D3033 : 0x00000000);
-            guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.add_waypoint"),
-                    (int)popupX + 6, (int)popupY + 6, 0xFFFFFF, false);
-
-            // Row 1: Teleport Here
-            boolean hoverOpt2 = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY + 20 && mouseY < popupY + 40;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 21, (int)popupX + menuWidth - 1, (int)popupY + 39,
-                    hoverOpt2 && canTeleport ? 0xFF2D3033 : 0x00000000);
-            guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.teleport_here"),
-                    (int)popupX + 6, (int)popupY + 26, canTeleport ? 0xFFFFFF : 0x777777, false);
-
-            // Row 2: Share Location
-            boolean hoverOpt3 = mouseX >= popupX && mouseX <= popupX + menuWidth
-                    && mouseY >= popupY + 40 && mouseY <= popupY + 60;
-            guiGraphics.fill((int)popupX + 1, (int)popupY + 41, (int)popupX + menuWidth - 1, (int)popupY + 59,
-                    hoverOpt3 ? 0xFF2D3033 : 0x00000000);
-            guiGraphics.drawString(this.font, Component.translatable("gui.simplemap.popup.share_location"),
-                    (int)popupX + 6, (int)popupY + 46, 0xFFFFFF, false);
+            Component[] labels = new Component[] {
+                    Component.translatable("gui.simplemap.add_waypoint"),
+                    Component.translatable("gui.simplemap.teleport_here"),
+                    Component.translatable("gui.simplemap.popup.share_location")
+            };
+            boolean[] enabled = new boolean[] { true, canTeleport, true };
+            for (int i = 0; i < labels.length; i++) {
+                int rowY = rowsStartY + i * POPUP_ROW_HEIGHT;
+                boolean hovered = insideMenuX && mouseY >= rowY && mouseY < rowY + POPUP_ROW_HEIGHT;
+                drawPopupMenuRow(guiGraphics, x, rowY, menuWidth, labels[i],
+                        hovered, enabled[i], 0xFFFFFFFF, 0xFF00E5FF);
+            }
         }
 
         guiGraphics.pose().popPose();
@@ -1756,7 +1800,7 @@ public class MapScreen extends Screen {
                 || (caveLayerSlider != null && caveLayerSlider.isDragging())
                 || Math.abs(momentumX) > 0.5 || Math.abs(momentumZ) > 0.5
                 || nowNanos - lastViewportInteractionNanos
-                        < VIEWPORT_INTERACTION_SETTLE_NANOS;
+                        < ACTIVE_PAN_SETTLE_NANOS;
     }
 
     @Override
@@ -1849,13 +1893,20 @@ public class MapScreen extends Screen {
         }
 
         // 1. If context menu is open, handle its options first
-        if (isPopupMenuOpen) {
+        if (isPopupMenuOpen && button == 0) {
             int menuWidth = getPopupMenuWidth();
-            int menuHeight = clickedWaypoint != null ? 100 : 60;
-            if (mouseX >= popupX && mouseX <= popupX + menuWidth && mouseY >= popupY && mouseY <= popupY + menuHeight) {
+            int menuHeight = getPopupMenuHeight();
+            int rowsStartY = (int) Math.round(popupY) + POPUP_HEADER_HEIGHT + 1;
+            if (mouseX >= popupX && mouseX <= popupX + menuWidth
+                    && mouseY >= popupY && mouseY <= popupY + menuHeight) {
+                if (mouseY < rowsStartY) {
+                    // Clicked on the header bar: keep menu open without triggering a row
+                    return true;
+                }
+                int rowIndex = (int) Math.floor((mouseY - rowsStartY) / (double) POPUP_ROW_HEIGHT);
                 if (clickedWaypoint != null) {
                     Waypoint targetWp = clickedWaypoint;
-                    if (mouseY < popupY + 20) {
+                    if (rowIndex == 0) {
                         // Row 0: Edit Waypoint
                         isPopupMenuOpen = false;
                         clickedWaypoint = null;
@@ -1863,12 +1914,12 @@ public class MapScreen extends Screen {
                             this.minecraft.setScreen(new MapConfigScreen.WaypointListScreen.AddWaypointScreen(
                                     this, targetWp));
                         }
-                    } else if (mouseY < popupY + 40) {
+                    } else if (rowIndex == 1) {
                         // Row 1: Delete Waypoint
                         WaypointManager.getInstance().removeWaypoint(targetWp);
                         clickedWaypoint = null;
                         isPopupMenuOpen = false;
-                    } else if (mouseY < popupY + 60) {
+                    } else if (rowIndex == 2) {
                         // Row 2: Teleport Here
                         if (MapTeleportController.canTeleport(this.minecraft)) {
                             isPopupMenuOpen = false;
@@ -1884,7 +1935,7 @@ public class MapScreen extends Screen {
                                 this.onClose();
                             }
                         }
-                    } else if (mouseY < popupY + 80) {
+                    } else if (rowIndex == 3) {
                         // Row 3: Share Location
                         String dimension = targetWp.dimension != null && !targetWp.dimension.isBlank()
                                 ? targetWp.dimension
@@ -1894,7 +1945,7 @@ public class MapScreen extends Screen {
                         this.onClose();
                         WaypointManager.shareLocation(this.minecraft, targetWp.name,
                                 targetWp.x, targetWp.y, targetWp.z, true, dimension);
-                    } else if (mouseY <= popupY + 100) {
+                    } else if (rowIndex == 4) {
                         // Row 4: Follow / Stop Following Waypoint
                         boolean isCurrentlyFollowing = MapConfig.pinActive &&
                                 Math.abs(MapConfig.pinWorldX - targetWp.x) < 0.01 &&
@@ -1909,7 +1960,7 @@ public class MapScreen extends Screen {
                         clickedWaypoint = null;
                     }
                 } else {
-                    if (mouseY < popupY + 20) {
+                    if (rowIndex == 0) {
                         // Row 0: Add Waypoint
                         isPopupMenuOpen = false;
                         if (this.minecraft != null) {
@@ -1922,7 +1973,7 @@ public class MapScreen extends Screen {
                                     popupWorldX, waypointY, popupWorldZ,
                                     waypointDimension));
                         }
-                    } else if (mouseY < popupY + 40) {
+                    } else if (rowIndex == 1) {
                         // Row 1: Teleport Here
                         if (MapTeleportController.canTeleport(this.minecraft)) {
                             isPopupMenuOpen = false;
@@ -1936,7 +1987,7 @@ public class MapScreen extends Screen {
                                 this.onClose();
                             }
                         }
-                    } else if (mouseY <= popupY + 60) {
+                    } else if (rowIndex == 2) {
                         // Row 2: Share Location
                         String dimension = MapManager.getInstance()
                                 .getCurrentDimensionResourceId();
@@ -1962,7 +2013,6 @@ public class MapScreen extends Screen {
 
         // 3. Left click: start drag tracking; determine if it's a click vs drag on mouseReleased
         if (button == 0) {
-            markViewportInteraction();
             cancelMotionAndOpenAnimation();
             this.isDragging = true;
             dragStartX = mouseX;
@@ -1971,10 +2021,8 @@ public class MapScreen extends Screen {
             return true;
         }
 
-        // 4. Right click opens the popup context menu
+        // 4. Right click opens the popup context menu (clamped inside screen bounds)
         if (button == 1) {
-            popupX = mouseX;
-            popupY = mouseY;
             popupWorldX = centerX + (mouseX - this.width / 2.0) / currentRenderScale;
             popupWorldZ = centerZ + (mouseY - this.height / 2.0) / currentRenderScale;
 
@@ -1997,6 +2045,7 @@ public class MapScreen extends Screen {
                 }
             }
 
+            clampPopupPosition(mouseX, mouseY);
             isPopupMenuOpen = true;
             return true;
         }

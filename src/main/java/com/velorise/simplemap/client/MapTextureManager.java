@@ -510,18 +510,23 @@ public class MapTextureManager {
         pageRevisions.merge(leafKey, 1L, Long::sum);
         dirtyPageSubtileMasks.merge(leafKey, updateMask,
                 (previous, added) -> previous | added);
+        boolean wasDirty = dirtyPages.contains(leafKey);
         firstDirtyPageNanos.putIfAbsent(leafKey, now);
         lastDirtyPageNanos.put(leafKey, now);
         enqueueDirtyPageLocked(leafKey);
-        MapRequestLane activeLane = effectivePageLane(
-                leafKey, System.currentTimeMillis());
-        ExactPageStateTracker.getInstance().transition(
-                "surface:" + leafKey,
-                activeLane == null ? ExactPageState.STALE_GENERATION
-                        : ExactPageState.REQUESTED,
-                activeLane == null ? MapRequestLane.BACKGROUND : activeLane,
-                pageRevisions.getOrDefault(leafKey, 0L));
-        pendingLeafPublications.removeIf(pending -> pending.regionKey.equals(regionKey));
+        if (!wasDirty) {
+            MapRequestLane activeLane = effectivePageLane(
+                    leafKey, System.currentTimeMillis());
+            ExactPageStateTracker.getInstance().transition(
+                    "surface:" + leafKey,
+                    activeLane == null ? ExactPageState.STALE_GENERATION
+                            : ExactPageState.REQUESTED,
+                    activeLane == null ? MapRequestLane.BACKGROUND : activeLane,
+                    pageRevisions.getOrDefault(leafKey, 0L));
+        }
+        if (!pendingLeafPublications.isEmpty()) {
+            pendingLeafPublications.removeIf(pending -> pending.regionKey.equals(regionKey));
+        }
     }
 
     /**
@@ -804,21 +809,14 @@ public class MapTextureManager {
                     minGlobalPageX, maxGlobalPageX,
                     minGlobalPageZ, maxGlobalPageZ);
             if (viewportChanged) {
-                clearAllPageDemandLane(MapRequestLane.FULLSCREEN);
-                /*
-                 * PASS100 retained-residency rule:
-                 * a viewport rebase changes ownership, not cache residency.
-                 * Eagerly releasing every exact page outside the new rectangle
-                 * caused hundreds of avoidable GPU evictions/restores and made
-                 * revisiting a location black until exact leaves were uploaded
-                 * again. Keep old exact slots resident and let the atlas/residency
-                 * LRU choose victims only when a new allocation actually needs
-                 * space. This mirrors loaded/cache separation.
-                 */
                 if (planner.retainedOverlap()) {
+                    retainFullscreenDemandInBounds(
+                            minGlobalPageX, maxGlobalPageX,
+                            minGlobalPageZ, maxGlobalPageZ);
                     MapProcessor.getInstance().retainSurfaceLoadsInRegions(
                             minRx, maxRx, minRz, maxRz);
                 } else {
+                    clearAllPageDemandLane(MapRequestLane.FULLSCREEN);
                     MapProcessor.getInstance().clearSurfaceLoads();
                 }
             }
@@ -1435,16 +1433,7 @@ public class MapTextureManager {
     }
 
     public boolean hasAnyPageTexture(int regionX, int regionZ) {
-        String prefix = key(regionX, regionZ) + ":";
-        synchronized (pageCache) {
-            for (var entry : pageCache.entrySet()) {
-                if (entry.getKey().startsWith(prefix)
-                        && entry.getValue().initialized
-                        && entry.getValue().atlasSlot >= 0
-                        && entry.getValue().knownColumns > 0) return true;
-            }
-        }
-        return false;
+        return hasResidentPageInNode(3, regionX, regionZ);
     }
 
     /**
@@ -3995,6 +3984,9 @@ public class MapTextureManager {
     private int acquireSurfaceAtlasSlot(String protectedKey) {
         int slot = leafAtlas.acquireSlot();
         if (slot >= 0) return slot;
+        if (leafAtlas.quarantinedSlotCount() >= FOCUSED_PAGE_WORK_BUDGET) {
+            return -1;
+        }
         java.util.List<String> candidates = new java.util.ArrayList<>();
         java.util.Map<String, PageTextureInfo> byKey = new java.util.HashMap<>();
         long nowNanos = System.nanoTime();
@@ -4558,6 +4550,22 @@ public class MapTextureManager {
         synchronized (dirtyTextures) {
             for (SurfacePageDemand demand : pageDemands.values()) {
                 demand.clearLane(lane);
+            }
+        }
+    }
+
+    private void retainFullscreenDemandInBounds(int minGlobalPageX, int maxGlobalPageX,
+            int minGlobalPageZ, int maxGlobalPageZ) {
+        synchronized (dirtyTextures) {
+            for (Map.Entry<String, SurfacePageDemand> entry : pageDemands.entrySet()) {
+                PageAddress addr = parsePageKey(entry.getKey());
+                if (addr == null) continue;
+                int gpx = addr.regionX() * MapPageLayout.PAGES_PER_REGION + addr.pageX();
+                int gpz = addr.regionZ() * MapPageLayout.PAGES_PER_REGION + addr.pageZ();
+                if (gpx < minGlobalPageX || gpx > maxGlobalPageX
+                        || gpz < minGlobalPageZ || gpz > maxGlobalPageZ) {
+                    entry.getValue().clearLane(MapRequestLane.FULLSCREEN);
+                }
             }
         }
     }
