@@ -71,6 +71,16 @@ public final class SurfaceLeafAtlas {
                 System.nanoTime() + SLOT_REUSE_FENCE_NANOS));
     }
 
+    public boolean hasQuarantinedSlots() {
+        drainQuarantinedSlots(System.nanoTime());
+        return !quarantined.isEmpty();
+    }
+
+    public int quarantinedSlotCount() {
+        drainQuarantinedSlots(System.nanoTime());
+        return quarantined.size();
+    }
+
     private void drainQuarantinedSlots(long nowNanos) {
         while (!quarantined.isEmpty()) {
             QuarantinedSlot head = quarantined.peekFirst();

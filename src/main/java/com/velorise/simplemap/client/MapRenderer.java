@@ -1332,8 +1332,19 @@ public class MapRenderer {
                 }
                 for (int pageZ = minVisiblePageZ;
                         pageZ <= maxVisiblePageZ; pageZ++) {
+                    int rz = Math.floorDiv(pageZ, MapPageLayout.PAGES_PER_REGION);
+                    int prevCheckedRx = Integer.MIN_VALUE;
+                    boolean prevRegionHasPages = false;
                     for (int pageX = minVisiblePageX;
                             pageX <= maxVisiblePageX; pageX++) {
+                        if (!pageTableCoverage) {
+                            int rx = Math.floorDiv(pageX, MapPageLayout.PAGES_PER_REGION);
+                            if (rx != prevCheckedRx) {
+                                prevCheckedRx = rx;
+                                prevRegionHasPages = surfaceTextures.hasAnyPageTexture(rx, rz);
+                            }
+                            if (!prevRegionHasPages) continue;
+                        }
                         collectSurfaceGlowLeaf(builder, surfaceTextures,
                                 pageX, pageZ, pageTableCoverage);
                     }
@@ -2774,8 +2785,9 @@ public class MapRenderer {
 
     private CaveAtlasRegion findCaveAncestor(CaveHierarchySource source,
             int level, int nodeX, int nodeZ) {
+        int maxAncestorLevel = Math.min(3, MapLodPolicy.MAX_BRANCH_LEVEL);
         for (int ancestorLevel = level + 1;
-                ancestorLevel <= MapLodPolicy.MAX_BRANCH_LEVEL; ancestorLevel++) {
+                ancestorLevel <= maxAncestorLevel; ancestorLevel++) {
             int scale = 1 << (ancestorLevel - level);
             CaveAtlasRegion ancestor = source.residentBranch(ancestorLevel,
                     Math.floorDiv(nodeX, scale), Math.floorDiv(nodeZ, scale));

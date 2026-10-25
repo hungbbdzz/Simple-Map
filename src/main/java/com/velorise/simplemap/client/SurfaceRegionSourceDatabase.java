@@ -562,7 +562,12 @@ public final class SurfaceRegionSourceDatabase {
                     captured++;
                     MapWorkGraph.getInstance().clearSourceChunkDirty(stamp,
                             key.regionX(), key.regionZ(), chunkZ * 32 + chunkX);
-                    wakeExactPageForRetainedChunk(stamp, key, chunkX, chunkZ);
+                    // Only wake once per 4x4 page interior or boundary chunk to avoid
+                    // 1,024 redundant lock/revision cycles per region warm.
+                    if (((chunkX & 3) == 0 && (chunkZ & 3) == 0)
+                            || (chunkX & 3) == 3 || (chunkZ & 3) == 3) {
+                        wakeExactPageForRetainedChunk(stamp, key, chunkX, chunkZ);
+                    }
                 }
             }
         }

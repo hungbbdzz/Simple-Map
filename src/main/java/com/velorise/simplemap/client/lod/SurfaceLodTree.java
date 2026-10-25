@@ -45,6 +45,7 @@ public final class SurfaceLodTree {
 
     private final SurfaceBranchAtlas[] atlases = new SurfaceBranchAtlas[MAX_LEVEL + 1];
     private final long[] observedStorageGeneration = new long[MAX_LEVEL + 1];
+    private final int[] levelNodeCounts = new int[MAX_LEVEL + 1];
     private final Map<NodeKey, Node> nodes = new LinkedHashMap<>(128, 0.75f, true);
     @SuppressWarnings("unchecked")
     private final ArrayDeque<NodeKey>[] dirtyQueues = new ArrayDeque[MAX_LEVEL + 1];
@@ -628,6 +629,7 @@ public final class SurfaceLodTree {
         diskCache.onDimensionSwitched();
         for (Node node : nodes.values()) node.close();
         nodes.clear();
+        java.util.Arrays.fill(levelNodeCounts, 0);
         for (int level = 1; level <= MAX_LEVEL; level++) dirtyQueues[level].clear();
         dirtySet.clear();
         loadGeneration++;
@@ -778,15 +780,27 @@ public final class SurfaceLodTree {
         return true;
     }
 
+    private Node getOrCreateNode(NodeKey key) {
+        Node existing = nodes.get(key);
+        if (existing != null) return existing;
+        Node created = new Node(key);
+        nodes.put(key, created);
+        if (key.level() >= 1 && key.level() <= MAX_LEVEL) {
+            levelNodeCounts[key.level()]++;
+        }
+        return created;
+    }
+
     private Node node(String dimension, int level, int nodeX, int nodeZ) {
         NodeKey key = new NodeKey(dimension, level, nodeX, nodeZ);
-        Node node = nodes.computeIfAbsent(key, Node::new);
+        Node node = getOrCreateNode(key);
         requestDiskLoad(key);
         return node;
     }
 
     private void requestDiskLoad(NodeKey key) {
-        if (nodes.containsKey(key) && nodes.get(key).knownMask != 0L) return;
+        Node existing = nodes.get(key);
+        if (existing != null && existing.knownMask != 0L) return;
         if (!diskCache.mayContain(diskKey(key))) return;
         if (!loadingFromDisk.add(key)) return;
         long generation = loadGeneration;
@@ -795,13 +809,14 @@ public final class SurfaceLodTree {
     }
 
     private void drainDiskLoads() {
+        if (loadedFromDisk.isEmpty()) return;
         LoadedNode loaded;
         while ((loaded = loadedFromDisk.poll()) != null) {
             loadingFromDisk.remove(loaded.key);
             if (loaded.generation != loadGeneration) continue;
             LodBranchDiskCache.Snapshot snapshot = loaded.snapshot;
             if (snapshot == null || snapshot.knownMask() == 0L) continue;
-            Node node = nodes.computeIfAbsent(loaded.key, Node::new);
+            Node node = getOrCreateNode(loaded.key);
             for (int y = 0; y < 64; y++) {
                 long incomingKnown = snapshot.knownRows()[y];
                 long missing = incomingKnown & ~node.knownRows[y];
@@ -901,9 +916,7 @@ public final class SurfaceLodTree {
     }
 
     private int countLevel(int level) {
-        int count = 0;
-        for (NodeKey key : nodes.keySet()) if (key.level() == level) count++;
-        return count;
+        return (level >= 1 && level <= MAX_LEVEL) ? levelNodeCounts[level] : 0;
     }
 
     /** Releases only GPU residency; CPU pixels and coverage remain reusable. */
@@ -945,6 +958,9 @@ public final class SurfaceLodTree {
             Node node = entry.getValue();
             if (node.atlasSlot >= 0 || node.isDirty()) continue;
             iterator.remove();
+            if (level >= 1 && level <= MAX_LEVEL && levelNodeCounts[level] > 0) {
+                levelNodeCounts[level]--;
+            }
             dirtySet.remove(node.key);
             return true;
         }

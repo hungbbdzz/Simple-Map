@@ -100,7 +100,62 @@ public final class CaveTextureManager {
     private final Map<BranchKey, BranchEntry> branchPages = new LinkedHashMap<>(128, 0.75f, true);
     private final Set<PageKey> dirtyPageKeys = new LinkedHashSet<>();
     private final Set<BranchKey> dirtyBranchKeys = new LinkedHashSet<>();
+    private final Map<RegionBandKey, Long> residentPageMasks = new ConcurrentHashMap<>();
+    private final Map<RegionBandKey, Integer> residentBranchMasks = new ConcurrentHashMap<>();
     private final AtomicLong contentRevision = new AtomicLong(1L);
+
+    private record RegionBandKey(String dimension, int band, int rx, int rz) {}
+
+    private void updatePageResidencyMask(PageKey key, boolean resident) {
+        if (key == null) return;
+        int rx = Math.floorDiv(key.globalPageX(), 8);
+        int rz = Math.floorDiv(key.globalPageZ(), 8);
+        int px = Math.floorMod(key.globalPageX(), 8);
+        int pz = Math.floorMod(key.globalPageZ(), 8);
+        long bit = 1L << ((pz << 3) | px);
+        RegionBandKey rbk = new RegionBandKey(key.dimension(), key.band(), rx, rz);
+        residentPageMasks.compute(rbk, (k, prev) -> {
+            long cur = prev == null ? 0L : prev;
+            long next = resident ? (cur | bit) : (cur & ~bit);
+            return next == 0L ? null : next;
+        });
+    }
+
+    private void updateBranchResidencyMask(BranchKey key, boolean resident) {
+        if (key == null || key.level() < 1 || key.level() > 3) return;
+        int span = 1 << (3 - key.level());
+        int rx = Math.floorDiv(key.nodeX(), span);
+        int rz = Math.floorDiv(key.nodeZ(), span);
+        int lnx = Math.floorMod(key.nodeX(), span);
+        int lnz = Math.floorMod(key.nodeZ(), span);
+        int bitIndex = key.level() == 3 ? 0
+                : key.level() == 2 ? (1 + (lnz << 1) + lnx)
+                : (5 + (lnz << 2) + lnx);
+        int bit = 1 << bitIndex;
+        RegionBandKey rbk = new RegionBandKey(key.dimension(), key.band(), rx, rz);
+        residentBranchMasks.compute(rbk, (k, prev) -> {
+            int cur = prev == null ? 0 : prev;
+            int next = resident ? (cur | bit) : (cur & ~bit);
+            return next == 0 ? null : next;
+        });
+    }
+
+    private static long nodePageBitMask(int level, int localPageX, int localPageZ) {
+        if (level >= 3) return -1L;
+        int shift = (localPageZ << 3) + localPageX;
+        if (level == 2) return 0x0F0F0F0FL << shift;
+        if (level == 1) return 0x0303L << shift;
+        return 1L << shift;
+    }
+
+    private static int nodeChildBranchBitMask(int level, int localPageX, int localPageZ) {
+        if (level <= 1) return 0;
+        if (level >= 3) return 0x1FFFFE;
+        int qx = (localPageX >> 2) & 1;
+        int qz = (localPageZ >> 2) & 1;
+        int baseBit = 5 + (qz << 3) + (qx << 1);
+        return 0x33 << baseBit;
+    }
 
     private volatile int activeLayerY = Integer.MIN_VALUE;
     private volatile int previousLayerY = Integer.MIN_VALUE;
@@ -539,11 +594,29 @@ public final class CaveTextureManager {
      * Queries a branch node, optionally suppressing new L1/L2 allocation when only
      * probing for an optional underlay or coarse ancestor at exact L0 zoom.
      */
+    private boolean isBranchResidentInMask(String dimId, int band, int level, int nodeX, int nodeZ) {
+        int span = 1 << (3 - level);
+        int rx = Math.floorDiv(nodeX, span);
+        int rz = Math.floorDiv(nodeZ, span);
+        Integer mask = residentBranchMasks.get(new RegionBandKey(dimId, band, rx, rz));
+        if (mask == null || mask == 0) return false;
+        int lnx = Math.floorMod(nodeX, span);
+        int lnz = Math.floorMod(nodeZ, span);
+        int bitIndex = level == 3 ? 0
+                : level == 2 ? (1 + (lnz << 1) + lnx)
+                : (5 + (lnz << 2) + lnx);
+        return (mask & (1 << bitIndex)) != 0;
+    }
+
     public CaveAtlasRegion peekBranchRegion(int layerY, int level,
             int nodeX, int nodeZ, MapRequestLane lane, boolean createIfMissing) {
         if (level <= 0 || level > 3) return null;
+        String dimId = currentDimensionId();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
-        BranchKey key = new BranchKey(currentDimensionId(), band, level, nodeX, nodeZ);
+        if (!createIfMissing && !isBranchResidentInMask(dimId, band, level, nodeX, nodeZ)) {
+            return null;
+        }
+        BranchKey key = new BranchKey(dimId, band, level, nodeX, nodeZ);
 
         BranchEntry entry;
         synchronized (branchPages) {
@@ -630,60 +703,52 @@ public final class CaveTextureManager {
         int pageSpan = MapViewportCoordinator.MapLodPolicy.pageSpanForBranch(level);
         int firstPageX = nodeX * pageSpan;
         int firstPageZ = nodeZ * pageSpan;
-        int lastPageX = firstPageX + pageSpan - 1;
-        int lastPageZ = firstPageZ + pageSpan - 1;
-
         String dimId = currentDimensionId();
-        int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveMode.CaveLayerBand.key(CaveMode.CaveLayerBand.CaveView.LAYERED, layerY);
+        int band = layerY == Integer.MIN_VALUE
+                ? Integer.MIN_VALUE
+                : CaveMode.CaveLayerBand.key(CaveMode.CaveLayerBand.CaveView.LAYERED, layerY);
 
-        // 1. Check GPU resident pages for active band
-        synchronized (pages) {
-            for (int pz = firstPageZ; pz <= lastPageZ; pz++) {
-                for (int px = firstPageX; px <= lastPageX; px++) {
-                    PageEntry entry = pages.get(new PageKey(dimId, band, px, pz));
-                    if (entry != null && entry.slot >= 0 && entry.hasContent) {
+        if (level >= 1 && level <= 3) {
+            int rx = Math.floorDiv(firstPageX, 8);
+            int rz = Math.floorDiv(firstPageZ, 8);
+            int localPageX = Math.floorMod(firstPageX, 8);
+            int localPageZ = Math.floorMod(firstPageZ, 8);
+            long pageMask = nodePageBitMask(level, localPageX, localPageZ);
+            RegionBandKey rbk = new RegionBandKey(dimId, band, rx, rz);
+            if ((residentPageMasks.getOrDefault(rbk, 0L) & pageMask) != 0L) {
+                return true;
+            }
+            int branchMask = nodeChildBranchBitMask(level, localPageX, localPageZ);
+            if (branchMask != 0 && (residentBranchMasks.getOrDefault(rbk, 0) & branchMask) != 0) {
+                return true;
+            }
+            if (previousLayerY != Integer.MIN_VALUE && CaveMode.isTransitionActive()) {
+                int prevBand = CaveMode.CaveLayerBand.key(CaveMode.CaveLayerBand.CaveView.LAYERED, previousLayerY);
+                if (prevBand != band) {
+                    RegionBandKey prevRbk = new RegionBandKey(dimId, prevBand, rx, rz);
+                    if ((residentPageMasks.getOrDefault(prevRbk, 0L) & pageMask) != 0L) {
                         return true;
                     }
                 }
             }
+            return false;
         }
 
-        // 2. Check fallback band if layer recently changed during transition
-        if (previousLayerY != Integer.MIN_VALUE && CaveMode.isTransitionActive()) {
-            int prevBand = CaveMode.CaveLayerBand.key(CaveMode.CaveLayerBand.CaveView.LAYERED, previousLayerY);
-            if (prevBand != band) {
-                synchronized (pages) {
-                    for (int pz = firstPageZ; pz <= lastPageZ; pz++) {
-                        for (int px = firstPageX; px <= lastPageX; px++) {
-                            PageEntry entry = pages.get(new PageKey(dimId, prevBand, px, pz));
-                            if (entry != null && entry.slot >= 0 && entry.hasContent) {
-                                return true;
-                            }
-                        }
-                    }
+        int lastPageX = firstPageX + pageSpan - 1;
+        int lastPageZ = firstPageZ + pageSpan - 1;
+        int minRx = Math.floorDiv(firstPageX, 8);
+        int maxRx = Math.floorDiv(lastPageX, 8);
+        int minRz = Math.floorDiv(firstPageZ, 8);
+        int maxRz = Math.floorDiv(lastPageZ, 8);
+        for (int rz = minRz; rz <= maxRz; rz++) {
+            for (int rx = minRx; rx <= maxRx; rx++) {
+                RegionBandKey rbk = new RegionBandKey(dimId, band, rx, rz);
+                if (residentPageMasks.getOrDefault(rbk, 0L) != 0L
+                        || residentBranchMasks.getOrDefault(rbk, 0) != 0) {
+                    return true;
                 }
             }
         }
-
-        // 3. Check GPU-resident child branch pages (L1..L(level-1))
-        synchronized (branchPages) {
-            for (int childLevel = level - 1; childLevel >= 1; childLevel--) {
-                int childSpan = MapViewportCoordinator.MapLodPolicy.pageSpanForBranch(childLevel);
-                int minNodeX = Math.floorDiv(firstPageX, childSpan);
-                int maxNodeX = Math.floorDiv(lastPageX, childSpan);
-                int minNodeZ = Math.floorDiv(firstPageZ, childSpan);
-                int maxNodeZ = Math.floorDiv(lastPageZ, childSpan);
-                for (int nz = minNodeZ; nz <= maxNodeZ; nz++) {
-                    for (int nx = minNodeX; nx <= maxNodeX; nx++) {
-                        BranchEntry bEntry = branchPages.get(new BranchKey(dimId, band, childLevel, nx, nz));
-                        if (bEntry != null && bEntry.slot >= 0 && bEntry.hasContent) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
         return false;
     }
 
@@ -701,43 +766,15 @@ public final class CaveTextureManager {
     public boolean hasAnyPageTexture(int layerY, int rx, int rz) {
         String dimId = currentDimensionId();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
-        int firstGlobalX = rx << 3;
-        int firstGlobalZ = rz << 3;
-        synchronized (pages) {
-            for (int pz = 0; pz < 8; pz++) {
-                for (int px = 0; px < 8; px++) {
-                    PageEntry entry = pages.get(new PageKey(dimId, band, firstGlobalX + px, firstGlobalZ + pz));
-                    if (entry != null && entry.slot >= 0 && entry.hasContent) return true;
-                }
-            }
-        }
-        return false;
+        return residentPageMasks.getOrDefault(new RegionBandKey(dimId, band, rx, rz), 0L) != 0L;
     }
 
     public boolean hasResidentCoverageForRegion(int layerY, int rx, int rz) {
-        if (hasAnyPageTexture(layerY, rx, rz)) return true;
         String dimId = currentDimensionId();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
-        int firstPageX = rx << 3;
-        int lastPageX = firstPageX + 7;
-        int firstPageZ = rz << 3;
-        int lastPageZ = firstPageZ + 7;
-        synchronized (branchPages) {
-            for (int level = 1; level <= 3; level++) {
-                int span = MapViewportCoordinator.MapLodPolicy.pageSpanForBranch(level);
-                int minNodeX = Math.floorDiv(firstPageX, span);
-                int maxNodeX = Math.floorDiv(lastPageX, span);
-                int minNodeZ = Math.floorDiv(firstPageZ, span);
-                int maxNodeZ = Math.floorDiv(lastPageZ, span);
-                for (int nz = minNodeZ; nz <= maxNodeZ; nz++) {
-                    for (int nx = minNodeX; nx <= maxNodeX; nx++) {
-                        BranchEntry bEntry = branchPages.get(new BranchKey(dimId, band, level, nx, nz));
-                        if (bEntry != null && bEntry.slot >= 0 && bEntry.hasContent) return true;
-                    }
-                }
-            }
-        }
-        return false;
+        RegionBandKey rbk = new RegionBandKey(dimId, band, rx, rz);
+        return residentPageMasks.getOrDefault(rbk, 0L) != 0L
+                || residentBranchMasks.getOrDefault(rbk, 0) != 0;
     }
 
     public ResourceLocation getRegionTexture(int layerY, int rx, int rz) {
@@ -952,6 +989,8 @@ public final class CaveTextureManager {
             branchPages.clear();
             dirtyBranchKeys.clear();
         }
+        residentPageMasks.clear();
+        residentBranchMasks.clear();
         atlas.resetSlots();
         activeLayerY = Integer.MIN_VALUE;
         previousLayerY = Integer.MIN_VALUE;
@@ -1081,6 +1120,7 @@ public final class CaveTextureManager {
         entry.knownMask = knownMask;
         entry.completeMask = completeMask;
         if (!hasContent) {
+            updateBranchResidencyMask(entry.key, false);
             if (entry.slot != -1) {
                 atlas.releaseSlot(entry.slot);
                 entry.slot = -1;
@@ -1106,6 +1146,7 @@ public final class CaveTextureManager {
         atlas.upload(entry.slot, 0, uploadBuffers[0],
                 new CaveTextureAtlas.DirtyRect(0, 0, branchSize - 1, branchSize - 1));
 
+        updateBranchResidencyMask(entry.key, true);
         entry.dirty = false;
         return true;
     }
@@ -1119,6 +1160,7 @@ public final class CaveTextureManager {
         CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(entry.key.dimension(), requestedLayer, rx, rz, false);
         if (region == null || !region.hasContent()) {
             entry.hasContent = false;
+            updatePageResidencyMask(entry.key, false);
             if (entry.slot != -1) {
                 atlas.releaseSlot(entry.slot);
                 entry.slot = -1;
@@ -1156,6 +1198,7 @@ public final class CaveTextureManager {
 
         entry.hasContent = hasContent;
         if (!hasContent) {
+            updatePageResidencyMask(entry.key, false);
             if (entry.slot != -1) {
                 atlas.releaseSlot(entry.slot);
                 entry.slot = -1;
@@ -1190,6 +1233,7 @@ public final class CaveTextureManager {
                     new CaveTextureAtlas.DirtyRect(0, 0, size - 1, size - 1));
         }
 
+        updatePageResidencyMask(entry.key, true);
         entry.dirty = false;
         return true;
     }
@@ -1262,6 +1306,7 @@ public final class CaveTextureManager {
         }
 
         if (oldestPage != null && oldestPage.slot != -1) {
+            updatePageResidencyMask(oldestPage.key, false);
             atlas.releaseSlot(oldestPage.slot);
             oldestPage.slot = -1;
             oldestPage.dirty = false;
@@ -1272,6 +1317,7 @@ public final class CaveTextureManager {
             MapMemoryBudgetPolicy.MapResidencyManager.getInstance().markTopologyChanged();
             contentRevision.incrementAndGet();
         } else if (oldestBranch != null && oldestBranch.slot != -1) {
+            updateBranchResidencyMask(oldestBranch.key, false);
             atlas.releaseSlot(oldestBranch.slot);
             oldestBranch.slot = -1;
             oldestBranch.dirty = false;
