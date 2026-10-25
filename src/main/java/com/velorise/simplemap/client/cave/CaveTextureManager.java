@@ -505,7 +505,9 @@ public final class CaveTextureManager {
                 entry.dirty = true;
                 dirtyPageKeys.add(key);
             }
-            entry.lastAccessTime = System.currentTimeMillis();
+            if (entry.slot >= 0) {
+                entry.lastAccessTime = System.currentTimeMillis();
+            }
         }
 
         if (entry.slot < 0 || !entry.hasContent) return null;
@@ -595,6 +597,7 @@ public final class CaveTextureManager {
      * probing for an optional underlay or coarse ancestor at exact L0 zoom.
      */
     private boolean isBranchResidentInMask(String dimId, int band, int level, int nodeX, int nodeZ) {
+        if (residentBranchMasks.isEmpty()) return false;
         int span = 1 << (3 - level);
         int rx = Math.floorDiv(nodeX, span);
         int rz = Math.floorDiv(nodeZ, span);
