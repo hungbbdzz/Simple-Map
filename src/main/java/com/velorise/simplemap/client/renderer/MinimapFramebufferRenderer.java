@@ -88,7 +88,6 @@ public final class MinimapFramebufferRenderer {
     private String renderedDimension;
     private int renderedCaveProjection;
     private int renderedCaveLayerY = Integer.MIN_VALUE;
-    private int renderedNightMode = -1;
     private int renderedTargetSize;
     private int renderedContentSize;
     private int renderedOverscan;
@@ -275,8 +274,16 @@ public final class MinimapFramebufferRenderer {
                 } else if (!RetainedMinimapHandoffPolicy
                         .canPublishSuccessfulRedraw(lastGoodCompatible,
                                 redraw.retainedUnderlayDrawn(),
-                                redraw.coldCoverageReady())
-                        && redraw.coverageScore() < renderedCoverageScore) {
+                                redraw.coldCoverageReady())) {
+                    /*
+                     * Only a genuinely cold authority switch (projection/scale/large
+                     * teleport) waits for complete hierarchy coverage. For ordinary
+                     * same-authority streaming redraws the back target already begins
+                     * with the full last-good front frame, then overwrites pages that
+                     * advanced. Rejecting that complete composite because one known M4
+                     * root/branch was not resident froze PASS120 at 13 redraws while
+                     * reuse/coalescing continued for thousands of frames.
+                     */
                     nextColdRedrawAttemptNanos =
                             RetainedMinimapHandoffPolicy.nextAttemptNanos(nowNanos);
                     reuseFrames++;
@@ -292,7 +299,6 @@ public final class MinimapFramebufferRenderer {
                     renderedDimension = dimension;
                     renderedCaveProjection = caveProjection;
                     renderedCaveLayerY = caveLayerY;
-                    renderedNightMode = MapConfig.minimapNightMode;
                     renderedTargetSize = targetSize;
                     renderedContentSize = contentSize;
                     renderedOverscan = overscan;
@@ -455,13 +461,11 @@ public final class MinimapFramebufferRenderer {
                 // construction. Only cold redraws need the expensive hierarchy
                 // readiness walk before they are eligible to become the front frame.
                 boolean coldCoverageReady = underlayDrawn || (caveActive
-                        ? ((MapLodPolicy.branchLevel(policyScale, 3) <= 0
-                                && result.exactPagesDrawn() > 0)
-                                || MapRenderer.getInstance()
-                                        .caveMinimapRetainedCoverageReady(
-                                                CaveMode.isFullView(minecraft),
-                                                caveLayerY, snappedX, snappedZ,
-                                                targetScale, targetSize))
+                        ? MapRenderer.getInstance()
+                                .caveMinimapRetainedCoverageReady(
+                                        CaveMode.isFullView(minecraft),
+                                        caveLayerY, snappedX, snappedZ,
+                                        targetScale, targetSize)
                         : MapRenderer.getInstance()
                                 .surfaceMinimapRetainedCoverageReady(
                                         snappedX, snappedZ, targetScale, targetSize));
@@ -492,7 +496,6 @@ public final class MinimapFramebufferRenderer {
         renderedDimension = null;
         renderedCaveProjection = 0;
         renderedCaveLayerY = Integer.MIN_VALUE;
-        renderedNightMode = -1;
         renderedTargetSize = 0;
         renderedContentSize = 0;
         renderedOverscan = 0;
@@ -576,8 +579,7 @@ public final class MinimapFramebufferRenderer {
         if (renderedTargetScale > 0.0f) {
             double shiftX = Math.abs((centerX - renderedSnappedX) * renderedTargetScale);
             double shiftZ = Math.abs((centerZ - renderedSnappedZ) * renderedTargetScale);
-            int maxGuardShift = Math.max(1, renderedOverscan);
-            if (shiftX > maxGuardShift || shiftZ > maxGuardShift) {
+            if (shiftX >= renderedTargetSize || shiftZ >= renderedTargetSize) {
                 return false;
             }
         }
@@ -591,7 +593,6 @@ public final class MinimapFramebufferRenderer {
         if (renderedSessionId != sessionId || renderedDimension == null
                 || !renderedDimension.equals(dimension)) return false;
         if (renderedCaveProjection != caveProjection
-                || renderedNightMode != MapConfig.minimapNightMode
                 || Float.floatToIntBits(renderedTargetScale)
                         != Float.floatToIntBits(targetScale)) return false;
         double shiftX = (renderedSnappedX - snappedX) * targetScale;
@@ -703,8 +704,6 @@ public final class MinimapFramebufferRenderer {
         compositionYaw = yaw;
         compositionValid = true;
 
-        boolean cullWasEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
-        RenderSystem.disableCull();
         guiGraphics.pose().pushPose();
         try {
             guiGraphics.pose().translate(x + size * 0.5f,
@@ -717,53 +716,19 @@ public final class MinimapFramebufferRenderer {
             Matrix4f matrix = guiGraphics.pose().last().pose();
             RenderSystem.enableBlend();
             RenderSystem.defaultBlendFunc();
-            RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
             RenderSystem.setShader(GameRenderer::getPositionTexShader);
             RenderSystem.setShaderTexture(0, frontTarget.getColorTextureId());
-            if (MapConfig.minimapCircle) {
-                float circleRadius = Math.min(half, size * 0.5f);
-                float uCenter = (u0 + u1) * 0.5f;
-                float vCenter = (vTop + vBottom) * 0.5f;
-                float uHalf = (u1 - u0) * 0.5f;
-                float vHalf = (vBottom - vTop) * 0.5f;
-                float invHalf = half > 0.0001f ? (1.0f / half) : 0.0f;
-                int segments = 64;
-                BufferBuilder buffer = Tesselator.getInstance().begin(
-                        VertexFormat.Mode.TRIANGLES,
-                        DefaultVertexFormat.POSITION_TEX);
-                double step = (Math.PI * 2.0) / segments;
-                for (int i = 0; i < segments; i++) {
-                    double a0 = i * step;
-                    double a1 = (i + 1) * step;
-                    float x0 = (float) Math.cos(a0) * circleRadius;
-                    float y0 = (float) Math.sin(a0) * circleRadius;
-                    float x1 = (float) Math.cos(a1) * circleRadius;
-                    float y1 = (float) Math.sin(a1) * circleRadius;
-                    float tu0 = uCenter + (x0 * invHalf) * uHalf;
-                    float tv0 = vCenter + (y0 * invHalf) * vHalf;
-                    float tu1 = uCenter + (x1 * invHalf) * uHalf;
-                    float tv1 = vCenter + (y1 * invHalf) * vHalf;
-                    // Counter-clockwise in NDC (where GUI +Y points down) so front-face culling never discards the fan.
-                    buffer.addVertex(matrix, 0.0f, 0.0f, 0.0f).setUv(uCenter, vCenter);
-                    buffer.addVertex(matrix, x1, y1, 0.0f).setUv(tu1, tv1);
-                    buffer.addVertex(matrix, x0, y0, 0.0f).setUv(tu0, tv0);
-                }
-                BufferUploader.drawWithShader(buffer.buildOrThrow());
-            } else {
-                BufferBuilder buffer = Tesselator.getInstance().begin(
-                        VertexFormat.Mode.QUADS,
-                        DefaultVertexFormat.POSITION_TEX);
-                buffer.addVertex(matrix, -half, -half, 0.0f).setUv(u0, vTop);
-                buffer.addVertex(matrix, -half, half, 0.0f).setUv(u0, vBottom);
-                buffer.addVertex(matrix, half, half, 0.0f).setUv(u1, vBottom);
-                buffer.addVertex(matrix, half, -half, 0.0f).setUv(u1, vTop);
-                BufferUploader.drawWithShader(buffer.buildOrThrow());
-            }
+            BufferBuilder buffer = Tesselator.getInstance().begin(
+                    VertexFormat.Mode.QUADS,
+                    DefaultVertexFormat.POSITION_TEX);
+            buffer.addVertex(matrix, -half, -half, 0.0f).setUv(u0, vTop);
+            buffer.addVertex(matrix, -half, half, 0.0f).setUv(u0, vBottom);
+            buffer.addVertex(matrix, half, half, 0.0f).setUv(u1, vBottom);
+            buffer.addVertex(matrix, half, -half, 0.0f).setUv(u1, vTop);
+            BufferUploader.drawWithShader(buffer.buildOrThrow());
         } finally {
             guiGraphics.pose().popPose();
             guiGraphics.disableScissor();
-            if (cullWasEnabled) RenderSystem.enableCull();
-            else RenderSystem.disableCull();
         }
     }
 }

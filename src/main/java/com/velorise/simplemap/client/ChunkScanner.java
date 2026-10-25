@@ -2394,7 +2394,7 @@ public class ChunkScanner {
         if (biome != null) {
             int grassTint = SurfaceColorizer.BiomeColors.getGrassColor(biome);
             int foliageTint = SurfaceColorizer.BiomeColors.getFoliageColor(biome);
-            return CaveTextureManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint);
+            return CaveTextureManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint, biome);
         }
         return CaveTextureManager.resolveCaveBlockBaseColor(state);
     }
@@ -2680,19 +2680,23 @@ public class ChunkScanner {
         state = blockEntityVisuals.resolveLive(level, pos, state);
         MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
         if (visual.fixedTextureColor()) return SurfaceTintData.NONE;
+        String blockId = visual.blockId();
         // Biome-driven tint is reconstructed from stored biome ids during region
         // composition. Capturing the live provider value here would freeze the
         // current chunk-loading neighbourhood into a permanent 16x16 colour seam.
-        if (visual.tintPolicy() != BlockTintPolicy.NONE) {
+        // Custom/constant modded BlockColors (e.g. Regions Unexplored, Biomes O' Plenty,
+        // colour customizers) are still captured using a chunk-interior clamped pos.
+        if (visual.tintPolicy() != BlockTintPolicy.NONE
+                && !BlockTextureColorSampler.usesCustomProviderTint(blockId)) {
             return SurfaceTintData.NONE;
         }
-        String blockId = visual.blockId();
         if (BlockTextureColorSampler.isBrokenTint(blockId)) {
             return SurfaceTintData.NONE;
         }
         try {
+            BlockPos samplePos = clampTintPositionToLoadedChunk(level, pos, scanScratch.get());
             int tint = Minecraft.getInstance().getBlockColors().getColor(
-                    state, level, pos, 0);
+                    state, level, samplePos, 0);
             return SurfaceTintData.fromProviderResult(tint);
         } catch (Throwable throwable) {
             BlockTextureColorSampler.markBrokenTint(blockId);
@@ -2714,24 +2718,55 @@ public class ChunkScanner {
         }
         if (fluid && !glowing) return SurfaceTintData.NONE;
         if (visual.fixedTextureColor()) return SurfaceTintData.NONE;
+        String blockId = visual.blockId();
         // Biome-driven tint is reconstructed from stored biome ids during region
         // composition. Capturing the live provider value here would freeze the
         // current chunk-loading neighbourhood into a permanent 16x16 colour seam.
-        if (visual.tintPolicy() != BlockTintPolicy.NONE) {
+        // Custom/constant modded BlockColors (e.g. Regions Unexplored, Biomes O' Plenty,
+        // colour customizers) are still captured using a chunk-interior clamped pos.
+        if (visual.tintPolicy() != BlockTintPolicy.NONE
+                && !BlockTextureColorSampler.usesCustomProviderTint(blockId)) {
             return SurfaceTintData.NONE;
         }
-        String blockId = visual.blockId();
         if (BlockTextureColorSampler.isBrokenTint(blockId)) {
             return SurfaceTintData.NONE;
         }
         try {
+            BlockPos samplePos = clampTintPositionToLoadedChunk(level, pos, scanScratch.get());
             int tint = Minecraft.getInstance().getBlockColors().getColor(
-                    visibleState, level, pos, 0);
+                    visibleState, level, samplePos, 0);
             return SurfaceTintData.fromProviderResult(tint);
         } catch (Throwable throwable) {
             BlockTextureColorSampler.markBrokenTint(blockId);
             return SurfaceTintData.NONE;
         }
+    }
+
+    private BlockPos clampTintPositionToLoadedChunk(Level level, BlockPos pos, ScanScratch scratch) {
+        int blockX = pos.getX();
+        int blockY = pos.getY();
+        int blockZ = pos.getZ();
+        int chunkX = blockX >> 4;
+        int chunkZ = blockZ >> 4;
+        int localX = blockX & 15;
+        int localZ = blockZ & 15;
+        int nx = localX < 3 ? -1 : (localX > 12 ? 1 : 0);
+        int nz = localZ < 3 ? -1 : (localZ > 12 ? 1 : 0);
+        if (nx == 0 && nz == 0) return pos;
+        int sampleX = blockX;
+        int sampleZ = blockZ;
+        if (nx != 0 && readySurfaceChunk(level, chunkX + nx, chunkZ) == null) {
+            sampleX = (chunkX << 4) + (nx < 0 ? 3 : 12);
+        }
+        if (nz != 0 && readySurfaceChunk(level, chunkX, chunkZ + nz) == null) {
+            sampleZ = (chunkZ << 4) + (nz < 0 ? 3 : 12);
+        }
+        if (nx != 0 && nz != 0 && readySurfaceChunk(level, chunkX + nx, chunkZ + nz) == null) {
+            sampleX = (chunkX << 4) + (nx < 0 ? 3 : 12);
+            sampleZ = (chunkZ << 4) + (nz < 0 ? 3 : 12);
+        }
+        if (sampleX == blockX && sampleZ == blockZ) return pos;
+        return scratch.position(3, sampleX, blockY, sampleZ);
     }
 
     /**

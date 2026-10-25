@@ -210,7 +210,12 @@ public final class CaveTextureManager {
     }
 
     public static int resolveCaveBlockBaseColor(BlockState state, int grassTint, int foliageTint) {
-        return CaveMapManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint);
+        return CaveMapManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint, null);
+    }
+
+    public static int resolveCaveBlockBaseColor(BlockState state, int grassTint,
+            int foliageTint, net.minecraft.world.level.biome.Biome biome) {
+        return CaveMapManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint, biome);
     }
 
     public static boolean requiresCaveBiomeTint(BlockState state) {
@@ -3510,13 +3515,26 @@ public final class CaveTextureManager {
                 if (argb == 0) return 0;
                 byte tintKind = paletteTintKinds[pIdx];
                 if (tintKind != TINT_NONE && MapConfig.blockColourMode == 0) {
-                    int bIdx = getBiomePaletteIndex(lx, ly, lz);
-                    if (tintKind == TINT_GRASS) {
-                        argb = SurfaceColorizer.applyBiomeTint(argb, biomeGrassTints[bIdx], 0.90f);
-                    } else if (tintKind == TINT_LEAVES_FOLIAGE) {
-                        argb = SurfaceColorizer.applyBiomeTint(argb, biomeFoliageTints[bIdx], 0.95f);
-                    } else if (tintKind == TINT_FOLIAGE) {
-                        argb = SurfaceColorizer.applyBiomeTint(argb, biomeFoliageTints[bIdx], 0.92f);
+                    String blkName = paletteBlockNames != null && pIdx < paletteBlockNames.length
+                            ? paletteBlockNames[pIdx] : null;
+                    SurfaceColorizer.BlockTextureColorSampler.TintInfo tintInfo = blkName == null
+                            ? SurfaceColorizer.BlockTextureColorSampler.TintInfo.NONE
+                            : SurfaceColorizer.BlockTextureColorSampler.getTintInfo(blkName);
+                    if (tintInfo.kind() == SurfaceColorizer.BlockTextureColorSampler.ProviderKind.CONSTANT_RGB
+                            && tintInfo.constantRgb() != -1) {
+                        float strength = (tintKind == TINT_LEAVES_FOLIAGE) ? 0.95f
+                                : (tintKind == TINT_GRASS ? 0.90f : 0.92f);
+                        argb = SurfaceColorizer.applyBiomeTint(
+                                argb, 0xFF000000 | tintInfo.constantRgb(), strength);
+                    } else {
+                        int bIdx = getBiomePaletteIndex(lx, ly, lz);
+                        if (tintKind == TINT_GRASS) {
+                            argb = SurfaceColorizer.applyBiomeTint(argb, biomeGrassTints[bIdx], 0.90f);
+                        } else if (tintKind == TINT_LEAVES_FOLIAGE) {
+                            argb = SurfaceColorizer.applyBiomeTint(argb, biomeFoliageTints[bIdx], 0.95f);
+                        } else if (tintKind == TINT_FOLIAGE) {
+                            argb = SurfaceColorizer.applyBiomeTint(argb, biomeFoliageTints[bIdx], 0.92f);
+                        }
                     }
                 }
                 int r = (argb >>> 16) & 0xFF;
@@ -3560,10 +3578,15 @@ public final class CaveTextureManager {
         }
 
         public static int resolveCaveBlockBaseColor(BlockState state) {
-            return resolveCaveBlockBaseColor(state, DEFAULT_GRASS_TINT, DEFAULT_FOLIAGE_TINT);
+            return resolveCaveBlockBaseColor(state, DEFAULT_GRASS_TINT, DEFAULT_FOLIAGE_TINT, null);
         }
 
         public static int resolveCaveBlockBaseColor(BlockState state, int grassTint, int foliageTint) {
+            return resolveCaveBlockBaseColor(state, grassTint, foliageTint, null);
+        }
+
+        public static int resolveCaveBlockBaseColor(BlockState state, int grassTint,
+                int foliageTint, net.minecraft.world.level.biome.Biome biome) {
             if (state == null || state.isAir()) return 0;
             SurfaceColorizer.MapVisualClassifier visualClassifier = SurfaceColorizer.MapVisualClassifier.getInstance();
             SurfaceColorizer.MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
@@ -3572,14 +3595,28 @@ public final class CaveTextureManager {
             if (argb == 0) return 0;
             byte tintKind = resolveBlockTintKind(name, state, visual);
             if (tintKind != TINT_NONE && MapConfig.blockColourMode == 0) {
-                int gTint = (grassTint == 0 || grassTint == -1) ? DEFAULT_GRASS_TINT : grassTint;
-                int fTint = (foliageTint == 0 || foliageTint == -1) ? DEFAULT_FOLIAGE_TINT : foliageTint;
-                if (tintKind == TINT_GRASS) {
-                    argb = SurfaceColorizer.applyBiomeTint(argb, gTint, 0.90f);
-                } else if (tintKind == TINT_LEAVES_FOLIAGE) {
-                    argb = SurfaceColorizer.applyBiomeTint(argb, fTint, 0.95f);
-                } else if (tintKind == TINT_FOLIAGE) {
-                    argb = SurfaceColorizer.applyBiomeTint(argb, fTint, 0.92f);
+                float strength = (tintKind == TINT_LEAVES_FOLIAGE) ? 0.95f
+                        : (tintKind == TINT_GRASS ? 0.90f : 0.92f);
+                SurfaceColorizer.BlockTextureColorSampler.TintInfo tintInfo =
+                        SurfaceColorizer.BlockTextureColorSampler.getTintInfo(name);
+                int customTint = -1;
+                if (tintInfo.kind() == SurfaceColorizer.BlockTextureColorSampler.ProviderKind.CONSTANT_RGB) {
+                    customTint = tintInfo.constantRgb();
+                } else if (tintInfo.kind() == SurfaceColorizer.BlockTextureColorSampler.ProviderKind.CUSTOM_PROVIDER) {
+                    customTint = SurfaceColorizer.BlockTextureColorSampler.sampleBiomeProviderTint(name, biome);
+                }
+                if (customTint != -1) {
+                    argb = SurfaceColorizer.applyBiomeTint(argb, 0xFF000000 | customTint, strength);
+                } else {
+                    int gTint = (grassTint == 0 || grassTint == -1) ? DEFAULT_GRASS_TINT : grassTint;
+                    int fTint = (foliageTint == 0 || foliageTint == -1) ? DEFAULT_FOLIAGE_TINT : foliageTint;
+                    if (tintKind == TINT_GRASS) {
+                        argb = SurfaceColorizer.applyBiomeTint(argb, gTint, 0.90f);
+                    } else if (tintKind == TINT_LEAVES_FOLIAGE) {
+                        argb = SurfaceColorizer.applyBiomeTint(argb, fTint, 0.95f);
+                    } else if (tintKind == TINT_FOLIAGE) {
+                        argb = SurfaceColorizer.applyBiomeTint(argb, fTint, 0.92f);
+                    }
                 }
             }
             int r = (argb >>> 16) & 0xFF;
@@ -3612,22 +3649,14 @@ public final class CaveTextureManager {
                     boolean isLeaves = (visual != null && visual.leaves())
                             || (state != null && state.is(BlockTags.LEAVES))
                             || name.endsWith("_leaves");
-                    BlockTintPolicy policy = visual != null ? visual.tintPolicy() : BlockTintPolicy.NONE;
-                    if (policy == BlockTintPolicy.NONE) {
-                        policy = MapTextureManager.getInstance().resolveTintPolicy(name);
-                    }
-                    if (policy == BlockTintPolicy.NONE) {
-                        if (isLeaves || name.contains("vine")) {
-                            policy = BlockTintPolicy.FOLIAGE;
-                        } else if (name.contains("grass") || name.contains("fern")) {
-                            policy = BlockTintPolicy.GRASS;
-                        }
-                    }
+                    BlockTintPolicy policy = MapTextureManager.getInstance().resolveTintPolicy(name);
                     if (policy == BlockTintPolicy.GRASS) {
                         kind = TINT_GRASS;
                     } else if (policy == BlockTintPolicy.FOLIAGE
                             || policy == BlockTintPolicy.SPRUCE
                             || policy == BlockTintPolicy.BIRCH) {
+                        kind = isLeaves ? TINT_LEAVES_FOLIAGE : TINT_FOLIAGE;
+                    } else if (SurfaceColorizer.BlockTextureColorSampler.usesCustomProviderTint(name)) {
                         kind = isLeaves ? TINT_LEAVES_FOLIAGE : TINT_FOLIAGE;
                     }
                 }
