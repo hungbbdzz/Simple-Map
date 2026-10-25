@@ -439,15 +439,9 @@ public final class RegionDataStore {
                 }
             }
             validatePaletteReferences(pixels, biomePalette.length, blockPalette.length);
-            if (version < 6) {
-                // PASS123: retain old pixels as last-good, but force only
-                // water-bearing chunks through the restored beta compositor/source
-                // authority path before treating them as current completion.
-                invalidateLegacyFluidCompletion(pixels, completeChunks);
-            }
             repairNetherBedrockColumns(pixels, tints, biomePalette, blockPalette, completeChunks, version);
             repairNetherAndEndPlainsBiomes(pixels, biomePalette, blockPalette);
-            repairChunkBorderBiomeSeams(pixels, biomePalette, completeChunks);
+            repairChunkBorderBiomeSeams(pixels, biomePalette, null);
             return new StoredRegion(pixels, tints, biomePalette, blockPalette,
                     completeChunks);
         }

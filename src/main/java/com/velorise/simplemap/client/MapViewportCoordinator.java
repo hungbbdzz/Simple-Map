@@ -95,11 +95,29 @@ public final class MapViewportCoordinator {
         maxX = admitted.maxX();
         minZ = admitted.minZ();
         maxZ = admitted.maxZ();
-        MapOverviewTextureManager.getInstance().setPreferredSurfaceScale(logicalScale);
+        float safeScale = Math.max(0.01f, logicalScale);
+        if (lane == MapRequestLane.FULLSCREEN
+                || (lane == MapRequestLane.MINIMAP
+                        && !MapPerformanceGovernor.getInstance().isFullscreenOpen())) {
+            int minGlobalPageX = MapPageLayout.globalPageFromBlock((int) Math.floor(minX));
+            int maxGlobalPageX = MapPageLayout.globalPageFromBlock((int) Math.floor(maxX));
+            int minGlobalPageZ = MapPageLayout.globalPageFromBlock((int) Math.floor(minZ));
+            int maxGlobalPageZ = MapPageLayout.globalPageFromBlock((int) Math.floor(maxZ));
+            int focusPageX = MapPageLayout.globalPageFromBlock((int) Math.floor(focusX));
+            int focusPageZ = MapPageLayout.globalPageFromBlock((int) Math.floor(focusZ));
+            int hierarchyLevel = MapLodPolicy.branchLevel(safeScale, 3);
+            MapOverviewTextureManager.getInstance().setPreferredSurfaceView(
+                    safeScale, hierarchyLevel,
+                    minGlobalPageX, maxGlobalPageX,
+                    minGlobalPageZ, maxGlobalPageZ,
+                    focusPageX, focusPageZ, lane);
+        } else {
+            MapOverviewTextureManager.getInstance().setPreferredSurfaceScale(safeScale);
+        }
         MapTextureManager.getInstance().requestVisiblePages(
                 minX, maxX, minZ, maxZ,
                 focusX, focusZ,
-                Math.max(0.01f, logicalScale), lane);
+                safeScale, lane);
         synchronized (this) { submittedSurfaceRequests++; }
     }
 
@@ -567,7 +585,7 @@ public final class MapViewportCoordinator {
                 ChunkScanner.getInstance().maintainLoadedSurfaceHalo(
                         minecraft, radius, budget);
             }
-            if (!caveActive) {
+            if (!caveActive && !fullscreenVisible) {
                 double centerX = minecraft.player.getX();
                 double centerZ = minecraft.player.getZ();
                 submitSurfaceDemand(

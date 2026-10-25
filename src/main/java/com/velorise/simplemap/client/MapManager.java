@@ -664,21 +664,37 @@ public class MapManager {
                     }
                 }
             }
-            if (isCeilingDimension(currentDimensionResourceId, currentDimensionProfile)) {
-                File mcaDir = getMcaDirectory(currentDimensionResourceId);
-                if (mcaDir != null && mcaDir.isDirectory()) {
-                    String[] mcaNames = mcaDir.list();
-                    if (mcaNames != null) {
-                        for (String name : mcaNames) {
-                            if (name.startsWith("r.") && name.endsWith(".mca")) {
-                                String[] parts = name.split("\\.");
-                                if (parts.length == 4) {
-                                    try {
-                                        int rx = Integer.parseInt(parts[1]);
-                                        int rz = Integer.parseInt(parts[2]);
-                                        regionFileExists.put(key(rx, rz), true);
-                                    } catch (NumberFormatException ignored) {}
-                                }
+            if ("minecraft:overworld".equals(currentDimensionResourceId)
+                    && currentWorldDir != null && currentWorldDir.isDirectory()) {
+                String[] legacyFiles = currentWorldDir.list();
+                if (legacyFiles != null) {
+                    for (String name : legacyFiles) {
+                        if (name.startsWith("r.") && name.endsWith(".smdat")) {
+                            String[] parts = name.split("\\.");
+                            if (parts.length == 4) {
+                                try {
+                                    int rx = Integer.parseInt(parts[1]);
+                                    int rz = Integer.parseInt(parts[2]);
+                                    regionFileExists.put(key(rx, rz), true);
+                                } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                }
+            }
+            File mcaDir = getMcaDirectory(currentDimensionResourceId);
+            if (mcaDir != null && mcaDir.isDirectory()) {
+                String[] mcaNames = mcaDir.list();
+                if (mcaNames != null) {
+                    for (String name : mcaNames) {
+                        if (name.startsWith("r.") && name.endsWith(".mca")) {
+                            String[] parts = name.split("\\.");
+                            if (parts.length == 4) {
+                                try {
+                                    int rx = Integer.parseInt(parts[1]);
+                                    int rz = Integer.parseInt(parts[2]);
+                                    regionFileExists.put(key(rx, rz), true);
+                                } catch (NumberFormatException ignored) {}
                             }
                         }
                     }
@@ -973,7 +989,18 @@ public class MapManager {
         if (directory == null) return false;
         long key = key(regionX, regionZ);
         synchronized (regionFileExists) {
-            if (regionFileExists.containsKey(key)) return regionFileExists.get(key);
+            if (regionFileExists.containsKey(key)) {
+                boolean cached = regionFileExists.get(key);
+                if (cached) return true;
+            }
+            if (RegionDataStore.hasFile(directory, regionX, regionZ)
+                    || ("minecraft:overworld".equals(currentDimensionResourceId)
+                            && currentWorldDir != null
+                            && RegionDataStore.hasFile(currentWorldDir, regionX, regionZ))
+                    || hasMcaRegionFile(currentDimensionResourceId, regionX, regionZ)) {
+                regionFileExists.put(key, true);
+                return true;
+            }
             long now = System.currentTimeMillis();
             if (now - lastRegionDirectoryScanMs >= 3_000L) {
                 scanRegionFiles(directory);
@@ -1132,12 +1159,19 @@ public class MapManager {
                 Arrays.fill(completeChunks, 0L);
                 List<String> biomePalette = new ArrayList<>();
                 List<String> blockPalette = new ArrayList<>();
-                boolean hasSmdat = RegionDataStore.hasFile(directory, region.rx, region.rz);
-                boolean loaded = hasSmdat && RegionDataStore.load(directory, region.rx, region.rz,
+                File loadDir = directory;
+                boolean hasSmdat = RegionDataStore.hasFile(loadDir, region.rx, region.rz);
+                if (!hasSmdat && "minecraft:overworld".equals(currentDimensionResourceId)
+                        && currentWorldDir != null
+                        && RegionDataStore.hasFile(currentWorldDir, region.rx, region.rz)) {
+                    loadDir = currentWorldDir;
+                    hasSmdat = true;
+                }
+                boolean loaded = hasSmdat && RegionDataStore.load(loadDir, region.rx, region.rz,
                         pixels, tints, completeChunks, biomePalette, blockPalette);
                 boolean scrubbedForeign = false;
                 if (hasSmdat && !loaded) {
-                    quarantineRegion(directory, region.rx, region.rz, generation,
+                    quarantineRegion(loadDir, region.rx, region.rz, generation,
                             "corrupt", "unreadable");
                 } else if (loaded && isLoadTargetCurrent(region, directory, generation)) {
                     int scrubOutcome = scrubForeignVanillaBiomeChunks(
@@ -1149,7 +1183,7 @@ public class MapManager {
                                 "dimension=" + currentDimensionResourceId
                                         + " region=" + region.rx + ',' + region.rz
                                         + " action=quarantine_and_rebuild");
-                        quarantineRegion(directory, region.rx, region.rz, generation,
+                        quarantineRegion(loadDir, region.rx, region.rz, generation,
                                 "dimension-mismatch", "cross-dimension");
                         Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
                         Arrays.fill(tints, SurfaceTintData.UNKNOWN);
@@ -1169,28 +1203,33 @@ public class MapManager {
                     }
                 }
                 if (!isLoadTargetCurrent(region, directory, generation)) return;
-                boolean backfilledFromAnvil = false;
-                if (isCeilingDimension(currentDimensionResourceId, currentDimensionProfile)) {
-                    backfilledFromAnvil = backfillCeilingSurfaceFromAnvil(
-                            region.rx, region.rz, currentDimensionResourceId,
-                            pixels, tints, completeChunks, biomePalette, blockPalette);
-                    if (backfilledFromAnvil) {
-                        loaded = true;
-                    }
-                    region.anvilBackfilled = true;
-                }
-                if (!isLoadTargetCurrent(region, directory, generation)) return;
-                region.applyLoadedData(pixels, tints, completeChunks,
-                        biomePalette, blockPalette);
-                region.markLoaded();
-                region.completeSourceCompletions();
                 if (loaded) {
+                    region.applyLoadedData(pixels, tints, completeChunks,
+                            biomePalette, blockPalette);
+                    region.markLoaded();
+                    region.completeSourceCompletions();
                     MapTextureManager.getInstance()
                             .markRegionSourceAvailable(region.rx, region.rz);
                 }
-                if (backfilledFromAnvil || scrubbedForeign) {
+                boolean backfilledFromAnvil = backfillCeilingSurfaceFromAnvil(
+                        region.rx, region.rz, currentDimensionResourceId,
+                        pixels, tints, completeChunks, biomePalette, blockPalette);
+                region.anvilBackfilled = true;
+                if (!isLoadTargetCurrent(region, directory, generation)) return;
+                if (backfilledFromAnvil || !loaded) {
+                    region.applyLoadedData(pixels, tints, completeChunks,
+                            biomePalette, blockPalette);
+                    region.markLoaded();
+                    region.completeSourceCompletions();
+                    if (backfilledFromAnvil) {
+                        loaded = true;
+                        MapTextureManager.getInstance()
+                                .markRegionSourceAvailable(region.rx, region.rz);
+                    }
+                }
+                if (backfilledFromAnvil || scrubbedForeign || loadDir != directory) {
                     markRegionDirty(region.rx, region.rz);
-                                    }
+                }
                 synchronized (loadedRegions) {
                     evictOldRegions();
                 }
@@ -1203,7 +1242,7 @@ public class MapManager {
     public void ensureCeilingSurfaceRegionsBackfilled() {
         File directory = currentDimensionDir;
         long generation = worldGeneration.get();
-        if (directory == null || !isCeilingDimension(currentDimensionResourceId, currentDimensionProfile)) {
+        if (directory == null) {
             return;
         }
         List<Region> candidates = new ArrayList<>();
@@ -1244,6 +1283,9 @@ public class MapManager {
             long[] pixels, int[] tints, long[] completeChunks,
             List<String> biomePalette, List<String> blockPalette) {
         if (pixels == null || tints == null || completeChunks == null) return false;
+        boolean ceilingDim = isCeilingDimension(dimensionId, currentDimensionProfile);
+        boolean isNether = "minecraft:the_nether".equals(dimensionId);
+        boolean isEnd = "minecraft:the_end".equals(dimensionId);
         boolean allComplete = true;
         for (int i = 0; i < completeChunks.length; i++) {
             if (completeChunks[i] != -1L) {
@@ -1267,6 +1309,8 @@ public class MapManager {
             blockMap.put(blockPalette.get(i), i);
         }
 
+        boolean showFlowers = MapConfig.displayFlowers;
+        MapVisualClassifier classifier = MapVisualClassifier.getInstance();
         boolean backfilledAny = false;
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(mcaFile, "r")) {
             SurfaceLoadBuffers loadBuf = SURFACE_LOAD_BUFFERS.get();
@@ -1278,10 +1322,15 @@ public class MapManager {
                 for (int cx = 0; cx < 32; cx++) {
                     int chunkIndex = (cz << 5) | cx;
                     int sampleIdx = ((cz << 4) + 8) * 512 + (cx << 4) + 8;
-                    if (SurfaceChunkCoverage.isComplete(completeChunks, chunkIndex)
-                            && !MapBlockData.isEmpty(pixels[sampleIdx])
-                            && MapBlockData.topY(pixels[sampleIdx]) >= 123) {
-                        continue;
+                    if (SurfaceChunkCoverage.isComplete(completeChunks, chunkIndex)) {
+                        if (ceilingDim) {
+                            if (!MapBlockData.isEmpty(pixels[sampleIdx])
+                                    && MapBlockData.topY(pixels[sampleIdx]) >= 123) {
+                                continue;
+                            }
+                        } else if (isEnd || !MapBlockData.isEmpty(pixels[sampleIdx])) {
+                            continue;
+                        }
                     }
                     int offset = chunkIndex * 4;
                     int sectorOffset = ((header[offset] & 0xFF) << 16)
@@ -1330,19 +1379,109 @@ public class MapManager {
                             "sections", net.minecraft.nbt.Tag.TAG_COMPOUND);
                     if (sections.isEmpty()) continue;
 
-                    net.minecraft.nbt.CompoundTag sec7 = null;
-                    net.minecraft.nbt.CompoundTag sec8 = null;
+                    if (ceilingDim) {
+                        net.minecraft.nbt.CompoundTag sec7 = null;
+                        net.minecraft.nbt.CompoundTag sec8 = null;
+                        for (int i = 0; i < sections.size(); i++) {
+                            net.minecraft.nbt.CompoundTag st = sections.getCompound(i);
+                            int sy = st.getByte("Y");
+                            if (sy == 7) sec7 = st;
+                            else if (sy == 8) sec8 = st;
+                        }
+                        if (sec7 == null && sec8 == null) continue;
+
+                        AnvilRoofSection roof8 = sec8 != null ? AnvilRoofSection.decode(sec8) : null;
+                        AnvilRoofSection roof7 = sec7 != null ? AnvilRoofSection.decode(sec7) : null;
+                        if (roof7 == null && roof8 == null) continue;
+
+                        int baseX = cx << 4;
+                        int baseZ = cz << 4;
+                        boolean chunkFilled = false;
+                        for (int lz = 0; lz < 16; lz++) {
+                            int row = (baseZ + lz) * 512 + baseX;
+                            for (int lx = 0; lx < 16; lx++) {
+                                int idx = row + lx;
+                                if (!MapBlockData.isEmpty(pixels[idx])
+                                        && MapBlockData.topY(pixels[idx]) >= 123) {
+                                    chunkFilled = true;
+                                    continue;
+                                }
+                                int foundY = Integer.MIN_VALUE;
+                                String blockName = null;
+                                String biomeName = null;
+                                int blockLight = 0;
+                                if (roof8 != null) {
+                                    for (int ly = 15; ly >= 0; ly--) {
+                                        String candidate = roof8.getBlockName(lx, ly, lz);
+                                        if (!isAirOrBarrierBlockName(candidate)) {
+                                            foundY = 128 + ly;
+                                            blockName = candidate;
+                                            biomeName = roof8.getBiomeName(lx, ly, lz);
+                                            blockLight = roof8.getBlockLight(lx, Math.min(15, ly + 1), lz);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (foundY == Integer.MIN_VALUE && roof7 != null) {
+                                    for (int ly = 15; ly >= 11; ly--) {
+                                        String candidate = roof7.getBlockName(lx, ly, lz);
+                                        if (!isAirOrBarrierBlockName(candidate)) {
+                                            foundY = 112 + ly;
+                                            blockName = candidate;
+                                            biomeName = roof7.getBiomeName(lx, ly, lz);
+                                            blockLight = (ly < 15)
+                                                    ? roof7.getBlockLight(lx, ly + 1, lz)
+                                                    : (roof8 != null ? roof8.getBlockLight(lx, 0, lz) : 0);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (foundY == Integer.MIN_VALUE || blockName == null) continue;
+                                if (biomeName == null || biomeName.isBlank()
+                                        || "minecraft:plains".equals(biomeName)) {
+                                    biomeName = "minecraft:nether_wastes";
+                                }
+                                int blkIdx = internPaletteEntry(blockName, blockPalette, blockMap, 65534);
+                                int bioIdx = internPaletteEntry(biomeName, biomePalette, biomeMap, 254);
+                                pixels[idx] = MapBlockData.packRaw((short) foundY, (short) blkIdx, (byte) bioIdx, (byte) Math.max(0, Math.min(15, blockLight)));
+                                tints[idx] = SurfaceTintData.NONE;
+                                chunkFilled = true;
+                            }
+                        }
+                        if (chunkFilled) {
+                            SurfaceChunkCoverage.markComplete(completeChunks, chunkIndex);
+                            backfilledAny = true;
+                        }
+                        continue;
+                    }
+
+                    int minSecY = Integer.MAX_VALUE;
+                    int maxSecY = Integer.MIN_VALUE;
+                    for (int i = 0; i < sections.size(); i++) {
+                        net.minecraft.nbt.CompoundTag st = sections.getCompound(i);
+                        if (isAllAirSection(st)) continue;
+                        int sy = st.getByte("Y");
+                        if (sy < minSecY) minSecY = sy;
+                        if (sy > maxSecY) maxSecY = sy;
+                    }
+                    if (minSecY > maxSecY) {
+                        if (isEnd) {
+                            SurfaceChunkCoverage.markComplete(completeChunks, chunkIndex);
+                            backfilledAny = true;
+                        }
+                        continue;
+                    }
+                    int secSpan = maxSecY - minSecY + 1;
+                    if (secSpan <= 0 || secSpan > 64) continue;
+                    net.minecraft.nbt.CompoundTag[] secTags = new net.minecraft.nbt.CompoundTag[secSpan];
+                    AnvilRoofSection[] decodedSecs = new AnvilRoofSection[secSpan];
                     for (int i = 0; i < sections.size(); i++) {
                         net.minecraft.nbt.CompoundTag st = sections.getCompound(i);
                         int sy = st.getByte("Y");
-                        if (sy == 7) sec7 = st;
-                        else if (sy == 8) sec8 = st;
+                        if (sy >= minSecY && sy <= maxSecY && !isAllAirSection(st)) {
+                            secTags[sy - minSecY] = st;
+                        }
                     }
-                    if (sec7 == null && sec8 == null) continue;
-
-                    AnvilRoofSection roof8 = sec8 != null ? AnvilRoofSection.decode(sec8) : null;
-                    AnvilRoofSection roof7 = sec7 != null ? AnvilRoofSection.decode(sec7) : null;
-                    if (roof7 == null && roof8 == null) continue;
 
                     int baseX = cx << 4;
                     int baseZ = cz << 4;
@@ -1351,54 +1490,125 @@ public class MapManager {
                         int row = (baseZ + lz) * 512 + baseX;
                         for (int lx = 0; lx < 16; lx++) {
                             int idx = row + lx;
-                            if (!MapBlockData.isEmpty(pixels[idx])
-                                    && MapBlockData.topY(pixels[idx]) >= 123) {
+                            if (!MapBlockData.isEmpty(pixels[idx])) {
                                 chunkFilled = true;
                                 continue;
                             }
                             int foundY = Integer.MIN_VALUE;
+                            int floorY = Integer.MIN_VALUE;
                             String blockName = null;
                             String biomeName = null;
                             int blockLight = 0;
-                            if (roof8 != null) {
+                            boolean inWater = false;
+                            int waterTopY = Integer.MIN_VALUE;
+                            String waterBiomeName = null;
+                            int waterLight = 0;
+                            String floorBlockName = null;
+                            MapVisualClassifier.VisualInfo surfaceVisual = null;
+
+                            sectionLoop:
+                            for (int sy = maxSecY; sy >= minSecY; sy--) {
+                                AnvilRoofSection sec = getOrDecodeSection(
+                                        sy, minSecY, secTags, decodedSecs);
+                                if (sec == null) continue;
                                 for (int ly = 15; ly >= 0; ly--) {
-                                    String candidate = roof8.getBlockName(lx, ly, lz);
-                                    if (!isAirOrBarrierBlockName(candidate)) {
-                                        foundY = 128 + ly;
-                                        blockName = candidate;
-                                        biomeName = roof8.getBiomeName(lx, ly, lz);
-                                        blockLight = roof8.getBlockLight(lx, Math.min(15, ly + 1), lz);
-                                        break;
+                                    String candidate = sec.getBlockName(lx, ly, lz);
+                                    if (isAirOrBarrierBlockName(candidate)) continue;
+                                    MapVisualClassifier.VisualInfo vInfo = classifier.info(candidate);
+                                    if (vInfo.role() == MapVisualClassifier.Role.INVISIBLE
+                                            || vInfo.invisibleDecoration()) {
+                                        continue;
                                     }
+                                    if (vInfo.flower() && !showFlowers) {
+                                        continue;
+                                    }
+                                    int worldY = (sy << 4) + ly;
+                                    boolean isWater = vInfo.water()
+                                            || "minecraft:water".equals(candidate)
+                                            || "minecraft:bubble_column".equals(candidate)
+                                            || "minecraft:kelp".equals(candidate)
+                                            || "minecraft:kelp_plant".equals(candidate)
+                                            || "minecraft:seagrass".equals(candidate)
+                                            || "minecraft:tall_seagrass".equals(candidate);
+                                    if (isWater) {
+                                        if (!inWater) {
+                                            inWater = true;
+                                            waterTopY = worldY;
+                                            waterBiomeName = sec.getBiomeName(lx, ly, lz);
+                                            waterLight = sampleAnvilBlockLightAbove(
+                                                    sy, ly, lx, lz, minSecY, maxSecY,
+                                                    secTags, decodedSecs);
+                                        }
+                                        continue;
+                                    }
+                                    if (inWater) {
+                                        floorY = worldY;
+                                        floorBlockName = candidate;
+                                        if (waterBiomeName == null || waterBiomeName.isBlank()) {
+                                            waterBiomeName = sec.getBiomeName(lx, ly, lz);
+                                        }
+                                        break sectionLoop;
+                                    }
+                                    foundY = worldY;
+                                    floorY = worldY;
+                                    blockName = candidate;
+                                    biomeName = sec.getBiomeName(lx, ly, lz);
+                                    blockLight = sampleAnvilBlockLightAbove(
+                                            sy, ly, lx, lz, minSecY, maxSecY,
+                                            secTags, decodedSecs);
+                                    surfaceVisual = vInfo;
+                                    break sectionLoop;
                                 }
                             }
-                            if (foundY == Integer.MIN_VALUE && roof7 != null) {
-                                for (int ly = 15; ly >= 11; ly--) {
-                                    String candidate = roof7.getBlockName(lx, ly, lz);
-                                    if (!isAirOrBarrierBlockName(candidate)) {
-                                        foundY = 112 + ly;
-                                        blockName = candidate;
-                                        biomeName = roof7.getBiomeName(lx, ly, lz);
-                                        blockLight = (ly < 15)
-                                                ? roof7.getBlockLight(lx, ly + 1, lz)
-                                                : (roof8 != null ? roof8.getBlockLight(lx, 0, lz) : 0);
-                                        break;
-                                    }
+
+                            int resultFlags;
+                            if (inWater) {
+                                foundY = waterTopY;
+                                if (floorBlockName == null) {
+                                    floorY = waterTopY - 1;
+                                    blockName = "minecraft:stone";
+                                } else {
+                                    blockName = floorBlockName;
                                 }
+                                biomeName = waterBiomeName;
+                                blockLight = waterLight;
+                                resultFlags = (Math.max(0, Math.min(15, blockLight)) & 0x0F) | 0x20;
+                            } else if (foundY != Integer.MIN_VALUE && blockName != null) {
+                                boolean fluid = surfaceVisual != null && surfaceVisual.fluid();
+                                boolean glowing = (surfaceVisual != null && surfaceVisual.emissive())
+                                        || "minecraft:lava".equals(blockName)
+                                        || "minecraft:magma_block".equals(blockName)
+                                        || "minecraft:glowstone".equals(blockName)
+                                        || "minecraft:shroomlight".equals(blockName)
+                                        || "minecraft:sea_lantern".equals(blockName);
+                                boolean flower = surfaceVisual != null && surfaceVisual.flower();
+                                boolean leaves = surfaceVisual != null && surfaceVisual.leaves();
+                                resultFlags = Math.max(0, Math.min(15, blockLight)) & 0x0F;
+                                if (glowing) resultFlags |= 0x10;
+                                if (fluid) resultFlags |= 0x20;
+                                if (flower) resultFlags |= 0x40;
+                                if (leaves) resultFlags |= 0x80;
+                            } else {
+                                continue;
                             }
-                            if (foundY == Integer.MIN_VALUE || blockName == null) continue;
-                            if (biomeName == null || biomeName.isBlank()
-                                    || "minecraft:plains".equals(biomeName)) {
-                                biomeName = "minecraft:nether_wastes";
+
+                            if (biomeName == null || biomeName.isBlank()) {
+                                biomeName = isNether ? "minecraft:nether_wastes"
+                                        : (isEnd ? "minecraft:the_end" : "minecraft:plains");
+                            } else if ("minecraft:plains".equals(biomeName)) {
+                                if (isNether) biomeName = "minecraft:nether_wastes";
+                                else if (isEnd) biomeName = "minecraft:the_end";
                             }
                             int blkIdx = internPaletteEntry(blockName, blockPalette, blockMap, 65534);
                             int bioIdx = internPaletteEntry(biomeName, biomePalette, biomeMap, 254);
-                            pixels[idx] = MapBlockData.packRaw((short) foundY, (short) blkIdx, (byte) bioIdx, (byte) Math.max(0, Math.min(15, blockLight)));
+                            pixels[idx] = MapBlockData.packRaw(
+                                    (short) foundY, (short) blkIdx, (byte) bioIdx,
+                                    (byte) resultFlags, (short) floorY);
                             tints[idx] = SurfaceTintData.NONE;
                             chunkFilled = true;
                         }
                     }
-                    if (chunkFilled) {
+                    if (chunkFilled || isEnd) {
                         SurfaceChunkCoverage.markComplete(completeChunks, chunkIndex);
                         backfilledAny = true;
                     }
@@ -1407,6 +1617,49 @@ public class MapManager {
         } catch (Throwable ignored) {
         }
         return backfilledAny;
+    }
+
+    private static boolean isAllAirSection(net.minecraft.nbt.CompoundTag secTag) {
+        if (secTag == null || !secTag.contains("block_states", net.minecraft.nbt.Tag.TAG_COMPOUND)) {
+            return true;
+        }
+        net.minecraft.nbt.CompoundTag bs = secTag.getCompound("block_states");
+        if (!bs.contains("palette", net.minecraft.nbt.Tag.TAG_LIST)) return true;
+        net.minecraft.nbt.ListTag pal = bs.getList("palette", net.minecraft.nbt.Tag.TAG_COMPOUND);
+        if (pal.isEmpty()) return true;
+        if (pal.size() == 1) {
+            String onlyName = pal.getCompound(0).getString("Name");
+            return isAirOrBarrierBlockName(onlyName);
+        }
+        return false;
+    }
+
+    private static AnvilRoofSection getOrDecodeSection(int sy, int minSecY,
+            net.minecraft.nbt.CompoundTag[] secTags, AnvilRoofSection[] decodedSecs) {
+        int idx = sy - minSecY;
+        if (idx < 0 || idx >= secTags.length) return null;
+        AnvilRoofSection existing = decodedSecs[idx];
+        if (existing != null) return existing;
+        net.minecraft.nbt.CompoundTag tag = secTags[idx];
+        if (tag == null) return null;
+        AnvilRoofSection decoded = AnvilRoofSection.decode(tag);
+        decodedSecs[idx] = decoded;
+        secTags[idx] = null;
+        return decoded;
+    }
+
+    private static int sampleAnvilBlockLightAbove(int sy, int ly, int lx, int lz,
+            int minSecY, int maxSecY,
+            net.minecraft.nbt.CompoundTag[] secTags, AnvilRoofSection[] decodedSecs) {
+        if (ly < 15) {
+            AnvilRoofSection sec = getOrDecodeSection(sy, minSecY, secTags, decodedSecs);
+            return sec != null ? sec.getBlockLight(lx, ly + 1, lz) : 0;
+        }
+        if (sy + 1 <= maxSecY) {
+            AnvilRoofSection above = getOrDecodeSection(sy + 1, minSecY, secTags, decodedSecs);
+            return above != null ? above.getBlockLight(lx, 0, lz) : 0;
+        }
+        return 0;
     }
 
     private static boolean isAirOrBarrierBlockName(String name) {
@@ -2749,6 +3002,38 @@ public class MapManager {
             lock.lock();
             try {
                 if (closed) return;
+                if (knownColumnCount > 0 && (!biomePalette.isEmpty() || !blockPalette.isEmpty())) {
+                    Map<String, Integer> bioMap = new HashMap<>();
+                    for (int i = 0; i < biomes.size(); i++) bioMap.put(biomes.get(i), i);
+                    Map<String, Integer> blkMap = new HashMap<>();
+                    for (int i = 0; i < blocks.size(); i++) blkMap.put(blocks.get(i), i);
+                    for (int i = 0; i < pixels.length; i++) {
+                        long existing = pixels[i];
+                        if (MapBlockData.isEmpty(existing)) continue;
+                        if (!MapBlockData.isEmpty(loadedPixels[i])) continue;
+                        int oldBlk = MapBlockData.blockId(existing) & 0xFFFF;
+                        int oldBio = MapBlockData.biomeId(existing) & 0xFF;
+                        String blkName = (oldBlk >= 0 && oldBlk < blockPalette.size())
+                                ? blockPalette.get(oldBlk) : "minecraft:stone";
+                        String bioName = (oldBio >= 0 && oldBio < biomePalette.size())
+                                ? biomePalette.get(oldBio) : "minecraft:plains";
+                        int newBlk = internPaletteEntry(blkName, blocks, blkMap, 65534);
+                        int newBio = internPaletteEntry(bioName, biomes, bioMap, 254);
+                        loadedPixels[i] = MapBlockData.packRaw(
+                                MapBlockData.topY(existing),
+                                (short) newBlk,
+                                (byte) newBio,
+                                MapBlockData.flags(existing),
+                                MapBlockData.floorY(existing));
+                        loadedTints[i] = tints[i];
+                    }
+                    if (loadedCompleteChunks != null
+                            && loadedCompleteChunks.length == completeChunks.length) {
+                        for (int w = 0; w < completeChunks.length; w++) {
+                            loadedCompleteChunks[w] |= completeChunks[w];
+                        }
+                    }
+                }
                 System.arraycopy(loadedPixels, 0, pixels, 0, pixels.length);
                 System.arraycopy(loadedTints, 0, tints, 0, tints.length);
                 Arrays.fill(knownColumnsPerPage, 0);

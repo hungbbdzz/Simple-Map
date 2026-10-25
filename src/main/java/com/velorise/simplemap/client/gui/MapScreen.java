@@ -362,6 +362,9 @@ public class MapScreen extends Screen {
             updateCaveControlLayout();
         }
 
+        if (this.minecraft != null && !CaveMode.isActive(this.minecraft)) {
+            MapManager.getInstance().ensureCeilingSurfaceRegionsBackfilled();
+        }
         layoutToolbar();
         updateToolbarTooltips();
     }
@@ -1832,23 +1835,25 @@ public class MapScreen extends Screen {
             this.scale = DEFAULT_MAP_SCALE;
             return true;
         }
-        if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F8
-                || SimpleMap.ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY.matches(keyCode, scanCode)) {
-            consumeBufferedClicks(SimpleMap.ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY);
-            MapDebugRecorder.getInstance().toggleOverlay();
-            return true;
-        }
-        if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F9
-                || SimpleMap.ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY.matches(keyCode, scanCode)) {
-            consumeBufferedClicks(SimpleMap.ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY);
-            MapDebugRecorder.getInstance().toggleRecording(this.minecraft);
-            return true;
-        }
-        if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F10
-                || SimpleMap.ClientModEvents.MARK_DEBUG_ISSUE_KEY.matches(keyCode, scanCode)) {
-            consumeBufferedClicks(SimpleMap.ClientModEvents.MARK_DEBUG_ISSUE_KEY);
-            MapDebugRecorder.getInstance().markIssue(this.minecraft);
-            return true;
+        if (MapDebugRecorder.DEBUG_ENABLED) {
+            if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F8
+                    || SimpleMap.ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY.matches(keyCode, scanCode)) {
+                consumeBufferedClicks(SimpleMap.ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY);
+                MapDebugRecorder.getInstance().toggleOverlay();
+                return true;
+            }
+            if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F9
+                    || SimpleMap.ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY.matches(keyCode, scanCode)) {
+                consumeBufferedClicks(SimpleMap.ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY);
+                MapDebugRecorder.getInstance().toggleRecording(this.minecraft);
+                return true;
+            }
+            if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F10
+                    || SimpleMap.ClientModEvents.MARK_DEBUG_ISSUE_KEY.matches(keyCode, scanCode)) {
+                consumeBufferedClicks(SimpleMap.ClientModEvents.MARK_DEBUG_ISSUE_KEY);
+                MapDebugRecorder.getInstance().markIssue(this.minecraft);
+                return true;
+            }
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
     }
@@ -2402,6 +2407,7 @@ public class MapScreen extends Screen {
         private MapDebugOverlay() { }
 
         public static void render(GuiGraphics graphics) {
+            if (!MapDebugRecorder.DEBUG_ENABLED) return;
             MapDebugRecorder recorder = MapDebugRecorder.getInstance();
             if (!recorder.isOverlayVisible()) return;
             Minecraft minecraft = Minecraft.getInstance();

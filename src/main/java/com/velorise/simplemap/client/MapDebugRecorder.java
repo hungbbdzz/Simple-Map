@@ -100,7 +100,7 @@ public final class MapDebugRecorder {
 
     public synchronized void transition(String key, ExactPageState state,
             MapRequestLane lane, long revision) {
-        if (key == null || state == null) return;
+        if (!DEBUG_ENABLED || key == null || state == null) return;
         Entry previous = entries.get(key);
         long now = System.currentTimeMillis();
         MapRequestLane effectiveLane = lane == null ? MapRequestLane.BACKGROUND : lane;
@@ -219,8 +219,14 @@ public final class MapDebugRecorder {
     // predecessor guard marker: PASS167_stable_product_revision_persistent_writer
     // predecessor guard marker: PASS168_ordered_writer_no_global_publication_mutex
     // predecessor guard marker: PASS169_single_generation_ack_on_ingest
+    /**
+     * Diagnostic capture and F8/F9/F10 debug controls are disabled by default in
+     * release builds. Pass {@code -Dsimplemap.debug=true} on the JVM command line
+     * to enable telemetry recording and the in-game debug overlay.
+     */
+    public static final boolean DEBUG_ENABLED = Boolean.getBoolean("simplemap.debug");
     private static final String BUILD_PROVENANCE =
-            "PASS170_ordered_presentation_writer";
+            "RELEASE_2_0_0";
     private static final Logger LOGGER = LogManager.getLogger();
     private static final MapDebugRecorder INSTANCE = new MapDebugRecorder();
     private static final DateTimeFormatter DIRECTORY_TIME = DateTimeFormatter
@@ -241,8 +247,8 @@ public final class MapDebugRecorder {
     private final com.sun.management.OperatingSystemMXBean osBean;
     private final com.sun.management.ThreadMXBean threadBean;
 
-    private volatile boolean recording = true;
-    private volatile boolean overlayVisible = true;
+    private volatile boolean recording = DEBUG_ENABLED;
+    private volatile boolean overlayVisible = DEBUG_ENABLED;
     private volatile long burstUntilNanos;
     private volatile long lastSampleNanos;
     private volatile long sessionStartNanos;
@@ -274,7 +280,7 @@ public final class MapDebugRecorder {
                 ManagementFactory.getThreadMXBean();
         threadBean = baseThread instanceof com.sun.management.ThreadMXBean sun
                 ? sun : null;
-        if (threadBean != null && threadBean.isThreadAllocatedMemorySupported()
+        if (DEBUG_ENABLED && threadBean != null && threadBean.isThreadAllocatedMemorySupported()
                 && !threadBean.isThreadAllocatedMemoryEnabled()) {
             try {
                 threadBean.setThreadAllocatedMemoryEnabled(true);
@@ -304,6 +310,7 @@ public final class MapDebugRecorder {
     }
 
     public void toggleOverlay() {
+        if (!DEBUG_ENABLED) return;
         overlayVisible = !overlayVisible;
         if (overlayVisible && lastSnapshot.timestampMs() == 0L) {
             Minecraft mc = Minecraft.getInstance();
@@ -315,6 +322,7 @@ public final class MapDebugRecorder {
     }
 
     public void toggleRecording(Minecraft minecraft) {
+        if (!DEBUG_ENABLED) return;
         boolean next = !recording;
         if (!next) {
             event("RECORDING_PAUSED", "source=keybind");
@@ -328,6 +336,7 @@ public final class MapDebugRecorder {
     }
 
     public void markIssue(Minecraft minecraft) {
+        if (!DEBUG_ENABLED) return;
         burstUntilNanos = System.nanoTime() + BURST_DURATION_NANOS;
         ensureSession(minecraft);
         event("USER_MARKER", "burst_ms=20000 screen="
@@ -337,6 +346,7 @@ public final class MapDebugRecorder {
 
     /** Called once per client tick after map scheduling has updated telemetry. */
     public void tick(Minecraft minecraft) {
+        if (!DEBUG_ENABLED) return;
         if (minecraft == null || minecraft.level == null || minecraft.player == null) return;
         if (!recording && !overlayVisible) return;
         if (recording) ensureSession(minecraft);
@@ -354,6 +364,7 @@ public final class MapDebugRecorder {
     }
 
     public void onWorldLeave() {
+        if (!DEBUG_ENABLED) return;
         event("WORLD_LEAVE", "session_id=" + activeSessionId);
         activeSessionId = Long.MIN_VALUE;
         activeDirectory = null;
@@ -364,7 +375,7 @@ public final class MapDebugRecorder {
     }
 
     public void event(String type, String detail) {
-        if (!recording || activeDirectory == null) return;
+        if (!DEBUG_ENABLED || !recording || activeDirectory == null) return;
         String safeType = type == null || type.isBlank() ? "UNKNOWN" : type;
         offer(new WriteItem(Stream.EVENTS, jsonEvent(safeType, detail)));
     }
@@ -374,7 +385,7 @@ public final class MapDebugRecorder {
      * Callers should only format the event payload when this returns true.
      */
     public boolean shouldEmitEvent(String rateKey, long minimumIntervalMillis) {
-        if (!recording || activeDirectory == null) return false;
+        if (!DEBUG_ENABLED || !recording || activeDirectory == null) return false;
         long now = System.nanoTime();
         long minimumNanos = Math.max(1L, minimumIntervalMillis) * 1_000_000L;
         Long previous = rateLimitNanos.put(String.valueOf(rateKey), now);
@@ -382,6 +393,7 @@ public final class MapDebugRecorder {
     }
 
     private void ensureSession(Minecraft minecraft) {
+        if (!DEBUG_ENABLED) return;
         MapSession session = MapSessionManager.getInstance().active();
         if (session == null || session.sessionId() == activeSessionId) return;
         activeSessionId = session.sessionId();
