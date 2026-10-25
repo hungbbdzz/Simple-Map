@@ -1874,11 +1874,11 @@ public class MapScreen extends Screen {
                             isPopupMenuOpen = false;
                             clickedWaypoint = null;
                             int tpX = (int) Math.floor(targetWp.x);
-                            int tpY = (int) Math.floor(targetWp.y);
                             int tpZ = (int) Math.floor(targetWp.z);
                             String targetDimension = targetWp.dimension != null && !targetWp.dimension.isBlank()
                                     ? targetWp.dimension
                                     : MapManager.getInstance().getCurrentDimensionResourceId();
+                            int tpY = (int) Math.floor(targetWp.y);
                             if (MapTeleportController.teleport(this.minecraft, targetDimension,
                                     tpX, tpY, tpZ)) {
                                 this.onClose();

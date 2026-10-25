@@ -122,6 +122,11 @@ public final class CaveTextureManager {
         return INSTANCE;
     }
 
+    private static String currentDimensionId() {
+        String dim = MapManager.getInstance().getCurrentDimensionResourceId();
+        return (dim == null || dim.isBlank()) ? "minecraft:overworld" : dim;
+    }
+
     public void setPreferredCaveView(int minPageX, int maxPageX,
             int minPageZ, int maxPageZ, int focusPageX, int focusPageZ) {
         this.minVisiblePageX = minPageX;
@@ -199,28 +204,29 @@ public final class CaveTextureManager {
     }
 
     public void markPageTextureDirty(int layerY, int globalPageX, int globalPageZ) {
+        String dimId = currentDimensionId();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
         int rx = Math.floorDiv(globalPageX, 8);
         int rz = Math.floorDiv(globalPageZ, 8);
-        PageKey key = new PageKey(band, globalPageX, globalPageZ);
+        PageKey key = new PageKey(dimId, band, globalPageX, globalPageZ);
         synchronized (pages) {
             PageEntry entry = pages.computeIfAbsent(key, PageEntry::new);
             entry.dirty = true;
             dirtyPageKeys.add(key);
         }
         synchronized (branchPages) {
-            BranchKey k3 = new BranchKey(band, 3, rx, rz);
+            BranchKey k3 = new BranchKey(dimId, band, 3, rx, rz);
             BranchEntry l3 = branchPages.computeIfAbsent(k3, BranchEntry::new);
             l3.dirty = true;
             dirtyBranchKeys.add(k3);
 
-            BranchKey k2 = new BranchKey(band, 2, Math.floorDiv(globalPageX, 4), Math.floorDiv(globalPageZ, 4));
+            BranchKey k2 = new BranchKey(dimId, band, 2, Math.floorDiv(globalPageX, 4), Math.floorDiv(globalPageZ, 4));
             BranchEntry l2 = branchPages.get(k2);
             if (l2 != null) {
                 l2.dirty = true;
                 dirtyBranchKeys.add(k2);
             }
-            BranchKey k1 = new BranchKey(band, 1, Math.floorDiv(globalPageX, 2), Math.floorDiv(globalPageZ, 2));
+            BranchKey k1 = new BranchKey(dimId, band, 1, Math.floorDiv(globalPageX, 2), Math.floorDiv(globalPageZ, 2));
             BranchEntry l1 = branchPages.get(k1);
             if (l1 != null) {
                 l1.dirty = true;
@@ -239,6 +245,11 @@ public final class CaveTextureManager {
         if (region == null) {
             return;
         }
+        String dimId = (region.dimensionResourceId == null || region.dimensionResourceId.isBlank())
+                ? currentDimensionId() : region.dimensionResourceId;
+        if (!dimId.equals(currentDimensionId())) {
+            return;
+        }
         boolean regionHasContent = region.hasContent();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
         int firstGlobalX = rx << 3;
@@ -255,7 +266,7 @@ public final class CaveTextureManager {
                 for (int px = 0; px < 8; px++) {
                     int gpx = firstGlobalX + px;
                     int gpz = firstGlobalZ + pz;
-                    PageKey key = new PageKey(band, gpx, gpz);
+                    PageKey key = new PageKey(dimId, band, gpx, gpz);
                     PageEntry existing = pages.get(key);
                     if (existing != null) {
                         existing.dirty = true;
@@ -272,7 +283,7 @@ public final class CaveTextureManager {
             }
         }
         synchronized (branchPages) {
-            BranchKey k3 = new BranchKey(band, 3, rx, rz);
+            BranchKey k3 = new BranchKey(dimId, band, 3, rx, rz);
             BranchEntry l3 = regionHasContent ? branchPages.computeIfAbsent(k3, BranchEntry::new) : branchPages.get(k3);
             if (l3 != null) {
                 l3.dirty = true;
@@ -283,7 +294,7 @@ public final class CaveTextureManager {
             int baseNodeZ2 = rz * 2;
             for (int dz = 0; dz < 2; dz++) {
                 for (int dx = 0; dx < 2; dx++) {
-                    BranchKey k2 = new BranchKey(band, 2, baseNodeX2 + dx, baseNodeZ2 + dz);
+                    BranchKey k2 = new BranchKey(dimId, band, 2, baseNodeX2 + dx, baseNodeZ2 + dz);
                     BranchEntry l2 = branchPages.get(k2);
                     if (l2 != null) {
                         l2.dirty = true;
@@ -295,7 +306,7 @@ public final class CaveTextureManager {
             int baseNodeZ1 = rz * 4;
             for (int dz = 0; dz < 4; dz++) {
                 for (int dx = 0; dx < 4; dx++) {
-                    BranchKey k1 = new BranchKey(band, 1, baseNodeX1 + dx, baseNodeZ1 + dz);
+                    BranchKey k1 = new BranchKey(dimId, band, 1, baseNodeX1 + dx, baseNodeZ1 + dz);
                     BranchEntry l1 = branchPages.get(k1);
                     if (l1 != null) {
                         l1.dirty = true;
@@ -367,11 +378,12 @@ public final class CaveTextureManager {
         // Keep resident GPU slots of FULL cave and recent LAYERED bands in memory
         // so switching OFF <-> LAYERED <-> FULL is instant (0ms reload); evictOldestPage()
         // automatically reclaims off-band slots only when the 576-slot atlas is full.
+        String activeDim = currentDimensionId();
         boolean needsIntraBandRefresh = (layerY != Integer.MIN_VALUE && oldLayer != Integer.MIN_VALUE
                 && CaveLayerBand.key(CaveView.LAYERED, oldLayer) == activeBand);
         synchronized (pages) {
             for (PageEntry entry : pages.values()) {
-                if (entry.key.band() == activeBand) {
+                if (activeDim.equals(entry.key.dimension()) && entry.key.band() == activeBand) {
                     if (needsIntraBandRefresh || entry.slot == -1 || entry.dirty) {
                         entry.dirty = true;
                         dirtyPageKeys.add(entry.key);
@@ -381,7 +393,7 @@ public final class CaveTextureManager {
         }
         synchronized (branchPages) {
             for (BranchEntry entry : branchPages.values()) {
-                if (entry.key.band() == activeBand) {
+                if (activeDim.equals(entry.key.dimension()) && entry.key.band() == activeBand) {
                     if (needsIntraBandRefresh || entry.slot == -1 || entry.dirty) {
                         entry.dirty = true;
                         dirtyBranchKeys.add(entry.key);
@@ -421,7 +433,7 @@ public final class CaveTextureManager {
         int globalPageX = (rx << 3) + pageX;
         int globalPageZ = (rz << 3) + pageZ;
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
-        PageKey key = new PageKey(band, globalPageX, globalPageZ);
+        PageKey key = new PageKey(currentDimensionId(), band, globalPageX, globalPageZ);
 
         PageEntry entry;
         synchronized (pages) {
@@ -474,7 +486,7 @@ public final class CaveTextureManager {
 
     private PageSelection tryGetFallbackPage(int band, int representativeLayerY,
             int globalPageX, int globalPageZ, float scale, MapRequestLane lane) {
-        PageKey key = new PageKey(band, globalPageX, globalPageZ);
+        PageKey key = new PageKey(currentDimensionId(), band, globalPageX, globalPageZ);
         PageEntry entry;
         synchronized (pages) {
             entry = pages.get(key);
@@ -531,7 +543,7 @@ public final class CaveTextureManager {
             int nodeX, int nodeZ, MapRequestLane lane, boolean createIfMissing) {
         if (level <= 0 || level > 3) return null;
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
-        BranchKey key = new BranchKey(band, level, nodeX, nodeZ);
+        BranchKey key = new BranchKey(currentDimensionId(), band, level, nodeX, nodeZ);
 
         BranchEntry entry;
         synchronized (branchPages) {
@@ -579,7 +591,7 @@ public final class CaveTextureManager {
         int band = layerY == Integer.MIN_VALUE
                 ? Integer.MIN_VALUE
                 : CaveMode.CaveLayerBand.key(CaveMode.CaveLayerBand.CaveView.LAYERED, layerY);
-        BranchKey key = new BranchKey(band, level, nodeX, nodeZ);
+        BranchKey key = new BranchKey(currentDimensionId(), band, level, nodeX, nodeZ);
         synchronized (branchPages) {
             BranchEntry entry = branchPages.get(key);
             if (entry != null && !entry.dirty) {
@@ -621,13 +633,14 @@ public final class CaveTextureManager {
         int lastPageX = firstPageX + pageSpan - 1;
         int lastPageZ = firstPageZ + pageSpan - 1;
 
+        String dimId = currentDimensionId();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveMode.CaveLayerBand.key(CaveMode.CaveLayerBand.CaveView.LAYERED, layerY);
 
         // 1. Check GPU resident pages for active band
         synchronized (pages) {
             for (int pz = firstPageZ; pz <= lastPageZ; pz++) {
                 for (int px = firstPageX; px <= lastPageX; px++) {
-                    PageEntry entry = pages.get(new PageKey(band, px, pz));
+                    PageEntry entry = pages.get(new PageKey(dimId, band, px, pz));
                     if (entry != null && entry.slot >= 0 && entry.hasContent) {
                         return true;
                     }
@@ -642,7 +655,7 @@ public final class CaveTextureManager {
                 synchronized (pages) {
                     for (int pz = firstPageZ; pz <= lastPageZ; pz++) {
                         for (int px = firstPageX; px <= lastPageX; px++) {
-                            PageEntry entry = pages.get(new PageKey(prevBand, px, pz));
+                            PageEntry entry = pages.get(new PageKey(dimId, prevBand, px, pz));
                             if (entry != null && entry.slot >= 0 && entry.hasContent) {
                                 return true;
                             }
@@ -662,7 +675,7 @@ public final class CaveTextureManager {
                 int maxNodeZ = Math.floorDiv(lastPageZ, childSpan);
                 for (int nz = minNodeZ; nz <= maxNodeZ; nz++) {
                     for (int nx = minNodeX; nx <= maxNodeX; nx++) {
-                        BranchEntry bEntry = branchPages.get(new BranchKey(band, childLevel, nx, nz));
+                        BranchEntry bEntry = branchPages.get(new BranchKey(dimId, band, childLevel, nx, nz));
                         if (bEntry != null && bEntry.slot >= 0 && bEntry.hasContent) {
                             return true;
                         }
@@ -686,13 +699,14 @@ public final class CaveTextureManager {
     }
 
     public boolean hasAnyPageTexture(int layerY, int rx, int rz) {
+        String dimId = currentDimensionId();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
         int firstGlobalX = rx << 3;
         int firstGlobalZ = rz << 3;
         synchronized (pages) {
             for (int pz = 0; pz < 8; pz++) {
                 for (int px = 0; px < 8; px++) {
-                    PageEntry entry = pages.get(new PageKey(band, firstGlobalX + px, firstGlobalZ + pz));
+                    PageEntry entry = pages.get(new PageKey(dimId, band, firstGlobalX + px, firstGlobalZ + pz));
                     if (entry != null && entry.slot >= 0 && entry.hasContent) return true;
                 }
             }
@@ -702,6 +716,7 @@ public final class CaveTextureManager {
 
     public boolean hasResidentCoverageForRegion(int layerY, int rx, int rz) {
         if (hasAnyPageTexture(layerY, rx, rz)) return true;
+        String dimId = currentDimensionId();
         int band = layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY);
         int firstPageX = rx << 3;
         int lastPageX = firstPageX + 7;
@@ -716,7 +731,7 @@ public final class CaveTextureManager {
                 int maxNodeZ = Math.floorDiv(lastPageZ, span);
                 for (int nz = minNodeZ; nz <= maxNodeZ; nz++) {
                     for (int nx = minNodeX; nx <= maxNodeX; nx++) {
-                        BranchEntry bEntry = branchPages.get(new BranchKey(band, level, nx, nz));
+                        BranchEntry bEntry = branchPages.get(new BranchKey(dimId, band, level, nx, nz));
                         if (bEntry != null && bEntry.slot >= 0 && bEntry.hasContent) return true;
                     }
                 }
@@ -745,6 +760,7 @@ public final class CaveTextureManager {
         RenderSystem.assertOnRenderThreadOrInit();
         atlas.onPageTableFrameBoundary();
 
+        final String activeDim = currentDimensionId();
         final int activeBand = activeLayerY == Integer.MIN_VALUE
                 ? Integer.MIN_VALUE
                 : CaveLayerBand.key(CaveView.LAYERED, activeLayerY);
@@ -758,7 +774,7 @@ public final class CaveTextureManager {
                     it.remove();
                     continue;
                 }
-                if (key.band() == activeBand) {
+                if (activeDim.equals(key.dimension()) && key.band() == activeBand) {
                     dirtyList.add(entry);
                 }
             }
@@ -816,7 +832,7 @@ public final class CaveTextureManager {
                     it.remove();
                     continue;
                 }
-                if (key.band() == activeBand) {
+                if (activeDim.equals(key.dimension()) && key.band() == activeBand) {
                     dirtyBranches.add(entry);
                 }
             }
@@ -958,7 +974,7 @@ public final class CaveTextureManager {
         int rx = Math.floorDiv(firstPageX, 8);
         int rz = Math.floorDiv(firstPageZ, 8);
 
-        CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(layerY, rx, rz, false);
+        CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(entry.key.dimension(), layerY, rx, rz, false);
         if (region == null || !region.hasContent()) {
             entry.dirty = false;
             return false;
@@ -1100,7 +1116,7 @@ public final class CaveTextureManager {
                 && CaveLayerBand.key(CaveView.LAYERED, activeLayerY) == requestedLayer) {
             requestedLayer = activeLayerY;
         }
-        CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(requestedLayer, rx, rz, false);
+        CaveMapManager.CaveRegion region = CaveMapManager.getInstance().getRegion(entry.key.dimension(), requestedLayer, rx, rz, false);
         if (region == null || !region.hasContent()) {
             entry.hasContent = false;
             if (entry.slot != -1) {
@@ -1181,6 +1197,7 @@ public final class CaveTextureManager {
     private void evictOldestPage() {
         if (atlas.availableSlotCount() > 0) return;
 
+        final String activeDim = currentDimensionId();
         final int activeBand = activeLayerY == Integer.MIN_VALUE
                 ? Integer.MIN_VALUE
                 : CaveLayerBand.key(CaveView.LAYERED, activeLayerY);
@@ -1198,7 +1215,7 @@ public final class CaveTextureManager {
         synchronized (pages) {
             for (PageEntry e : pages.values()) {
                 if (e.slot == -1) continue;
-                boolean inActiveBand = e.key.band() == activeBand;
+                boolean inActiveBand = activeDim.equals(e.key.dimension()) && e.key.band() == activeBand;
                 boolean inView = inActiveBand
                         && e.key.globalPageX() >= minPx - 1 && e.key.globalPageX() <= maxPx + 1
                         && e.key.globalPageZ() >= minPz - 1 && e.key.globalPageZ() <= maxPz + 1;
@@ -1216,7 +1233,7 @@ public final class CaveTextureManager {
         synchronized (branchPages) {
             for (BranchEntry b : branchPages.values()) {
                 if (b.slot == -1) continue;
-                boolean inActiveBand = b.key.band() == activeBand;
+                boolean inActiveBand = activeDim.equals(b.key.dimension()) && b.key.band() == activeBand;
                 int span = MapViewportCoordinator.MapLodPolicy.pageSpanForBranch(b.key.level());
                 int firstPx = b.key.nodeX() * span;
                 int lastPx = firstPx + span - 1;
@@ -1314,7 +1331,7 @@ public final class CaveTextureManager {
     public record PageSelection(CaveAtlasRegion region, TileKey tileKey) {
     }
 
-    public record PageKey(int band, int globalPageX, int globalPageZ) {
+    public record PageKey(String dimension, int band, int globalPageX, int globalPageZ) {
     }
 
     private static final class PageEntry {
@@ -1329,7 +1346,7 @@ public final class CaveTextureManager {
         }
     }
 
-    public record BranchKey(int band, int level, int nodeX, int nodeZ) {
+    public record BranchKey(String dimension, int band, int level, int nodeX, int nodeZ) {
     }
 
     private static final class BranchEntry {
@@ -1506,6 +1523,14 @@ public final class CaveTextureManager {
         private volatile File surfaceDirectory;
         private final Map<String, Boolean> mcaExistsCache = new ConcurrentHashMap<>();
         private final Map<String, Boolean> scdatExistsCache = new ConcurrentHashMap<>();
+        private final Map<String, Set<Long>> indexedMcaRegions = new ConcurrentHashMap<>();
+        private final Map<String, Long> indexedMcaTimestampMs = new ConcurrentHashMap<>();
+        private final Map<String, Set<Long>> indexedScdatRegions = new ConcurrentHashMap<>();
+        private final Map<String, Long> indexedScdatTimestampMs = new ConcurrentHashMap<>();
+
+        private static long packRegionCoords(int rx, int rz) {
+            return ((long) rx << 32) | (rz & 0xFFFFFFFFL);
+        }
         private static final Map<String, Integer> BLOCK_UNTINTED_ARGB_CACHE = new ConcurrentHashMap<>();
         private static final Map<String, Byte> BLOCK_TINT_KIND_CACHE = new ConcurrentHashMap<>();
         private static final Map<String, Byte> BLOCK_KIND_CACHE = new ConcurrentHashMap<>();
@@ -1649,6 +1674,10 @@ public final class CaveTextureManager {
             this.surfaceDirectory = surfaceDirectory;
             this.mcaExistsCache.clear();
             this.scdatExistsCache.clear();
+            this.indexedMcaRegions.clear();
+            this.indexedMcaTimestampMs.clear();
+            this.indexedScdatRegions.clear();
+            this.indexedScdatTimestampMs.clear();
             deferProjectionCompletions();
             layerGeneration.incrementAndGet();
         }
@@ -1782,6 +1811,10 @@ public final class CaveTextureManager {
 
         public void setPixel(int layerY, int blockX, int blockZ, int abgrColor, int surfaceY, boolean markLive,
                 String blockId, String biomeId) {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc != null && mc.level != null && !MapManager.getInstance().acceptsLiveLevel(mc.level)) {
+                return;
+            }
             int rx = blockX >> 9;
             int rz = blockZ >> 9;
             int px = blockX & 511;
@@ -1798,6 +1831,10 @@ public final class CaveTextureManager {
 
         public void setChunkPixels(int layerY, int chunkX, int chunkZ, int[] chunkColors, short[] chunkHeights,
                 String[] chunkBlockIds, String[] chunkBiomeIds) {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc != null && mc.level != null && !MapManager.getInstance().acceptsLiveLevel(mc.level)) {
+                return;
+            }
             int rx = chunkX >> 5;
             int rz = chunkZ >> 5;
             int cxInRegion = chunkX & 31;
@@ -1891,8 +1928,87 @@ public final class CaveTextureManager {
             return materialize(layerY, rx, rz, loadIfMissing);
         }
 
+        public CaveRegion getRegion(String dimId, int layerY, int rx, int rz, boolean loadIfMissing) {
+            String safeDim = (dimId == null || dimId.isBlank()) ? currentDimensionId() : dimId;
+            if (!loadIfMissing) {
+                int band = (layerY == Integer.MIN_VALUE ? Integer.MIN_VALUE : CaveLayerBand.key(CaveView.LAYERED, layerY));
+                String key = regionCacheKey(safeDim, band, rx, rz);
+                synchronized (regions) {
+                    RegionHolder holder = regions.get(key);
+                    return holder != null ? holder.region : null;
+                }
+            }
+            if (!safeDim.equals(currentDimensionId())) return null;
+            return materialize(layerY, rx, rz, true);
+        }
+
         public boolean hasRegionFile(int rx, int rz) {
             return hasRegionFile(activeLayerY, rx, rz);
+        }
+
+        private Set<Long> scdatRegionsForBand(String dimId, int band) {
+            String bandKey = dimId + ":" + (band == Integer.MIN_VALUE ? "full" : String.valueOf(band));
+            long now = System.currentTimeMillis();
+            Long lastScan = indexedScdatTimestampMs.get(bandKey);
+            Set<Long> set = indexedScdatRegions.get(bandKey);
+            if (set != null && lastScan != null && now - lastScan < 3_000L) {
+                return set;
+            }
+            Set<Long> fresh = ConcurrentHashMap.newKeySet();
+            File baseDir = this.baseDirectory;
+            if (baseDir != null) {
+                String folder = band == Integer.MIN_VALUE ? "full" : ("y_" + band);
+                File bandDir = new File(baseDir, folder);
+                String[] names = bandDir.list();
+                if (names != null) {
+                    for (String name : names) {
+                        if (name.startsWith("r.") && name.endsWith(".scdat")) {
+                            String[] parts = name.split("\\.");
+                            if (parts.length == 4) {
+                                try {
+                                    int rx = Integer.parseInt(parts[1]);
+                                    int rz = Integer.parseInt(parts[2]);
+                                    fresh.add(packRegionCoords(rx, rz));
+                                } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                }
+            }
+            indexedScdatRegions.put(bandKey, fresh);
+            indexedScdatTimestampMs.put(bandKey, now);
+            return fresh;
+        }
+
+        private Set<Long> mcaRegionsForDimension(String dimId) {
+            long now = System.currentTimeMillis();
+            Long lastScan = indexedMcaTimestampMs.get(dimId);
+            Set<Long> set = indexedMcaRegions.get(dimId);
+            if (set != null && lastScan != null && now - lastScan < 3_000L) {
+                return set;
+            }
+            Set<Long> fresh = ConcurrentHashMap.newKeySet();
+            File mcaDir = getMcaDirectory(dimId);
+            if (mcaDir != null) {
+                String[] names = mcaDir.list();
+                if (names != null) {
+                    for (String name : names) {
+                        if (name.startsWith("r.") && name.endsWith(".mca")) {
+                            String[] parts = name.split("\\.");
+                            if (parts.length == 4) {
+                                try {
+                                    int rx = Integer.parseInt(parts[1]);
+                                    int rz = Integer.parseInt(parts[2]);
+                                    fresh.add(packRegionCoords(rx, rz));
+                                } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                }
+            }
+            indexedMcaRegions.put(dimId, fresh);
+            indexedMcaTimestampMs.put(dimId, now);
+            return fresh;
         }
 
         public boolean hasRegionFile(int layerY, int rx, int rz) {
@@ -1912,8 +2028,7 @@ public final class CaveTextureManager {
             }
             Boolean cachedScdat = scdatExistsCache.get(key);
             if (cachedScdat == null) {
-                File scdat = getRegionDiskFile(this.baseDirectory, band, rx, rz);
-                cachedScdat = (scdat != null && scdat.exists());
+                cachedScdat = scdatRegionsForBand(dimId, band).contains(packRegionCoords(rx, rz));
                 scdatExistsCache.put(key, cachedScdat);
             }
             if (cachedScdat) return true;
@@ -1927,14 +2042,9 @@ public final class CaveTextureManager {
             Boolean cachedMca = mcaExistsCache.get(mcaKey);
             if (cachedMca != null) return cachedMca;
 
-            File mcaDir = getMcaDirectory(dimId);
-            if (mcaDir != null) {
-                File mca = new File(mcaDir, "r." + rx + "." + rz + ".mca");
-                boolean exists = mca.exists();
-                mcaExistsCache.put(mcaKey, exists);
-                return exists;
-            }
-            return false;
+            boolean exists = mcaRegionsForDimension(dimId).contains(packRegionCoords(rx, rz));
+            mcaExistsCache.put(mcaKey, exists);
+            return exists;
         }
 
         public boolean isRegionPending(int layerY, int rx, int rz) {
@@ -2140,6 +2250,9 @@ public final class CaveTextureManager {
             if (temp.renameTo(file)) {
                 String key = regionCacheKey(region.dimensionResourceId, band, rx, rz);
                 scdatExistsCache.put(key, true);
+                String bandKey = region.dimensionResourceId + ":" + (band == Integer.MIN_VALUE ? "full" : String.valueOf(band));
+                Set<Long> bandSet = indexedScdatRegions.get(bandKey);
+                if (bandSet != null) bandSet.add(packRegionCoords(rx, rz));
             } else {
                 temp.delete();
             }
@@ -2235,6 +2348,74 @@ public final class CaveTextureManager {
 
             if (!hasContent) return false;
 
+            boolean[] foreignBiome = new boolean[loadedBiomePalette.length + 1];
+            boolean anyForeignInPalette = false;
+            for (int i = 0; i < loadedBiomePalette.length; i++) {
+                if (MapManager.isForeignVanillaBiomeForDimension(
+                        region.dimensionResourceId, loadedBiomePalette[i])) {
+                    foreignBiome[i + 1] = true;
+                    anyForeignInPalette = true;
+                }
+            }
+            boolean scrubbedForeignPollution = false;
+            if (anyForeignInPalette) {
+                for (int cz = 0; cz < 32; cz++) {
+                    int baseZ = cz << 4;
+                    for (int cx = 0; cx < 32; cx++) {
+                        int baseX = cx << 4;
+                        boolean chunkForeign = false;
+                        for (int lz = 0; lz < 16 && !chunkForeign; lz++) {
+                            int row = (baseZ + lz) * 512 + baseX;
+                            for (int lx = 0; lx < 16; lx++) {
+                                int idx = row + lx;
+                                if (tempPixels[idx] == 0) continue;
+                                int bioIdx = tempBiomeIds[idx] & 0xFF;
+                                if (bioIdx > 0 && bioIdx < foreignBiome.length && foreignBiome[bioIdx]) {
+                                    chunkForeign = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (chunkForeign) {
+                            scrubbedForeignPollution = true;
+                            for (int lz = 0; lz < 16; lz++) {
+                                int row = (baseZ + lz) * 512 + baseX;
+                                for (int lx = 0; lx < 16; lx++) {
+                                    int idx = row + lx;
+                                    tempPixels[idx] = 0;
+                                    tempHeights[idx] = CaveRegion.NO_SURFACE;
+                                    tempBlockIds[idx] = 0;
+                                    tempBiomeIds[idx] = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (scrubbedForeignPollution) {
+                    hasContent = false;
+                    for (int i = 0; i < 512 * 512; i++) {
+                        if (tempPixels[i] != 0) {
+                            hasContent = true;
+                            break;
+                        }
+                    }
+                    anvilSliced = false;
+                    int targetSliceLayer = (band == Integer.MIN_VALUE)
+                            ? Integer.MIN_VALUE
+                            : (savedAnvilLayerY != Integer.MAX_VALUE ? savedAnvilLayerY : layerY);
+                    region.requestAnvilSlice(targetSliceLayer);
+                    if (!hasContent) {
+                        file.delete();
+                        String key = regionCacheKey(region.dimensionResourceId, band, rx, rz);
+                        scdatExistsCache.put(key, false);
+                        String bandKey = region.dimensionResourceId + ":" + (band == Integer.MIN_VALUE ? "full" : String.valueOf(band));
+                        Set<Long> bandSet = indexedScdatRegions.get(bandKey);
+                        if (bandSet != null) bandSet.remove(packRegionCoords(rx, rz));
+                        return false;
+                    }
+                }
+            }
+
             int[] pixels = region.getPixelsDirect();
             short[] heights = region.getHeightsDirect();
             short[] blockIds = region.getBlockIdsDirect();
@@ -2247,7 +2428,9 @@ public final class CaveTextureManager {
                 }
                 byte[] biomeRemap = new byte[loadedBiomePalette.length + 1];
                 for (int i = 0; i < loadedBiomePalette.length; i++) {
-                    biomeRemap[i + 1] = region.getOrAddBiomeIndexLocked(loadedBiomePalette[i]);
+                    if (!foreignBiome[i + 1]) {
+                        biomeRemap[i + 1] = region.getOrAddBiomeIndexLocked(loadedBiomePalette[i]);
+                    }
                 }
                 for (int i = 0; i < 512 * 512; i++) {
                     if (!region.isLivePixelLocked(i)) {
@@ -2264,10 +2447,16 @@ public final class CaveTextureManager {
                 if (anvilSliced) {
                     region.setAnvilSliced(true);
                     region.setWrittenAnvilLayerY(savedAnvilLayerY);
+                } else if (scrubbedForeignPollution) {
+                    region.setAnvilSliced(false);
+                    region.setDirty(true);
                 }
                 region.markExactSnapshotLoaded();
             } finally {
                 region.unlock();
+            }
+            if (scrubbedForeignPollution) {
+                saveRegionToDisk(region, band, rx, rz);
             }
             return true;
         }

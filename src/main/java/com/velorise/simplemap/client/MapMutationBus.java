@@ -117,6 +117,7 @@ public final class MapMutationBus {
         Level level = Minecraft.getInstance().level;
         if (level != null) GeneratedChunkIndex.getInstance().markMutation(
                 level, centerX >> 4, centerZ >> 4);
+        if (level == null || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         int reasons = BLOCK_STATE | NEIGHBOUR_DEPENDENCY;
         boolean urgent = isHotChunk(centerX >> 4, centerZ >> 4);
         enqueueNeighbourhoodColumns(centerX, centerZ, reasons, urgent);
@@ -131,6 +132,7 @@ public final class MapMutationBus {
         Level level = Minecraft.getInstance().level;
         if (level != null) GeneratedChunkIndex.getInstance().markMutation(
                 level, centerX >> 4, centerZ >> 4);
+        if (level == null || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         int reasons = BLOCK_ENTITY | NEIGHBOUR_DEPENDENCY;
         boolean urgent = isHotChunk(centerX >> 4, centerZ >> 4);
         enqueueNeighbourhoodColumns(centerX, centerZ, reasons, urgent);
@@ -145,6 +147,7 @@ public final class MapMutationBus {
             // frame deadline, matching the chunk writer queue rather than scanning in
             // the packet callback.
             GeneratedChunkIndex.getInstance().markLive(level, chunkX, chunkZ);
+            if (!MapManager.getInstance().acceptsLiveLevel(level)) return;
             /*
              * PASS108: every chunk-data packet is an O(1) authoritative Surface
              * ingress event. The old fixed radius=6 gate meant chunks that Minecraft
@@ -164,9 +167,8 @@ public final class MapMutationBus {
             }
         }
         if (MapActivityGate.getInstance().blocksMapWork()) return;
-        if (level != null) {
-            GeneratedChunkIndex.getInstance().markMutation(level, chunkX, chunkZ);
-        }
+        if (level == null || !MapManager.getInstance().acceptsLiveLevel(level)) return;
+        GeneratedChunkIndex.getInstance().markMutation(level, chunkX, chunkZ);
         // Exact/Region LOD capture is awakened only after the complete 16x16
         // Surface transaction is published. Waking it at packet admission makes
         // every viewport probe the same 25/50/75%-complete source repeatedly.
@@ -183,12 +185,13 @@ public final class MapMutationBus {
         if (MapActivityGate.getInstance().blocksMapWork()) return;
         Level level = Minecraft.getInstance().level;
         if (level != null) GeneratedChunkIndex.getInstance().markMutation(level, chunkX, chunkZ);
+        if (level == null || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         enqueueCaveFanout(chunkX, chunkZ, LIGHT);
         // Surface lighting is an independent byte cache. It does not affect slope
         // or neighbouring geometry, so a light packet must not fan out into the 68
         // border columns used by topology changes. When night shading is disabled,
         // Cave owns this observation and no empty Surface queue entry is required.
-        if (MapConfig.minimapNightMode != 0 && level != null
+        if (MapConfig.minimapNightMode != 0
                 && level.hasChunk(chunkX, chunkZ)
                 && isHotChunk(chunkX, chunkZ)) {
             enqueueChunk(chunkX, chunkZ, LIGHT, true,
@@ -201,6 +204,7 @@ public final class MapMutationBus {
         if (MapActivityGate.getInstance().blocksMapWork()) return;
         Level level = Minecraft.getInstance().level;
         if (level != null) GeneratedChunkIndex.getInstance().markUnavailable(level, chunkX, chunkZ);
+        if (level == null || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         enqueueCaveFanout(chunkX, chunkZ,
                 CHUNK_UNLOAD | NEIGHBOUR_DEPENDENCY);
         // Unloading revokes live authority but intentionally keeps the last exact
@@ -219,6 +223,7 @@ public final class MapMutationBus {
         if (MapActivityGate.getInstance().blocksMapWork()) return;
         Level level = Minecraft.getInstance().level;
         if (level != null) GeneratedChunkIndex.getInstance().markMutation(level, chunkX, chunkZ);
+        if (level == null || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         enqueueCaveFanout(chunkX, chunkZ,
                 BLOCK_STATE | NEIGHBOUR_DEPENDENCY);
         enqueueChunk(chunkX, chunkZ,

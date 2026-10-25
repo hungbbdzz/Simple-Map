@@ -255,7 +255,8 @@ public class ChunkScanner {
                     localPageX, localPageZ, missingSubtileMask));
             return;
         }
-        if (minecraft.level == null || missingSubtileMask == 0) return;
+        if (minecraft.level == null || missingSubtileMask == 0
+                || !MapManager.getInstance().acceptsLiveLevel(minecraft.level)) return;
         int firstChunkX = regionX * REGION_CHUNK_SIZE + localPageX * 4;
         int firstChunkZ = regionZ * REGION_CHUNK_SIZE + localPageZ * 4;
         for (int localZ = 0; localZ < 4; localZ++) {
@@ -329,6 +330,11 @@ public class ChunkScanner {
 
     private void enqueueLoadedSurfaceChunk(int chunkX, int chunkZ,
             boolean packetAuthoritative) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.level != null
+                && !MapManager.getInstance().acceptsLiveLevel(mc.level)) {
+            return;
+        }
         long key = packChunk(chunkX, chunkZ);
         if (packetAuthoritative) {
             // A packet arriving at TAIL is newer than any seed scan or persisted
@@ -427,7 +433,8 @@ public class ChunkScanner {
      * instead of being forgotten and later resurrected from stale persisted pixels.</p>
      */
     private void seedForegroundSurfaceNeighborhood(Minecraft minecraft) {
-        if (minecraft == null || minecraft.level == null || minecraft.player == null) return;
+        if (minecraft == null || minecraft.level == null || minecraft.player == null
+                || !MapManager.getInstance().acceptsLiveLevel(minecraft.level)) return;
         int centerChunkX = minecraft.player.getBlockX() >> 4;
         int centerChunkZ = minecraft.player.getBlockZ() >> 4;
         int effectiveRenderDistance = Math.max(2,
@@ -801,12 +808,15 @@ public class ChunkScanner {
         observedCaveBandY = nextBand;
         observedCaveProjectionTopY = nextTopY;
 
-        if (bandOrLayerChanged && active && minecraft.player != null) {
+        if (bandOrLayerChanged && active && minecraft.player != null
+                && MapManager.getInstance().acceptsLiveLevel(minecraft.level)) {
             scanCaveAroundPlayerUniform(minecraft, 32);
         }
     }
 
     private void scanColumnIfLoaded(Minecraft mc, int blockX, int blockZ) {
+        if (mc == null || mc.level == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         if (mc.level.hasChunk(blockX >> 4, blockZ >> 4)) {
             GeneratedChunkIndex.getInstance().markLive(
                     mc.level, blockX >> 4, blockZ >> 4);
@@ -826,6 +836,8 @@ public class ChunkScanner {
     }
 
     private void scanCaveAroundPlayerUniform(Minecraft mc, int maxRadius) {
+        if (mc == null || mc.level == null || mc.player == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         int layerY = CaveMode.getLayerY(mc);
         boolean fullView = CaveMode.isFullView(mc);
         CaveMapManager.getInstance().setActiveLayer(fullView ? Integer.MIN_VALUE : layerY);
@@ -1040,6 +1052,8 @@ public class ChunkScanner {
     /** Completes the player chunk first, then two chunks in the movement direction. */
     private void scanUrgentLoadedChunks(Minecraft mc, int layerY, boolean cave,
             boolean fullView, long deadline) {
+        if (mc == null || mc.player == null || mc.level == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         int playerChunkX = ((int) Math.floor(mc.player.getX())) >> 4;
         int playerChunkZ = ((int) Math.floor(mc.player.getZ())) >> 4;
         double velocityX = mc.player.getDeltaMovement().x;
@@ -1067,7 +1081,9 @@ public class ChunkScanner {
 
     private boolean scanUrgentChunk(Minecraft mc, int chunkX, int chunkZ, int layerY,
             boolean cave, boolean fullView, long deadline) {
-        if (!isSurfaceChunkReady(mc.level, chunkX, chunkZ)) return false;
+        if (mc == null || mc.level == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)
+                || !isSurfaceChunkReady(mc.level, chunkX, chunkZ)) return false;
         String key = viewKey(mc, cave, fullView, layerY) + ":urgent:" + chunkX + ',' + chunkZ;
         if (!cave) {
             long chunkKey = packChunk(chunkX, chunkZ);
@@ -1191,7 +1207,8 @@ public class ChunkScanner {
     private void scanVisibleCaveChunks(Minecraft mc, double minX, double maxX,
             double minZ, double maxZ, double focusX, double focusZ,
             int layerY, boolean fullView, long deadline) {
-        if (mc.player == null || mc.level == null) return;
+        if (mc.player == null || mc.level == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         int playerChunkX = mc.player.getBlockX() >> 4;
         int playerChunkZ = mc.player.getBlockZ() >> 4;
         int loadedRadius = Math.max(4, mc.options.getEffectiveRenderDistance() + 2);
@@ -1313,13 +1330,15 @@ public class ChunkScanner {
         surfaceWriterLastPulseNanos = 0L;
         MapViewportCoordinator.getInstance().onLayerChanged();
         SurfaceRegionSourceDatabase.getInstance().invalidateStyle();
-        seedForegroundSurfaceNeighborhood(mc);
-        long started = System.nanoTime();
-        long deadline = started + 8_000_000L;
-        scanUrgentLoadedChunks(mc, 0, false, false, started + 3_000_000L);
-        scanQueuedSurfaceChunks(mc, deadline);
-        if (System.nanoTime() < deadline) {
-            scanNearestChunks(mc, 96, 4096, 0, false, false, deadline);
+        if (MapManager.getInstance().acceptsLiveLevel(mc.level)) {
+            seedForegroundSurfaceNeighborhood(mc);
+            long started = System.nanoTime();
+            long deadline = started + 8_000_000L;
+            scanUrgentLoadedChunks(mc, 0, false, false, started + 3_000_000L);
+            scanQueuedSurfaceChunks(mc, deadline);
+            if (System.nanoTime() < deadline) {
+                scanNearestChunks(mc, 96, 4096, 0, false, false, deadline);
+            }
         }
         MapTextureManager.getInstance().uploadExactTextures(MapRequestLane.FULLSCREEN, true);
     }
@@ -1345,7 +1364,8 @@ public class ChunkScanner {
         observedCaveBandY = bandY;
         observedCaveProjectionTopY = topY;
         MapViewportCoordinator.getInstance().onLayerChanged();
-        if (mc.level != null && mc.player != null) {
+        if (mc.level != null && mc.player != null
+                && MapManager.getInstance().acceptsLiveLevel(mc.level)) {
             // Prime immediate player neighborhood without stalling the UI frame;
             // remaining chunks stream progressively via scanVisibleCaveArea.
             scanCaveAroundPlayerUniform(mc, 48);
@@ -1380,6 +1400,8 @@ public class ChunkScanner {
 
     private void scanNearestChunks(Minecraft mc, int radius, int samplesTarget,
             int layerY, boolean cave, boolean fullView, long deadline) {
+        if (mc == null || mc.level == null || mc.player == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         int playerX = (int) Math.floor(mc.player.getX());
         int playerZ = (int) Math.floor(mc.player.getZ());
         String key = viewKey(mc, cave, fullView, layerY);
@@ -1833,13 +1855,15 @@ public class ChunkScanner {
     }
 
     private void scanCavePixelIfLoaded(Level level, int blockX, int layerY, int blockZ, boolean fullView) {
-        if (!level.hasChunk(blockX >> 4, blockZ >> 4)) return;
+        if (level == null || !MapManager.getInstance().acceptsLiveLevel(level)
+                || !level.hasChunk(blockX >> 4, blockZ >> 4)) return;
         LevelChunk chunk = level.getChunk(blockX >> 4, blockZ >> 4);
         scanCavePixelIfLoaded(level, chunk, blockX, layerY, blockZ, fullView);
     }
 
     private void scanCavePixelIfLoaded(Level level, LevelChunk chunk, int blockX, int layerY, int blockZ, boolean fullView) {
-        if (chunk == null) return;
+        if (chunk == null || level == null
+                || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         ScanScratch scratch = scanScratch.get();
         long pixel = getCavePixel(level, chunk, blockX, layerY, blockZ, fullView);
         String caveBlockId = scratch.lastCaveBlockId;
@@ -2554,7 +2578,8 @@ public class ChunkScanner {
 
     /** Light-only packet path: preserve geometry and update the surface light cache. */
     public void scanSurfaceLightColumn(Level level, int blockX, int blockZ) {
-        if (level == null || !level.isClientSide()) return;
+        if (level == null || !level.isClientSide()
+                || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         long data = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
         int surfaceY = !MapBlockData.isEmpty(data)
                 ? MapBlockData.topY(data) : getHighestY(level, blockX, blockZ);
@@ -2623,7 +2648,8 @@ public class ChunkScanner {
 
     /** Re-scans one map pixel using whichever surface/cave view is currently active. */
     public void scanDisplayedColumn(Minecraft mc, int blockX, int blockZ) {
-        if (mc == null || mc.level == null || mc.player == null) return;
+        if (mc == null || mc.level == null || mc.player == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         if (CaveMode.isActive(mc)) {
             boolean fullView = CaveMode.isFullView(mc);
             int layerY = CaveMode.getLayerY(mc);
@@ -3375,7 +3401,8 @@ public class ChunkScanner {
      * the circular area, independently of the selected progressive reveal order.
      */
     public void scanAroundPlayer(Minecraft mc, int radius) {
-        if (mc.level == null || mc.player == null)
+        if (mc == null || mc.level == null || mc.player == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level))
             return;
 
         if (CaveMode.isActive(mc)) {
