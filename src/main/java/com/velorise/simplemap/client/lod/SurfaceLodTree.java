@@ -625,6 +625,7 @@ public final class SurfaceLodTree {
     }
 
     public void clear() {
+        diskCache.onDimensionSwitched();
         for (Node node : nodes.values()) node.close();
         nodes.clear();
         for (int level = 1; level <= MAX_LEVEL; level++) dirtyQueues[level].clear();

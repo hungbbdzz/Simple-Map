@@ -115,6 +115,17 @@ public class MapManager {
     private long lastSaveTime;
     private volatile boolean currentDimensionHasSavedData;
     private volatile long lastSavedDataProbeMs;
+    private volatile long lastRegionDirectoryScanMs;
+
+    private static final class SurfaceLoadBuffers {
+        final long[] pixels = new long[PIXEL_COUNT];
+        final int[] tints = new int[PIXEL_COUNT];
+        final long[] completeChunks = new long[RegionDataStore.COMPLETE_CHUNK_WORDS];
+        final byte[] mcaHeader = new byte[4096];
+        byte[] mcaChunkData = new byte[65536];
+    }
+    private static final ThreadLocal<SurfaceLoadBuffers> SURFACE_LOAD_BUFFERS =
+            ThreadLocal.withInitial(SurfaceLoadBuffers::new);
 
     private static final long PERSIST_ACTIVE_RETRY_MS = 1_000L;
     private static final long PERSIST_SURFACE_IDLE_INTERVAL_MS = 10_000L;
@@ -633,32 +644,14 @@ public class MapManager {
     }
 
     private void scanRegionFiles(File directory) {
-        regionFileExists.clear();
-        if (directory != null && directory.isDirectory()) {
-            String[] files = directory.list();
-            if (files != null) {
-                for (String name : files) {
-                    if (name.startsWith("r.") && name.endsWith(".smdat")) {
-                        String[] parts = name.split("\\.");
-                        if (parts.length == 4) {
-                            try {
-                                int rx = Integer.parseInt(parts[1]);
-                                int rz = Integer.parseInt(parts[2]);
-                                regionFileExists.put(key(rx, rz), true);
-                            } catch (NumberFormatException ignored) {}
-                        }
-                    }
-                }
-            }
-        }
-        if (isCeilingDimension(currentDimensionResourceId, currentDimensionProfile)) {
-            File mcaDir = getMcaDirectory(currentDimensionResourceId);
-            if (mcaDir != null && mcaDir.isDirectory()) {
-                File[] mcaFiles = mcaDir.listFiles();
-                if (mcaFiles != null) {
-                    for (File f : mcaFiles) {
-                        String name = f.getName();
-                        if (name.startsWith("r.") && name.endsWith(".mca") && f.length() >= 8192L) {
+        synchronized (regionFileExists) {
+            regionFileExists.clear();
+            lastRegionDirectoryScanMs = System.currentTimeMillis();
+            if (directory != null && directory.isDirectory()) {
+                String[] files = directory.list();
+                if (files != null) {
+                    for (String name : files) {
+                        if (name.startsWith("r.") && name.endsWith(".smdat")) {
                             String[] parts = name.split("\\.");
                             if (parts.length == 4) {
                                 try {
@@ -666,6 +659,26 @@ public class MapManager {
                                     int rz = Integer.parseInt(parts[2]);
                                     regionFileExists.put(key(rx, rz), true);
                                 } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                }
+            }
+            if (isCeilingDimension(currentDimensionResourceId, currentDimensionProfile)) {
+                File mcaDir = getMcaDirectory(currentDimensionResourceId);
+                if (mcaDir != null && mcaDir.isDirectory()) {
+                    String[] mcaNames = mcaDir.list();
+                    if (mcaNames != null) {
+                        for (String name : mcaNames) {
+                            if (name.startsWith("r.") && name.endsWith(".mca")) {
+                                String[] parts = name.split("\\.");
+                                if (parts.length == 4) {
+                                    try {
+                                        int rx = Integer.parseInt(parts[1]);
+                                        int rz = Integer.parseInt(parts[2]);
+                                        regionFileExists.put(key(rx, rz), true);
+                                    } catch (NumberFormatException ignored) {}
+                                }
                             }
                         }
                     }
@@ -788,6 +801,8 @@ public class MapManager {
     }
 
     public void setBlockData(int blockX, int blockZ, MapBlockData data, int tint) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.level != null && !acceptsLiveLevel(mc.level)) return;
         int regionX = blockX >> 9;
         int regionZ = blockZ >> 9;
         Region region = getRegion(regionX, regionZ, true);
@@ -825,6 +840,10 @@ public class MapManager {
                 || sourceOffset + count > validColumns.length) {
             return SurfaceChunkCommit.empty();
         }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.level != null && !acceptsLiveLevel(mc.level)) {
+            return SurfaceChunkCommit.empty();
+        }
         int safeCount = Math.min(count, 256 - startColumn);
         int blockX = chunkX << 4;
         int blockZ = chunkZ << 4;
@@ -844,6 +863,10 @@ public class MapManager {
 
     /** Publishes one completed 16x16 Surface scan transaction to downstream work. */
     public SurfaceChunkCommit finishSurfaceChunkTransaction(int chunkX, int chunkZ) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.level != null && !acceptsLiveLevel(mc.level)) {
+            return SurfaceChunkCommit.empty();
+        }
         int blockX = chunkX << 4;
         int blockZ = chunkZ << 4;
         int regionX = blockX >> 9;
@@ -951,14 +974,14 @@ public class MapManager {
         long key = key(regionX, regionZ);
         synchronized (regionFileExists) {
             if (regionFileExists.containsKey(key)) return regionFileExists.get(key);
+            long now = System.currentTimeMillis();
+            if (now - lastRegionDirectoryScanMs >= 3_000L) {
+                scanRegionFiles(directory);
+                if (regionFileExists.containsKey(key)) return regionFileExists.get(key);
+            }
+            regionFileExists.put(key, false);
+            return false;
         }
-        boolean exists = RegionDataStore.hasFile(directory, regionX, regionZ)
-                || (isCeilingDimension(currentDimensionResourceId, currentDimensionProfile)
-                        && hasMcaRegionFile(currentDimensionResourceId, regionX, regionZ));
-        synchronized (regionFileExists) {
-            regionFileExists.put(key, exists);
-        }
-        return exists;
     }
 
     public boolean isRegionLoadedInCache(int regionX, int regionZ) {
@@ -1100,35 +1123,50 @@ public class MapManager {
                 MapRequestLane.FULLSCREEN.priorityBase(), 24,
                 () -> isLoadTargetCurrent(region, directory, generation), () -> {
             try {
-                long[] pixels = new long[PIXEL_COUNT];
-                int[] tints = new int[PIXEL_COUNT];
-                long[] completeChunks = new long[RegionDataStore.COMPLETE_CHUNK_WORDS];
+                SurfaceLoadBuffers loadBuffers = SURFACE_LOAD_BUFFERS.get();
+                long[] pixels = loadBuffers.pixels;
+                int[] tints = loadBuffers.tints;
+                long[] completeChunks = loadBuffers.completeChunks;
                 Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
                 Arrays.fill(tints, SurfaceTintData.UNKNOWN);
+                Arrays.fill(completeChunks, 0L);
                 List<String> biomePalette = new ArrayList<>();
                 List<String> blockPalette = new ArrayList<>();
                 boolean hasSmdat = RegionDataStore.hasFile(directory, region.rx, region.rz);
                 boolean loaded = hasSmdat && RegionDataStore.load(directory, region.rx, region.rz,
                         pixels, tints, completeChunks, biomePalette, blockPalette);
+                boolean scrubbedForeign = false;
                 if (hasSmdat && !loaded) {
                     quarantineRegion(directory, region.rx, region.rz, generation,
                             "corrupt", "unreadable");
-                } else if (loaded && isLoadTargetCurrent(region, directory, generation)
-                        && hasForeignVanillaBiome(currentDimensionResourceId,
-                                pixels, biomePalette)) {
-                    MapDebugRecorder.getInstance().event(
-                            "SURFACE_REGION_DIMENSION_MISMATCH",
-                            "dimension=" + currentDimensionResourceId
-                                    + " region=" + region.rx + ',' + region.rz
-                                    + " action=quarantine_and_rebuild");
-                    quarantineRegion(directory, region.rx, region.rz, generation,
-                            "dimension-mismatch", "cross-dimension");
-                    Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
-                    Arrays.fill(tints, SurfaceTintData.UNKNOWN);
-                    Arrays.fill(completeChunks, 0L);
-                    biomePalette.clear();
-                    blockPalette.clear();
-                    loaded = false;
+                } else if (loaded && isLoadTargetCurrent(region, directory, generation)) {
+                    int scrubOutcome = scrubForeignVanillaBiomeChunks(
+                            currentDimensionResourceId, pixels, tints,
+                            completeChunks, biomePalette);
+                    if (scrubOutcome == 2) {
+                        MapDebugRecorder.getInstance().event(
+                                "SURFACE_REGION_DIMENSION_MISMATCH",
+                                "dimension=" + currentDimensionResourceId
+                                        + " region=" + region.rx + ',' + region.rz
+                                        + " action=quarantine_and_rebuild");
+                        quarantineRegion(directory, region.rx, region.rz, generation,
+                                "dimension-mismatch", "cross-dimension");
+                        Arrays.fill(pixels, MapBlockData.EMPTY_PACKED);
+                        Arrays.fill(tints, SurfaceTintData.UNKNOWN);
+                        Arrays.fill(completeChunks, 0L);
+                        biomePalette.clear();
+                        blockPalette.clear();
+                        loaded = false;
+                        com.velorise.simplemap.client.lod.SurfaceLodTree.invalidatePersistentCache();
+                    } else if (scrubOutcome == 1) {
+                        scrubbedForeign = true;
+                        MapDebugRecorder.getInstance().event(
+                                "SURFACE_REGION_DIMENSION_SCRUBBED",
+                                "dimension=" + currentDimensionResourceId
+                                        + " region=" + region.rx + ',' + region.rz
+                                        + " action=scrub_foreign_chunks");
+                        com.velorise.simplemap.client.lod.SurfaceLodTree.invalidatePersistentCache();
+                    }
                 }
                 if (!isLoadTargetCurrent(region, directory, generation)) return;
                 boolean backfilledFromAnvil = false;
@@ -1150,9 +1188,9 @@ public class MapManager {
                     MapTextureManager.getInstance()
                             .markRegionSourceAvailable(region.rx, region.rz);
                 }
-                if (backfilledFromAnvil) {
+                if (backfilledFromAnvil || scrubbedForeign) {
                     markRegionDirty(region.rx, region.rz);
-                }
+                                    }
                 synchronized (loadedRegions) {
                     evictOldRegions();
                 }
@@ -1197,7 +1235,7 @@ public class MapManager {
                             MapTextureManager.getInstance()
                                     .markRegionSourceAvailable(region.rx, region.rz);
                             markRegionDirty(region.rx, region.rz);
-                        }
+                                                    }
                     });
         }
     }
@@ -1231,9 +1269,10 @@ public class MapManager {
 
         boolean backfilledAny = false;
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(mcaFile, "r")) {
-            byte[] header = new byte[4096];
+            SurfaceLoadBuffers loadBuf = SURFACE_LOAD_BUFFERS.get();
+            byte[] header = loadBuf.mcaHeader;
             raf.readFully(header);
-            byte[] chunkDataBuffer = new byte[65536];
+            byte[] chunkDataBuffer = loadBuf.mcaChunkData;
 
             for (int cz = 0; cz < 32; cz++) {
                 for (int cx = 0; cx < 32; cx++) {
@@ -1260,6 +1299,7 @@ public class MapManager {
                     int dataLength = length - 1;
                     if (chunkDataBuffer.length < dataLength) {
                         chunkDataBuffer = new byte[Math.max(dataLength, chunkDataBuffer.length * 2)];
+                        loadBuf.mcaChunkData = chunkDataBuffer;
                     }
                     raf.readFully(chunkDataBuffer, 0, dataLength);
 
@@ -1353,8 +1393,7 @@ public class MapManager {
                             }
                             int blkIdx = internPaletteEntry(blockName, blockPalette, blockMap, 65534);
                             int bioIdx = internPaletteEntry(biomeName, biomePalette, biomeMap, 254);
-                            pixels[idx] = MapBlockData.packRaw((short) foundY, (short) blkIdx,
-                                    (byte) bioIdx, (byte) Math.max(0, Math.min(15, blockLight)));
+                            pixels[idx] = MapBlockData.packRaw((short) foundY, (short) blkIdx, (byte) bioIdx, (byte) Math.max(0, Math.min(15, blockLight)));
                             tints[idx] = SurfaceTintData.NONE;
                             chunkFilled = true;
                         }
@@ -1767,6 +1806,76 @@ public class MapManager {
         }
     }
 
+    /**
+     * Scrubs any 16x16 chunk containing foreign-dimension vanilla biomes.
+     *
+     * @return 0 if clean, 1 if some foreign chunks were scrubbed while valid chunks
+     *         remain, or 2 if the entire region consisted only of foreign data.
+     */
+    private static int scrubForeignVanillaBiomeChunks(String dimension,
+            long[] pixels, int[] tints, long[] completeChunks,
+            List<String> biomePalette) {
+        if (pixels == null || biomePalette == null || biomePalette.isEmpty()
+                || !("minecraft:the_end".equals(dimension)
+                        || "minecraft:the_nether".equals(dimension)
+                        || "minecraft:overworld".equals(dimension))) return 0;
+        boolean anyForeignInPalette = false;
+        for (String b : biomePalette) {
+            if (isForeignVanillaBiomeForDimension(dimension, b)) {
+                anyForeignInPalette = true;
+                break;
+            }
+        }
+        if (!anyForeignInPalette) return 0;
+
+        int scrubbedChunks = 0;
+        for (int cz = 0; cz < 32; cz++) {
+            int baseZ = cz << 4;
+            for (int cx = 0; cx < 32; cx++) {
+                int baseX = cx << 4;
+                boolean chunkForeign = false;
+                for (int lz = 0; lz < 16 && !chunkForeign; lz++) {
+                    int row = (baseZ + lz) * 512 + baseX;
+                    for (int lx = 0; lx < 16; lx++) {
+                        long packed = pixels[row + lx];
+                        if (MapBlockData.isEmpty(packed)) continue;
+                        int bioIdx = MapBlockData.biomeId(packed) & 0xFF;
+                        if (bioIdx >= biomePalette.size()) continue;
+                        String biome = biomePalette.get(bioIdx);
+                        if ("minecraft:the_nether".equals(dimension)
+                                && "minecraft:plains".equals(biome)
+                                && MapBlockData.topY(packed) >= 120) {
+                            continue;
+                        }
+                        if (isForeignVanillaBiomeForDimension(dimension, biome)) {
+                            chunkForeign = true;
+                            break;
+                        }
+                    }
+                }
+                if (chunkForeign) {
+                    scrubbedChunks++;
+                    int chunkIndex = (cz << 5) | cx;
+                    if (completeChunks != null && (chunkIndex >>> 6) < completeChunks.length) {
+                        completeChunks[chunkIndex >>> 6] &= ~(1L << (chunkIndex & 63));
+                    }
+                    for (int lz = 0; lz < 16; lz++) {
+                        int row = (baseZ + lz) * 512 + baseX;
+                        for (int lx = 0; lx < 16; lx++) {
+                            pixels[row + lx] = MapBlockData.EMPTY_PACKED;
+                            if (tints != null) tints[row + lx] = SurfaceTintData.UNKNOWN;
+                        }
+                    }
+                }
+            }
+        }
+        if (scrubbedChunks == 0) return 0;
+        for (long packed : pixels) {
+            if (!MapBlockData.isEmpty(packed)) return 1;
+        }
+        return 2;
+    }
+
     private static boolean hasForeignVanillaBiome(String dimension,
             long[] pixels, List<String> biomePalette) {
         if (pixels == null || biomePalette == null
@@ -1785,9 +1894,8 @@ public class MapManager {
         return false;
     }
 
-    private static boolean isForeignVanillaBiome(String dimension, String biome) {
-        if (biome == null || !biome.startsWith("minecraft:")
-                || "minecraft:plains".equals(biome)) return false;
+    public static boolean isForeignVanillaBiomeForDimension(String dimension, String biome) {
+        if (biome == null || !biome.startsWith("minecraft:")) return false;
         boolean end = switch (biome) {
             case "minecraft:the_end", "minecraft:end_highlands",
                     "minecraft:end_midlands", "minecraft:end_barrens",
@@ -1802,7 +1910,14 @@ public class MapManager {
         };
         if ("minecraft:the_end".equals(dimension)) return !end;
         if ("minecraft:the_nether".equals(dimension)) return !nether;
-        return end || nether;
+        if ("minecraft:overworld".equals(dimension)) return end || nether;
+        return false;
+    }
+
+    private static boolean isForeignVanillaBiome(String dimension, String biome) {
+        if (biome == null || !biome.startsWith("minecraft:")
+                || ("minecraft:plains".equals(biome) && !"minecraft:the_end".equals(dimension))) return false;
+        return isForeignVanillaBiomeForDimension(dimension, biome);
     }
 
     private void quarantineRegion(File directory, int rx, int rz,
@@ -3885,6 +4000,8 @@ public static final class MapLightManager {
     }
 
     public void setLight(int blockX, int blockZ, int light) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.level != null && !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
         int rx = blockX >> 9;
         int rz = blockZ >> 9;
         LightRegion region = getRegion(rx, rz, true);

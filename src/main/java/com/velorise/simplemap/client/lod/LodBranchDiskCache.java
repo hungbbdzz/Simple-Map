@@ -194,6 +194,14 @@ final class LodBranchDiskCache {
         scheduleWrite(key, file, path);
     }
 
+    synchronized void onDimensionSwitched() {
+        epoch.incrementAndGet();
+        pendingWrites.clear();
+        pendingReads.clear();
+        knownMissing.clear();
+        resetMetadataRoot();
+    }
+
     synchronized void invalidateCurrentDimension() {
         File base = baseDirectory();
         String basePath = base == null ? "" : base.getAbsolutePath();
