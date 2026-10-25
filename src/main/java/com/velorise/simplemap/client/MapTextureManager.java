@@ -309,11 +309,40 @@ public class MapTextureManager {
                 tintPolicyCache.put(blockIdText, BlockTintPolicy.NONE);
                 return BlockTintPolicy.NONE;
             }
-            if (BlockTextureColorSampler.modelUsesTint(blockId)) {
+            BlockTextureColorSampler.TintInfo tintInfo =
+                    BlockTextureColorSampler.getTintInfo(blockIdText);
+            if (tintInfo.kind() == BlockTextureColorSampler.ProviderKind.BIOME_GRASS) {
+                resolved = BlockTintPolicy.GRASS;
+            } else if (tintInfo.kind() == BlockTextureColorSampler.ProviderKind.BIOME_FOLIAGE) {
+                resolved = BlockTintPolicy.FOLIAGE;
+            } else if (state.is(net.minecraft.world.level.block.Blocks.SPRUCE_LEAVES)) {
+                resolved = BlockTintPolicy.SPRUCE;
+            } else if (state.is(net.minecraft.world.level.block.Blocks.BIRCH_LEAVES)) {
+                resolved = BlockTintPolicy.BIRCH;
+            } else if (BlockTextureColorSampler.modelUsesTint(blockId)
+                    || tintInfo.hasProvider()) {
                 boolean leaves = state.is(net.minecraft.tags.BlockTags.LEAVES)
-                        || path.endsWith("_leaves") || path.contains("foliage");
-                if (leaves || path.contains("vine")) resolved = BlockTintPolicy.FOLIAGE;
-                else if (path.contains("grass") || path.contains("fern")) resolved = BlockTintPolicy.GRASS;
+                        || path.endsWith("_leaves") || path.contains("leaves")
+                        || path.contains("foliage") || path.contains("vine")
+                        || path.contains("canopy") || path.contains("branch")
+                        || path.contains("willow");
+                boolean grass = state.is(net.minecraft.world.level.block.Blocks.GRASS_BLOCK)
+                        || path.contains("grass") || path.contains("fern")
+                        || path.contains("clover") || path.contains("shrub")
+                        || path.contains("bush") || path.contains("moss")
+                        || path.contains("turf") || path.contains("sod")
+                        || path.contains("reed") || path.contains("cane");
+                if (leaves) {
+                    resolved = BlockTintPolicy.FOLIAGE;
+                } else if (grass) {
+                    resolved = BlockTintPolicy.GRASS;
+                } else {
+                    MapColor mapColor = state.getMapColor(
+                            net.minecraft.world.level.EmptyBlockGetter.INSTANCE,
+                            net.minecraft.core.BlockPos.ZERO);
+                    resolved = (mapColor == MapColor.GRASS)
+                            ? BlockTintPolicy.GRASS : BlockTintPolicy.FOLIAGE;
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -3310,6 +3339,9 @@ public class MapTextureManager {
             }
         });
 
+        if (MapConfig.blockColourMode == 0) {
+            BlockTextureColorSampler.warmBiomeTints(seenBlocks, resolvedBiomes.values());
+        }
         return MapStyleSnapshot.takeOwnershipById(stamp, resolvedBiomes,
                 paletteColors.isEmpty() ? Map.of() : Map.copyOf(paletteColors),
                 paletteTintPolicies.isEmpty() ? Map.of()
@@ -3365,6 +3397,10 @@ public class MapTextureManager {
                 : Map.copyOf(paletteTintPolicies);
         Set<String> immutableTintDisabled = paletteTintDisabled.isEmpty()
                 ? Set.of() : Set.copyOf(paletteTintDisabled);
+        if (MapConfig.blockColourMode == 0) {
+            BlockTextureColorSampler.warmBiomeTints(
+                    blockPalette, java.util.Arrays.asList(resolvedBiomes));
+        }
         return MapStyleSnapshot.takeOwnership(stamp, resolvedBiomes,
                 immutableColors, immutableTintPolicies, immutableTintDisabled,
                 MapConfig.blockColourMode, MapConfig.displayFlowers,

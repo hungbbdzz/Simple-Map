@@ -510,10 +510,8 @@ public final class MapOverviewTextureManager {
         }
         surfaceLodTree.synchronizeStorage();
         MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
-        boolean styleRefresh = isStyleRefreshActive() && !governor.underPressure();
         long deadline = System.nanoTime() + Math.max(500_000L,
-                styleRefresh ? governor.textureUploadBudgetNanos(true)
-                        : governor.textureUploadBudgetNanos(focus) / 2);
+                governor.textureUploadBudgetNanos(focus) / 2);
         // M4 region authority always receives the first publication slice.
         regionLodService.publish(focus, deadline);
         int legacyBudget = regionLodService.legacyPublishBudget(focus);

@@ -32,7 +32,7 @@ public final class MapBlockData {
     // v6 invalidates completion only for water-bearing chunks. Pixels remain
     // available as last-good while the canonical live/disk authority rebuilds them,
     // so land does not pay another cache migration.
-    public static final int FILE_VERSION = 7;
+    public static final int FILE_VERSION = 6;
 
     public static final long EMPTY_PACKED = packRaw(
             EMPTY_Y, NO_BLOCK, NO_BIOME, (byte) 0, EMPTY_Y);

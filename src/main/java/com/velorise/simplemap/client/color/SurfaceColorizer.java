@@ -3,6 +3,15 @@ import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
 import com.velorise.simplemap.client.cave.*;
 import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager.CaveStateClassifier;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.util.RandomSource;
+import net.minecraft.client.renderer.block.model.BakedQuad;
+import net.minecraft.client.resources.model.BakedModel;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.world.level.BlockAndTintGetter;
+import net.minecraft.world.level.ColorResolver;
+import net.minecraft.world.level.lighting.LevelLightEngine;
+import net.minecraft.world.level.material.FluidState;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
@@ -153,13 +162,6 @@ public final class SurfaceColorizer {
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
-                int blockLight = sampleSmoothedBlockLight(pixels, px, pz, SIZE, SIZE);
-                if (blockLight > 4) {
-                    float warmth = Math.min(0.26f, ((blockLight - 4) / 11.0f) * 0.26f);
-                    red = clamp(Math.round(red + (255 - red) * warmth));
-                    green = clamp(Math.round(green + (192 - green) * warmth));
-                    blue = clamp(Math.round(blue + (92 - blue) * warmth));
-                }
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0 && !glowingPixel) {
@@ -312,13 +314,6 @@ public final class SurfaceColorizer {
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
-                int blockLight = sampleSmoothedBlockLight(pixels, px, pz, stride, stride);
-                if (blockLight > 4) {
-                    float warmth = Math.min(0.26f, ((blockLight - 4) / 11.0f) * 0.26f);
-                    red = clamp(Math.round(red + (255 - red) * warmth));
-                    green = clamp(Math.round(green + (192 - green) * warmth));
-                    blue = clamp(Math.round(blue + (92 - blue) * warmth));
-                }
 
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0 && !glowingPixel) {
@@ -415,17 +410,6 @@ public final class SurfaceColorizer {
                 red = clamp(Math.round(red * shade));
                 green = clamp(Math.round(green * shade));
                 blue = clamp(Math.round(blue * shade));
-                int blockLight = sampleSmoothedBlockLight(pixels, px, pz, stride, stride);
-                if (blockLight > 4) {
-                    float warmth = Math.min(0.32f, ((blockLight - 4) / 11.0f) * 0.32f);
-                    red = clamp(Math.round(red + (255 - red) * warmth));
-                    green = clamp(Math.round(green + (196 - green) * warmth));
-                    blue = clamp(Math.round(blue + (96 - blue) * warmth));
-                    float lift = 1.0f + ((blockLight - 4) / 11.0f) * 0.18f;
-                    red = clamp(Math.round(red * lift));
-                    green = clamp(Math.round(green * lift));
-                    blue = clamp(Math.round(blue * lift));
-                }
                 int argb = 0xFF000000 | (red << 16) | (green << 8) | blue;
                 if (colourMode == 0 && !glowingPixel) {
                     argb = applyAccurateFilter(argb,
@@ -439,36 +423,6 @@ public final class SurfaceColorizer {
             }
         }
         return output;
-    }
-
-    private static int sampleSmoothedBlockLight(long[] pixels, int px, int pz, int width, int height) {
-        if (pixels == null || width <= 0 || height <= 0) return 0;
-        int centerIdx = pz * width + px;
-        if (centerIdx < 0 || centerIdx >= pixels.length) return 0;
-        long centerPacked = pixels[centerIdx];
-        int centerLight = MapBlockData.isEmpty(centerPacked) ? 0
-                : (MapBlockData.isGlowing(centerPacked) ? 15 : MapBlockData.getBlockLight(centerPacked));
-        int weighted = 0;
-        int weight = 0;
-        for (int dz = -1; dz <= 1; dz++) {
-            int sz = pz + dz;
-            if (sz < 0 || sz >= height) continue;
-            int wz = dz == 0 ? 2 : 1;
-            int row = sz * width;
-            for (int dx = -1; dx <= 1; dx++) {
-                int sx = px + dx;
-                if (sx < 0 || sx >= width) continue;
-                int wx = dx == 0 ? 2 : 1;
-                int w = wx * wz;
-                long p = pixels[row + sx];
-                int l = MapBlockData.isEmpty(p) ? 0
-                        : (MapBlockData.isGlowing(p) ? 15 : MapBlockData.getBlockLight(p));
-                weighted += l * w;
-                weight += w;
-            }
-        }
-        int filtered = weight > 0 ? Math.round((float) weighted / weight) : centerLight;
-        return Math.max(centerLight, filtered);
     }
 
     private static int resolveBaseColor(long packed, int storedTint,
@@ -556,14 +510,40 @@ public final class SurfaceColorizer {
          * A provider result remains authoritative only for policy NONE, which is the
          * custom/fixed tint case that cannot be reconstructed from biome identity.
          */
-        if (colourMode == 0 && texture != 0 && !tintDisabled
-                && usesStoredProviderTint(policy)) {
-            if (SurfaceTintData.hasColor(storedTint)) {
+        if (colourMode == 0 && texture != 0 && !tintDisabled) {
+            BlockTextureColorSampler.TintInfo tintInfo = blockName == null
+                    ? null : BlockTextureColorSampler.getTintInfo(blockName);
+            float customStrength = MapBlockData.isLeaves(packed)
+                    ? 0.95f
+                    : (policy == BlockTintPolicy.GRASS ? 0.90f
+                            : (policy == BlockTintPolicy.FOLIAGE ? 0.92f : 1.0f));
+            if (tintInfo != null
+                    && tintInfo.kind() == BlockTextureColorSampler.ProviderKind.CONSTANT_RGB) {
                 return applyBiomeTint(texture,
-                        0xFF000000 | SurfaceTintData.rgb(storedTint), 1.0f);
+                        0xFF000000 | tintInfo.constantRgb(), customStrength);
             }
-            if (storedTint == SurfaceTintData.NONE)
-                return texture;
+            if (tintInfo != null
+                    && tintInfo.kind() == BlockTextureColorSampler.ProviderKind.CUSTOM_PROVIDER) {
+                if (SurfaceTintData.hasColor(storedTint)) {
+                    return applyBiomeTint(texture,
+                            0xFF000000 | SurfaceTintData.rgb(storedTint), customStrength);
+                }
+                Biome selfBiome = resolvePixelBiome(packed, biomeLookup);
+                int customTint = BlockTextureColorSampler.sampleBiomeProviderTint(
+                        blockName, selfBiome);
+                if (customTint != -1) {
+                    return applyBiomeTint(texture,
+                            0xFF000000 | customTint, customStrength);
+                }
+            }
+            if (usesStoredProviderTint(policy)) {
+                if (SurfaceTintData.hasColor(storedTint)) {
+                    return applyBiomeTint(texture,
+                            0xFF000000 | SurfaceTintData.rgb(storedTint), 1.0f);
+                }
+                if (storedTint == SurfaceTintData.NONE)
+                    return texture;
+            }
         }
         if (tintDisabled)
             return texture;
@@ -574,12 +554,30 @@ public final class SurfaceColorizer {
             if (colourMode != 0)
                 return texture;
             return switch (policy) {
-                case SPRUCE, BIRCH, FOLIAGE -> {
+                case SPRUCE -> {
+                    int tint = BlockTextureColorSampler.sampleBiomeProviderTint(
+                            blockName, resolvePixelBiome(packed, biomeLookup));
+                    if (tint == -1) tint = 0x619961;
+                    yield applyBiomeTint(texture, 0xFF000000 | tint, 0.95f);
+                }
+                case BIRCH -> {
+                    int tint = BlockTextureColorSampler.sampleBiomeProviderTint(
+                            blockName, resolvePixelBiome(packed, biomeLookup));
+                    if (tint == -1) tint = 0x80A755;
+                    yield applyBiomeTint(texture, 0xFF000000 | tint, 0.95f);
+                }
+                case FOLIAGE -> {
                     int tint = BiomeColors.blendFoliage(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
+                    if (tint == -1 && SurfaceTintData.hasColor(storedTint)) {
+                        tint = 0xFF000000 | SurfaceTintData.rgb(storedTint);
+                    }
                     yield tint == -1 ? texture : applyBiomeTint(texture, tint, 0.95f);
                 }
                 case GRASS -> {
                     int tint = BiomeColors.blendGrass(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
+                    if (tint == -1 && SurfaceTintData.hasColor(storedTint)) {
+                        tint = 0xFF000000 | SurfaceTintData.rgb(storedTint);
+                    }
                     yield tint == -1 ? texture : applyBiomeTint(texture, tint, 0.90f);
                 }
                 case NONE -> texture;
@@ -593,15 +591,30 @@ public final class SurfaceColorizer {
         if (colourMode == 0 && texture != 0) {
             if (policy == BlockTintPolicy.GRASS) {
                 int tint = BiomeColors.blendGrass(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
+                if (tint == -1 && SurfaceTintData.hasColor(storedTint)) {
+                    tint = 0xFF000000 | SurfaceTintData.rgb(storedTint);
+                }
                 return tint == -1 ? texture : applyBiomeTint(texture, tint, 0.90f);
             }
-            if (policy == BlockTintPolicy.FOLIAGE) {
+            if (policy == BlockTintPolicy.FOLIAGE
+                    || policy == BlockTintPolicy.SPRUCE
+                    || policy == BlockTintPolicy.BIRCH) {
                 int tint = BiomeColors.blendFoliage(allPixels, biomeLookup, px, pz, sampleWidth, sampleHeight);
+                if (tint == -1 && SurfaceTintData.hasColor(storedTint)) {
+                    tint = 0xFF000000 | SurfaceTintData.rgb(storedTint);
+                }
                 return tint == -1 ? texture : applyBiomeTint(texture, tint, 0.92f);
             }
         }
 
         return texture;
+    }
+
+    private static Biome resolvePixelBiome(long packed, IntFunction<Biome> biomeLookup) {
+        if (biomeLookup == null || MapBlockData.isEmpty(packed)) return null;
+        int biomeIndex = MapBlockData.biomeId(packed) & 0xFF;
+        if (biomeIndex == (MapBlockData.NO_BIOME & 0xFF)) return null;
+        return biomeLookup.apply(biomeIndex);
     }
 
     public static boolean usesStoredProviderTint(BlockTintPolicy policy) {
@@ -812,6 +825,17 @@ public final class SurfaceColorizer {
         private BiomeColors() {}
 
         public static int getGrassColor(net.minecraft.world.level.biome.Biome biome) {
+            if (biome == null) return 0xFF79C05A;
+            try {
+                int resolved = net.minecraft.client.renderer.BiomeColors.GRASS_COLOR_RESOLVER
+                        .getColor(biome, 0.0, 0.0);
+                return 0xFF000000 | (resolved & 0x00FFFFFF);
+            } catch (Throwable ignored) {
+            }
+            try {
+                return 0xFF000000 | (biome.getGrassColor(0.0, 0.0) & 0x00FFFFFF);
+            } catch (Throwable ignored) {
+            }
             var effects = biome.getSpecialEffects();
             var override = effects.getGrassColorOverride();
             if (override.isPresent()) return 0xFF000000 | override.get();
@@ -823,6 +847,17 @@ public final class SurfaceColorizer {
         }
 
         public static int getFoliageColor(net.minecraft.world.level.biome.Biome biome) {
+            if (biome == null) return 0xFF48B518;
+            try {
+                int resolved = net.minecraft.client.renderer.BiomeColors.FOLIAGE_COLOR_RESOLVER
+                        .getColor(biome, 0.0, 0.0);
+                return 0xFF000000 | (resolved & 0x00FFFFFF);
+            } catch (Throwable ignored) {
+            }
+            try {
+                return 0xFF000000 | (biome.getFoliageColor() & 0x00FFFFFF);
+            } catch (Throwable ignored) {
+            }
             var effects = biome.getSpecialEffects();
             var override = effects.getFoliageColorOverride();
             if (override.isPresent()) return 0xFF000000 | override.get();
@@ -833,6 +868,13 @@ public final class SurfaceColorizer {
         }
 
         public static int getWaterColor(net.minecraft.world.level.biome.Biome biome) {
+            if (biome == null) return VANILLA_WATER;
+            try {
+                int resolved = net.minecraft.client.renderer.BiomeColors.WATER_COLOR_RESOLVER
+                        .getColor(biome, 0.0, 0.0);
+                return 0xFF000000 | (resolved & 0x00FFFFFF);
+            } catch (Throwable ignored) {
+            }
             int col = biome.getSpecialEffects().getWaterColor();
             return 0xFF000000 | col;
         }
@@ -1582,14 +1624,46 @@ public static final class MapVisualClassifier {
         }
     }
 
-    /** Best-effort average colour and tint metadata from the actual block model. */
-    public static final class BlockTextureColorSampler {
+    /**
+     * Universal block texture & tint sampler (BakedModel quad inspection
+     * + BlockColors provider probing + cross-namespace JSON fallback + grayscale
+     * foliage template detection).
+     */
+    public static class BlockTextureColorSampler {
         private static final int MAX_MODEL_DEPTH = 12;
+        private static final Direction[] QUAD_DIRECTIONS = {
+                Direction.UP, Direction.NORTH, Direction.SOUTH,
+                Direction.EAST, Direction.WEST, Direction.DOWN
+        };
         private static final Map<ResourceLocation, Sample> CACHE = new ConcurrentHashMap<>();
         private static final Set<ResourceLocation> FAILED = ConcurrentHashMap.newKeySet();
         private static final Set<String> BROKEN_TINTS = ConcurrentHashMap.newKeySet();
+        private static final Map<String, TintInfo> TINT_INFO_CACHE = new ConcurrentHashMap<>();
+        private static final Map<String, Map<Biome, Integer>> BIOME_PROVIDER_TINT_CACHE =
+                new ConcurrentHashMap<>();
 
-        private BlockTextureColorSampler() {
+        public enum ProviderKind {
+            NONE,
+            CONSTANT_RGB,
+            BIOME_FOLIAGE,
+            BIOME_GRASS,
+            CUSTOM_PROVIDER
+        }
+
+        public record TintInfo(ProviderKind kind, int constantRgb) {
+            public static final TintInfo NONE = new TintInfo(ProviderKind.NONE, -1);
+
+            public boolean hasProvider() {
+                return kind != ProviderKind.NONE;
+            }
+
+            public boolean isCustomOrConstant() {
+                return kind == ProviderKind.CONSTANT_RGB
+                        || kind == ProviderKind.CUSTOM_PROVIDER;
+            }
+        }
+
+        BlockTextureColorSampler() {
         }
 
         public static boolean isBrokenTint(String blockId) {
@@ -1599,6 +1673,141 @@ public static final class MapVisualClassifier {
         public static void markBrokenTint(String blockId) {
             if (blockId != null) {
                 BROKEN_TINTS.add(blockId);
+            }
+        }
+
+        public static TintInfo getTintInfo(String blockIdText) {
+            if (blockIdText == null || blockIdText.isBlank()) return TintInfo.NONE;
+            TintInfo cached = TINT_INFO_CACHE.get(blockIdText);
+            if (cached != null) return cached;
+            Minecraft minecraft = Minecraft.getInstance();
+            if (minecraft == null) return TintInfo.NONE;
+            TintInfo resolved = inspectBlockTint(minecraft, blockIdText);
+            TINT_INFO_CACHE.put(blockIdText, resolved);
+            return resolved;
+        }
+
+        public static boolean usesCustomProviderTint(String blockIdText) {
+            return getTintInfo(blockIdText).isCustomOrConstant();
+        }
+
+        public static void warmBiomeTints(Iterable<String> blockIds, Iterable<Biome> biomes) {
+            if (blockIds == null) return;
+            Minecraft minecraft = Minecraft.getInstance();
+            if (minecraft == null) return;
+            for (String blockId : blockIds) {
+                if (blockId == null || blockId.isBlank() || "minecraft:air".equals(blockId)) continue;
+                TintInfo info = getTintInfo(blockId);
+                if (info.kind() == ProviderKind.CUSTOM_PROVIDER && biomes != null) {
+                    for (Biome biome : biomes) {
+                        if (biome != null) {
+                            sampleBiomeProviderTint(blockId, biome);
+                        }
+                    }
+                }
+            }
+        }
+
+        public static int sampleBiomeProviderTint(String blockIdText, Biome biome) {
+            if (blockIdText == null || blockIdText.isBlank() || isBrokenTint(blockIdText)) {
+                return -1;
+            }
+            TintInfo info = getTintInfo(blockIdText);
+            if (info.kind() == ProviderKind.NONE) return -1;
+            if (info.kind() == ProviderKind.CONSTANT_RGB) return info.constantRgb();
+            if (info.kind() == ProviderKind.BIOME_FOLIAGE) {
+                return biome == null ? -1 : (BiomeColors.getFoliageColor(biome) & 0x00FFFFFF);
+            }
+            if (info.kind() == ProviderKind.BIOME_GRASS) {
+                return biome == null ? -1 : (BiomeColors.getGrassColor(biome) & 0x00FFFFFF);
+            }
+            if (biome == null) {
+                return info.constantRgb() != -1 ? info.constantRgb() : -1;
+            }
+            Map<Biome, Integer> byBiome = BIOME_PROVIDER_TINT_CACHE.computeIfAbsent(
+                    blockIdText, ignored -> new ConcurrentHashMap<>());
+            Integer cached = byBiome.get(biome);
+            if (cached != null) return cached;
+            int evaluated = evaluateBiomeProviderTint(blockIdText, biome, info.constantRgb());
+            byBiome.put(biome, evaluated);
+            return evaluated;
+        }
+
+        private static int evaluateBiomeProviderTint(String blockIdText, Biome biome, int fallbackRgb) {
+            try {
+                Minecraft minecraft = Minecraft.getInstance();
+                if (minecraft == null || minecraft.getBlockColors() == null) return fallbackRgb;
+                ResourceLocation blockId = ResourceLocation.parse(blockIdText);
+                Block block = BuiltInRegistries.BLOCK.get(blockId);
+                if (block == null || block == Blocks.AIR) return fallbackRgb;
+                BlockState state = block.defaultBlockState();
+                SingleBiomeTintGetter getter = new SingleBiomeTintGetter(biome, state);
+                int tint = minecraft.getBlockColors().getColor(state, getter, BlockPos.ZERO, 0);
+                if (tint != -1) {
+                    return tint & 0x00FFFFFF;
+                }
+            } catch (Throwable ignored) {
+            }
+            return fallbackRgb;
+        }
+
+        private static TintInfo inspectBlockTint(Minecraft minecraft, String blockIdText) {
+            if (isBrokenTint(blockIdText)) return TintInfo.NONE;
+            try {
+                if (minecraft.getBlockColors() == null) return TintInfo.NONE;
+                ResourceLocation blockId = ResourceLocation.parse(blockIdText);
+                Block block = BuiltInRegistries.BLOCK.get(blockId);
+                if (block == null || block == Blocks.AIR) return TintInfo.NONE;
+                BlockState state = block.defaultBlockState();
+                if (state.is(Blocks.CHERRY_LEAVES)) return TintInfo.NONE;
+
+                ProbeTintGetter probe1 = new ProbeTintGetter(state, 0x48B518);
+                int c1 = minecraft.getBlockColors().getColor(
+                        state, probe1, new BlockPos(0, 64, 0), 0);
+
+                ProbeTintGetter probe2 = new ProbeTintGetter(state, 0x80A755);
+                int c2 = minecraft.getBlockColors().getColor(
+                        state, probe2, new BlockPos(96, 64, 96), 0);
+
+                if (c1 == -1 && c2 == -1 && !probe1.calledBlockTint && !probe2.calledBlockTint) {
+                    return TintInfo.NONE;
+                }
+                int rgb1 = c1 == -1 ? -1 : (c1 & 0x00FFFFFF);
+                int rgb2 = c2 == -1 ? -1 : (c2 & 0x00FFFFFF);
+                if (!probe1.calledBlockTint && !probe2.calledBlockTint && rgb1 != -1 && rgb1 == rgb2) {
+                    return new TintInfo(ProviderKind.CONSTANT_RGB, rgb1);
+                }
+                if (probe1.calledBlockTint
+                        && probe1.resolver == net.minecraft.client.renderer.BiomeColors.FOLIAGE_COLOR_RESOLVER
+                        && rgb1 == 0x48B518 && rgb2 == 0x80A755) {
+                    return new TintInfo(ProviderKind.BIOME_FOLIAGE, -1);
+                }
+                if (probe1.calledBlockTint
+                        && probe1.resolver == net.minecraft.client.renderer.BiomeColors.GRASS_COLOR_RESOLVER
+                        && rgb1 == 0x48B518 && rgb2 == 0x80A755) {
+                    return new TintInfo(ProviderKind.BIOME_GRASS, -1);
+                }
+                int fallbackRgb = rgb1 != -1 ? rgb1 : rgb2;
+                return new TintInfo(ProviderKind.CUSTOM_PROVIDER, fallbackRgb);
+            } catch (Throwable throwable) {
+                try {
+                    if (minecraft.level != null) {
+                        ResourceLocation blockId = ResourceLocation.parse(blockIdText);
+                        Block block = BuiltInRegistries.BLOCK.get(blockId);
+                        if (block != null && block != Blocks.AIR) {
+                            BlockState state = block.defaultBlockState();
+                            BlockPos pos = minecraft.player != null
+                                    ? minecraft.player.blockPosition() : BlockPos.ZERO;
+                            int live = minecraft.getBlockColors().getColor(state, minecraft.level, pos, 0);
+                            if (live != -1) {
+                                return new TintInfo(ProviderKind.CUSTOM_PROVIDER, live & 0x00FFFFFF);
+                            }
+                        }
+                    }
+                } catch (Throwable inner) {
+                    markBrokenTint(blockIdText);
+                }
+                return TintInfo.NONE;
             }
         }
 
@@ -1620,13 +1829,39 @@ public static final class MapVisualClassifier {
             Minecraft minecraft = Minecraft.getInstance();
             if (minecraft == null || minecraft.getResourceManager() == null) return null;
 
+            String blockIdText = blockId.toString();
+            TintInfo tintInfo = getTintInfo(blockIdText);
+            boolean providerUsesTint = tintInfo.hasProvider();
+            boolean isFoliageOrGrassCandidate = isFoliageOrGrassCandidate(blockId);
+
+            // 1. Primary BakedModel path: inspect compiled BakedModel quads & sprites.
+            try {
+                BakedModelSample bakedSample = sampleFromBakedModel(minecraft, blockId);
+                if (bakedSample != null && bakedSample.imageSample() != null) {
+                    ImageSample img = bakedSample.imageSample();
+                    boolean usesTint = bakedSample.usesTintIndex()
+                            || providerUsesTint
+                            || (isFoliageOrGrassCandidate && img.achromatic());
+                    Sample result = new Sample(img.argb(), usesTint);
+                    CACHE.put(blockId, result);
+                    return result;
+                }
+            } catch (Throwable ignored) {
+            }
+
+            // 2. Secondary path: JSON blockstate & model parent chain (with cross-namespace parent support).
+            boolean jsonUsesTint = false;
             try {
                 ResourceLocation model = findModel(minecraft, blockId);
                 if (model != null) {
                     ModelInfo info = resolveModelInfo(minecraft, model);
-                    Integer argb = info.texture() == null ? null : sampleTexture(minecraft, info.texture());
-                    if (argb != null) {
-                        Sample result = new Sample(argb, info.usesTintIndex());
+                    jsonUsesTint = info.usesTintIndex();
+                    ImageSample img = info.texture() == null ? null : sampleTexture(minecraft, info.texture());
+                    if (img != null) {
+                        boolean usesTint = jsonUsesTint
+                                || providerUsesTint
+                                || (isFoliageOrGrassCandidate && img.achromatic());
+                        Sample result = new Sample(img.argb(), usesTint);
                         CACHE.put(blockId, result);
                         return result;
                     }
@@ -1634,10 +1869,14 @@ public static final class MapVisualClassifier {
             } catch (Throwable ignored) {
             }
 
+            // 3. Direct texture candidate fallback.
             for (ResourceLocation texture : directCandidates(blockId)) {
-                Integer argb = sampleTexture(minecraft, texture);
-                if (argb != null) {
-                    Sample result = new Sample(argb, false);
+                ImageSample img = sampleTexture(minecraft, texture);
+                if (img != null) {
+                    boolean usesTint = jsonUsesTint
+                            || providerUsesTint
+                            || (isFoliageOrGrassCandidate && img.achromatic());
+                    Sample result = new Sample(img.argb(), usesTint);
                     CACHE.put(blockId, result);
                     return result;
                 }
@@ -1646,15 +1885,156 @@ public static final class MapVisualClassifier {
             return null;
         }
 
+        private static boolean isFoliageOrGrassCandidate(ResourceLocation blockId) {
+            try {
+                Block block = BuiltInRegistries.BLOCK.get(blockId);
+                if (block != null && block != Blocks.AIR) {
+                    BlockState state = block.defaultBlockState();
+                    if (state.is(Blocks.CHERRY_LEAVES)) return false;
+                    if (state.is(BlockTags.LEAVES) || state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.VINE)) {
+                        return true;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            String path = blockId.getPath();
+            if (path.contains("cherry")) return false;
+            return path.endsWith("_leaves") || path.contains("leaves")
+                    || path.contains("foliage") || path.contains("grass")
+                    || path.contains("fern") || path.contains("vine");
+        }
+
+        private static BakedModelSample sampleFromBakedModel(Minecraft minecraft, ResourceLocation blockId) {
+            if (minecraft.getBlockRenderer() == null) return null;
+            Block block = BuiltInRegistries.BLOCK.get(blockId);
+            if (block == null || block == Blocks.AIR) return null;
+            BlockState state = block.defaultBlockState();
+            BakedModel bakedModel = minecraft.getBlockRenderer().getBlockModel(state);
+            if (bakedModel == null) return null;
+
+            RandomSource random = RandomSource.create(42L);
+            boolean upOrNullTinted = false;
+            boolean anyQuadTinted = false;
+            boolean hasUpQuads = false;
+            TextureAtlasSprite upTintedSprite = null;
+            TextureAtlasSprite upSprite = null;
+            TextureAtlasSprite nullTintedSprite = null;
+            TextureAtlasSprite nullSprite = null;
+            TextureAtlasSprite sideTintedSprite = null;
+            TextureAtlasSprite sideSprite = null;
+
+            try {
+                List<BakedQuad> upQuads = bakedModel.getQuads(state, Direction.UP, random);
+                if (upQuads != null && !upQuads.isEmpty()) {
+                    hasUpQuads = true;
+                    for (BakedQuad quad : upQuads) {
+                        if (quad == null) continue;
+                        TextureAtlasSprite sprite = quad.getSprite();
+                        if (upSprite == null && isUsableSprite(sprite)) {
+                            upSprite = sprite;
+                        }
+                        if (quad.isTinted()) {
+                            upOrNullTinted = true;
+                            anyQuadTinted = true;
+                            if (upTintedSprite == null && isUsableSprite(sprite)) {
+                                upTintedSprite = sprite;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                random.setSeed(42L);
+                List<BakedQuad> generalQuads = bakedModel.getQuads(state, null, random);
+                if (generalQuads != null && !generalQuads.isEmpty()) {
+                    for (BakedQuad quad : generalQuads) {
+                        if (quad == null) continue;
+                        TextureAtlasSprite sprite = quad.getSprite();
+                        if (nullSprite == null && isUsableSprite(sprite)) {
+                            nullSprite = sprite;
+                        }
+                        if (quad.isTinted()) {
+                            upOrNullTinted = true;
+                            anyQuadTinted = true;
+                            if (nullTintedSprite == null && isUsableSprite(sprite)) {
+                                nullTintedSprite = sprite;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+
+            for (int i = 1; i < QUAD_DIRECTIONS.length; i++) {
+                Direction dir = QUAD_DIRECTIONS[i];
+                try {
+                    random.setSeed(42L);
+                    List<BakedQuad> dirQuads = bakedModel.getQuads(state, dir, random);
+                    if (dirQuads == null) continue;
+                    for (BakedQuad quad : dirQuads) {
+                        if (quad == null) continue;
+                        TextureAtlasSprite sprite = quad.getSprite();
+                        if (sideSprite == null && isUsableSprite(sprite)) {
+                            sideSprite = sprite;
+                        }
+                        if (quad.isTinted()) {
+                            anyQuadTinted = true;
+                            if (sideTintedSprite == null && isUsableSprite(sprite)) {
+                                sideTintedSprite = sprite;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            TextureAtlasSprite chosen = upTintedSprite != null ? upTintedSprite
+                    : (upSprite != null ? upSprite
+                    : (nullTintedSprite != null ? nullTintedSprite
+                    : (nullSprite != null ? nullSprite
+                    : (sideTintedSprite != null ? sideTintedSprite : sideSprite))));
+            if (!isUsableSprite(chosen)) {
+                try {
+                    TextureAtlasSprite particle = bakedModel.getParticleIcon();
+                    if (isUsableSprite(particle)) {
+                        chosen = particle;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (!isUsableSprite(chosen)) return null;
+
+            ResourceLocation spriteName = chosen.contents().name();
+            ImageSample imageSample = sampleTexture(minecraft, toTextureFile(spriteName));
+            if (imageSample == null) return null;
+            boolean usesTint = hasUpQuads ? upOrNullTinted : anyQuadTinted;
+            return new BakedModelSample(imageSample, usesTint);
+        }
+
+        private static boolean isUsableSprite(TextureAtlasSprite sprite) {
+            if (sprite == null || sprite.contents() == null || sprite.contents().name() == null) {
+                return false;
+            }
+            String path = sprite.contents().name().getPath();
+            return !path.equals("missingno") && !path.endsWith("/missingno");
+        }
+
         public static void invalidate(ResourceLocation blockId) {
             if (blockId == null) return;
             CACHE.remove(blockId);
             FAILED.remove(blockId);
+            String key = blockId.toString();
+            TINT_INFO_CACHE.remove(key);
+            BIOME_PROVIDER_TINT_CACHE.remove(key);
         }
 
         public static void clearCache() {
             CACHE.clear();
             FAILED.clear();
+            TINT_INFO_CACHE.clear();
+            BIOME_PROVIDER_TINT_CACHE.clear();
         }
 
         private static ResourceLocation findModel(Minecraft minecraft, ResourceLocation blockId) {
@@ -1707,6 +2087,14 @@ public static final class MapVisualClassifier {
                 ResourceLocation modelJson = ResourceLocation.fromNamespaceAndPath(model.getNamespace(),
                         "models/" + model.getPath() + ".json");
                 JsonObject json = readJson(minecraft, modelJson);
+                if (json == null && !"minecraft".equals(model.getNamespace())) {
+                    ResourceLocation mcModelJson = ResourceLocation.fromNamespaceAndPath("minecraft",
+                            "models/" + model.getPath() + ".json");
+                    json = readJson(minecraft, mcModelJson);
+                    if (json != null) {
+                        model = ResourceLocation.fromNamespaceAndPath("minecraft", model.getPath());
+                    }
+                }
                 if (json == null) break;
                 namespace = model.getNamespace();
                 usesTint |= containsTintIndex(json);
@@ -1718,19 +2106,37 @@ public static final class MapVisualClassifier {
                     }
                 }
                 if (!json.has("parent") || !json.get("parent").isJsonPrimitive()) break;
-                model = parseLocation(namespace, json.get("parent").getAsString());
+                String parentText = json.get("parent").getAsString();
+                model = parseModelParentLocation(namespace, parentText, minecraft);
             }
 
-            String[] preferred = { "top", "up", "all", "end", "particle", "side", "texture" };
+            String rootNamespace = initialModel.getNamespace();
+            String[] preferred = { "top", "up", "all", "end", "particle", "side", "texture", "cross", "plant" };
             for (String key : preferred) {
-                ResourceLocation location = resolveTextureReference(namespace, textures, textures.get(key));
+                ResourceLocation location = resolveTextureReference(rootNamespace, textures, textures.get(key));
                 if (location != null) return new ModelInfo(toTextureFile(location), usesTint);
             }
             for (String value : textures.values()) {
-                ResourceLocation location = resolveTextureReference(namespace, textures, value);
+                ResourceLocation location = resolveTextureReference(rootNamespace, textures, value);
                 if (location != null) return new ModelInfo(toTextureFile(location), usesTint);
             }
             return new ModelInfo(null, usesTint);
+        }
+
+        private static ResourceLocation parseModelParentLocation(String currentNamespace,
+                String parentText, Minecraft minecraft) {
+            if (parentText == null || parentText.isBlank()) return null;
+            if (parentText.indexOf(':') >= 0) {
+                return ResourceLocation.parse(parentText);
+            }
+            ResourceLocation inCurrent = ResourceLocation.fromNamespaceAndPath(currentNamespace, parentText);
+            ResourceLocation inCurrentJson = ResourceLocation.fromNamespaceAndPath(
+                    currentNamespace, "models/" + parentText + ".json");
+            if (minecraft != null && minecraft.getResourceManager() != null
+                    && minecraft.getResourceManager().getResource(inCurrentJson).isPresent()) {
+                return inCurrent;
+            }
+            return ResourceLocation.fromNamespaceAndPath("minecraft", parentText);
         }
 
         private static boolean containsTintIndex(JsonObject model) {
@@ -1767,6 +2173,10 @@ public static final class MapVisualClassifier {
         private static JsonObject readJson(Minecraft minecraft, ResourceLocation location) {
             try {
                 Optional<Resource> resource = minecraft.getResourceManager().getResource(location);
+                if (resource.isEmpty() && !"minecraft".equals(location.getNamespace())) {
+                    resource = minecraft.getResourceManager().getResource(
+                            ResourceLocation.fromNamespaceAndPath("minecraft", location.getPath()));
+                }
                 if (resource.isEmpty()) return null;
                 try (InputStream stream = resource.get().open();
                         InputStreamReader reader = new InputStreamReader(stream, StandardCharsets.UTF_8)) {
@@ -1778,9 +2188,13 @@ public static final class MapVisualClassifier {
             }
         }
 
-        private static Integer sampleTexture(Minecraft minecraft, ResourceLocation texture) {
+        private static ImageSample sampleTexture(Minecraft minecraft, ResourceLocation texture) {
             try {
                 Optional<Resource> resource = minecraft.getResourceManager().getResource(texture);
+                if (resource.isEmpty() && !"minecraft".equals(texture.getNamespace())) {
+                    resource = minecraft.getResourceManager().getResource(
+                            ResourceLocation.fromNamespaceAndPath("minecraft", texture.getPath()));
+                }
                 if (resource.isEmpty()) return null;
                 try (InputStream stream = resource.get().open(); NativeImage image = NativeImage.read(stream)) {
                     return average(image);
@@ -1828,10 +2242,11 @@ public static final class MapVisualClassifier {
                     : ResourceLocation.fromNamespaceAndPath(defaultNamespace, text);
         }
 
-        private static Integer average(NativeImage image) {
+        private static ImageSample average(NativeImage image) {
             long red = 0L;
             long green = 0L;
             long blue = 0L;
+            long chroma = 0L;
             long weight = 0L;
             int width = image.getWidth();
             int height = image.getHeight();
@@ -1847,9 +2262,12 @@ public static final class MapVisualClassifier {
                     int sampleRed = abgr & 0xFF;
                     int sampleGreen = (abgr >>> 8) & 0xFF;
                     int sampleBlue = (abgr >>> 16) & 0xFF;
+                    int maxC = Math.max(sampleRed, Math.max(sampleGreen, sampleBlue));
+                    int minC = Math.min(sampleRed, Math.min(sampleGreen, sampleBlue));
                     red += (long) sampleRed * alpha;
                     green += (long) sampleGreen * alpha;
                     blue += (long) sampleBlue * alpha;
+                    chroma += (long) (maxC - minC) * alpha;
                     weight += alpha;
                 }
             }
@@ -1857,15 +2275,136 @@ public static final class MapVisualClassifier {
             int outRed = (int) (red / weight);
             int outGreen = (int) (green / weight);
             int outBlue = (int) (blue / weight);
-            return 0xFF000000 | (outRed << 16) | (outGreen << 8) | outBlue;
+            int avgChroma = (int) (chroma / weight);
+            int outSpread = Math.max(outRed, Math.max(outGreen, outBlue))
+                    - Math.min(outRed, Math.min(outGreen, outBlue));
+            boolean achromatic = avgChroma <= 12 && outSpread <= 12;
+            int argb = 0xFF000000 | (outRed << 16) | (outGreen << 8) | outBlue;
+            return new ImageSample(argb, achromatic);
         }
 
         public record Sample(int argb, boolean usesTintIndex) {
         }
 
+        private record ImageSample(int argb, boolean achromatic) {
+        }
+
+        private record BakedModelSample(ImageSample imageSample, boolean usesTintIndex) {
+        }
+
         private record ModelInfo(ResourceLocation texture, boolean usesTintIndex) {
+        }
+
+        private static final class ProbeTintGetter implements BlockAndTintGetter {
+            private final BlockState state;
+            private final int dummyTint;
+            private boolean calledBlockTint;
+            private ColorResolver resolver;
+
+            private ProbeTintGetter(BlockState state, int dummyTint) {
+                this.state = state != null ? state : Blocks.AIR.defaultBlockState();
+                this.dummyTint = dummyTint;
+            }
+
+            @Override
+            public float getShade(Direction direction, boolean shade) {
+                return 1.0f;
+            }
+
+            @Override
+            public LevelLightEngine getLightEngine() {
+                return null;
+            }
+
+            @Override
+            public int getBlockTint(BlockPos pos, ColorResolver colorResolver) {
+                this.calledBlockTint = true;
+                this.resolver = colorResolver;
+                return dummyTint;
+            }
+
+            @Override
+            public BlockEntity getBlockEntity(BlockPos pos) {
+                return null;
+            }
+
+            @Override
+            public BlockState getBlockState(BlockPos pos) {
+                return state;
+            }
+
+            @Override
+            public FluidState getFluidState(BlockPos pos) {
+                return state.getFluidState();
+            }
+
+            @Override
+            public int getHeight() {
+                return 384;
+            }
+
+            @Override
+            public int getMinBuildHeight() {
+                return -64;
+            }
+        }
+
+        private static final class SingleBiomeTintGetter implements BlockAndTintGetter {
+            private final Biome biome;
+            private final BlockState state;
+
+            private SingleBiomeTintGetter(Biome biome, BlockState state) {
+                this.biome = biome;
+                this.state = state != null ? state : Blocks.AIR.defaultBlockState();
+            }
+
+            @Override
+            public float getShade(Direction direction, boolean shade) {
+                return 1.0f;
+            }
+
+            @Override
+            public LevelLightEngine getLightEngine() {
+                return null;
+            }
+
+            @Override
+            public int getBlockTint(BlockPos pos, ColorResolver colorResolver) {
+                if (colorResolver == null || biome == null) {
+                    return 0x48B518;
+                }
+                int x = pos != null ? pos.getX() : 0;
+                int z = pos != null ? pos.getZ() : 0;
+                return colorResolver.getColor(biome, x, z);
+            }
+
+            @Override
+            public BlockEntity getBlockEntity(BlockPos pos) {
+                return null;
+            }
+
+            @Override
+            public BlockState getBlockState(BlockPos pos) {
+                return state;
+            }
+
+            @Override
+            public FluidState getFluidState(BlockPos pos) {
+                return state.getFluidState();
+            }
+
+            @Override
+            public int getHeight() {
+                return 384;
+            }
+
+            @Override
+            public int getMinBuildHeight() {
+                return -64;
+            }
         }
     }
 }
 
+    public static class BlockTextureColorSampler extends MapVisualClassifier.BlockTextureColorSampler {}
 }

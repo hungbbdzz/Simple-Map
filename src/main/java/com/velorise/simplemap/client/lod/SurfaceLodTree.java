@@ -848,7 +848,7 @@ public final class SurfaceLodTree {
     }
 
     private static LodBranchDiskCache.Key diskKey(NodeKey key) {
-        return new LodBranchDiskCache.Key("surface_v3_chunk16_" + key.dimension,
+        return new LodBranchDiskCache.Key("surface_v4_chunk16_" + key.dimension,
                 key.level, key.nodeX, key.nodeZ);
     }
 
