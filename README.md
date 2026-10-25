@@ -1,305 +1,173 @@
 # Simple Map
 
-Simple Map focuses on readable terrain, fast client-side exploration, practical navigation tools, and an optional Map Book system for sharing explored regions without turning the interface into a separate game.
+[![Minecraft](https://img.shields.io/badge/Minecraft-1.21.1-brightgreen.svg)]()
+[![NeoForge](https://img.shields.io/badge/NeoForge-21.1.x-orange.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/badge/Release-v2.0.0-blue.svg)]()
+
+**Simple Map** is a high-performance, exploration-driven world map and minimap mod for Minecraft. It combines accurate GPU-sampled block colors, persistent layered cave mapping, waypoints, and an optional server-side Map Book progression system—all optimized for a silky-smooth **120+ FPS** experience with zero frame tearing.
 
 ---
 
-## Highlights
+## ✨ Highlights
 
-- Full-screen world map with smooth pan, zoom-to-cursor, pins, waypoints, block information, biome information, and optional teleport tools.
-- Square or circular minimap with rotatable map/player modes, configurable compass letters, coordinates, pointer styles, colours, size, zoom, and screen position.
-- Surface and cave mapping with automatic roof detection, manual Top-Y layers, and a full cave-network view when enabled by the server.
-- Two block-colour pipelines: **Accurate** texture/tint-aware rendering and **Vanilla** map colours.
-- Optional 2D/3D terrain relief, biome tinting, water/depth shading, colour profiles, and per-block colour overrides.
-- Chunk-priority scanning, asynchronous region loading, background texture preparation, bounded GPU uploads, and LRU caches.
-- Map Books can save, update, copy, merge, and transfer explored map regions between players.
-
----
-
-## World Map
-
-Press `M` to open the map. The key can be changed in Minecraft's Controls menu.
-
-### Navigation and map interaction
-
-- Click and drag to pan.
-- Scroll to zoom toward the mouse cursor.
-- Left-click to place or remove the active navigation pin.
-- Right-click to open the context menu:
-  - add or delete a waypoint;
-  - follow or stop following a waypoint;
-  - teleport to the selected position when the player has permission;
-  - override the displayed colour of the selected block.
-- Hover the map to inspect coordinates, block height, block identity, and optionally the biome.
-- Click the player-coordinate panel in the bottom-right to copy a message such as `I am at coordinates [X, Y, Z]` and open chat with it pre-filled.
-- Shift-click the refresh icon to re-centre the map on the player and restore `1.0x` zoom.
-
-### Map toolbar
-
-The compact left toolbar provides:
-
-- waypoint visibility;
-- refresh / rescan;
-- surface night or cave-light mode;
-- map and minimap settings.
-
-The cave control appears separately at the bottom-left when cave mapping is available.
+- **Silky Smooth 120+ FPS Panning:** Retained GPU framebuffer compositor and spatial $O(1)$ page tables eliminate stutters and screen tearing.
+- **Universal Mod Compatibility:** Automatically extracts true in-game colors and biome tints for *any* modded block directly from compiled GPU models (`BakedModel`).
+- **Deep Cave Exploration:** Full subterranean network mapping, automatic roof detection, manual Top-Y layers, and bedrock depth (`Y <= 29`) scanning in the Nether and Overworld.
+- **Instant Lighting (0 ms):** Cycle between Day, Night, and Cave lighting instantly via shaders without reloading regions or LODs.
+- **Anvil (`.mca`) World Recovery:** Automatically discovers and backfills explored regions on pre-existing worlds across all dimensions.
+- **Customizable Minimap:** Round or Square shapes, rotating map or player pointer, North-lock, waypoint icons, and drag-and-drop HUD placement.
+- **Waypoints & Navigation Pins:** Item-icon browser, live distance/direction radar, death markers, and right-click context menu editing.
+- **Map Book System:** Optional vanilla-friendly progression: save, copy, merge, and learn maps across multiplayer servers.
 
 ---
 
-## Minimap
+## 🗺️ World Map
 
-The minimap is rendered from the same explored region data as the full-screen map.
+Press `M` to open the full-screen world map.
 
-- Square and circular shapes.
-- Rotating-map or rotating-player-pointer modes.
-- Configurable size from 16 to 150 GUI pixels.
-- Independent minimap zoom.
-- Draggable, anchor-based placement that remains stable across resolution and GUI-scale changes.
-- Optional coordinates with independent scale and position.
-- Arrow-only or skin-plus-arrow player marker.
-- Configurable player pointer, pin, coordinate text, compass letters, and minimap ring colours.
-- Optional compass letters: `N`, `E`, `S`, and `W`.
-- Optional rendering over inventory, pause, chat, and container screens.
-- Navigation pins clamp to the minimap edge and continue showing distance to the destination.
-- Pins may clear automatically when the player comes within five blocks of the target.
+- **Navigation:** Click and drag to pan; scroll to zoom smoothly toward the mouse cursor.
+- **Quick Re-Center:** Shift + Left-click the Refresh button to instantly center on your player and reset zoom to `1.0x`.
+- **Right-Click Context Menu:**
+  - Place or clear temporary navigation pins.
+  - Create, edit, follow, share, or delete waypoints.
+  - Teleport to coordinates (when permissions allow).
+  - Set custom block color overrides.
+- **Hover Inspector:** Live cursor coordinates (X, Y, Z), block identity, and biome name.
+- **Chat Coordinate Sharing:** Click the bottom-right coordinate badge to paste your current location into chat. Clicking shared coordinates in chat opens the map directly at that spot (`/simplemap_view`).
+- **Dimension Switcher:** Seamlessly view any visited dimension with proportional coordinate scaling (1:8 between Nether and Overworld).
 
 ---
 
-## Cave Mapping
+## 🧭 Minimap
 
-Cave mapping is controlled by the server because it can reveal underground terrain.
+A lightweight HUD minimap rendered from the same explored data as the world map.
 
-| Server mode | Behaviour |
-|---|---|
-| `OFF` | Surface map only. |
-| `AUTO` | Automatically switches to a layered cave map when a solid roof is detected above the player, including ceiling dimensions such as the Nether. |
-| `ON` | Enables automatic detection plus player controls for `OFF`, `LAYERED`, `FULL`, and manual Top-Y selection. |
-
-### Layered mode
-
-- Scans a bounded vertical band below the selected Top-Y value.
-- Automatic Top-Y follows the player's elevation in stable bands.
-- Manual Top-Y can be selected with the map slider when the server uses `ON` mode.
-- Layer changes are debounced to avoid rapid switching while moving on stairs or near a layer boundary.
-
-### Full cave view
-
-- Builds a wider underground projection from discovered cave columns.
-- Keeps surface and cave data separate.
-- Seamless layer transitions: the previous cave layer remains visible until replacement regions are ready, eliminating black flashes.
-- Full depth scanning: accurately maps underground caverns, mining tunnels, and deep Nether layers (`Y <= 29`) down to bedrock.
-
-The light button works independently in cave mode:
-
-- `OFF`: full clear visibility;
-- `AUTO`: natural environmental darkening;
-- `ON`: high-contrast underground ambiance.
-- Toggling cave light operates directly on the GPU shader in 0 ms with zero reload stutter.
+- **Shapes & Modes:** Toggle between **Square** and **Circular** shapes. Choose between a rotating map or a fixed-North rotating pointer (`L` key).
+- **Free Placement:** Drag-and-drop the minimap anywhere on screen with automatic resolution and GUI-scale anchoring.
+- **Visual Customization:** Configurable size (16–150 px), independent zoom, opacity, border ring colors, compass letters (`N`, `E`, `S`, `W`), and player arrow/skin styles.
+- **Screen Overlay:** Optionally keep the minimap visible while viewing inventories, containers, chat, or pause screens.
+- **Radar & Clamping:** Navigation pins and waypoints clamp smoothly to the minimap edge with live distance indicators.
 
 ---
 
-## Colour and Terrain Rendering
+## 🏔️ Cave Mapping
 
-### Colour modes
+Underground mapping features dedicated roof detection and vertical volume rendering:
 
-| Mode | Description |
-|---|---|
-| `ACCURATE` | Samples block/model textures and applies biome-aware tint policies where appropriate. Intended for detailed vanilla and modded terrain. |
-| `VANILLA` | Uses Minecraft's built-in map-colour system for a simpler, familiar result. |
+| Server Mode | Behavior |
+|:---|:---|
+| `OFF` | Surface mapping only. |
+| `AUTO` | Automatically engages layered cave mapping when a solid ceiling/roof is detected above the player (including Nether & End ceilings). |
+| `ON` | Full player control with `OFF`, `LAYERED`, and `FULL` view options plus manual Top-Y slider selection. |
 
-Additional rendering options include:
-
-- biome-aware grass, foliage, and water tinting;
-- transparent-leaf and fluid handling;
-- terrain slopes: `OFF`, `2D`, or `3D`;
-- map profiles: `Balanced`, `Vibrant`, `Natural`, and `Contrast`;
-- optional flower/detail display;
-- saved custom colour palette;
-- per-block colour overrides from the map context menu.
-
-The override system is also a fallback for blocks whose model or tint behaviour cannot be inferred reliably.
+- **Layered Mode:** Renders a bounded vertical slice below the selected Top-Y level. Auto Top-Y smoothly tracks player elevation in stable bands.
+- **Full Cave View:** Projects deep cave systems, mining shafts, and Ancient Debris tunnels down to bedrock (`Y <= 29`).
+- **Seamless Transitions:** Previous cave layers remain visible during layer switching until new data is ready—eliminating black screen flashes.
+- **0 ms Cave Lighting:** Toggle between `OFF` (clear visibility), `AUTO` (environmental shading), and `ON` (atmospheric darkening) instantly on the GPU.
 
 ---
 
-## Waypoints and Pins
+## 🎨 Universal Color & Terrain Engine
 
-- Right-click an empty map position to add a waypoint.
-- Choose waypoint icons from categorized vanilla item groups or the searchable A-Z browser.
-- Right-click an existing waypoint to follow it, delete it, or stop following it.
-- Left-click anywhere to create a temporary navigation pin.
-- The full map and minimap both display direction and live distance.
-- Waypoint visibility, waypoint scale, pin scale, and automatic pin clearing are configurable.
+Simple Map features an advanced rendering engine that supports vanilla and all modded blocks out of the box:
 
----
-
-## Map Book System
-
-Map Books provide an optional progression and multiplayer sharing layer.
-
-### Items
-
-| Item | Purpose |
-|---|---|
-| **Empty Map Book** | Saves the player's currently explored region files into a new written Map Book. |
-| **Map Book** | Stores a server-side map ID, owner information, and references to saved explored regions. |
-
-The Empty Map Book recipe is shapeless:
-
-- Book
-- Compass
-- Empty Map
-
-### Workflow
-
-1. **Create:** Right-click an Empty Map Book to save explored regions and create an owned Map Book.
-2. **Open:** The owner can right-click the written book to open the map.
-3. **Update:** The owner can Shift + right-click to upload newly explored regions to the same book.
-4. **Learn:** A non-owner can right-click a shared copy to merge its regions into local map data. Learning is a one-time use and consumes that copy.
-5. **Copy:** Craft one written Map Book with one Empty Map Book to produce two copies of the written book.
-6. **Merge:** Craft two valid written Map Books together to create a new merged Map Book containing regions from both sources.
-
-When `requireMapBook` is enabled, a player must have learned map data and carry a valid Map Book to scan or open the map.
+- **GPU BakedModel Inspection:** Samples exact textures and colors from compiled block models (`Direction.UP` prioritized).
+- **NeoForge BlockColors Probing:** Automatically detects and applies modded color providers (`BIOME_FOLIAGE`, `BIOME_GRASS`, and custom dynamic tint resolvers).
+- **Achromatic Foliage Protection:** Identifies grayscale template textures (such as *Socotra Leaves* in Regions Unexplored) and applies correct biome coloration while preserving pre-colored vibrant foliage (Cherry, Autumn leaves).
+- **Color Modes:**
+  - `Accurate`: High-detail texture-sampled terrain with biome blending and translucent water depth.
+  - `Vanilla`: Traditional built-in Minecraft map colors.
+- **Terrain Relief:** Optional `OFF`, `2D`, or `3D` hillshading slopes for realistic landscape depth.
+- **Visual Profiles:** Switch between `Balanced`, `Vibrant`, `Natural`, and `Contrast` color palettes.
 
 ---
 
-## Configuration
+## 📍 Waypoints & Navigation Pins
 
-### Client configuration
+- **Quick Waypoints:** Press `U` to open the Waypoint Manager, or right-click anywhere on the map to create or edit a waypoint.
+- **Categorized Icon Browser:** Select icons from vanilla creative categories or search alphabetically (A–Z).
+- **In-World Beacons:** Waypoints render customizable beacon rays, distance labels, and minimap icons.
+- **Death Markers:** Automatically marks your death position with configurable history limits.
+- **Temporary Pins:** Left-click on the map to drop a temporary navigation beacon. Pins automatically clear upon arrival (within 5 blocks).
 
-Client settings are stored in:
+---
 
-```text
-.minecraft/simplemap/config.json
-```
+## 📖 Map Book System
 
-The in-map settings screen is divided into four tabs:
+An optional, vanilla-friendly progression mechanic designed for survival and multiplayer servers:
 
-- **Map:** minimap state, size, shape, zoom, rotation, pointer style, pointer scale, pin scale, and display in other screens.
-- **Coords:** coordinate visibility and scale, plus cursor-biome information.
-- **Colors:** UI colour targets, presets, custom hexadecimal colours, saved palette entries, and map colour profile.
-- **System:** chunk-stream mapping, scan budget, always-rescan mode, pin behaviour, Accurate/Vanilla colour mode, flowers, and terrain relief.
+| Item | Crafting / Purpose |
+|:---|:---|
+| **Empty Map Book** | Crafted with **Book + Compass + Empty Map** (shapeless). Right-click to record all your explored regions into a new Map Book. |
+| **Map Book** | Stores explored map data. Shift + Right-click to update newly explored terrain into the book. Non-owners can right-click to **Learn** and absorb the map data into their client. |
 
-`Scan: AUTO` is recommended for modern systems. Manual values represent an approximate loaded-chunk budget per client tick rather than random dots.
+- **Copying:** Combine a written Map Book with an Empty Map Book to create duplicate copies.
+- **Merging:** Craft two written Map Books together to combine exploration data from both players.
+- **Server Enforcement:** When `requireMapBook` is enabled on a server, players must carry a valid Map Book in their inventory to access the map or minimap.
 
-### Server configuration
+---
 
-Server settings are stored in:
+## ⚙️ Configuration
 
-```text
-config/simplemap-server.json
-```
+### Client Settings (In-Game GUI)
+Access via the map toolbar gear icon or mod menu. Divided into 4 intuitive tabs:
+- **Map:** Minimap toggle, shape, size, zoom, rotation, pointer style, screen overlay, and waypoint radar.
+- **Coords:** Coordinate HUD toggle, scale, positioning, cursor biome, and cursor block display.
+- **Colors:** UI color picker, preset palettes, custom hex values, map profile, and per-block overrides.
+- **System:** Block color pipeline (`Accurate`/`Vanilla`), 2D/3D slopes, flower rendering, scan budgets, and death waypoints.
 
+### Server Configuration (`config/simplemap-server.json`)
 ```json
 {
   "requireMapBook": false,
   "caveMapMode": 0
 }
 ```
-
-- `requireMapBook`: requires learned map data and a valid written Map Book in the player's inventory.
-- `caveMapMode`: `0 = OFF`, `1 = AUTO`, `2 = ON`.
-
-In singleplayer or an integrated server, these settings can also be edited through the mod's Config screen. On a remote server, clients only see the server-selected values.
+- `requireMapBook`: `true` forces players to own and carry a Map Book to use map features.
+- `caveMapMode`: `0 = OFF` (Surface only), `1 = AUTO` (Automatic roof detection), `2 = ON` (Full player control).
 
 ---
 
-## Controls
+## ⌨️ Controls & Keybinds
 
-| Action | Default input |
-|---|---|
-| Open world map | `M` |
-| Pan map | Left-click and drag |
-| Zoom | Mouse wheel |
-| Place or remove navigation pin | Left-click without dragging |
-| Open map context menu | Right-click |
-| Refresh visible loaded chunks | Refresh toolbar button |
-| Reset centre and zoom | Shift + refresh toolbar button |
-| Cycle night / cave light | Sun/moon toolbar button |
-| Cycle cave view | Cave button, when server mode is `ON` |
-| Select automatic or manual Top-Y | Cave-layer slider |
-| Open settings | Gear toolbar button |
-| Save/update Map Book | Right-click / Shift + right-click the corresponding book |
+| Action | Default Key | Description |
+|:---|:---:|:---|
+| **Open World Map** | `M` | Opens the full-screen world map |
+| **Toggle Minimap** | `N` | Toggles minimap HUD visibility |
+| **Toggle North Lock** | `L` | Locks minimap orientation to North |
+| **Waypoint Manager** | `U` | Opens the waypoints list and editor |
+| **Zoom In / Out** | `= / -` | Adjusts zoom level (or use mouse scroll) |
+| **Pan Map** | Left-Click Drag | Drags and pans across explored terrain |
+| **Place / Clear Pin** | Left-Click | Drops or removes temporary navigation pin |
+| **Context Menu** | Right-Click | Opens context menu on map or waypoint |
+| **Re-Center on Player** | Shift + Refresh | Centers map on player and resets zoom to 1.0x |
+| **Cycle Brightness** | Toolbar Sun/Moon | Instantly toggles Day / Auto / Night lighting |
 
----
-
-## Performance Architecture
-
-Simple Map performs world sampling on the client and uses the server only for policy synchronization and Map Book transfer/storage.
-
-The current mapping pipeline includes:
-
-- loaded-chunk priority queues instead of the old random-dot scanner;
-- immediate handling of newly streamed chunks near the player;
-- centre-first viewport scanning while the full map is open;
-- separate surface, layered-cave, full-cave, and light-region caches;
-- asynchronous region-file loading and saving;
-- background CPU texture construction;
-- coalesced dirty-region revisions to prevent redundant rebuilds;
-- bounded texture publication per frame to reduce upload spikes;
-- batched region rendering with a single flush per map pass;
-- LRU limits for CPU region caches and GPU textures;
-- cached data preloading when panning across previously explored regions.
-
-### Performance settings
-
-- Keep **Always Rescan** disabled unless frequently changing terrain must update continuously.
-- Use **Scan: AUTO** for the fastest deadline-bounded scan rate.
-- Lower the scan budget on slower CPUs if exploration causes frame-time spikes.
-- Cave mapping uses spatial GPU page caching and retained framebuffer compositing for smooth 120+ FPS underground navigation.
+*Additional functions (Cave mode cycle, shape toggle, quick add waypoint) can be bound in Minecraft's **Controls > Key Binds** menu.*
 
 ---
 
-## Installation
+## 📦 Installation & Build
 
-1. Install Minecraft `1.21.1`.
-2. Install a compatible NeoForge `21.1.x` build.
-3. Place the Simple Map `.jar` file in the Minecraft `mods` directory.
-4. Launch the game and bind the map key if `M` conflicts with another mod.
-5. For multiplayer, install the mod on both the server and participating clients when using Map Books or server-controlled cave mapping.
+### Requirements
+- **Minecraft:** `1.21.1`
+- **Mod Loader:** `NeoForge 21.1.65+`
+- **Java:** `21`
 
-Java 21 is required by Minecraft 1.21.1 and the development toolchain.
-
----
-
-## Building from Source
-
+### Build from Source
 ```bash
+# Linux / macOS
 ./gradlew build
-```
 
-On Windows:
-
-```powershell
+# Windows
 .\gradlew.bat build
 ```
-
-The project uses:
-
-- Java 21;
-- NeoForge ModDevGradle;
-- Parchment mappings for Minecraft 1.21.1.
-
-Development run configurations:
-
-```bash
-./gradlew runClient
-./gradlew runServer
-```
+Built `.jar` artifacts are located in `../mods/` or `build/libs/`.
 
 ---
 
-## Notes
+## 📄 License
 
-- The map discovers and renders both live loaded chunks and previously explored Anvil (`.mca`) region files.
-- Cave mapping exposes underground structures and can be enabled or restricted server-side via `config/simplemap-server.json` to suit multiplayer server rules.
-- Optional per-block colour overrides are available via the right-click context menu for custom aesthetic personalization.
-
----
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-Copyright © 2026 Velorise.
-
+This project is licensed under the [MIT License](LICENSE).  
+Copyright © 2026 **Velorise**.
