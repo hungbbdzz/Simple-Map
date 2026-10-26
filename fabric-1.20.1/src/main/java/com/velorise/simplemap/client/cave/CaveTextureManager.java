@@ -319,7 +319,10 @@ public final class CaveTextureManager {
         int maxPz = maxVisiblePageZ;
         int fpx = focusPageX;
         int fpz = focusPageZ;
-        boolean allowLeafPrecreate = preferredCaveScale >= 0.35f;
+        boolean allowLeafPrecreate = preferredCaveScale >= 0.25f;
+        boolean regionNearViewport = minPx == Integer.MIN_VALUE
+                || (firstGlobalX + 7 >= minPx - 8 && firstGlobalX <= maxPx + 8
+                        && firstGlobalZ + 7 >= minPz - 8 && firstGlobalZ <= maxPz + 8);
         synchronized (pages) {
             for (int pz = 0; pz < 8; pz++) {
                 for (int px = 0; px < 8; px++) {
@@ -332,8 +335,7 @@ public final class CaveTextureManager {
                         dirtyPageKeys.add(key);
                     } else if (regionHasContent && allowLeafPrecreate && minPx != Integer.MIN_VALUE
                             && gpx >= minPx - 1 && gpx <= maxPx + 1
-                            && gpz >= minPz - 1 && gpz <= maxPz + 1
-                            && Math.abs(gpx - fpx) <= 12 && Math.abs(gpz - fpz) <= 12) {
+                            && gpz >= minPz - 1 && gpz <= maxPz + 1) {
                         PageEntry entry = pages.computeIfAbsent(key, PageEntry::new);
                         entry.dirty = true;
                         dirtyPageKeys.add(key);
@@ -354,7 +356,9 @@ public final class CaveTextureManager {
             for (int dz = 0; dz < 2; dz++) {
                 for (int dx = 0; dx < 2; dx++) {
                     BranchKey k2 = new BranchKey(dimId, band, 2, baseNodeX2 + dx, baseNodeZ2 + dz);
-                    BranchEntry l2 = branchPages.get(k2);
+                    BranchEntry l2 = (regionHasContent && regionNearViewport)
+                            ? branchPages.computeIfAbsent(k2, BranchEntry::new)
+                            : branchPages.get(k2);
                     if (l2 != null) {
                         l2.dirty = true;
                         dirtyBranchKeys.add(k2);
@@ -363,10 +367,13 @@ public final class CaveTextureManager {
             }
             int baseNodeX1 = rx * 4;
             int baseNodeZ1 = rz * 4;
+            boolean precreateL1 = regionHasContent && regionNearViewport && preferredCaveScale < 0.65f;
             for (int dz = 0; dz < 4; dz++) {
                 for (int dx = 0; dx < 4; dx++) {
                     BranchKey k1 = new BranchKey(dimId, band, 1, baseNodeX1 + dx, baseNodeZ1 + dz);
-                    BranchEntry l1 = branchPages.get(k1);
+                    BranchEntry l1 = precreateL1
+                            ? branchPages.computeIfAbsent(k1, BranchEntry::new)
+                            : branchPages.get(k1);
                     if (l1 != null) {
                         l1.dirty = true;
                         dirtyBranchKeys.add(k1);
@@ -374,6 +381,10 @@ public final class CaveTextureManager {
                 }
             }
         }
+        MapMemoryBudgetPolicy.MapResidencyManager.getInstance()
+                .markCoverageChanged(MapMemoryBudgetPolicy.MapResidencyManager.Kind.CAVE_EXACT);
+        MapMemoryBudgetPolicy.MapResidencyManager.getInstance()
+                .markCoverageChanged(MapMemoryBudgetPolicy.MapResidencyManager.Kind.CAVE_BRANCH);
         contentRevision.incrementAndGet();
     }
 
@@ -1785,24 +1796,33 @@ public final class CaveTextureManager {
             deferProjectionCompletions();
             layerGeneration.incrementAndGet();
             CaveTextureManager.getInstance().onLayerActivated(layerY);
-            if (layerY != Integer.MIN_VALUE) {
-                String dimId = currentDimensionId();
-                int band = CaveLayerBand.key(CaveView.LAYERED, layerY);
-                List<CaveRegion> toReslice = new ArrayList<>();
-                synchronized (regions) {
-                    for (RegionHolder holder : regions.values()) {
-                        CaveRegion reg = holder.region;
-                        if (reg != null && !reg.isClosed()
-                                && dimId.equals(reg.dimensionResourceId)
-                                && reg.band == band
-                                && reg.isAnvilSliced() && reg.getWrittenAnvilLayerY() != layerY) {
+            String dimId = currentDimensionId();
+            int band = layerY == Integer.MIN_VALUE
+                    ? Integer.MIN_VALUE
+                    : CaveLayerBand.key(CaveView.LAYERED, layerY);
+            List<CaveRegion> toReslice = new ArrayList<>();
+            List<CaveRegion> toDirty = new ArrayList<>();
+            synchronized (regions) {
+                for (RegionHolder holder : regions.values()) {
+                    CaveRegion reg = holder.region;
+                    if (reg != null && !reg.isClosed()
+                            && dimId.equals(reg.dimensionResourceId)
+                            && reg.band == band) {
+                        if (!reg.isAnvilSliced()
+                                || (layerY != Integer.MIN_VALUE && reg.getWrittenAnvilLayerY() != layerY)
+                                || isMcaUpdatedSinceSlice(reg, reg.rx, reg.rz)) {
                             toReslice.add(reg);
+                        } else if (reg.hasContent()) {
+                            toDirty.add(reg);
                         }
                     }
                 }
-                for (CaveRegion reg : toReslice) {
-                    materialize(layerY, reg.rx, reg.rz, false, true);
-                }
+            }
+            for (CaveRegion reg : toDirty) {
+                CaveTextureManager.getInstance().markRegionTextureDirty(layerY, reg.rx, reg.rz);
+            }
+            for (CaveRegion reg : toReslice) {
+                materialize(layerY, reg.rx, reg.rz, false, true);
             }
         }
 
@@ -2070,13 +2090,8 @@ public final class CaveTextureManager {
             String key = regionCacheKey(dimId, band, rx, rz);
             synchronized (regions) {
                 RegionHolder holder = regions.get(key);
-                if (holder != null) {
-                    if (holder.region.hasContent()) return true;
-                    if (holder.region.isLoaded()
-                            && !holder.region.isAnvilSlicing()
-                            && !holder.region.hasPendingAnvilSlice()) {
-                        return false;
-                    }
+                if (holder != null && holder.region.hasContent()) {
+                    return true;
                 }
             }
             Boolean cachedScdat = scdatExistsCache.get(key);
@@ -2125,10 +2140,45 @@ public final class CaveTextureManager {
             return reg.isChunkLiveAtLayer(chunkX & 31, chunkZ & 31, layerY);
         }
 
+        private final Map<String, long[]> mcaMetaCache = new ConcurrentHashMap<>();
+
+        private boolean isMcaUpdatedSinceSlice(CaveRegion region, int rx, int rz) {
+            if (region == null || !region.isAnvilSliced()) return true;
+            long slicedMod = region.getSlicedMcaLastModified();
+            long slicedLen = region.getSlicedMcaLength();
+            String dimId = region.dimensionResourceId != null ? region.dimensionResourceId : currentDimensionId();
+            String metaKey = dimId + ":" + rx + "," + rz;
+            long now = System.currentTimeMillis();
+            long[] cached = mcaMetaCache.get(metaKey);
+            long mcaMod;
+            long mcaLen;
+            if (cached != null && now - cached[0] < 3_000L) {
+                mcaMod = cached[1];
+                mcaLen = cached[2];
+            } else {
+                File mcaDir = region.mcaDir != null ? region.mcaDir : getMcaDirectory(dimId);
+                File mcaFile = mcaDir != null ? new File(mcaDir, "r." + rx + "." + rz + ".mca") : null;
+                if (mcaFile != null && mcaFile.exists()) {
+                    mcaMod = mcaFile.lastModified();
+                    mcaLen = mcaFile.length();
+                } else {
+                    mcaMod = -1L;
+                    mcaLen = -1L;
+                }
+                mcaMetaCache.put(metaKey, new long[] { now, mcaMod, mcaLen });
+            }
+            if (mcaLen < 8192L) return false;
+            if (slicedMod <= 0L) return true;
+            if (mcaMod > slicedMod + 1_000L) return true;
+            if (slicedLen > 0L && mcaLen != slicedLen) return true;
+            return false;
+        }
+
         public boolean isRegionAnvilSlicedAtLayer(int layerY, int rx, int rz) {
             CaveRegion region = getRegion(layerY, rx, rz, false);
             if (region == null || !region.isAnvilSliced()) return false;
-            return layerY == Integer.MIN_VALUE || region.getWrittenAnvilLayerY() == layerY;
+            if (layerY != Integer.MIN_VALUE && region.getWrittenAnvilLayerY() != layerY) return false;
+            return !isMcaUpdatedSinceSlice(region, rx, rz);
         }
 
         public boolean isRegionLoaded(int rx, int rz) {
@@ -2500,6 +2550,7 @@ public final class CaveTextureManager {
                 if (anvilSliced) {
                     region.setAnvilSliced(true);
                     region.setWrittenAnvilLayerY(savedAnvilLayerY);
+                    region.setSlicedMcaStamp(file.lastModified(), 0L);
                 } else if (scrubbedForeignPollution) {
                     region.setAnvilSliced(false);
                     region.setDirty(true);
@@ -2555,11 +2606,11 @@ public final class CaveTextureManager {
             if (mcaDir == null) return;
             File mcaFile = new File(mcaDir, "r." + rx + "." + rz + ".mca");
             if (!mcaFile.exists() || mcaFile.length() < 8192) {
-                region.setAnvilSliced(true);
-                region.setWrittenAnvilLayerY(layerY);
                 region.markExactSnapshotLoaded();
                 return;
             }
+            long observedMcaMod = mcaFile.lastModified();
+            long observedMcaLen = mcaFile.length();
 
             try (RandomAccessFile raf = new RandomAccessFile(mcaFile, "r")) {
                 byte[] header = new byte[4096];
@@ -2671,8 +2722,6 @@ public final class CaveTextureManager {
                 }
 
                 if (!hasAnyChunk) {
-                    region.setAnvilSliced(true);
-                    region.setWrittenAnvilLayerY(layerY);
                     region.markExactSnapshotLoaded();
                     return;
                 }
@@ -2749,6 +2798,7 @@ public final class CaveTextureManager {
                         region.markHasContent();
                         region.setDirty(true);
                     }
+                    region.setSlicedMcaStamp(observedMcaMod, observedMcaLen);
                     region.setAnvilSliced(true);
                     region.setWrittenAnvilLayerY(layerY);
                     region.markExactSnapshotLoaded();
@@ -3971,7 +4021,8 @@ public final class CaveTextureManager {
                 }
                 if (allowAnvilSlice) {
                     boolean needsSlice = !target.isAnvilSliced()
-                            || (layerY != Integer.MIN_VALUE && target.getWrittenAnvilLayerY() != layerY);
+                            || (layerY != Integer.MIN_VALUE && target.getWrittenAnvilLayerY() != layerY)
+                            || isMcaUpdatedSinceSlice(target, rx, rz);
                     if (needsSlice) {
                         target.requestAnvilSlice(layerY);
                     }
@@ -4006,7 +4057,8 @@ public final class CaveTextureManager {
                         dirtyLayerY = requestedLayer;
                         boolean needsSlice = !asyncTarget.isAnvilSliced()
                                 || (requestedLayer != Integer.MIN_VALUE
-                                        && asyncTarget.getWrittenAnvilLayerY() != requestedLayer);
+                                        && asyncTarget.getWrittenAnvilLayerY() != requestedLayer)
+                                || isMcaUpdatedSinceSlice(asyncTarget, rx, rz);
                         if (needsSlice && asyncTarget.markAnvilSlicing()) {
                             try {
                                 sliceAnvilRegion(asyncTarget, requestedLayer, rx, rz);
@@ -4127,6 +4179,8 @@ public final class CaveTextureManager {
             private volatile boolean dirty;
             private volatile boolean anvilSliced;
             private volatile int writtenAnvilLayerY = Integer.MAX_VALUE;
+            private volatile long slicedMcaLastModified = -1L;
+            private volatile long slicedMcaLength = -1L;
             private volatile boolean pendingAnvilSlice;
             private volatile int pendingAnvilLayerY = Integer.MIN_VALUE;
             private final AtomicBoolean anvilSlicing = new AtomicBoolean(false);
@@ -4231,6 +4285,12 @@ public final class CaveTextureManager {
             public void setAnvilSliced(boolean sliced) { if (!closed) this.anvilSliced = sliced; }
             public int getWrittenAnvilLayerY() { return writtenAnvilLayerY; }
             public void setWrittenAnvilLayerY(int layerY) { this.writtenAnvilLayerY = layerY; }
+            public long getSlicedMcaLastModified() { return slicedMcaLastModified; }
+            public long getSlicedMcaLength() { return slicedMcaLength; }
+            public void setSlicedMcaStamp(long lastModified, long length) {
+                this.slicedMcaLastModified = lastModified;
+                this.slicedMcaLength = length;
+            }
             public boolean isAnvilSlicing() { return anvilSlicing.get() && !closed; }
             public boolean markAnvilSlicing() { return anvilSlicing.compareAndSet(false, true); }
             public void finishAnvilSlicing() { anvilSlicing.set(false); }

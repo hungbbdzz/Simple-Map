@@ -23,10 +23,10 @@ public class MinimapRenderer {
     private static final MinimapRenderer INSTANCE = new MinimapRenderer();
     private static final ResourceLocation PLAYER_OFF_MAP_TEXTURE =
             ResourceLocation.fromNamespaceAndPath(
-                    "minecraft", "textures/map/decorations/player_off_map.png");
+                    "simplemap", "textures/gui/player_off_map.png");
     private static final ResourceLocation RED_X_TEXTURE =
             ResourceLocation.fromNamespaceAndPath(
-                    "minecraft", "textures/map/decorations/red_x.png");
+                    "simplemap", "textures/gui/red_x.png");
     private static final int CIRCLE_SEGMENTS = 64;
     private static final float[] CIRCLE_COS = new float[CIRCLE_SEGMENTS + 1];
     private static final float[] CIRCLE_SIN = new float[CIRCLE_SEGMENTS + 1];

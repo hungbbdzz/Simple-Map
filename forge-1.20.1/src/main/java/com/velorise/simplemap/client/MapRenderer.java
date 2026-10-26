@@ -79,7 +79,7 @@ public class MapRenderer {
     private static final MapRenderer INSTANCE = new MapRenderer();
     private static final ResourceLocation RED_X_TEXTURE =
             new ResourceLocation(
-                    "minecraft", "textures/map/decorations/red_x.png");
+                    "simplemap", "textures/gui/red_x.png");
     private static final float NIGHT_MIN_BRIGHTNESS = 0.22f;
     /** Derives map lighting from DimensionType ambient light instead of a
      * hardcoded universal night floor. Keep the same 0.375 baseline. */

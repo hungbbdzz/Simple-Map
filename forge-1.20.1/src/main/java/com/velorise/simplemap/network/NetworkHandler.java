@@ -281,7 +281,11 @@ public final class NetworkHandler {
                             throw new IOException("Map-book destination escaped base directory");
                         }
                         Files.createDirectories(destinationDirectory);
-                        RegionDataStore.writeAtomic(destination.toFile(), decoded);
+                        if (destination.toFile().isFile()) {
+                            RegionDataStore.mergeIntoFile(destination.toFile(), data);
+                        } else {
+                            RegionDataStore.writeAtomic(destination.toFile(), decoded);
+                        }
                     }
                 } catch (IOException exception) {
                     accepted = false;
@@ -499,14 +503,31 @@ public final class NetworkHandler {
             CompoundTag tag = customTag(stack);
             if (tag.contains("OwnerUUID")
                     && !player.getUUID().toString().equals(tag.getString("OwnerUUID"))) {
-                stack.shrink(1);
-                player.sendSystemMessage(Component.translatable("gui.simplemap.book.crumbled"));
-                player.level().playSound(null, player.getX(), player.getY(), player.getZ(),
-                        net.minecraft.sounds.SoundEvents.ITEM_BREAK,
-                        net.minecraft.sounds.SoundSource.PLAYERS, 1.0f, 1.0f);
+                if (com.velorise.simplemap.ServerConfig.requireMapBook && countMapBooks(player) <= 1 && stack.getCount() <= 1) {
+                    tag.putString("OwnerUUID", player.getUUID().toString());
+                    tag.putString("OwnerName", player.getName().getString());
+                    stack.setTag(tag);
+                } else {
+                    stack.shrink(1);
+                    player.sendSystemMessage(Component.translatable("gui.simplemap.book.crumbled"));
+                    player.level().playSound(null, player.getX(), player.getY(), player.getZ(),
+                            net.minecraft.sounds.SoundEvents.ITEM_BREAK,
+                            net.minecraft.sounds.SoundSource.PLAYERS, 1.0f, 1.0f);
+                }
             }
             return;
         }
+    }
+
+    private static int countMapBooks(ServerPlayer player) {
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (stack.is(ModItems.MAP_BOOK.get()) && !heldBookId(stack).isEmpty()) {
+                total += stack.getCount();
+            }
+        }
+        return total;
     }
 
     private static CompoundTag customTag(ItemStack stack) {

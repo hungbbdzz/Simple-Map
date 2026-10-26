@@ -6,7 +6,7 @@ set "RESULT=%ERRORLEVEL%"
 if not "%RESULT%"=="0" (
     echo.
     echo Build failed. Read the error above.
-    pause
+    if not "%CI%"=="true" if not "%NONINTERACTIVE%"=="1" if "%ANTIGRAVITY_AGENT%"=="" pause
 )
 exit /b %RESULT%
 #>
@@ -112,16 +112,26 @@ function Copy-ReleaseJar(
 ) {
     if ($null -eq $Jar) { return }
 
-    # Copy to local mods folder
+    # Copy to local mods folder if not already there
     $destLocal = Join-Path $LocalModsDir $Jar.Name
-    Copy-Item -Path $Jar.FullName -Destination $destLocal -Force
-    Write-Host "Copied $DisplayName -> $destLocal" -ForegroundColor Green
+    $sourceResolved = (Resolve-Path $Jar.FullName).Path
+    $destResolved = if (Test-Path $destLocal) { (Resolve-Path $destLocal).Path } else { $null }
+
+    if ($null -eq $destResolved -or $sourceResolved -ne $destResolved) {
+        Copy-Item -Path $Jar.FullName -Destination $destLocal -Force
+        Write-Host "Copied $DisplayName -> $destLocal" -ForegroundColor Green
+    } else {
+        Write-Host "Present $DisplayName -> $destLocal" -ForegroundColor Green
+    }
 
     # Copy to global workspace mods folder if available
     if (Test-Path $GlobalModsDir) {
         $destGlobal = Join-Path $GlobalModsDir $Jar.Name
-        Copy-Item -Path $Jar.FullName -Destination $destGlobal -Force
-        Write-Host "Copied $DisplayName -> $destGlobal" -ForegroundColor Green
+        $destGlobalResolved = if (Test-Path $destGlobal) { (Resolve-Path $destGlobal).Path } else { $null }
+        if ($null -eq $destGlobalResolved -or $sourceResolved -ne $destGlobalResolved) {
+            Copy-Item -Path $Jar.FullName -Destination $destGlobal -Force
+            Write-Host "Copied $DisplayName -> $destGlobal" -ForegroundColor Green
+        }
     }
 }
 

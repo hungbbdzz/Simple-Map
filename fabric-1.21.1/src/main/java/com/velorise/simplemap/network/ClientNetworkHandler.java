@@ -102,7 +102,12 @@ public final class ClientNetworkHandler {
                 return;
             }
 
-            File directory = MapManager.getInstance().getCurrentDimensionDir();
+            MapManager mapManager = MapManager.getInstance();
+            if (!mapManager.isViewingLiveDimension()) {
+                mapManager.setViewDimensionOverride(null);
+                mapManager.updateWorldAndDimension(Minecraft.getInstance());
+            }
+            File directory = mapManager.getCurrentDimensionDir();
             if (directory == null) {
                 sendEmptySaveReply(payload);
                 return;
@@ -153,9 +158,9 @@ public final class ClientNetworkHandler {
 
     static void handleSaveBookComplete(SaveBookCompletePayload payload, Executor executor) {
         executor.execute(() -> {
-            if (NetworkHandler.isValidBookId(payload.bookId(), false)
-                    && MapConfig.serverRequireMapBook) {
+            if (NetworkHandler.isValidBookId(payload.bookId(), false)) {
                 MapManager.getInstance().setHasLearnedMap(true);
+                MapManager.getInstance().setLastLearnedBookId(payload.bookId());
             }
         });
     }
@@ -170,11 +175,18 @@ public final class ClientNetworkHandler {
             }
 
             MapManager mapManager = MapManager.getInstance();
+            if (!mapManager.isViewingLiveDimension()) {
+                mapManager.setViewDimensionOverride(null);
+                mapManager.updateWorldAndDimension(Minecraft.getInstance());
+            }
             File directory = mapManager.getCurrentDimensionDir();
             long mapGeneration = mapManager.getGeneration();
+            int[] parsedCoords = NetworkHandler.parseRegionCoordinates(payload.regionName());
+            RegionDataStore.StoredRegion liveSnapshot = parsedCoords == null ? null
+                    : mapManager.snapshotStoredRegion(parsedCoords[0], parsedCoords[1]);
             byte[] data = Arrays.copyOf(payload.data(), payload.data().length);
             NetworkHandler.BOOK_IO_POOL.execute(() -> {
-                int[] coordinates = NetworkHandler.parseRegionCoordinates(payload.regionName());
+                int[] coordinates = parsedCoords;
                 boolean merged = false;
                 try {
                     if (directory == null || coordinates == null || data.length == 0) {
@@ -185,6 +197,12 @@ public final class ClientNetworkHandler {
                         throw new IOException("Learned region escaped map directory");
                     }
                     Files.createDirectories(directory.toPath());
+                    if (liveSnapshot != null) {
+                        byte[] liveBytes = RegionDataStore.toBytes(liveSnapshot);
+                        if (liveBytes.length <= NetworkHandler.MAX_REGION_FILE_BYTES) {
+                            RegionDataStore.mergeIntoFile(localFile, liveBytes);
+                        }
+                    }
                     RegionDataStore.mergeIntoFile(localFile, data);
                     merged = true;
                 } catch (IOException exception) {
@@ -214,9 +232,17 @@ public final class ClientNetworkHandler {
             if (!NetworkHandler.isValidBookId(payload.bookId(), false)) return;
             MapManager.getInstance().setHasLearnedMap(true);
             MapManager.getInstance().setLastLearnedBookId(payload.bookId());
+            com.velorise.simplemap.client.SurfaceRegionSourceDatabase.getInstance().clear();
+            com.velorise.simplemap.client.RegionSurfaceLodService.getInstance().clear();
             MapTextureManager.getInstance().clearCache();
+            com.velorise.simplemap.client.MapOverviewTextureManager.getInstance().clearCache();
+            com.velorise.simplemap.client.renderer.FullscreenMapFramebufferRenderer.getInstance().invalidate();
+            com.velorise.simplemap.client.renderer.MinimapFramebufferRenderer.getInstance().invalidate();
+            com.velorise.simplemap.client.MapRenderer.getInstance().clearFullscreenFallback();
+            com.velorise.simplemap.client.MapViewportCoordinator.getInstance().onLayerChanged();
             Minecraft minecraft = Minecraft.getInstance();
-            if (minecraft.player != null) {
+            if (minecraft.level != null && minecraft.player != null) {
+                com.velorise.simplemap.client.ChunkScanner.getInstance().requestRefresh(minecraft);
                 minecraft.player.sendSystemMessage(Component.translatable("gui.simplemap.book.learn_success"));
             }
         });

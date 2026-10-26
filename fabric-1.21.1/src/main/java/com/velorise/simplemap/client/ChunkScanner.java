@@ -1195,8 +1195,12 @@ public class ChunkScanner {
         boolean fullView = CaveMode.isFullView(mc);
         int targetLayer = fullView ? Integer.MIN_VALUE : layerY;
         CaveMapManager.getInstance().setActiveLayer(targetLayer);
+        double guiScale = mc.getWindow() == null
+                ? 1.0D : Math.max(1.0D, mc.getWindow().getGuiScale());
+        float physicalScale = MapViewportCoordinator.MapLodPolicy.MapRenderScalePolicy
+                .physicalPixelsPerBlock(scale, guiScale);
         CaveTextureManager.getInstance().requestVisiblePages(targetLayer, minX, maxX, minZ, maxZ,
-                scale, focusX, focusZ, lane);
+                physicalScale, focusX, focusZ, lane);
         long budget = scanBudget(mc, true, scale);
         if (budget > 0L) {
             scanVisibleCaveChunks(mc, minX, maxX, minZ, maxZ, focusX, focusZ,

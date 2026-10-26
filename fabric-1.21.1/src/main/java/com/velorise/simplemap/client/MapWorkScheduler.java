@@ -2382,7 +2382,17 @@ public static final class MapTextureBuildWorker {
                     biomePalette, blockPalette, biomeLookup, blockColors,
                     tintPolicies, tintDisabledBlocks, colourMode, showFlowers,
                     terrainSlopes, profile, updateSubtiles, valid);
-            byte[] pageLight = buildSmoothedLightPageWindow(light, stride, halo,
+            byte[] effectiveLight = light;
+            if (effectiveLight == null && pixels != null) {
+                effectiveLight = new byte[pixels.length];
+                for (int k = 0; k < pixels.length; k++) {
+                    long p = pixels[k];
+                    if (!MapBlockData.isEmpty(p)) {
+                        effectiveLight[k] = (byte) (MapBlockData.isGlowing(p) ? 15 : MapBlockData.getBlockLight(p));
+                    }
+                }
+            }
+            byte[] pageLight = buildSmoothedLightPageWindow(effectiveLight, stride, halo,
                     updateSubtiles, valid);
             int[] pageGlow = new int[pageStyled.length];
             for (int i = 0; i < pageStyled.length; i++) {
@@ -2609,10 +2619,15 @@ public static final class MapTextureBuildWorker {
                             knownCount++;
                             int color = supersampled[colorRowOffset + sourceX];
                             if ((color >>> 24) == 0) continue;
-                            colored++;
-                            red += color & 0xFF;
-                            green += (color >>> 8) & 0xFF;
-                            blue += (color >>> 16) & 0xFF;
+                            int r = color & 0xFF;
+                            int g = (color >>> 8) & 0xFF;
+                            int b = (color >>> 16) & 0xFF;
+                            int lum = Math.max(r, Math.max(g, b));
+                            int w = (r + g + b >= 380 || lum >= 195) ? 4 : 1;
+                            colored += w;
+                            red += (long) r * w;
+                            green += (long) g * w;
+                            blue += (long) b * w;
                         }
                     }
                     if (knownCount > 0) knownRows[y] |= 1L << x;
