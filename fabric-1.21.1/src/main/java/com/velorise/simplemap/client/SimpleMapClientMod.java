@@ -74,7 +74,12 @@ public final class SimpleMapClientMod implements ClientModInitializer {
             unavailable(player);
             return;
         }
-        List<String> regionNames = MapManager.getInstance().getKnownRegionNamesForBook(4096);
+        MapManager mapManager = MapManager.getInstance();
+        if (!mapManager.isViewingLiveDimension()) {
+            mapManager.setViewDimensionOverride(null);
+            mapManager.updateWorldAndDimension(Minecraft.getInstance());
+        }
+        List<String> regionNames = mapManager.getKnownRegionNamesForBook(4096);
         if (regionNames.isEmpty()) {
             player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_regions_to_save"));
             return;
@@ -111,8 +116,13 @@ public final class SimpleMapClientMod implements ClientModInitializer {
         boolean isOwner = tag.contains("OwnerUUID")
                 && tag.getString("OwnerUUID").equals(player.getUUID().toString());
         MapManager mapManager = MapManager.getInstance();
-        if (mapManager.hasLearnedMap()
-                && (isOwner || bookId.equals(mapManager.getLastLearnedBookId()))) {
+        if (!mapManager.isViewingLiveDimension()) {
+            mapManager.setViewDimensionOverride(null);
+            mapManager.updateWorldAndDimension(Minecraft.getInstance());
+        }
+        if (isOwner && !mapManager.getKnownRegionNamesForBook(1).isEmpty()) {
+            mapManager.setHasLearnedMap(true);
+            mapManager.setLastLearnedBookId(bookId);
             mapManager.openMapScreen();
             return;
         }
@@ -132,7 +142,12 @@ public final class SimpleMapClientMod implements ClientModInitializer {
             unavailable(player);
             return;
         }
-        List<String> regionNames = MapManager.getInstance().getKnownRegionNamesForBook(4096);
+        MapManager mapManager = MapManager.getInstance();
+        if (!mapManager.isViewingLiveDimension()) {
+            mapManager.setViewDimensionOverride(null);
+            mapManager.updateWorldAndDimension(Minecraft.getInstance());
+        }
+        List<String> regionNames = mapManager.getKnownRegionNamesForBook(4096);
         if (regionNames.isEmpty()) {
             player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_regions_to_save"));
             return;

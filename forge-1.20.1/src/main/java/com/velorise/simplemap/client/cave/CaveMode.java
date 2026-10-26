@@ -161,11 +161,9 @@ public final class CaveMode {
 
     public static boolean isActive(Minecraft mc) {
         if (mc == null || mc.level == null || mc.player == null) return false;
-        // Cave permission, cave type and cave activation are kept separate.
-        // OFF disables cave rendering. CAVE/FULL use the same AUTO/manual cave-start
-        // decision; the type only decides whether that active cave is layered or full.
+        CaveType currentType = getCaveType(mc);
         if (MapConfig.getEffectiveCaveMapMode() == 0
-                || getCaveType(mc) == CaveType.OFF) return false;
+                || currentType == CaveType.OFF) return false;
         MapManager manager = MapManager.getInstance();
         boolean acceptsLive = manager.acceptsLiveLevel(mc.level);
         // Portal handoff can expose the new ClientLevel one render frame before
@@ -173,25 +171,20 @@ public final class CaveMode {
         // render the previous dimension under the new live session. An intentional
         // remote map view is different: its explicit override may use manual Cave.
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
+        if (currentType == CaveType.FULL) return true;
         if (hasManualTopY(mc)) return true;
+        if (mc.screen instanceof com.velorise.simplemap.client.gui.MapScreen
+                && currentType == CaveType.LAYERED) {
+            return true;
+        }
         DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
         boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
         boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();
         if (viewedHasCeiling || !viewedHasSkyLight) {
             return true;
         }
-        // Remote AUTO in an open-sky dimension (like Overworld):
-        // if the user explicitly chose FULL cave mode (or LAYERED cave mode while viewing remotely),
-        // honor that selection so remote Cave/Full Cave views work seamlessly!
         if (!acceptsLive) {
-            CaveType explicit = CAVE_TYPES.get(dimensionKey(mc));
-            if (explicit == null) {
-                String stored = MapConfig.caveDimensionModes.get(dimensionKey(mc));
-                if (stored != null) {
-                    try { explicit = CaveType.valueOf(stored); } catch (IllegalArgumentException ignored) {}
-                }
-            }
-            return explicit == CaveType.FULL || explicit == CaveType.LAYERED;
+            return currentType == CaveType.FULL || currentType == CaveType.LAYERED;
         }
         return updateAutomaticDetection(mc);
     }
@@ -205,12 +198,17 @@ public final class CaveMode {
      */
     public static synchronized boolean shouldPrepare(Minecraft mc) {
         if (mc == null || mc.level == null || mc.player == null) return false;
+        CaveType currentType = getCaveType(mc);
         if (MapConfig.getEffectiveCaveMapMode() == 0
-                || getCaveType(mc) == CaveType.OFF) return false;
+                || currentType == CaveType.OFF) return false;
         MapManager manager = MapManager.getInstance();
         boolean acceptsLive = manager.acceptsLiveLevel(mc.level);
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
-        if (hasManualTopY(mc)) return true;
+        if (currentType == CaveType.FULL || hasManualTopY(mc)) return true;
+        if (mc.screen instanceof com.velorise.simplemap.client.gui.MapScreen
+                && currentType == CaveType.LAYERED) {
+            return true;
+        }
         DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
         boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
         boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();
@@ -311,15 +309,26 @@ public final class CaveMode {
 
     public static synchronized void setManualLayer(Minecraft mc, int topY) {
         if (MapConfig.getEffectiveCaveMapMode() == 0 || mc == null || mc.level == null) return;
+        String dimension = dimensionKey(mc);
         int clamped = clampViewedY(mc,
                 CaveLayerBand.projectionTopY(CaveView.LAYERED, topY));
-        Integer previous = MANUAL_TOP_Y.put(dimensionKey(mc), clamped);
-        if (previous == null || previous != clamped) modeRevision++;
+        Integer previous = MANUAL_TOP_Y.put(dimension, clamped);
+        Integer previousStored = MapConfig.caveDimensionManualY.put(dimension, clamped);
+        if (previous == null || previous != clamped || previousStored == null || previousStored != clamped) {
+            modeRevision++;
+            MapConfig.save();
+        }
     }
 
     public static synchronized void setAutoTopY(Minecraft mc) {
         if (mc == null || mc.level == null) return;
-        if (MANUAL_TOP_Y.remove(dimensionKey(mc)) != null) modeRevision++;
+        String dimension = dimensionKey(mc);
+        Integer removedMem = MANUAL_TOP_Y.remove(dimension);
+        Integer removedCfg = MapConfig.caveDimensionManualY.remove(dimension);
+        if (removedMem != null || removedCfg != null) {
+            modeRevision++;
+            MapConfig.save();
+        }
     }
 
     public static synchronized boolean hasManualTopY(Minecraft mc) {
@@ -434,7 +443,17 @@ public final class CaveMode {
 
     private static synchronized Integer getManualTopY(Minecraft mc) {
         if (mc == null || mc.level == null) return null;
-        return MANUAL_TOP_Y.get(dimensionKey(mc));
+        String dimension = dimensionKey(mc);
+        Integer cached = MANUAL_TOP_Y.get(dimension);
+        if (cached != null) return cached;
+        Integer stored = MapConfig.caveDimensionManualY.get(dimension);
+        if (stored != null) {
+            int clamped = clampViewedY(mc,
+                    CaveLayerBand.projectionTopY(CaveView.LAYERED, stored));
+            MANUAL_TOP_Y.put(dimension, clamped);
+            return clamped;
+        }
+        return null;
     }
 
     private static String dimensionKey(Minecraft mc) {

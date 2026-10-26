@@ -42,22 +42,25 @@ public final class SimpleMapClientMod {
 
     public static void useEmptyBook(Player player, InteractionHand hand, Item cooldownItem) {
         if (player == null) return;
-        if (!MapConfig.serverExtensionAvailable || !ClientNetworkHandler.isServerExtensionAvailable()) {
-            player.sendSystemMessage(Component.translatable("gui.simplemap.book.server_mod_required"));
+        if (!ClientNetworkHandler.isServerExtensionAvailable()) {
+            unavailable(player);
             return;
         }
-        List<String> regions = MapManager.getInstance().getKnownRegionNamesForBook(4096);
-        if (regions.isEmpty()) {
-            player.sendSystemMessage(Component.translatable("gui.simplemap.book.empty_map"));
+        MapManager mapManager = MapManager.getInstance();
+        if (!mapManager.isViewingLiveDimension()) {
+            mapManager.setViewDimensionOverride(null);
+            mapManager.updateWorldAndDimension(Minecraft.getInstance());
+        }
+        List<String> regionNames = mapManager.getKnownRegionNamesForBook(4096);
+        if (regionNames.isEmpty()) {
+            player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_regions_to_save"));
             return;
         }
-        String newBookId = UUID.randomUUID().toString();
-        player.sendSystemMessage(Component.translatable("gui.simplemap.book.saving", regions.size()));
+
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.preparing_save", regionNames.size()));
         if (ClientNetworkHandler.sendToServer(
-                new InitSaveBookPayload(regions, hand == InteractionHand.MAIN_HAND, newBookId))) {
-            player.getCooldowns().addCooldown(cooldownItem, 100);
-        } else {
-            player.sendSystemMessage(Component.translatable("gui.simplemap.book.server_mod_required"));
+                new InitSaveBookPayload(regionNames, hand == InteractionHand.MAIN_HAND, ""))) {
+            player.getCooldowns().addCooldown(cooldownItem, 120);
         }
     }
 
@@ -68,34 +71,68 @@ public final class SimpleMapClientMod {
             player.sendSystemMessage(Component.translatable("gui.simplemap.book.invalid"));
             return;
         }
-        if (!MapConfig.serverExtensionAvailable || !ClientNetworkHandler.isServerExtensionAvailable()) {
-            player.sendSystemMessage(Component.translatable("gui.simplemap.book.server_mod_required"));
-            return;
-        }
 
         String bookId = tag.getString("MapBookID");
-        if (player.isShiftKeyDown()) {
-            List<String> regions = MapManager.getInstance().getKnownRegionNamesForBook(4096);
-            if (regions.isEmpty()) {
-                player.sendSystemMessage(Component.translatable("gui.simplemap.book.empty_map"));
+        if (player.isSecondaryUseActive()) {
+            boolean isOwner = !tag.contains("OwnerUUID")
+                    || tag.getString("OwnerUUID").equals(player.getUUID().toString());
+            if (!isOwner) {
+                player.sendSystemMessage(Component.translatable("gui.simplemap.book.not_owner"));
                 return;
             }
-            player.sendSystemMessage(Component.translatable("gui.simplemap.book.updating", regions.size()));
-            if (ClientNetworkHandler.sendToServer(
-                    new InitSaveBookPayload(regions, hand == InteractionHand.MAIN_HAND, bookId))) {
-                player.getCooldowns().addCooldown(cooldownItem, 100);
-            } else {
-                player.sendSystemMessage(Component.translatable("gui.simplemap.book.server_mod_required"));
-            }
+            updateBook(player, hand, bookId, cooldownItem);
             return;
         }
 
-        player.sendSystemMessage(Component.translatable("gui.simplemap.book.requesting"));
-        if (ClientNetworkHandler.sendToServer(new RequestLearnBookPayload(bookId))) {
-            player.getCooldowns().addCooldown(cooldownItem, 100);
-        } else {
-            player.sendSystemMessage(Component.translatable("gui.simplemap.book.server_mod_required"));
+        boolean isOwner = tag.contains("OwnerUUID")
+                && tag.getString("OwnerUUID").equals(player.getUUID().toString());
+        MapManager mapManager = MapManager.getInstance();
+        if (!mapManager.isViewingLiveDimension()) {
+            mapManager.setViewDimensionOverride(null);
+            mapManager.updateWorldAndDimension(Minecraft.getInstance());
         }
+        if (isOwner && !mapManager.getKnownRegionNamesForBook(1).isEmpty()) {
+            mapManager.setHasLearnedMap(true);
+            mapManager.setLastLearnedBookId(bookId);
+            mapManager.openMapScreen();
+            return;
+        }
+        if (!ClientNetworkHandler.isServerExtensionAvailable()) {
+            unavailable(player);
+            return;
+        }
+
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.reading"));
+        if (ClientNetworkHandler.sendToServer(new RequestLearnBookPayload(bookId))) {
+            player.getCooldowns().addCooldown(cooldownItem, 120);
+        }
+    }
+
+    private static void updateBook(Player player, InteractionHand hand, String bookId, Item cooldownItem) {
+        if (!ClientNetworkHandler.isServerExtensionAvailable()) {
+            unavailable(player);
+            return;
+        }
+        MapManager mapManager = MapManager.getInstance();
+        if (!mapManager.isViewingLiveDimension()) {
+            mapManager.setViewDimensionOverride(null);
+            mapManager.updateWorldAndDimension(Minecraft.getInstance());
+        }
+        List<String> regionNames = mapManager.getKnownRegionNamesForBook(4096);
+        if (regionNames.isEmpty()) {
+            player.sendSystemMessage(Component.translatable("gui.simplemap.book.no_regions_to_save"));
+            return;
+        }
+
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.preparing_update", regionNames.size()));
+        if (ClientNetworkHandler.sendToServer(
+                new InitSaveBookPayload(regionNames, hand == InteractionHand.MAIN_HAND, bookId))) {
+            player.getCooldowns().addCooldown(cooldownItem, 120);
+        }
+    }
+
+    private static void unavailable(Player player) {
+        player.sendSystemMessage(Component.translatable("gui.simplemap.book.server_required"));
     }
 
     public static final class MapKeybindActions {

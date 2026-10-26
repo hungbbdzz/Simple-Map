@@ -777,11 +777,9 @@ public final class MapViewportCoordinator {
             layerStream = LayerStreamState.create(dimension, layerY,
                     minRx, maxRx, minRz, maxRz, focusRx, focusRz);
         } else if (layerStream.cursor >= layerStream.regions.size()
-                && System.nanoTime() - layerStream.completedAtNanos >= 15_000_000_000L) {
-            // A slow maintenance pass catches previously saturated IO or newly
-            // written archive data without producing a visible centre-out wave
-            // or allocating empty regions every few seconds.
-            layerStream.cursor = 0;
+                && System.nanoTime() - layerStream.completedAtNanos >= 2_500_000_000L) {
+            layerStream = LayerStreamState.create(dimension, layerY,
+                    minRx, maxRx, minRz, maxRz, focusRx, focusRz);
         }
 
         int budget = layerRegionBudget(request.scale);
@@ -946,10 +944,10 @@ public final class MapViewportCoordinator {
             state.centerRx = Math.max(minRx, Math.min(maxRx, focusRx));
             state.centerRz = Math.max(minRz, Math.min(maxRz, focusRz));
             CaveMapManager layers = CaveMapManager.getInstance();
-            int clampedMinRx = Math.max(minRx, state.centerRx - 12);
-            int clampedMaxRx = Math.min(maxRx, state.centerRx + 12);
-            int clampedMinRz = Math.max(minRz, state.centerRz - 12);
-            int clampedMaxRz = Math.min(maxRz, state.centerRz + 12);
+            int clampedMinRx = Math.max(minRx, state.centerRx - 24);
+            int clampedMaxRx = Math.min(maxRx, state.centerRx + 24);
+            int clampedMinRz = Math.max(minRz, state.centerRz - 24);
+            int clampedMaxRz = Math.min(maxRz, state.centerRz + 24);
             List<int[]> regions = new ArrayList<>();
             for (int rx = clampedMinRx; rx <= clampedMaxRx; rx++) {
                 for (int rz = clampedMinRz; rz <= clampedMaxRz; rz++) {
@@ -979,7 +977,8 @@ public final class MapViewportCoordinator {
                 int focusRx, int focusRz) {
             return this.dimension.equals(dimension) && this.layerY == layerY
                     && this.minRx == minRx && this.maxRx == maxRx
-                    && this.minRz == minRz && this.maxRz == maxRz;
+                    && this.minRz == minRz && this.maxRz == maxRz
+                    && this.centerRx == focusRx && this.centerRz == focusRz;
         }
     }
 

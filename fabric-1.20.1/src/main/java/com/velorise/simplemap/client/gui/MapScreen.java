@@ -2090,12 +2090,18 @@ public class MapScreen extends Screen {
     @Override
     public boolean mouseReleased(double mouseX, double mouseY, int button) {
         if (button == 0) {
+            if (this.caveLayerSlider != null && this.caveLayerSlider.isDragging()) {
+                this.caveLayerSlider.onRelease(mouseX, mouseY);
+                this.setDragging(false);
+                return true;
+            }
             boolean wasDragging = this.isDragging;
             this.isDragging = false;
 
             // If mouse barely moved, treat as a click -> place/remove pin
             double moved = Math.sqrt(Math.pow(mouseX - dragStartX, 2) + Math.pow(mouseY - dragStartZ, 2));
-            if (wasDragging && moved < 4.0 && !isPopupMenuOpen && MapManager.getInstance().hasLearnedMap()) {
+            if (wasDragging && moved < 4.0 && !isPopupMenuOpen
+                    && com.velorise.simplemap.SimpleMap.isMapUnlocked(this.minecraft.player)) {
                 momentumX = 0.0;
                 momentumZ = 0.0;
                 double clickWorldX = centerX + (mouseX - 1 - (this.width - 2) / 2.0) / currentRenderScale;
@@ -2118,7 +2124,7 @@ public class MapScreen extends Screen {
 
     @Override
     public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
-        if (!MapManager.getInstance().hasLearnedMap()) {
+        if (!com.velorise.simplemap.SimpleMap.isMapUnlocked(this.minecraft.player)) {
             return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
         }
 
@@ -2165,7 +2171,7 @@ public class MapScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollY) {
-        if (!MapManager.getInstance().hasLearnedMap()) {
+        if (!com.velorise.simplemap.SimpleMap.isMapUnlocked(this.minecraft.player)) {
             return super.mouseScrolled(mouseX, mouseY, scrollY);
         }
 
@@ -2237,7 +2243,7 @@ public class MapScreen extends Screen {
         }
 
         private boolean isAutoSelection() {
-            return this.value <= AUTO_ZONE * 0.55;
+            return this.value <= AUTO_ZONE;
         }
 
         @Override
@@ -2286,6 +2292,7 @@ public class MapScreen extends Screen {
         @Override
         protected void onDrag(double mouseX, double mouseY, double dragX, double dragY) {
             MapScreen.this.markViewportInteraction();
+            dragging = true;
             super.onDrag(mouseX, mouseY, dragX, dragY);
         }
 
@@ -2329,6 +2336,9 @@ public class MapScreen extends Screen {
 
     @Override
     public void onClose() {
+        if (this.caveLayerSlider != null && this.caveLayerSlider.isDragging()) {
+            this.caveLayerSlider.onRelease(0.0, 0.0);
+        }
         // Retain the selected dimension in MapManager when closing MapScreen so
         // the Minimap can display the chosen dimension with proportional coordinate scaling
         // (1:8 Nether <-> Overworld), cross-dimension scaling.

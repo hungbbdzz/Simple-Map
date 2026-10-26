@@ -486,6 +486,10 @@ public class MapManager {
         return viewDimensionOverride;
     }
 
+    public synchronized void setViewDimensionOverride(String dimensionOverride) {
+        this.viewDimensionOverride = dimensionOverride;
+    }
+
     /**
      * Returns the coordinate scale multiplier from the player's live dimension
      * to the currently viewed map dimension (e.g., 8.0 when in Nether viewing Overworld,
@@ -3834,6 +3838,8 @@ public class MapManager {
     public static int localCaveMapMode = 2; // 0 = OFF, 1 = AUTO, 2 = ON
     /** Explicit OFF/LAYERED/FULL selection persisted independently for each dimension. */
     public static Map<String, String> caveDimensionModes = new LinkedHashMap<>();
+    /** Explicit manual Cave Layer Top-Y persisted independently for each dimension (missing = AUTO). */
+    public static Map<String, Integer> caveDimensionManualY = new LinkedHashMap<>();
 
     // Compass letter (N/E/S/W) display config
     public static boolean compassLettersVisible = true;
@@ -4013,6 +4019,18 @@ public class MapManager {
                     if (caveDimensionModes.size() == 256) break;
                 }
             }
+            caveDimensionManualY = new LinkedHashMap<>();
+            if (data.caveDimensionManualY != null) {
+                for (Map.Entry<String, Integer> entry : data.caveDimensionManualY.entrySet()) {
+                    String dimension = entry.getKey();
+                    Integer manualY = entry.getValue();
+                    if (dimension == null || manualY == null
+                            || !dimension.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) continue;
+                    int clampedY = Math.max(-2048, Math.min(2048, manualY));
+                    caveDimensionManualY.put(dimension, clampedY);
+                    if (caveDimensionManualY.size() == 256) break;
+                }
+            }
         } catch (Exception exception) {
             LOGGER.error("Failed to load map config; preserving the unreadable file and restoring defaults", exception);
             quarantineCorruptConfig();
@@ -4083,6 +4101,7 @@ public class MapManager {
                 data.performanceDefaultsVersion = CURRENT_PERFORMANCE_DEFAULTS_VERSION;
                 data.localCaveMapMode = localCaveMapMode;
                 data.caveDimensionModes = new LinkedHashMap<>(caveDimensionModes);
+                data.caveDimensionManualY = new LinkedHashMap<>(caveDimensionManualY);
                 GSON.toJson(data, writer);
             }
             moveReplacing(temporary, target);
@@ -4173,6 +4192,7 @@ public class MapManager {
         fastFullscreenLoading = false;
         localCaveMapMode = 2;
         caveDimensionModes = new LinkedHashMap<>();
+        caveDimensionManualY = new LinkedHashMap<>();
         compassLettersVisible = true;
         compassLetterColor = 0xFFFFFFFF;
     }
@@ -4230,6 +4250,7 @@ public class MapManager {
         Integer performanceDefaultsVersion;
         Integer localCaveMapMode = 2;
         Map<String, String> caveDimensionModes = new LinkedHashMap<>();
+        Map<String, Integer> caveDimensionManualY = new LinkedHashMap<>();
     }
 
     /**
