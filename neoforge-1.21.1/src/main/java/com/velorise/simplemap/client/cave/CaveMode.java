@@ -171,12 +171,7 @@ public final class CaveMode {
         // render the previous dimension under the new live session. An intentional
         // remote map view is different: its explicit override may use manual Cave.
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
-        if (currentType == CaveType.FULL) return true;
         if (hasManualTopY(mc)) return true;
-        if (mc.screen instanceof com.velorise.simplemap.client.gui.MapScreen
-                && currentType == CaveType.LAYERED) {
-            return true;
-        }
         DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
         boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
         boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();
@@ -184,7 +179,7 @@ public final class CaveMode {
             return true;
         }
         if (!acceptsLive) {
-            return currentType == CaveType.FULL || currentType == CaveType.LAYERED;
+            return false;
         }
         return updateAutomaticDetection(mc);
     }
@@ -204,11 +199,7 @@ public final class CaveMode {
         MapManager manager = MapManager.getInstance();
         boolean acceptsLive = manager.acceptsLiveLevel(mc.level);
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
-        if (currentType == CaveType.FULL || hasManualTopY(mc)) return true;
-        if (mc.screen instanceof com.velorise.simplemap.client.gui.MapScreen
-                && currentType == CaveType.LAYERED) {
-            return true;
-        }
+        if (hasManualTopY(mc)) return true;
         DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
         boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
         boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();

@@ -588,10 +588,24 @@ public final class MapViewportCoordinator {
             if (!caveActive && !fullscreenVisible) {
                 double centerX = minecraft.player.getX();
                 double centerZ = minecraft.player.getZ();
+                double minX = centerX - radius;
+                double maxX = centerX + radius;
+                double minZ = centerZ - radius;
+                double maxZ = centerZ + radius;
+                float demandScale = 1.0f;
+                Request activeMinimap = minimapRequest;
+                if (activeMinimap != null
+                        && now - activeMinimap.submittedNanos <= 500_000_000L) {
+                    minX = Math.min(minX, activeMinimap.minX);
+                    maxX = Math.max(maxX, activeMinimap.maxX);
+                    minZ = Math.min(minZ, activeMinimap.minZ);
+                    maxZ = Math.max(maxZ, activeMinimap.maxZ);
+                    demandScale = Math.min(demandScale, activeMinimap.scale);
+                }
                 submitSurfaceDemand(
-                        centerX - radius, centerX + radius,
-                        centerZ - radius, centerZ + radius,
-                        centerX, centerZ, 1.0f,
+                        minX, maxX,
+                        minZ, maxZ,
+                        centerX, centerZ, demandScale,
                         MapRequestLane.MINIMAP, false);
                 publication.requestSurface(MapRequestLane.MINIMAP, false);
             }

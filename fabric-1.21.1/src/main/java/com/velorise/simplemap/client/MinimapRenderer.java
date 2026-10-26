@@ -90,7 +90,7 @@ public class MinimapRenderer {
     }
 
     private float getAnimatedZoom(Minecraft mc) {
-        boolean caveActive = CaveMode.isActive(mc);
+        boolean caveActive = CaveMode.isActive(mc) && MapConfig.caveAutoZoom;
         long now = System.nanoTime();
         if (!caveAnimationInitialized) {
             caveAnimationInitialized = true;

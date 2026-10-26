@@ -875,7 +875,8 @@ public class MapRenderer {
          * plan. PlanKey includes the map session, authority, viewport and style.
          */
         if (current != null && current.key().equals(planKey)
-                && current.plan().logicalExactCoverage() && !caveMode) {
+                && current.plan().logicalExactCoverage() && !caveMode
+                && current.plan().result().drewAnyMapContent()) {
             minimapStagingPlan = null;
             minimapStagingSinceNanos = 0L;
             MapPipelineTelemetry.getInstance().recordRenderPlanReuse();
@@ -990,12 +991,20 @@ public class MapRenderer {
         int minRegionZ = (int) Math.floor(centerZ - half - 1.0) >> 9;
         int maxRegionZ = (int) Math.floor(centerZ + half + 1.0) >> 9;
         MapManager manager = MapManager.getInstance();
+        MapTextureManager surfaceTextures = MapTextureManager.getInstance();
         MapOverviewTextureManager overview = MapOverviewTextureManager.getInstance();
         for (int regionZ = minRegionZ; regionZ <= maxRegionZ; regionZ++) {
             for (int regionX = minRegionX; regionX <= maxRegionX; regionX++) {
-                boolean knownSource = manager.hasRegionFile(regionX, regionZ)
-                        || manager.isRegionLoadedInCache(regionX, regionZ);
+                MapManager.Region loadedRegion = manager.getRegion(
+                        regionX, regionZ, false);
+                boolean knownSource = loadedRegion != null
+                        && loadedRegion.isLoaded()
+                        && loadedRegion.hasAnyData();
                 if (!knownSource) continue;
+                if (surfaceTextures.hasAnyPageTexture(regionX, regionZ)
+                        || surfaceTextures.peekRegionTexture(regionX, regionZ) != null) {
+                    continue;
+                }
                 CaveAtlasRegion root = overview.peekRegionSurfaceBranch(
                         0, regionX, regionZ);
                 if (root == null || root.knownMask() == 0L) return false;
@@ -1894,6 +1903,7 @@ public class MapRenderer {
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ) {
         RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
         if (stamp == null) return;
+        MapOverviewTextureManager overview = MapOverviewTextureManager.getInstance();
         int worldSize = MapRegionLodPolicy.worldSize(0);
         for (int regionZ = minRegionZ; regionZ <= maxRegionZ; regionZ++) {
             for (int regionX = minRegionX; regionX <= maxRegionX; regionX++) {
@@ -1904,7 +1914,11 @@ public class MapRenderer {
                         MapRenderPlan.PHASE_REGION_COARSE,
                         regionX * worldSize, regionZ * worldSize,
                         worldSize, worldSize)) {
-                    builder.branch();
+                    CaveAtlasRegion root = overview.peekRegionSurfaceBranch(
+                            0, regionX, regionZ);
+                    if (root != null && root.knownMask() != 0L) {
+                        builder.branch();
+                    }
                 }
             }
         }

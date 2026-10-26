@@ -920,6 +920,17 @@ public class MapTextureManager {
         int pageX = MapPageLayout.localPage(globalPageX);
         int pageZ = MapPageLayout.localPage(globalPageZ);
         if (retainedLeafSourceMask(regionX, regionZ, pageX, pageZ) == 0) {
+            MapManager manager = MapManager.getInstance();
+            if (manager.isRegionLoadedInCache(regionX, regionZ)
+                    || manager.hasRegionFile(regionX, regionZ)) {
+                MapRequestLane effectiveLane = lane == null
+                        ? MapRequestLane.BACKGROUND : lane;
+                ensureRetainedSurfaceSource(regionX, regionZ, pageX, pageZ,
+                        effectiveLane, effectiveLane.priorityBase());
+                String leafKey = pageKey(regionX, regionZ, pageX, pageZ);
+                observePageDemand(leafKey, effectiveLane,
+                        effectiveLane.priorityBase(), Long.MAX_VALUE, false);
+            }
             return false;
         }
 
@@ -2623,8 +2634,10 @@ public class MapTextureManager {
          */
         int retainedSubtilesNow = retainedLeafSourceMask(
                 address.regionX(), address.regionZ(), address.pageX(), address.pageZ());
-        boolean capturesCurrentSweep = retainedSubtilesNow != 0
-                && (mergedSubtiles & retainedSubtilesNow) == retainedSubtilesNow;
+        int expectedSweep = retainedSubtilesNow
+                & (previousCompleteSubtiles | prepared.updateSubtileMask());
+        boolean capturesCurrentSweep = expectedSweep != 0
+                && (mergedSubtiles & expectedSweep) == expectedSweep;
         if (!page.initialized
                 && mergedSubtiles != MapPageLayout.FULL_SUBTILE_MASK
                 && !capturesCurrentSweep) {

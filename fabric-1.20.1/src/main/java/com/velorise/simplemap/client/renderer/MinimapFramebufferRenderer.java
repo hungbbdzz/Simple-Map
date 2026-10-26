@@ -239,7 +239,9 @@ public final class MinimapFramebufferRenderer {
                     decision == RetainedMinimapFramePolicy.Decision.REDRAW_HARD
                     || decision == RetainedMinimapFramePolicy.Decision.REDRAW_STREAMING;
             boolean lastGoodCompatible = canDisplayLastGood(
-                    sessionId, dimension, targetSize, centerX, centerZ);
+                    sessionId, styleGeneration, dimension,
+                    caveProjection, caveLayerY, targetScale,
+                    targetSize, centerX, centerZ);
             if (redrawRequested
                     && !RetainedMinimapHandoffPolicy.shouldAttemptRedraw(
                             lastGoodCompatible, nowNanos,
@@ -253,7 +255,7 @@ public final class MinimapFramebufferRenderer {
                 boolean retainPrevious = renderedStyleGeneration == styleGeneration
                         && canRetainPreviousFrame(sessionId,
                         dimension, caveProjection, caveLayerY, targetScale,
-                        snappedX, snappedZ);
+                        snappedX, snappedZ, targetSize);
                 RedrawResult redraw = redrawTarget(guiGraphics, minecraft,
                         targetSize, contentSize, overscan, snappedX, snappedZ,
                         targetScale, targetScale, fixedOverlayScale, caveActive,
@@ -267,6 +269,7 @@ public final class MinimapFramebufferRenderer {
                         reuseFrames++;
                         coalescedFrames++;
                     } else {
+                        frontFrameValid = false;
                         framePolicy.invalidate();
                         fallbackFrames++;
                         return false;
@@ -441,6 +444,8 @@ public final class MinimapFramebufferRenderer {
 
             boolean underlayDrawn = retainPrevious
                     && drawRetainedUnderlay(snappedX, snappedZ, targetScale, targetSize);
+            boolean underlayCoversTarget = underlayDrawn
+                    && isRetainedUnderlayComplete(snappedX, snappedZ, targetScale, targetSize);
             guiGraphics.pose().pushPose();
             guiGraphics.pose().setIdentity();
             try {
@@ -460,7 +465,7 @@ public final class MinimapFramebufferRenderer {
                 // A compatible retained underlay is already complete by
                 // construction. Only cold redraws need the expensive hierarchy
                 // readiness walk before they are eligible to become the front frame.
-                boolean coldCoverageReady = underlayDrawn || (caveActive
+                boolean coldCoverageReady = underlayCoversTarget || (caveActive
                         ? MapRenderer.getInstance()
                                 .caveMinimapRetainedCoverageReady(
                                         CaveMode.isFullView(minecraft),
@@ -470,7 +475,7 @@ public final class MinimapFramebufferRenderer {
                                 .surfaceMinimapRetainedCoverageReady(
                                         snappedX, snappedZ, targetScale, targetSize));
                 return new RedrawResult(true, newCoverage, coldCoverageReady,
-                        underlayDrawn);
+                        underlayCoversTarget);
             } finally {
                 guiGraphics.pose().popPose();
             }
@@ -569,37 +574,67 @@ public final class MinimapFramebufferRenderer {
         backTarget = previousFront;
     }
 
-    private boolean canDisplayLastGood(long sessionId, String dimension,
-            int targetSize, double centerX, double centerZ) {
-        if (!frontFrameValid || frontTarget == null) return false;
+    private boolean canDisplayLastGood(long sessionId, long styleGeneration,
+            String dimension, int caveProjection, int caveLayerY,
+            float targetScale, int targetSize, double centerX, double centerZ) {
+        if (!frontFrameValid || frontTarget == null || renderedTargetScale <= 0.0f) return false;
         if (renderedSessionId != sessionId) return false;
+        if (renderedStyleGeneration != styleGeneration) return false;
         if (renderedDimension == null || !renderedDimension.equals(dimension)) return false;
         if (renderedTargetSize != targetSize) return false;
-        // Nếu người chơi đã di chuyển ra ngoài phạm vi minimap texture cũ, frame cũ không còn hợp lệ
-        if (renderedTargetScale > 0.0f) {
-            double shiftX = Math.abs((centerX - renderedSnappedX) * renderedTargetScale);
-            double shiftZ = Math.abs((centerZ - renderedSnappedZ) * renderedTargetScale);
-            if (shiftX >= renderedTargetSize || shiftZ >= renderedTargetSize) {
-                return false;
-            }
+        if (renderedCaveProjection != caveProjection) return false;
+        if (caveProjection == 1
+                && CaveLayerBand.key(CaveView.LAYERED, renderedCaveLayerY)
+                        != CaveLayerBand.key(CaveView.LAYERED, caveLayerY)) {
+            return false;
         }
-        return true;
+        if (Float.floatToIntBits(renderedTargetScale)
+                != Float.floatToIntBits(targetScale)) {
+            return false;
+        }
+        // Nếu người chơi đã di chuyển vượt quá overscan của frame cũ, UV sẽ bị clamp làm kẹt vị trí minimap
+        double maxOffset = Math.max(1.0, renderedOverscan);
+        double shiftX = Math.abs((centerX - renderedSnappedX) * renderedTargetScale);
+        double shiftZ = Math.abs((centerZ - renderedSnappedZ) * renderedTargetScale);
+        return shiftX <= maxOffset && shiftZ <= maxOffset;
     }
 
     private boolean canRetainPreviousFrame(long sessionId, String dimension,
             int caveProjection, int caveLayerY, float targetScale,
-            double snappedX, double snappedZ) {
-        if (frontTarget == null || renderedTargetScale <= 0.0f) return false;
+            double snappedX, double snappedZ, int targetSize) {
+        if (!frontFrameValid || frontTarget == null
+                || renderedTargetScale <= 0.0f || targetScale <= 0.0f) return false;
         if (renderedSessionId != sessionId || renderedDimension == null
                 || !renderedDimension.equals(dimension)) return false;
-        if (renderedCaveProjection != caveProjection
-                || Float.floatToIntBits(renderedTargetScale)
-                        != Float.floatToIntBits(targetScale)) return false;
-        double shiftX = (renderedSnappedX - snappedX) * targetScale;
-        double shiftZ = (renderedSnappedZ - snappedZ) * targetScale;
+        if (renderedCaveProjection != caveProjection) return false;
+        if (caveProjection == 1
+                && CaveLayerBand.key(CaveView.LAYERED, renderedCaveLayerY)
+                        != CaveLayerBand.key(CaveView.LAYERED, caveLayerY)) {
+            return false;
+        }
+        float scaleRatio = targetScale / renderedTargetScale;
+        float scaledSize = renderedTargetSize * scaleRatio;
+        float shiftX = (float) ((renderedSnappedX - snappedX) * targetScale);
+        float shiftZ = (float) ((renderedSnappedZ - snappedZ) * targetScale);
+        float left = targetSize * 0.5f + shiftX - scaledSize * 0.5f;
+        float top = targetSize * 0.5f + shiftZ - scaledSize * 0.5f;
+        float right = left + scaledSize;
+        float bottom = top + scaledSize;
         return renderedTargetSize > 0
-                && Math.abs(shiftX) < renderedTargetSize
-                && Math.abs(shiftZ) < renderedTargetSize;
+                && right > 0.0f && left < targetSize
+                && bottom > 0.0f && top < targetSize;
+    }
+
+    private boolean isRetainedUnderlayComplete(double snappedX, double snappedZ,
+            float targetScale, int targetSize) {
+        if (Float.floatToIntBits(renderedTargetScale)
+                != Float.floatToIntBits(targetScale)) {
+            return false;
+        }
+        double maxTranslation = Math.max(1.0, renderedOverscan);
+        double shiftX = Math.abs((snappedX - renderedSnappedX) * targetScale);
+        double shiftZ = Math.abs((snappedZ - renderedSnappedZ) * targetScale);
+        return shiftX <= maxTranslation && shiftZ <= maxTranslation;
     }
 
     /**
@@ -610,13 +645,15 @@ public final class MinimapFramebufferRenderer {
      */
     private boolean drawRetainedUnderlay(double snappedX, double snappedZ,
             float targetScale, int targetSize) {
-        if (frontTarget == null) return false;
+        if (frontTarget == null || renderedTargetScale <= 0.0f) return false;
+        float scaleRatio = targetScale / renderedTargetScale;
+        float scaledSize = renderedTargetSize * scaleRatio;
         float shiftX = (float) ((renderedSnappedX - snappedX) * targetScale);
         float shiftZ = (float) ((renderedSnappedZ - snappedZ) * targetScale);
-        float left = shiftX;
-        float top = shiftZ;
-        float right = left + renderedTargetSize;
-        float bottom = top + renderedTargetSize;
+        float left = targetSize * 0.5f + shiftX - scaledSize * 0.5f;
+        float top = targetSize * 0.5f + shiftZ - scaledSize * 0.5f;
+        float right = left + scaledSize;
+        float bottom = top + scaledSize;
 
         RenderSystem.disableBlend();
         RenderSystem.setShader(GameRenderer::getPositionTexShader);
