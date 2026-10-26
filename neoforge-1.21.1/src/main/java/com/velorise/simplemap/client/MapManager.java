@@ -3840,6 +3840,7 @@ public class MapManager {
     public static Map<String, String> caveDimensionModes = new LinkedHashMap<>();
     /** Explicit manual Cave Layer Top-Y persisted independently for each dimension (missing = AUTO). */
     public static Map<String, Integer> caveDimensionManualY = new LinkedHashMap<>();
+    public static boolean caveAutoZoom = true;
 
     // Compass letter (N/E/S/W) display config
     public static boolean compassLettersVisible = true;
@@ -4031,6 +4032,7 @@ public class MapManager {
                     if (caveDimensionManualY.size() == 256) break;
                 }
             }
+            caveAutoZoom = data.caveAutoZoom != null ? data.caveAutoZoom : true;
         } catch (Exception exception) {
             LOGGER.error("Failed to load map config; preserving the unreadable file and restoring defaults", exception);
             quarantineCorruptConfig();
@@ -4102,6 +4104,7 @@ public class MapManager {
                 data.localCaveMapMode = localCaveMapMode;
                 data.caveDimensionModes = new LinkedHashMap<>(caveDimensionModes);
                 data.caveDimensionManualY = new LinkedHashMap<>(caveDimensionManualY);
+                data.caveAutoZoom = caveAutoZoom;
                 GSON.toJson(data, writer);
             }
             moveReplacing(temporary, target);
@@ -4193,6 +4196,7 @@ public class MapManager {
         localCaveMapMode = 2;
         caveDimensionModes = new LinkedHashMap<>();
         caveDimensionManualY = new LinkedHashMap<>();
+        caveAutoZoom = true;
         compassLettersVisible = true;
         compassLetterColor = 0xFFFFFFFF;
     }
@@ -4251,6 +4255,7 @@ public class MapManager {
         Integer localCaveMapMode = 2;
         Map<String, String> caveDimensionModes = new LinkedHashMap<>();
         Map<String, Integer> caveDimensionManualY = new LinkedHashMap<>();
+        Boolean caveAutoZoom = true;
     }
 
     /**
