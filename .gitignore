@@ -34,7 +34,6 @@ dev-audit/
 ENGINE_NOTES.md
 ENGINE_NOTES*.md
 *_NOTES.md
-!BUG_NOTES.md
 *.ps1
 *.zip
 
