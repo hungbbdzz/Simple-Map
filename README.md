@@ -1,8 +1,17 @@
 # Velorise Simple Map
 
-[![Release](https://img.shields.io/badge/Release-v2.0.1-brightgreen.svg)](https://github.com/hungbbdzz/Simple-Map/releases)
-[![Minecraft](https://img.shields.io/badge/Minecraft-1.21.1%20%7C%201.20.1-blue.svg)](https://minecraft.net/)
-[![Loaders](https://img.shields.io/badge/Loaders-NeoForge%20%7C%20Fabric%20%7C%20Forge-orange.svg)](https://github.com/hungbbdzz/Simple-Map)
+<p align="center">
+  <a href="https://modrinth.com/mod/velorise-simple-map"><img src="https://img.shields.io/badge/Modrinth-Available_Now-00af5c?style=for-the-badge&logo=modrinth&logoColor=white" alt="Modrinth" /></a>
+  <a href="https://www.curseforge.com/minecraft/mc-mods/velorise-simple-map"><img src="https://img.shields.io/badge/CurseForge-Available_Now-f16436?style=for-the-badge&logo=curseforge&logoColor=white" alt="CurseForge" /></a>
+  <a href="https://github.com/hungbbdzz/Simple-Map"><img src="https://img.shields.io/badge/GitHub-Repository-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub" /></a>
+  <a href="https://github.com/sponsors/hungbbdzz"><img src="https://img.shields.io/badge/Sponsor-GitHub_Sponsors-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors" /></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Release-v2.0.1-brightgreen.svg" alt="Release" />
+  <img src="https://img.shields.io/badge/Minecraft-1.21.1%20%7C%201.20.1-blue.svg" alt="Minecraft Versions" />
+  <img src="https://img.shields.io/badge/Loaders-NeoForge%20%7C%20Fabric%20%7C%20Forge-orange.svg" alt="Mod Loaders" />
+</p>
 
 Modern, ultra-performant client-side and server-friendly Minecraft map mod featuring full Cave mapping with zero-latency layer stepping, universal modded block tint colorization, retained GPU framebuffer rendering, and physical multi-region Map Book sharing.
 
