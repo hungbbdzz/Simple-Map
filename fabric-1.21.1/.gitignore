@@ -1,0 +1,46 @@
+# Gradle files
+.gradle/
+build/
+.gemini/
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+bin/
+out/
+
+# Minecraft Run directory (world saves, logs, configs)
+run/
+*.log
+
+# Local NeoForge/Minecraft config (machine-specific)
+config/
+
+# Internal dev files (not for public repo)
+dev-audit/
+ENGINE_NOTES.md
+ENGINE_NOTES*.md
+*_NOTES.md
+*.ps1
+
+# Local performance investigation and reference sources
+.simplemap-sandbox-gradle-home/
+temp_ref/
+
+javac.*.args
+
+# Local PASS/runtime reports and captures
+STATIC_VALIDATION_*.txt
+
+# Patch files (internal hotfixes)
+*.patch
+
+# Accidental backup files
+gradle copy.properties
+
+# OS generated files
+.DS_Store
+Thumbs.db
