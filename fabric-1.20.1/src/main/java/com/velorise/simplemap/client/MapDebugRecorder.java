@@ -226,7 +226,7 @@ public final class MapDebugRecorder {
      */
     public static final boolean DEBUG_ENABLED = Boolean.getBoolean("simplemap.debug");
     private static final String BUILD_PROVENANCE =
-            "RELEASE_2_0_0";
+            "RELEASE_2_0_1";
     private static final Logger LOGGER = LogManager.getLogger();
     private static final MapDebugRecorder INSTANCE = new MapDebugRecorder();
     private static final DateTimeFormatter DIRECTORY_TIME = DateTimeFormatter
