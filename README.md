@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Loaders-NeoForge%20%7C%20Fabric%20%7C%20Forge-orange.svg" alt="Mod Loaders" />
 </p>
 
-Modern, ultra-performant client-side and server-friendly Minecraft map mod featuring full Cave mapping with zero-latency layer stepping, universal modded block tint colorization, retained GPU framebuffer rendering, and physical multi-region Map Book sharing.
+A modern, lightweight and vanilla-friendly Minecraft map mod featuring an all-in-one Minimap and World Map, 3D Cave mapping, accurate block and biome tinting, optimized GPU framebuffer rendering, and physical Map Book sharing.
 
 ---
 
