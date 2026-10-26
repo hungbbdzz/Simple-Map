@@ -1,0 +1,245 @@
+plugins {
+    id 'fabric-loom' version '1.7-SNAPSHOT'
+    id 'maven-publish'
+    id 'idea'
+}
+
+version = project.mod_version
+group = project.mod_group_id
+
+base {
+    archivesName = "${project.mod_id}-1.20.1-fabric"
+}
+
+sourceSets.main.resources {
+    srcDir('src/generated/resources')
+    exclude("**/*.bbmodel")
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    maven {
+        name = "TerraformersMC"
+        url = "https://maven.terraformersmc.com/releases/"
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+    withSourcesJar()
+}
+
+loom {
+    runs {
+        client {
+            client()
+            setConfigName("Fabric Client")
+            ideConfigGenerated(true)
+            runDir("run")
+            if (Boolean.getBoolean("simplemap.debug") || "true".equalsIgnoreCase(System.getenv("SIMPLEMAP_DEBUG")) || project.hasProperty("simplemap.debug")) {
+                property "simplemap.debug", "true"
+            }
+        }
+        server {
+            server()
+            setConfigName("Fabric Server")
+            ideConfigGenerated(true)
+            runDir("run")
+            programArg("--nogui")
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Optional Mod Menu config screen integration
+    modCompileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+    modLocalRuntime "com.terraformersmc:modmenu:${project.modmenu_version}"
+}
+
+tasks.withType(ProcessResources).configureEach {
+    var replaceProperties = [
+        minecraft_version: project.minecraft_version,
+        loader_version   : project.loader_version,
+        fabric_version   : project.fabric_version,
+        mod_id           : project.mod_id,
+        mod_name         : project.mod_name,
+        mod_license      : project.mod_license,
+        mod_version      : project.mod_version,
+        mod_authors      : project.mod_authors,
+        mod_description  : project.mod_description
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['fabric.mod.json', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 17
+}
+
+// src/test/java contains standalone architecture checks with main() methods,
+// not JUnit/TestNG tests.
+tasks.named('test', Test) {
+    if (delegate.hasProperty('failOnNoDiscoveredTests')) {
+        delegate.setProperty('failOnNoDiscoveredTests', false)
+    }
+}
+
+// Dependency-light state checks for the M2/M3 migration and M4 foundation.
+tasks.register('m2m3CoreCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.M2M3CoreCheck'
+}
+
+// Alias used by checkpoints that also validate the M4 durable LOD graph.
+tasks.register('m2m4CoreCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.M2M3CoreCheck'
+}
+
+// M4 region-centric hierarchy invariants: direct source seeding, 8x8 parent
+// propagation, deferred-work durability and exact-eviction replacement.
+tasks.register('m4RegionLodCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.M4RegionLodAuthorityCheck'
+}
+
+tasks.named('m2m4CoreCheck') {
+    dependsOn tasks.named('m4RegionLodCheck')
+}
+
+// Integrated architecture invariants for M5 page tables, M6 minimap ring,
+// M7/M8 cave archive/projection, M9 upload admission, M10 recovery and M11 boundaries.
+tasks.register('architectureStackCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.ArchitectureStackCheck'
+}
+
+// Surface fullscreen/minimap demand uses primitive centre-out buffers.
+tasks.register('viewportLoadPlannerCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.MapViewLoadPlannerCheck'
+}
+
+// AUTO dimension topology must not let repeated End-island roofs become a
+// persistent cave world, and each Layered cache key must own one immutable Top Y.
+tasks.register('caveDimensionEvidenceCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveDimensionEvidenceCheck'
+}
+
+tasks.register('caveLayerBandCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveLayerBandCheck'
+}
+
+// Retained minimap invalidation must react to atlas pixel writes without
+// rebuilding for sub-texel movement or camera rotation.
+tasks.register('retainedMinimapFramePolicyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedMinimapFramePolicyCheck'
+}
+
+// Logical instance plans must remain compact, phase-sorted and independent
+// from atlas texture/UV residency state.
+tasks.register('mapGpuInstancePlanCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.gpu.MapGpuInstancePlanCheck'
+}
+
+// Sustained movement must keep exact mutation work bounded around the visible
+// frontier and must not create Surface scans for unload-only observations.
+tasks.register('movementMutationPolicyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.MovementMutationPolicyCheck'
+}
+
+// Retained off-screen composition has one viewport-demand owner; atlas replay
+// must not publish a second, differently guarded planning rectangle.
+tasks.register('viewportDemandPublicationPolicyCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.ViewportDemandPublicationPolicyCheck'
+}
+
+// Immutable revision metadata is reused until a session generation changes.
+tasks.register('mapSessionStampCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.session.MapSessionStampCheck'
+}
+
+// Aggregate static/state gate for the complete region-centric architecture stack.
+tasks.register('architectureAllCheck') {
+    dependsOn tasks.named('m2m4CoreCheck')
+    dependsOn tasks.named('architectureStackCheck')
+    dependsOn tasks.named('mapSessionStampCheck')
+    dependsOn tasks.named('viewportLoadPlannerCheck')
+    dependsOn tasks.named('caveDimensionEvidenceCheck')
+    dependsOn tasks.named('caveLayerBandCheck')
+    dependsOn tasks.named('retainedMinimapFramePolicyCheck')
+    dependsOn tasks.named('mapGpuInstancePlanCheck')
+    dependsOn tasks.named('movementMutationPolicyCheck')
+    dependsOn tasks.named('viewportDemandPublicationPolicyCheck')
+    dependsOn tasks.named('surfaceCaptureFrameAllowanceCheck')
+    dependsOn tasks.named('retainedFullscreenFramePolicyCheck')
+    dependsOn tasks.named('retainedViewportCompositionCheck')
+    dependsOn tasks.named('framePacingHardGateCheck')
+    dependsOn tasks.named('retainedFramebufferBindingCheck')
+}
+
+// Runtime-validated PASS46 policy checks.
+tasks.register('surfaceCaptureFrameAllowanceCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.SurfaceCaptureFrameAllowanceCheck'
+    dependsOn testClasses
+}
+
+tasks.register('retainedFullscreenFramePolicyCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedFullscreenFramePolicyCheck'
+    dependsOn testClasses
+}
+
+tasks.register('retainedViewportCompositionCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedViewportCompositionCheck'
+    dependsOn testClasses
+}
+
+tasks.register('framePacingHardGateCheck', JavaExec) {
+    group = 'verification'
+    description = 'Verifies runtime-validated movement, viewport and lease constants.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.FramePacingHardGateCheck'
+    dependsOn testClasses
+}
+
+tasks.register('retainedFramebufferBindingCheck', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.RetainedFramebufferBindingCheck'
+    dependsOn testClasses
+}

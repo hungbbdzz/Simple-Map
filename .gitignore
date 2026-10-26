@@ -1,6 +1,8 @@
 # Gradle files
 .gradle/
+**/.gradle/
 build/
+**/build/
 .gemini/
 
 # IDE files
@@ -10,11 +12,19 @@ build/
 *.iws
 .vscode/
 bin/
+**/bin/
 out/
+.eclipse/
 
 # Minecraft Run directory (world saves, logs, configs)
 run/
+**/run/
 *.log
+*.class
+
+# Built mod outputs (built via build-all.bat)
+mods/
+**/mods/
 
 # Local NeoForge/Minecraft config (machine-specific)
 config/
@@ -24,7 +34,9 @@ dev-audit/
 ENGINE_NOTES.md
 ENGINE_NOTES*.md
 *_NOTES.md
+!BUG_NOTES.md
 *.ps1
+*.zip
 
 # Local performance investigation and reference sources
 .simplemap-sandbox-gradle-home/

@@ -1,0 +1,6055 @@
+package com.velorise.simplemap.client.gui;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
+import com.velorise.simplemap.client.color.SurfaceColorizer.MapVisualClassifier;
+import com.velorise.simplemap.client.MapManager.MapConfig;
+
+import com.mojang.blaze3d.systems.RenderSystem;
+import net.minecraft.resources.ResourceLocation;
+import java.util.Set;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager.Waypoint;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.renderer.*;
+import com.velorise.simplemap.client.color.*;
+import com.velorise.simplemap.client.color.SurfaceColorizer.MapColorProfile;
+import com.velorise.simplemap.client.*;
+import com.velorise.simplemap.client.MinimapRenderer.MinimapPosition;
+import com.velorise.simplemap.client.session.MapSessionManager;
+import com.velorise.simplemap.ServerConfig;
+import com.velorise.simplemap.network.NetworkHandler;
+import com.velorise.simplemap.network.payload.SyncConfigPayload;
+import net.minecraft.client.gui.components.AbstractButton;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.ConfirmScreen;
+import net.minecraft.client.gui.narration.NarrationElementOutput;
+import java.util.Comparator;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import java.util.LinkedHashSet;
+import com.velorise.simplemap.client.MapWorkScheduler.MapProcessor;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager;
+import com.velorise.simplemap.client.waypoint.PinNavigation.WaypointManager.Waypoint;
+import com.velorise.simplemap.client.MapDebugRecorder.ExactPageState;
+import com.velorise.simplemap.client.MapViewportCoordinator.MapSurfaceDemandPolicy;
+import com.velorise.simplemap.client.cave.*;
+import com.velorise.simplemap.client.renderer.*;
+import com.velorise.simplemap.client.color.*;
+import com.velorise.simplemap.SimpleMap;
+import com.velorise.simplemap.client.*;
+import com.velorise.simplemap.client.MapManager.DimensionMapProfile;
+
+import com.velorise.simplemap.client.MapManager.MapTeleportController;
+import com.velorise.simplemap.client.waypoint.*;
+import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager.CaveStateClassifier;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.AbstractSliderButton;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.Tooltip;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+public class MapScreen extends Screen {
+    private static final int TOOLBAR_BUTTON_SIZE = 22;
+    private static final int TOOLBAR_MARGIN = 3;
+    private static final int TOOLBAR_GAP = 2;
+    private static final float TOOLBAR_ICON_SCALE = 1.0f;
+    private static final int PLAYER_PANEL_MARGIN = 4;
+    private static final int PLAYER_PANEL_HEIGHT = 15;
+    private static final int ZOOM_PANEL_MARGIN = 4;
+    private static final int ZOOM_PANEL_HEIGHT = 15;
+    private static final float DEFAULT_MAP_SCALE = 0.5f;
+    private static final long OPEN_ANIMATION_NANOS = 1_000_000_000L;
+    /** 5x default view opens at 6x and settles back to 5x. */
+    private static final float OPEN_ANIMATION_START_MULTIPLIER = 1.2f;
+    private static final long CURSOR_CACHE_NANOS = 120_000_000L;
+    private static final long VIEWPORT_INTERACTION_SETTLE_NANOS = 750_000_000L;
+    private static final long ACTIVE_PAN_SETTLE_NANOS = 65_000_000L;
+    private static final int POPUP_SCREEN_MARGIN = 6;
+    private static final int POPUP_HEADER_HEIGHT = 20;
+    private static final int POPUP_ROW_HEIGHT = 20;
+    private static final double MOMENTUM_FRICTION = 7.5;
+    private static final double MAX_MOMENTUM_BLOCKS_PER_SECOND = 12_000.0;
+    private double centerX;
+    private double centerZ;
+    private float scale = DEFAULT_MAP_SCALE;
+    private float currentRenderScale = DEFAULT_MAP_SCALE;
+    private boolean isDragging = false;
+    private long openAnimationStartNanos = System.nanoTime();
+    private long lastFrameNanos;
+    private long lastDragSampleNanos;
+    private long lastViewportInteractionNanos;
+    private double momentumX;
+    private double momentumZ;
+    private int cachedCursorX = Integer.MIN_VALUE;
+    private int cachedCursorZ = Integer.MIN_VALUE;
+    private long cachedCursorRevision = Long.MIN_VALUE;
+    private long cachedCursorAtNanos;
+    private BlockInfo cachedCursorInfo;
+    private boolean cursorCacheValid;
+    private boolean temporaryVsyncDisabled;
+    private final StringBuilder overlayTextBuilder = new StringBuilder(64);
+    private int cachedPlayerTextX = Integer.MIN_VALUE;
+    private int cachedPlayerTextY = Integer.MIN_VALUE;
+    private int cachedPlayerTextZ = Integer.MIN_VALUE;
+    private String cachedPlayerLang = "";
+    private String cachedPlayerText = "";
+    private int cachedZoomTextKey = Integer.MIN_VALUE;
+    private String cachedZoomText = "";
+    private int cachedCoordTextX = Integer.MIN_VALUE;
+    private int cachedCoordTextY = Integer.MIN_VALUE;
+    private int cachedCoordTextZ = Integer.MIN_VALUE;
+    private int cachedCoordWaterY = Integer.MIN_VALUE;
+    private boolean cachedCoordHasY;
+    private String cachedCoordText = "";
+    private int cachedBiomeX = Integer.MIN_VALUE;
+    private int cachedBiomeY = Integer.MIN_VALUE;
+    private int cachedBiomeZ = Integer.MIN_VALUE;
+    private String cachedBiomeDimension = "";
+    private long cachedBiomeCaveRevision = Long.MIN_VALUE;
+    private String cachedBiomeText;
+    private boolean hasFocusedCoordinateOverride;
+    private double focusedCoordinateX;
+    private double focusedCoordinateZ;
+    private long focusedCoordinateUntilNanos;
+    private final CaveStateClassifier caveStateClassifier = CaveStateClassifier.getInstance();
+    private final MapVisualClassifier visualClassifier = MapVisualClassifier.getInstance();
+
+    // Popup context menu for waypoints and teleportation
+    private boolean isPopupMenuOpen = false;
+    private double popupX = 0;
+    private double popupY = 0;
+    private double popupWorldX = 0;
+    private double popupWorldZ = 0;
+    private WaypointManager.Waypoint clickedWaypoint = null;
+
+    // Track drag vs click
+    private double dragStartX = 0;
+    private double dragStartZ = 0;
+
+    public double getCenterX() { return this.centerX; }
+    public double getCenterZ() { return this.centerZ; }
+    public float getScale() { return this.scale; }
+
+    public MapScreen() {
+        super(Component.translatable("gui.simplemap.world_map"));
+        Minecraft mc = Minecraft.getInstance();
+        MapManager manager = MapManager.getInstance();
+        String override = manager.getViewDimensionOverride();
+        this.selectedDimension = (override != null && !override.isBlank()) ? override : "LIVE";
+        if (mc.player != null) {
+            double dimRatio = manager.getCrossDimensionCoordinateScale();
+            this.centerX = mc.player.getX() * dimRatio;
+            this.centerZ = mc.player.getZ() * dimRatio;
+        }
+    }
+
+    /** Opens the requested waypoint's dimension and places it at map centre. */
+    public void focusOnWaypoint(WaypointManager.Waypoint waypoint) {
+        if (waypoint == null || this.minecraft == null) return;
+        hasFocusedCoordinateOverride = true;
+        MapManager manager = MapManager.getInstance();
+        String target = manager.resolveDimensionResourceId(waypoint.dimension);
+        if (target.equals(manager.getLiveDimensionResourceId())) {
+            selectedDimension = "LIVE";
+            manager.returnToLiveDimension(this.minecraft);
+        } else {
+            selectedDimension = target;
+            manager.switchToDimension(target);
+        }
+        centerX = waypoint.x;
+        centerZ = waypoint.z;
+        scale = Math.max(getMinimumStableScale(), 0.75f);
+        currentRenderScale = scale;
+        cancelMotionAndOpenAnimation();
+        cursorCacheValid = false;
+        isPopupMenuOpen = false;
+        updateToolbarTooltips();
+    }
+
+    /** Centers the fullscreen map on a clicked chat coordinate and highlights the target block. */
+    public void focusOnCoordinates(double targetX, double targetZ, String targetDimension) {
+        hasFocusedCoordinateOverride = true;
+        MapManager manager = MapManager.getInstance();
+        if (targetDimension != null && !targetDimension.isBlank()) {
+            String target = manager.resolveDimensionResourceId(targetDimension);
+            if (target.equals(manager.getLiveDimensionResourceId())) {
+                selectedDimension = "LIVE";
+                if (this.minecraft != null) {
+                    manager.returnToLiveDimension(this.minecraft);
+                }
+            } else {
+                selectedDimension = target;
+                manager.switchToDimension(target);
+            }
+        }
+        centerX = targetX;
+        centerZ = targetZ;
+        scale = Math.max(getMinimumStableScale(), Math.max(scale, 1.25f));
+        currentRenderScale = scale;
+        focusedCoordinateX = targetX;
+        focusedCoordinateZ = targetZ;
+        focusedCoordinateUntilNanos = System.nanoTime() + 6_000_000_000L;
+        cancelMotionAndOpenAnimation();
+        cursorCacheValid = false;
+        isPopupMenuOpen = false;
+        updateToolbarTooltips();
+    }
+
+    private Button waypointsToggleButton;
+    private Button waypointListButton;
+    private Button refreshMapButton;
+    private Button minimapConfigButton;
+    private Button nightModeButton;
+    private Button caveLayerModeButton;
+    private Button dimensionSwitchButton;
+    private CaveLayerSlider caveLayerSlider;
+    private String selectedDimension = "LIVE";
+    private final Map<String, double[]> dimensionCameras = new HashMap<>();
+    private int toolbarStartX;
+    private int toolbarStartY;
+    private int toolbarStepY;
+    private int toolbarWidth;
+    private int toolbarRows;
+
+    @Override
+    protected void init() {
+        markViewportInteraction();
+        FullscreenMapFramebufferRenderer.getInstance().resetFailureState();
+        if (this.minecraft != null) {
+            /*
+             * The fullscreen map has its own configured FPS budget and does not
+             * render the 3D level behind this opaque screen.  On a 120/130 Hz
+             * display, GLFW VSync otherwise drops the whole screen to the next
+             * divisor (~60 FPS) whenever a single frame misses the refresh slot.
+             * Bypass VSync only for this screen, without changing/saving the
+             * player's option, and restore it from removed().
+             */
+            // Keep hardware VSync active when enabled by the user (matching smooth GuiMap standard)
+            // so fast horizontal/diagonal pans synchronize with display refresh and never tear.
+            MapManager.getInstance().updateWorldAndDimension(this.minecraft);
+        }
+        if (this.width > 0 && !this.hasFocusedCoordinateOverride) {
+            this.scale = Math.max(getMinimumStableScale(), (this.width - 2) / 1000.0f);
+            this.currentRenderScale = this.scale;
+        }
+
+        // Pos 1: Settings
+        minimapConfigButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.SETTINGS, button -> {
+            if (this.minecraft != null) {
+                this.minecraft.setScreen(new MapConfigScreen(this));
+            }
+        });
+        this.addRenderableWidget(minimapConfigButton);
+
+        // Pos 2: Waypoint Toggle Visibility
+        waypointsToggleButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.WAYPOINT_OUTLINE,
+                button -> {
+                    MapConfig.waypointsVisible = !MapConfig.waypointsVisible;
+                    MapConfig.save();
+                    updateToolbarTooltips();
+                });
+        this.addRenderableWidget(waypointsToggleButton);
+
+        // Pos 3: Waypoint List Manager (Flag directly below Waypoint Toggle)
+        waypointListButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.WAYPOINT_LIST, button -> {
+            if (this.minecraft != null) {
+                this.minecraft.setScreen(new MapConfigScreen.WaypointListScreen(this));
+            }
+        });
+        this.addRenderableWidget(waypointListButton);
+
+        // Pos 4: Night Mode
+        nightModeButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.SUN, button -> {
+            MapConfig.minimapNightMode = (MapConfig.minimapNightMode + 1) % 3;
+            MapConfig.save();
+            MapManager.getInstance().onNightModeChanged();
+            updateToolbarTooltips();
+        });
+        this.addRenderableWidget(nightModeButton);
+
+        // Pos 5: Refresh
+        refreshMapButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.REFRESH, button -> {
+            if (this.minecraft != null && this.minecraft.player != null) {
+                if (Screen.hasShiftDown()) {
+                    MapManager manager = MapManager.getInstance();
+                    if (!"LIVE".equals(selectedDimension) || !manager.isViewingLiveDimension()) {
+                        selectedDimension = "LIVE";
+                        manager.returnToLiveDimension(this.minecraft);
+                        if (caveLayerSlider != null) {
+                            caveLayerSlider.syncBoundsFromDimension();
+                        }
+                        updateCaveControlLayout();
+                        cursorCacheValid = false;
+                        cachedBiomeText = null;
+                        isPopupMenuOpen = false;
+                        updateToolbarTooltips();
+                    }
+                    this.centerX = this.minecraft.player.getX();
+                    this.centerZ = this.minecraft.player.getZ();
+                    this.scale = DEFAULT_MAP_SCALE;
+                    clampScaleForCurrentMode();
+                    cancelMotionAndOpenAnimation();
+                    FullscreenMapFramebufferRenderer.getInstance().invalidate();
+                    return;
+                }
+                ChunkScanner.getInstance().requestRefresh(this.minecraft);
+                if (CaveMode.isActive(this.minecraft)) {
+                    CaveTextureManager.getInstance().uploadDirtyTextures(true);
+                } else {
+                    MapTextureManager.getInstance().uploadDirtyTextures(true);
+                }
+            }
+        });
+        this.addRenderableWidget(refreshMapButton);
+
+        // Dimension Switcher (above Cave controls)
+        dimensionSwitchButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE,
+                MapUiIcons.Icon.DIMENSION_PORTAL, button -> cycleViewedDimension());
+        this.addRenderableWidget(dimensionSwitchButton);
+
+        if (this.minecraft != null && this.minecraft.level != null) {
+            caveLayerModeButton = new PixelIconButton(0, 0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE, MapUiIcons.Icon.CAVE_OFF, button -> {
+                if (MapConfig.getEffectiveCaveMapMode() == 0) return;
+                markViewportInteraction();
+                CaveMode.cycleCaveType(this.minecraft);
+                clampScaleForCurrentMode();
+                FullscreenMapFramebufferRenderer.getInstance().invalidate();
+                FullscreenMapFramebufferRenderer.getInstance().resetFailureState();
+                MapRenderer.getInstance().clearFullscreenFallback();
+                this.lastViewportInteractionNanos = 0L;
+                MapPerformanceGovernor.getInstance().setFullscreenState(true, false);
+                if (CaveMode.getCaveType(this.minecraft) == CaveMode.CaveType.OFF) {
+                    MapManager.getInstance().ensureCeilingSurfaceRegionsBackfilled();
+                    ChunkScanner.getInstance().requestImmediateSurfaceRefresh(this.minecraft);
+                } else if (CaveMode.getCaveType(this.minecraft) == CaveMode.CaveType.LAYERED) {
+                    ChunkScanner.getInstance().requestImmediateCaveLayerRefresh(this.minecraft);
+                } else {
+                    ChunkScanner.getInstance().requestImmediateCaveLayerRefresh(
+                            this.minecraft);
+                }
+                if (caveLayerSlider != null) caveLayerSlider.syncFromMode();
+                updateCaveControlLayout();
+            });
+            this.addRenderableWidget(caveLayerModeButton);
+
+            caveLayerModeButton.active = MapConfig.getEffectiveCaveMapMode() != 0;
+
+            if (MapConfig.getEffectiveCaveMapMode() != 0) {
+                DimensionMapProfile viewedProfile = MapManager.getInstance()
+                        .getCurrentDimensionProfile();
+                int minimumY = viewedProfile == null
+                        ? this.minecraft.level.getMinBuildHeight() : viewedProfile.minY();
+                int maximumY = viewedProfile == null
+                        ? this.minecraft.level.getMaxBuildHeight() - 1 : viewedProfile.maxY();
+                double initialValue = CaveMode.hasManualTopY(this.minecraft)
+                        ? CaveLayerSlider.normalizeNumeric(CaveMode.getSelectedTopY(this.minecraft), minimumY, maximumY)
+                        : 0.0;
+                caveLayerSlider = new CaveLayerSlider(0, 0, 156, 18,
+                        minimumY, maximumY, initialValue);
+                caveLayerSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cave_top_y")));
+                this.addRenderableWidget(caveLayerSlider);
+            }
+            updateCaveControlLayout();
+        }
+
+        if (this.minecraft != null && !CaveMode.isActive(this.minecraft)) {
+            MapManager.getInstance().ensureCeilingSurfaceRegionsBackfilled();
+        }
+        layoutToolbar();
+        updateToolbarTooltips();
+    }
+
+    private void layoutToolbar() {
+        Button[] buttons = { minimapConfigButton, waypointsToggleButton, waypointListButton,
+                nightModeButton, refreshMapButton };
+        toolbarStartX = TOOLBAR_MARGIN;
+        toolbarStartY = TOOLBAR_MARGIN;
+        toolbarStepY = TOOLBAR_BUTTON_SIZE + TOOLBAR_GAP;
+        toolbarWidth = TOOLBAR_BUTTON_SIZE;
+        toolbarRows = buttons.length;
+        for (int i = 0; i < buttons.length; i++) {
+            buttons[i].setX(toolbarStartX);
+            buttons[i].setY(toolbarStartY + i * toolbarStepY);
+            buttons[i].setWidth(TOOLBAR_BUTTON_SIZE);
+        }
+    }
+
+    private void drawToolbarBackground(GuiGraphics guiGraphics) {
+        // Intentionally empty
+    }
+
+    private void updateToolbarTooltips() {
+        if (minimapConfigButton != null) minimapConfigButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.settings_button")));
+        if (waypointListButton != null) waypointListButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.waypoint_manager_button")));
+        if (waypointsToggleButton != null) waypointsToggleButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.waypoint_visibility",
+                        Component.translatable(MapConfig.waypointsVisible ? "gui.simplemap.value.on" : "gui.simplemap.value.off"))));
+        if (refreshMapButton != null) refreshMapButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.refresh_map")));
+        if (nightModeButton != null) nightModeButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.map_brightness", getNightModeMessage())));
+        if (dimensionSwitchButton != null) dimensionSwitchButton.setTooltip(Tooltip.create(
+                Component.translatable("gui.simplemap.tooltip.dimension_switch", getDimensionName(selectedDimension))));
+        updateCaveTooltip();
+    }
+
+    private String getDimensionName(String dim) {
+        if ("LIVE".equals(dim)) {
+            String live = MapManager.getInstance().getLiveDimensionResourceId();
+            return Component.translatable("gui.simplemap.dimension.current",
+                    MapManager.displayDimensionName(live)).getString();
+        }
+        return MapManager.displayDimensionName(dim);
+    }
+
+    private void cycleViewedDimension() {
+        if (this.minecraft == null) return;
+        MapManager manager = MapManager.getInstance();
+        String liveDimension = manager.getLiveDimensionResourceId();
+
+        // "Current" already represents the player's live dimension. Excluding that
+        // same resource id removes redundant cycles such as Overworld -> Current
+        // while the player is already in the Overworld.
+        if (!"LIVE".equals(selectedDimension) && selectedDimension.equals(liveDimension)) {
+            selectedDimension = "LIVE";
+        }
+        saveCurrentDimensionCamera();
+
+        List<String> options = new ArrayList<>();
+        options.add("LIVE");
+        for (String dimension : manager.getSelectableDimensions()) {
+            if (dimension == null || dimension.isBlank()
+                    || dimension.equals(liveDimension) || options.contains(dimension)) {
+                continue;
+            }
+            options.add(dimension);
+        }
+        if (options.size() <= 1) {
+            selectedDimension = "LIVE";
+            updateToolbarTooltips();
+            return;
+        }
+        int currentIndex = options.indexOf(selectedDimension);
+        String previous = selectedDimension;
+        selectedDimension = options.get((currentIndex + 1 + options.size()) % options.size());
+
+        if ("LIVE".equals(selectedDimension)) manager.returnToLiveDimension(this.minecraft);
+        else manager.switchToDimension(selectedDimension);
+        restoreDimensionCamera(previous, selectedDimension);
+        if (caveLayerSlider != null) caveLayerSlider.syncBoundsFromDimension();
+        cursorCacheValid = false;
+        isPopupMenuOpen = false;
+        updateToolbarTooltips();
+    }
+
+    private void saveCurrentDimensionCamera() {
+        // Intentionally unused: Camera scales camera position proportionally from the current view
+        // rather than jumping to a stale cached coordinate from an earlier dimension visit.
+    }
+
+    private void restoreDimensionCamera(String previous, String target) {
+        MapManager mapManager = MapManager.getInstance();
+        String from = "LIVE".equals(previous)
+                ? mapManager.getLiveDimensionResourceId() : previous;
+        String to = "LIVE".equals(target)
+                ? mapManager.getLiveDimensionResourceId() : target;
+        // Scale the current map camera proportionally by each dimension's coordinateScale()
+        // (e.g. 8:1 Nether -> Overworld, 1:8 Overworld -> Nether), matching cross-dimension coordinate scaling
+        // (GuiMap.playerDimDiv). This opens the target dimension at the exact corresponding
+        // relative position of the current map view instead of snapping to an old saved camera.
+        DimensionMapProfile fromProfile = mapManager.getDimensionProfile(from);
+        DimensionMapProfile toProfile = mapManager.getDimensionProfile(to);
+        double ratio = fromProfile.coordinateScale() / toProfile.coordinateScale();
+        if (Double.isFinite(ratio) && ratio > 0.0) {
+            centerX *= ratio;
+            centerZ *= ratio;
+        }
+        cachedBiomeText = null;
+        cancelMotionAndOpenAnimation();
+    }
+
+    private void updateCaveTooltip() {
+        if (caveLayerModeButton == null) return;
+        String detail = switch (CaveMode.getCaveType(this.minecraft)) {
+            case OFF -> Component.translatable("gui.simplemap.cave.detail.off").getString();
+            case LAYERED -> Component.translatable("gui.simplemap.cave.detail.layered").getString();
+            case FULL -> Component.translatable("gui.simplemap.cave.detail.full").getString();
+        };
+        String permission = MapConfig.getEffectiveCaveMapMode() == 0
+                ? "\n" + Component.translatable("gui.simplemap.cave.permission.disabled").getString()
+                : "\n" + Component.translatable("gui.simplemap.cave.permission.enabled").getString();
+        caveLayerModeButton.setTooltip(Tooltip.create(Component.literal(
+                getCaveLayerModeMessage().getString() + "\n" + detail + permission)));
+    }
+
+    private void updateCaveControlLayout() {
+        int controlY = this.height - TOOLBAR_BUTTON_SIZE - TOOLBAR_MARGIN;
+        if (caveLayerModeButton != null) {
+            updateCaveTooltip();
+            caveLayerModeButton.setWidth(TOOLBAR_BUTTON_SIZE);
+            caveLayerModeButton.setX(TOOLBAR_MARGIN);
+            caveLayerModeButton.setY(controlY);
+        }
+        if (dimensionSwitchButton != null) {
+            dimensionSwitchButton.setWidth(TOOLBAR_BUTTON_SIZE);
+            dimensionSwitchButton.setX(TOOLBAR_MARGIN);
+            dimensionSwitchButton.setY(controlY - TOOLBAR_BUTTON_SIZE - TOOLBAR_GAP);
+        }
+        if (caveLayerSlider == null || caveLayerModeButton == null) return;
+
+        int availableWidth = Math.max(44, this.width - 38);
+        CaveMode.CaveType caveType = CaveMode.getCaveType(this.minecraft);
+        // Keeps the cave-start AUTO/manual control available for both
+        // layered CAVE and FULL. FULL ignores the exact Top Y for projection, but
+        // the value still decides whether cave mode is manually active.
+        caveLayerSlider.visible = caveType != CaveMode.CaveType.OFF;
+        caveLayerSlider.active = caveType != CaveMode.CaveType.OFF;
+        if (!caveLayerSlider.visible) return;
+
+        caveLayerSlider.setWidth(Math.min(190, availableWidth));
+        caveLayerSlider.setX(TOOLBAR_MARGIN + TOOLBAR_BUTTON_SIZE + TOOLBAR_GAP + 2);
+        caveLayerSlider.setY(controlY + 2);
+    }
+
+    private void drawCaveControlBackground(GuiGraphics guiGraphics) {
+        // Intentionally empty. The cave icon and vanilla slider remain individually
+        // readable without covering the underlying map with another dark rectangle.
+    }
+
+    private Component getWaypointsToggleMessage() {
+        return Component.translatable("gui.simplemap.waypoints_short",
+                Component.translatable(MapConfig.waypointsVisible ? "gui.simplemap.value.on" : "gui.simplemap.value.off"));
+    }
+
+    private Component getNightModeMessage() {
+        Component mode = switch (MapConfig.minimapNightMode) {
+            case 1 -> Component.translatable("gui.simplemap.value.auto");
+            case 2 -> Component.translatable("gui.simplemap.value.on");
+            default -> Component.translatable("gui.simplemap.value.off");
+        };
+        return Component.translatable(
+                CaveMode.isActive(this.minecraft) ? "gui.simplemap.cave_light" : "gui.simplemap.night_mode",
+                mode);
+    }
+
+    private Component getCaveLayerModeMessage() {
+        return switch (CaveMode.getCaveType(this.minecraft)) {
+            case OFF -> Component.translatable("gui.simplemap.cave_mode.off");
+            case LAYERED -> Component.translatable("gui.simplemap.cave_mode.cave");
+            case FULL -> Component.translatable("gui.simplemap.cave_mode.full");
+        };
+    }
+
+    private void cancelMotionAndOpenAnimation() {
+        momentumX = 0.0;
+        momentumZ = 0.0;
+        openAnimationStartNanos = 0L;
+    }
+
+    private float openAnimationMultiplier(long now) {
+        if (openAnimationStartNanos == 0L) return 1.0f;
+        float progress = Math.min(1.0f,
+                (now - openAnimationStartNanos) / (float) OPEN_ANIMATION_NANOS);
+        if (progress >= 1.0f) {
+            openAnimationStartNanos = 0L;
+            return 1.0f;
+        }
+        // Smoothstep keeps the 3x-to-2x opening motion visible through the full second.
+        float eased = progress * progress * (3.0f - 2.0f * progress);
+        return OPEN_ANIMATION_START_MULTIPLIER
+                + (1.0f - OPEN_ANIMATION_START_MULTIPLIER) * eased;
+    }
+
+    private void updateMomentum(long now) {
+        if (lastFrameNanos == 0L) {
+            lastFrameNanos = now;
+            return;
+        }
+        double seconds = Math.min(0.050, Math.max(0.0, (now - lastFrameNanos) / 1_000_000_000.0));
+        lastFrameNanos = now;
+        if (isDragging || seconds <= 0.0) return;
+        if (Math.abs(momentumX) < 0.5 && Math.abs(momentumZ) < 0.5) {
+            momentumX = 0.0;
+            momentumZ = 0.0;
+            return;
+        }
+        centerX += momentumX * seconds;
+        centerZ += momentumZ * seconds;
+        double damping = Math.exp(-MOMENTUM_FRICTION * seconds);
+        momentumX *= damping;
+        momentumZ *= damping;
+    }
+
+    @Override
+    public void renderBackground(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+        // Override to draw a plain dark background instead of Minecraft 1.21's
+        // built-in gaussian blur post-processing shader (which blurs our map).
+        // We draw the background ourselves in render(), so this is intentionally empty.
+    }
+
+    @Override
+    public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+        long frameNow = System.nanoTime();
+        updateMomentum(frameNow);
+        clampScaleForCurrentMode();
+        currentRenderScale = scale * openAnimationMultiplier(frameNow);
+        // AUTO is a live view: keep the compact Y readout synchronized with the
+        // player's stable scan band without turning the slider into manual mode.
+        if (caveLayerSlider != null && !caveLayerSlider.isDragging()
+                && !CaveMode.hasManualTopY(this.minecraft)) {
+            caveLayerSlider.syncFromMode();
+        }
+        // Fullscreen dark background
+        guiGraphics.fill(0, 0, this.width, this.height, 0xFF0D0D0D);
+
+        // Thin 2-pixel border at screen edges (clean 2-pixel margin)
+        guiGraphics.fill(0, 0, this.width, 1, 0xFF2D3033); // top
+        guiGraphics.fill(0, this.height - 1, this.width, this.height, 0xFF2D3033); // bottom
+        guiGraphics.fill(0, 0, 1, this.height, 0xFF2D3033); // left
+        guiGraphics.fill(this.width - 1, 0, this.width, this.height, 0xFF2D3033); // right
+
+        // If map is not unlocked, draw a lock message and only render widgets
+        if (!com.velorise.simplemap.SimpleMap.isMapUnlocked(this.minecraft.player)) {
+            drawToolbarBackground(guiGraphics);
+            drawCaveControlBackground(guiGraphics);
+            super.render(guiGraphics, mouseX, mouseY, partialTick);
+            String title = Component.translatable("gui.simplemap.map_locked.title").getString();
+            String subtitle = Component.translatable(MapManager.getInstance().hasLearnedMap()
+                ? "gui.simplemap.map_locked.hold_book"
+                : "gui.simplemap.map_locked.craft_book").getString();
+            int tw1 = this.font.width(title);
+            int tw2 = this.font.width(subtitle);
+            guiGraphics.drawString(this.font, title, (this.width - tw1) / 2, this.height / 2 - 20, 0xFF5555, false);
+            guiGraphics.drawString(this.font, subtitle, (this.width - tw2) / 2, this.height / 2, 0xAAAAAA, false);
+            return;
+        }
+
+        // Viewport occupies the full screen (minus 1px border)
+        int vx = 1, vy = 1, vw = this.width - 2, vh = this.height - 2;
+
+        // Mouse world coordinates relative to fullscreen viewport centre
+        double mouseWorldX = centerX + (mouseX - vx - vw / 2.0) / currentRenderScale;
+        double mouseWorldZ = centerZ + (mouseY - vy - vh / 2.0) / currentRenderScale;
+
+        // Scanning, IO and texture publication are handled by MapViewportCoordinator
+        // from client tick. Retained composition may reuse one texture for many
+        // visual frames, so refresh the lightweight fullscreen demand independently
+        // from atlas replay. Otherwise demand expires while the FBO is doing exactly
+        // what it should: not calling MapRenderer every frame.
+        double demandGuard = FullscreenMapFramebufferRenderer.demandOverscanPixels();
+        // Use the stable post-animation zoom for loading. Otherwise the one-second
+        // opening animation changes page bounds every frame and repeatedly rebases
+        // the centre-out planner while the final viewport is still cold.
+        float demandScale = scale;
+        double demandHalfW = (vw * 0.5 + demandGuard)
+                / Math.max(0.0001f, demandScale);
+        double demandHalfH = (vh * 0.5 + demandGuard)
+                / Math.max(0.0001f, demandScale);
+        boolean viewportInteracting = isViewportInteracting(frameNow);
+        MapViewportCoordinator.getInstance().submitFullscreen(
+                centerX - demandHalfW, centerX + demandHalfW,
+                centerZ - demandHalfH, centerZ + demandHalfH,
+                demandScale, centerX, centerZ, viewportInteracting);
+
+        // Draw map fullscreen, North-up, no rotation. The optional pixel-aligned
+        // framebuffer retains the atlas replay and applies bounded pan motion as
+        // source UV translation. Direct rendering remains the correctness fallback.
+        boolean framebufferRendered = false;
+        if (FullscreenMapFramebufferRenderer.shouldUse(this.minecraft,
+                currentRenderScale)) {
+            framebufferRendered = FullscreenMapFramebufferRenderer.getInstance().render(
+                    guiGraphics, vx, vy, vw, vh, centerX, centerZ,
+                    scale, currentRenderScale, partialTick, viewportInteracting);
+        }
+        boolean drawPlayerInCurrentDimension = MapManager.getInstance().isViewingLiveDimension();
+        if (!framebufferRendered) {
+            MapRenderer.getInstance().drawMap(
+                guiGraphics,
+                vx, vy, vw, vh,
+                centerX, centerZ, currentRenderScale,
+                drawPlayerInCurrentDimension,
+                false,
+                false, mouseWorldX, mouseWorldZ,
+                partialTick, false
+            );
+        } else {
+            MapRenderer.getInstance().drawFullscreenOverlays(
+                    guiGraphics, vx, vy, vw, vh,
+                    centerX, centerZ, currentRenderScale,
+                    drawPlayerInCurrentDimension,
+                    mouseWorldX, mouseWorldZ, partialTick);
+        }
+
+        if (!MapManager.getInstance().isViewingLiveDimension()
+                && !MapManager.getInstance().hasSavedDataForCurrentDimension()) {
+            String message = Component.translatable("gui.simplemap.no_saved_data",
+                    MapManager.displayDimensionName(
+                            MapManager.getInstance().getCurrentDimensionResourceId())).getString();
+            int textWidth = this.font.width(message);
+            guiGraphics.fill((this.width - textWidth) / 2 - 6, this.height / 2 - 8,
+                    (this.width + textWidth) / 2 + 6, this.height / 2 + 8, 0xB0000000);
+            guiGraphics.drawString(this.font, message,
+                    (this.width - textWidth) / 2, this.height / 2 - 4,
+                    0xFFB8B8B8, false);
+        }
+
+        // Highlight target coordinate when opened from a clickable chat coordinate
+        if (frameNow < focusedCoordinateUntilNanos) {
+            float screenTargetX = (float) (vx + vw * 0.5 + (focusedCoordinateX - centerX) * currentRenderScale);
+            float screenTargetY = (float) (vy + vh * 0.5 + (focusedCoordinateZ - centerZ) * currentRenderScale);
+            if (screenTargetX >= vx && screenTargetX <= vx + vw
+                    && screenTargetY >= vy && screenTargetY <= vy + vh) {
+                float remSec = (focusedCoordinateUntilNanos - frameNow) / 1_000_000_000.0f;
+                float pulse = 0.5f + 0.5f * (float) Math.sin((6.0f - remSec) * 6.5f);
+                float ringR = 7.0f + pulse * 4.5f;
+                int alpha = Math.min(255, (int) (Math.min(1.0f, remSec * 1.2f) * 235.0f));
+                int ringColor = (alpha << 24) | 0x00E5FF;
+                int shadowColor = (Math.min(255, alpha / 2) << 24);
+                drawCircleRing(guiGraphics, screenTargetX, screenTargetY, ringR - 1.5f, ringR + 1.5f, 48, shadowColor);
+                drawCircleRing(guiGraphics, screenTargetX, screenTargetY, ringR - 0.75f, ringR + 0.75f, 48, ringColor);
+                drawSolidCircleHelper(guiGraphics, screenTargetX, screenTargetY, 2.2f, 24, ringColor, 0.0f);
+                guiGraphics.flush();
+            }
+        }
+
+        // Draw GUI widgets (buttons)
+        drawToolbarBackground(guiGraphics);
+        drawCaveControlBackground(guiGraphics);
+        super.render(guiGraphics, mouseX, mouseY, partialTick);
+
+        // Draw coordinates overlay
+        drawCoordsOverlay(guiGraphics, mouseX, mouseY);
+
+        // Draw the custom context menu if open
+        if (isPopupMenuOpen) {
+            drawPopupMenu(guiGraphics, mouseX, mouseY);
+        }
+    }
+
+    static void drawSolidCircleHelper(GuiGraphics guiGraphics, float cx, float cy, float radius, int numSegments,
+            int color, float z) {
+        float a = ((color >> 24) & 0xFF) / 255.0f;
+        float r = ((color >> 16) & 0xFF) / 255.0f;
+        float g = ((color >> 8) & 0xFF) / 255.0f;
+        float b = (color & 0xFF) / 255.0f;
+
+        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
+        net.minecraft.client.renderer.MultiBufferSource bufferSource = guiGraphics.bufferSource();
+        com.mojang.blaze3d.vertex.VertexConsumer consumer = bufferSource
+                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
+
+        double angleStep = 2.0 * Math.PI / numSegments;
+        for (int i = 0; i < numSegments; i++) {
+            double angle1 = i * angleStep;
+            double angle2 = (i + 1) * angleStep;
+
+            float x1 = (float) (cx + radius * Math.cos(angle1));
+            float y1 = (float) (cy + radius * Math.sin(angle1));
+            float x2 = (float) (cx + radius * Math.cos(angle2));
+            float y2 = (float) (cy + radius * Math.sin(angle2));
+
+            // Degenerate Quad (4 vertices representing a CCW triangle in GUI NDC) at Z = z
+            consumer.addVertex(matrix, cx, cy, z).setColor(r, g, b, a);
+            consumer.addVertex(matrix, x2, y2, z).setColor(r, g, b, a);
+            consumer.addVertex(matrix, x1, y1, z).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx, cy, z).setColor(r, g, b, a);
+        }
+    }
+
+    static void drawCircleRing(GuiGraphics guiGraphics, float cx, float cy, float r1, float r2, int numSegments,
+            int color) {
+        float a = ((color >> 24) & 0xFF) / 255.0f;
+        float r = ((color >> 16) & 0xFF) / 255.0f;
+        float g = ((color >> 8) & 0xFF) / 255.0f;
+        float b = (color & 0xFF) / 255.0f;
+
+        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
+        net.minecraft.client.renderer.MultiBufferSource bufferSource = guiGraphics.bufferSource();
+        com.mojang.blaze3d.vertex.VertexConsumer consumer = bufferSource
+                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
+
+        double angleStep = 2.0 * Math.PI / numSegments;
+        for (int i = 0; i < numSegments; i++) {
+            double angle1 = i * angleStep;
+            double angle2 = (i + 1) * angleStep;
+
+            float cos1 = (float) Math.cos(angle1);
+            float sin1 = (float) Math.sin(angle1);
+            float cos2 = (float) Math.cos(angle2);
+            float sin2 = (float) Math.sin(angle2);
+
+            consumer.addVertex(matrix, cx + r1 * cos1, cy + r1 * sin1, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + r1 * cos2, cy + r1 * sin2, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + r2 * cos2, cy + r2 * sin2, 0.0f).setColor(r, g, b, a);
+            consumer.addVertex(matrix, cx + r2 * cos1, cy + r2 * sin1, 0.0f).setColor(r, g, b, a);
+        }
+    }
+
+    private static class BlockInfo {
+        final String name;
+        final String id;
+        final int y;
+        final int waterSurfaceY;
+        final boolean cached;
+
+        BlockInfo(String name, String id, int y) {
+            this(name, id, y, Integer.MIN_VALUE, false);
+        }
+
+        BlockInfo(String name, String id, int y, int waterSurfaceY) {
+            this(name, id, y, waterSurfaceY, false);
+        }
+
+        BlockInfo(String name, String id, int y, int waterSurfaceY, boolean cached) {
+            this.name = name;
+            this.id = id;
+            this.y = y;
+            this.waterSurfaceY = waterSurfaceY;
+            this.cached = cached;
+        }
+
+        boolean hasWaterSurface() {
+            return waterSurfaceY != Integer.MIN_VALUE;
+        }
+    }
+
+    /** Small vanilla-backed button whose foreground comes from our shared icon atlas. */
+    private static final class PixelIconButton extends Button {
+        private final MapUiIcons.Icon icon;
+
+        private PixelIconButton(int x, int y, int width, int height,
+                MapUiIcons.Icon icon, OnPress onPress) {
+            super(x, y, width, height, Component.empty(), onPress, DEFAULT_NARRATION);
+            this.icon = icon;
+        }
+
+        @Override
+        public void renderWidget(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+            if (!visible) {
+                return;
+            }
+            MapUiIcons.Icon displayedIcon = icon;
+            if (icon == MapUiIcons.Icon.WAYPOINT_OUTLINE) {
+                displayedIcon = MapConfig.waypointsVisible
+                        ? MapUiIcons.Icon.WAYPOINT_FILLED
+                        : MapUiIcons.Icon.WAYPOINT_OUTLINE;
+            } else if (icon == MapUiIcons.Icon.SUN) {
+                displayedIcon = switch (MapConfig.minimapNightMode) {
+                    case 1 -> MapUiIcons.Icon.NIGHT_AUTO;
+                    case 2 -> MapUiIcons.Icon.MOON;
+                    default -> MapUiIcons.Icon.SUN;
+                };
+            } else if (icon == MapUiIcons.Icon.CAVE_ON || icon == MapUiIcons.Icon.CAVE_OFF) {
+                // The hollow cave icon means cave view is active; the solid icon means OFF.
+                displayedIcon = CaveMode.getCaveType(Minecraft.getInstance()) == CaveMode.CaveType.OFF
+                        ? MapUiIcons.Icon.CAVE_OFF
+                        : MapUiIcons.Icon.CAVE_ON;
+            }
+            if (isHoveredOrFocused()) {
+                graphics.fill(getX(), getY(), getX() + getWidth(), getY() + getHeight(), 0x12FFFFFF);
+            }
+            MapUiIcons.drawScaled(graphics, displayedIcon,
+                    getX() + getWidth() / 2, getY() + getHeight() / 2,
+                    active, TOOLBAR_ICON_SCALE);
+        }
+    }
+
+    private void drawCoordsOverlay(GuiGraphics guiGraphics, int mouseX, int mouseY) {
+        // Calculate world coordinates under the mouse cursor (viewport starts at x=1, y=1)
+        double worldX = centerX + (mouseX - 1 - (this.width - 2) / 2.0) / currentRenderScale;
+        double worldZ = centerZ + (mouseY - 1 - (this.height - 2) / 2.0) / currentRenderScale;
+
+        int bx = (int) Math.floor(worldX);
+        int bz = (int) Math.floor(worldZ);
+
+        // Resolve live world data first. Outside the client's chunk radius, fall back
+        // to the persistent surface/vertical archive instead of dropping the Y value.
+        int yCoord = 0;
+        int waterSurfaceY = Integer.MIN_VALUE;
+        boolean hasY = false;
+        boolean chunkLoaded = MapManager.getInstance().isViewingLiveDimension()
+                && this.minecraft != null && this.minecraft.level != null
+                && this.minecraft.level.hasChunk(bx >> 4, bz >> 4);
+        BlockInfo resolved = resolveCursorBlockInfo(bx, bz, chunkLoaded, System.nanoTime());
+        if (resolved != null && (!resolved.name.isEmpty() || resolved.cached)) {
+            yCoord = resolved.y;
+            waterSurfaceY = resolved.waterSurfaceY;
+            hasY = true;
+        }
+
+        String coordText = buildCoordinateText(bx, bz, hasY,
+                yCoord, waterSurfaceY);
+
+        String blockText = null;
+        if (MapConfig.cursorBlockEnabled && resolved != null && resolved.name != null && !resolved.name.isBlank()) {
+            blockText = resolved.name;
+        }
+
+        String biomeText = null;
+        if (MapConfig.cursorBiomeEnabled && hasY
+                && this.minecraft != null && this.minecraft.level != null) {
+            biomeText = resolveCursorBiomeText(bx, yCoord, bz, chunkLoaded);
+        }
+
+        int coordWidth = this.font.width(coordText);
+        int blockWidth = blockText == null ? 0 : this.font.width(blockText);
+        int biomeWidth = biomeText == null ? 0 : this.font.width(biomeText);
+        int panelWidth = Math.max(coordWidth, Math.max(blockWidth, biomeWidth)) + 10;
+        int lines = 1 + (blockText == null ? 0 : 1) + (biomeText == null ? 0 : 1);
+        int panelHeight = 3 + lines * 10;
+        int panelX = (this.width - panelWidth) / 2;
+        // Nudge coordinate readout closer to the top edge
+        int panelY = 4;
+        guiGraphics.fill(panelX, panelY, panelX + panelWidth, panelY + panelHeight, 0x88000000);
+        int lineY = panelY + 3;
+        guiGraphics.drawString(this.font, coordText,
+                panelX + (panelWidth - coordWidth) / 2, lineY, 0xFFFFFF, false);
+        lineY += 10;
+        if (blockText != null) {
+            guiGraphics.drawString(this.font, blockText,
+                    panelX + (panelWidth - blockWidth) / 2, lineY, 0xD8D8D8, false);
+            lineY += 10;
+        }
+        if (biomeText != null) {
+            guiGraphics.drawString(this.font, biomeText,
+                    panelX + (panelWidth - biomeWidth) / 2, lineY, 0xA8D69C, false);
+        }
+
+        drawZoomPanel(guiGraphics);
+
+        // Render player coordinates at bottom-right. Bounds and text use one shared
+        // calculation so the clickable panel cannot drift below the label.
+        if (this.minecraft != null && this.minecraft.player != null) {
+            String playerText = getPlayerCoordinatesText();
+            int playerPanelWidth = this.font.width(playerText) + 10;
+            int panelRight = this.width - PLAYER_PANEL_MARGIN;
+            int panelBottom = this.height - PLAYER_PANEL_MARGIN;
+            int panelLeft = panelRight - playerPanelWidth;
+            int panelTop = panelBottom - PLAYER_PANEL_HEIGHT;
+            boolean hovered = isInside(mouseX, mouseY,
+                    panelLeft, panelTop, panelRight, panelBottom);
+            guiGraphics.fill(panelLeft, panelTop, panelRight, panelBottom,
+                    hovered ? 0xAA000000 : 0x78000000);
+            if (hovered) {
+                guiGraphics.renderOutline(panelLeft, panelTop, playerPanelWidth,
+                        PLAYER_PANEL_HEIGHT, 0x88FFFFFF);
+            }
+            guiGraphics.drawString(this.font, playerText, panelLeft + 5, panelTop + 3,
+                    0xFFFFFFFF, false);
+            if (hovered) {
+                guiGraphics.renderTooltip(this.font,
+                        Component.translatable("gui.simplemap.copy_coords"),
+                        mouseX, mouseY);
+            }
+        }
+    }
+
+    private void drawZoomPanel(GuiGraphics guiGraphics) {
+        String zoomText = getZoomText();
+        int panelWidth = this.font.width(zoomText) + 10;
+        int left = (this.width - panelWidth) / 2;
+        int bottom = this.height - ZOOM_PANEL_MARGIN;
+        int top = bottom - ZOOM_PANEL_HEIGHT;
+        guiGraphics.fill(left, top, left + panelWidth, bottom, 0x78000000);
+        guiGraphics.drawString(this.font, zoomText, left + 5, top + 3,
+                0xFFE6E6E6, false);
+    }
+
+    private String getZoomText() {
+        // MapScreen.scale is expressed in logical GUI pixels per block. the 
+        // fullscreen label is effectively physical framebuffer pixels per block on
+        // a 1080p display. Printing the logical value made 0.262x in Simple Map look
+        // comparable to 0.262x in world units even though GUI scale 3 renders it at 0.786
+        // physical pixels/block. Report the actual screen density so screenshots and
+        // performance tests use the same unit.
+        double guiScale = this.minecraft == null || this.minecraft.getWindow() == null
+                ? 1.0D : Math.max(1.0D, this.minecraft.getWindow().getGuiScale());
+        float displayedScale = (float) (Math.max(getMinimumStableScale(), this.scale)
+                * guiScale);
+        int decimals = displayedScale < 1.0f ? 3 : displayedScale < 10.0f ? 2 : 1;
+        int divisor = decimals == 3 ? 1000 : decimals == 2 ? 100 : 10;
+        int quantized = Math.round(displayedScale * divisor);
+        int key = quantized * 31 + divisor;
+        if (key == cachedZoomTextKey) return cachedZoomText;
+        int fraction = Math.abs(quantized % divisor);
+        overlayTextBuilder.setLength(0);
+        overlayTextBuilder.append(quantized / divisor).append('.');
+        if (decimals >= 2 && fraction < divisor / 10) overlayTextBuilder.append('0');
+        if (decimals == 3 && fraction < 10) overlayTextBuilder.append('0');
+        overlayTextBuilder.append(fraction).append('x');
+        cachedZoomTextKey = key;
+        cachedZoomText = overlayTextBuilder.toString();
+        return cachedZoomText;
+    }
+
+    private String getPlayerCoordinatesText() {
+        int x = (int) Math.floor(this.minecraft.player.getX());
+        int y = (int) Math.floor(this.minecraft.player.getY());
+        int z = (int) Math.floor(this.minecraft.player.getZ());
+        String lang = this.minecraft.getLanguageManager() != null
+                ? this.minecraft.getLanguageManager().getSelected() : "";
+        if (x == cachedPlayerTextX && y == cachedPlayerTextY
+                && z == cachedPlayerTextZ && lang.equals(cachedPlayerLang)) return cachedPlayerText;
+        overlayTextBuilder.setLength(0);
+        overlayTextBuilder.append(Component.translatable("gui.simplemap.player_x_prefix").getString());
+        appendGroupedInteger(overlayTextBuilder, x);
+        overlayTextBuilder.append(" | Y: ");
+        appendGroupedInteger(overlayTextBuilder, y);
+        overlayTextBuilder.append(" | Z: ");
+        appendGroupedInteger(overlayTextBuilder, z);
+        cachedPlayerTextX = x;
+        cachedPlayerTextY = y;
+        cachedPlayerTextZ = z;
+        cachedPlayerLang = lang;
+        cachedPlayerText = overlayTextBuilder.toString();
+        return cachedPlayerText;
+    }
+
+    private String buildCoordinateText(int x, int z, boolean hasY,
+            int y, int waterSurfaceY) {
+        if (x == cachedCoordTextX && z == cachedCoordTextZ
+                && hasY == cachedCoordHasY
+                && (!hasY || (y == cachedCoordTextY
+                        && waterSurfaceY == cachedCoordWaterY))) {
+            return cachedCoordText;
+        }
+        overlayTextBuilder.setLength(0);
+        overlayTextBuilder.append("X: ");
+        appendGroupedInteger(overlayTextBuilder, x);
+        if (hasY) {
+            overlayTextBuilder.append("  Y: ").append(y);
+            if (waterSurfaceY != Integer.MIN_VALUE) {
+                overlayTextBuilder.append(" (").append(waterSurfaceY).append(')');
+            }
+        }
+        overlayTextBuilder.append("  Z: ");
+        appendGroupedInteger(overlayTextBuilder, z);
+        cachedCoordTextX = x;
+        cachedCoordTextY = y;
+        cachedCoordTextZ = z;
+        cachedCoordWaterY = waterSurfaceY;
+        cachedCoordHasY = hasY;
+        cachedCoordText = overlayTextBuilder.toString();
+        return cachedCoordText;
+    }
+
+    private String resolveCursorBiomeText(int x, int y, int z) {
+        boolean chunkLoaded = MapManager.getInstance().isViewingLiveDimension()
+                && this.minecraft != null && this.minecraft.level != null
+                && this.minecraft.level.hasChunk(x >> 4, z >> 4);
+        return resolveCursorBiomeText(x, y, z, chunkLoaded);
+    }
+
+    private static boolean isInvalidPlainsForDimension(String biomeId, boolean isNether, boolean isEnd) {
+        return (isNether || isEnd) && "minecraft:plains".equals(biomeId);
+    }
+
+    private static String inferNetherBiomeFromBlockId(String blockId) {
+        if (blockId == null || blockId.isBlank()) return "minecraft:nether_wastes";
+        if (blockId.contains("crimson") || blockId.contains("nether_wart_block") || blockId.contains("weeping_vines")) {
+            return "minecraft:crimson_forest";
+        }
+        if (blockId.contains("warped") || blockId.contains("twisting_vines")) {
+            return "minecraft:warped_forest";
+        }
+        if (blockId.contains("soul_sand") || blockId.contains("soul_soil") || blockId.contains("bone_block")) {
+            return "minecraft:soul_sand_valley";
+        }
+        if (blockId.contains("basalt") || blockId.contains("blackstone") || blockId.contains("magma_block")) {
+            return "minecraft:basalt_deltas";
+        }
+        return "minecraft:nether_wastes";
+    }
+
+    private String resolveSingleplayerGeneratorBiomeId(String currentDim, int x, int y, int z) {
+        if (this.minecraft == null) return null;
+        var server = this.minecraft.getSingleplayerServer();
+        if (server == null) return null;
+        try {
+            net.minecraft.resources.ResourceLocation dimLoc =
+                    net.minecraft.resources.ResourceLocation.tryParse(currentDim);
+            if (dimLoc == null) return null;
+            net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> levelKey =
+                    net.minecraft.resources.ResourceKey.create(
+                            net.minecraft.core.registries.Registries.DIMENSION, dimLoc);
+            net.minecraft.server.level.ServerLevel serverLevel = server.getLevel(levelKey);
+            if (serverLevel == null) return null;
+            var chunkSource = serverLevel.getChunkSource();
+            var biomeSource = chunkSource.getGenerator().getBiomeSource();
+            var sampler = chunkSource.randomState().sampler();
+            if (biomeSource == null || sampler == null) return null;
+            net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> holder =
+                    serverLevel.getBiomeManager()
+                            .withDifferentSource((qx, qy, qz) ->
+                                    biomeSource.getNoiseBiome(qx, qy, qz, sampler))
+                            .getBiome(new net.minecraft.core.BlockPos(x, y, z));
+            if (holder != null) {
+                return holder.unwrapKey()
+                        .map(k -> k.location().toString())
+                        .orElse(null);
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private String resolveCursorBiomeText(int x, int y, int z, boolean chunkLoaded) {
+        MapManager mapManager = MapManager.getInstance();
+        String currentDim = mapManager.getCurrentDimensionResourceId();
+        long caveRev = CaveMode.getRevision();
+        if (x == cachedBiomeX && y == cachedBiomeY && z == cachedBiomeZ
+                && currentDim.equals(cachedBiomeDimension)
+                && caveRev == cachedBiomeCaveRevision
+                && cachedBiomeText != null) {
+            return cachedBiomeText;
+        }
+
+        boolean isNether = "minecraft:the_nether".equals(currentDim);
+        boolean isEnd = "minecraft:the_end".equals(currentDim);
+        String resolvedId = null;
+
+        if (chunkLoaded && this.minecraft != null && this.minecraft.level != null) {
+            try {
+                int chunkX = x >> 4;
+                int chunkZ = z >> 4;
+                int localX = x & 15;
+                int localZ = z & 15;
+                int sampleX = x;
+                int sampleZ = z;
+                if (localX < 2 && !this.minecraft.level.hasChunk(chunkX - 1, chunkZ)) {
+                    sampleX = (chunkX << 4) + 2;
+                } else if (localX > 13 && !this.minecraft.level.hasChunk(chunkX + 1, chunkZ)) {
+                    sampleX = (chunkX << 4) + 13;
+                }
+                if (localZ < 2 && !this.minecraft.level.hasChunk(chunkX, chunkZ - 1)) {
+                    sampleZ = (chunkZ << 4) + 2;
+                } else if (localZ > 13 && !this.minecraft.level.hasChunk(chunkX, chunkZ + 1)) {
+                    sampleZ = (chunkX << 4) + 13;
+                }
+                net.minecraft.core.BlockPos biomePos = new net.minecraft.core.BlockPos(sampleX, y, sampleZ);
+                resolvedId = this.minecraft.level.getBiome(biomePos).unwrapKey()
+                        .map(key -> key.location().toString())
+                        .orElse(null);
+                if ("minecraft:plains".equals(resolvedId)
+                        || isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                    net.minecraft.world.level.chunk.LevelChunk chunk = this.minecraft.level.getChunk(chunkX, chunkZ);
+                    if (chunk != null) {
+                        String ownNoiseBiome = chunk.getNoiseBiome(sampleX >> 2, y >> 2, sampleZ >> 2)
+                                .unwrapKey()
+                                .map(key -> key.location().toString())
+                                .orElse(null);
+                        if (ownNoiseBiome != null && !ownNoiseBiome.isBlank()) {
+                            resolvedId = ownNoiseBiome;
+                        }
+                    }
+                    if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                        resolvedId = null;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        boolean caveActive = CaveMode.isActive(this.minecraft);
+        int targetLayer = caveActive
+                ? (CaveMode.isFullView(this.minecraft) ? Integer.MIN_VALUE : CaveMode.getLayerY(this.minecraft))
+                : Integer.MIN_VALUE;
+
+        if ((resolvedId == null || resolvedId.isBlank()) && caveActive) {
+            resolvedId = CaveMapManager.getInstance().getBiomeId(targetLayer, x, z);
+            if (isInvalidPlainsForDimension(resolvedId, isNether, isEnd)) {
+                resolvedId = null;
+            }
+        }
+
+        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+            String surfaceBiome = mapManager.getBiomeId(x, z);
+            if (surfaceBiome != null && !surfaceBiome.isBlank()
+                    && !isInvalidPlainsForDimension(surfaceBiome, isNether, isEnd)) {
+                if (resolvedId == null || resolvedId.isBlank()
+                        || !"minecraft:plains".equals(surfaceBiome)) {
+                    resolvedId = surfaceBiome;
+                }
+            }
+        }
+
+        int regionX = x >> 9;
+        int regionZ = z >> 9;
+        if ((resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId))
+                && mapManager.hasRegionFile(regionX, regionZ)
+                && !mapManager.isRegionLoadedInCache(regionX, regionZ)) {
+            mapManager.getRegion(regionX, regionZ, true);
+            MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
+        }
+
+        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+            String caveBiome = CaveMapManager.getInstance().getBiomeId(
+                    caveActive ? targetLayer : Integer.MIN_VALUE, x, z);
+            if (caveBiome != null && !caveBiome.isBlank()
+                    && !isInvalidPlainsForDimension(caveBiome, isNether, isEnd)) {
+                if (resolvedId == null || resolvedId.isBlank()
+                        || !"minecraft:plains".equals(caveBiome)) {
+                    resolvedId = caveBiome;
+                }
+            }
+        }
+
+        // In Singleplayer / LAN host, query the integrated server's thread-safe noise
+        // BiomeSource + BiomeManager zoom math whenever the cached region was evicted,
+        // not yet loaded, or had an older render-border "minecraft:plains" fallback baked in.
+        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+            String generatorBiome = resolveSingleplayerGeneratorBiomeId(currentDim, x, y, z);
+            if (generatorBiome != null && !generatorBiome.isBlank()
+                    && !isInvalidPlainsForDimension(generatorBiome, isNether, isEnd)) {
+                resolvedId = generatorBiome;
+            }
+        }
+
+        if (resolvedId == null || resolvedId.isBlank()) {
+            if (isNether) {
+                String blkId = cachedCursorInfo != null && cachedCursorX == x && cachedCursorZ == z
+                        ? cachedCursorInfo.id : null;
+                if (blkId == null || blkId.isBlank()) {
+                    blkId = caveActive
+                            ? CaveMapManager.getInstance().getBlockId(targetLayer, x, z)
+                            : mapManager.getBlockId(x, z);
+                }
+                resolvedId = inferNetherBiomeFromBlockId(blkId);
+            } else if (isEnd) {
+                resolvedId = "minecraft:the_end";
+            } else {
+                return null;
+            }
+        }
+
+        cachedBiomeText = formatBiomeDisplayName(resolvedId);
+        cachedBiomeX = x;
+        cachedBiomeY = y;
+        cachedBiomeZ = z;
+        cachedBiomeDimension = currentDim;
+        cachedBiomeCaveRevision = caveRev;
+        return cachedBiomeText;
+    }
+
+    private static String formatBlockDisplayName(String blockId) {
+        if (blockId == null || blockId.isBlank()
+                || "minecraft:air".equals(blockId)
+                || "minecraft:cave_air".equals(blockId)
+                || "minecraft:void_air".equals(blockId)) {
+            return "";
+        }
+        try {
+            net.minecraft.resources.ResourceLocation loc = net.minecraft.resources.ResourceLocation.tryParse(blockId);
+            if (loc != null && net.minecraft.core.registries.BuiltInRegistries.BLOCK.containsKey(loc)) {
+                net.minecraft.world.level.block.Block block = net.minecraft.core.registries.BuiltInRegistries.BLOCK.get(loc);
+                if (block != null && block != net.minecraft.world.level.block.Blocks.AIR) {
+                    String translated = block.getName().getString();
+                    if (translated != null && !translated.isBlank()) {
+                        return translated;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        int colon = blockId.indexOf(':');
+        String path = colon >= 0 ? blockId.substring(colon + 1) : blockId;
+        return prettifyId(path);
+    }
+
+    private static String formatBiomeDisplayName(String biomeId) {
+        if (biomeId == null || biomeId.isBlank()) return null;
+        int colon = biomeId.indexOf(':');
+        String namespace = colon >= 0 ? biomeId.substring(0, colon) : "minecraft";
+        String path = colon >= 0 ? biomeId.substring(colon + 1) : biomeId;
+        String translationKey = "biome." + namespace + "." + path;
+        try {
+            net.minecraft.locale.Language language = net.minecraft.locale.Language.getInstance();
+            if (language != null && language.has(translationKey)) {
+                String translated = Component.translatable(translationKey).getString();
+                if (translated != null && !translated.isBlank()
+                        && !translated.equals(translationKey)) {
+                    return translated;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return prettifyId(path);
+    }
+
+    private static void appendGroupedInteger(StringBuilder builder, int value) {
+        long absolute = Math.abs((long) value);
+        if (value < 0) builder.append('-');
+        long divisor = 1L;
+        int digits = 1;
+        while (divisor <= absolute / 10L) {
+            divisor *= 10L;
+            digits++;
+        }
+        while (divisor > 0L) {
+            builder.append((char) ('0' + (absolute / divisor) % 10L));
+            divisor /= 10L;
+            digits--;
+            if (digits > 0 && digits % 3 == 0) builder.append(',');
+        }
+    }
+
+    private static boolean isInside(double mouseX, double mouseY,
+            int left, int top, int right, int bottom) {
+        return mouseX >= left && mouseX <= right
+                && mouseY >= top && mouseY <= bottom;
+    }
+
+    /**
+     * Looks up cursor height without requiring the Minecraft chunk to remain loaded.
+     * Surface mode uses the persisted .smdat column, while layered/full cave modes
+     * use the v3 vertical-run archive (with the older full-cave snapshot as a fallback).
+     */
+    private BlockInfo resolveCursorBlockInfo(int bx, int bz, boolean chunkLoaded, long now) {
+        long revision = CaveMode.getRevision();
+        if (cursorCacheValid && cachedCursorX == bx && cachedCursorZ == bz
+                && cachedCursorRevision == revision
+                && now - cachedCursorAtNanos < CURSOR_CACHE_NANOS) {
+            return cachedCursorInfo;
+        }
+        BlockInfo resolved = null;
+        if (MapManager.getInstance().isViewingLiveDimension()
+                && chunkLoaded && this.minecraft != null && this.minecraft.level != null) {
+            resolved = getBlockInfoAt(this.minecraft.level, bx, bz);
+        }
+        if (resolved == null || resolved.name.isEmpty()) {
+            BlockInfo cached = getCachedBlockInfoAt(bx, bz);
+            if (cached != null) resolved = cached;
+        }
+        cachedCursorX = bx;
+        cachedCursorZ = bz;
+        cachedCursorRevision = revision;
+        cachedCursorAtNanos = now;
+        cachedCursorInfo = resolved;
+        cursorCacheValid = true;
+        return resolved;
+    }
+
+    private BlockInfo getCachedBlockInfoAt(int bx, int bz) {
+        if (this.minecraft == null || this.minecraft.level == null) return null;
+        MapManager manager = MapManager.getInstance();
+        CaveMapManager caveManager = CaveMapManager.getInstance();
+
+        if (CaveMode.isActive(this.minecraft)) {
+            boolean fullView = CaveMode.isFullView(this.minecraft);
+            int targetLayer = fullView
+                    ? Integer.MIN_VALUE
+                    : CaveMode.getLayerY(this.minecraft);
+            int cachedY = caveManager.getSurfaceY(targetLayer, bx, bz);
+            if (cachedY != CaveMapManager.NO_SURFACE) {
+                String blockId = caveManager.getBlockId(targetLayer, bx, bz);
+                if (blockId == null || blockId.isBlank()) {
+                    MapBlockData surfData = manager.getBlockData(bx, bz);
+                    if (surfData != null && !surfData.isEmpty()
+                            && (fullView || Math.abs(surfData.getReliefY() - cachedY) <= 2)) {
+                        blockId = manager.getBlockId(bx, bz);
+                    }
+                }
+                String blockName = formatBlockDisplayName(blockId);
+                return new BlockInfo(blockName, blockId != null ? blockId : "", cachedY, Integer.MIN_VALUE, true);
+            }
+            if (fullView) {
+                MapBlockData surfData = manager.getBlockData(bx, bz);
+                if (surfData != null && !surfData.isEmpty()) {
+                    String blockId = manager.getBlockId(bx, bz);
+                    String blockName = formatBlockDisplayName(blockId);
+                    int waterSurface = surfData.isFluid() && !surfData.isGlowing()
+                            ? surfData.topY : Integer.MIN_VALUE;
+                    return new BlockInfo(blockName, blockId != null ? blockId : "",
+                            surfData.getReliefY(), waterSurface, true);
+                }
+            }
+            return null;
+        }
+
+        MapBlockData data = manager.getBlockData(bx, bz);
+        if (data == null) {
+            int regionX = bx >> 9;
+            int regionZ = bz >> 9;
+            if (manager.hasRegionFile(regionX, regionZ)
+                    && !manager.isRegionLoadedInCache(regionX, regionZ)) {
+                manager.getRegion(regionX, regionZ, true);
+                MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
+            }
+            // In ceiling dimensions (or when Full Cave is already materialized from .mca),
+            // allow immediate fallback while the .smdat region loads asynchronously.
+            int caveY = caveManager.getSurfaceY(Integer.MIN_VALUE, bx, bz);
+            if (caveY != CaveMapManager.NO_SURFACE) {
+                String blockId = caveManager.getBlockId(Integer.MIN_VALUE, bx, bz);
+                String blockName = formatBlockDisplayName(blockId);
+                return new BlockInfo(blockName, blockId != null ? blockId : "", caveY, Integer.MIN_VALUE, true);
+            }
+            return null;
+        }
+        if (data.isEmpty()) return null;
+        String blockId = manager.getBlockId(bx, bz);
+        if (blockId == null || blockId.isBlank()) {
+            blockId = caveManager.getBlockId(Integer.MIN_VALUE, bx, bz);
+        }
+        String blockName = formatBlockDisplayName(blockId);
+        int waterSurface = data.isFluid() && !data.isGlowing()
+                ? data.topY : Integer.MIN_VALUE;
+        return new BlockInfo(blockName, blockId != null ? blockId : "", data.getReliefY(), waterSurface, true);
+    }
+
+    private BlockInfo getBlockInfoAt(net.minecraft.world.level.Level level, int bx, int bz) {
+        boolean scanFromWorldTop = CaveMode.shouldScanFromWorldTop(level);
+        int minBuildHeight = level.getMinBuildHeight();
+        net.minecraft.core.BlockPos.MutableBlockPos pos = new net.minecraft.core.BlockPos.MutableBlockPos(bx, 0, bz);
+
+        if (CaveMode.isActive(this.minecraft)) {
+            boolean fullView = CaveMode.isFullView(this.minecraft);
+            int layerY = fullView ? Integer.MIN_VALUE : CaveMode.getLayerY(this.minecraft);
+            int maxBuildY = level.getMaxBuildHeight() - 1;
+            int ceilingCap = level.dimensionType().hasCeiling() ? 122 : maxBuildY;
+            int scanMaximum = fullView
+                    ? ceilingCap
+                    : Math.min(ceilingCap, CaveMode.getScanMaximum(level, layerY));
+            int scanMinimum = fullView
+                    ? minBuildHeight
+                    : CaveMode.getScanMinimum(level, layerY);
+
+            int surfaceY = CaveMapManager.getInstance().getSurfaceY(layerY, bx, bz);
+            if (surfaceY != CaveMapManager.NO_SURFACE) {
+                // 1. If the cave floor is under water (surfaceY = floorY), walk up to find waterSurfaceY
+                // so the cursor displays Y: floorY (waterSurfaceY) consistently.
+                if (surfaceY + 1 <= scanMaximum) {
+                    pos.setY(surfaceY + 1);
+                    net.minecraft.world.level.block.state.BlockState aboveState = level.getBlockState(pos);
+                    if (aboveState.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
+                        int waterTopY = surfaceY + 1;
+                        for (int wy = surfaceY + 2; wy <= scanMaximum; wy++) {
+                            pos.setY(wy);
+                            if (!level.getBlockState(pos).getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
+                                break;
+                            }
+                            waterTopY = wy;
+                        }
+                        pos.setY(surfaceY);
+                        net.minecraft.world.level.block.state.BlockState floorState = level.getBlockState(pos);
+                        String floorId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                                .getKey(floorState.getBlock()).toString();
+                        return new BlockInfo(floorState.getBlock().getName().getString(),
+                                floorId, surfaceY, waterTopY);
+                    }
+                    // 2. Check surfaceY + 1 in case a thin floor block (carpet/rail) adjusted height by -1
+                    if (!aboveState.isAir()
+                            && !CaveMode.isCaveOpenOrInvisible(aboveState, MapConfig.displayFlowers)
+                            && CaveMode.isShortFloorBlock(level, pos, aboveState)) {
+                        String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                                .getKey(aboveState.getBlock()).toString();
+                        return new BlockInfo(aboveState.getBlock().getName().getString(),
+                                blockId, surfaceY);
+                    }
+                }
+                pos.setY(surfaceY);
+                net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+                if (!state.isAir()) {
+                    return createBlockInfo(level, pos, surfaceY);
+                }
+                String cachedBlockId = CaveMapManager.getInstance().getBlockId(layerY, bx, bz);
+                return new BlockInfo(formatBlockDisplayName(cachedBlockId),
+                        cachedBlockId != null ? cachedBlockId : "", surfaceY, Integer.MIN_VALUE, true);
+            }
+
+            // If this chunk is already live in CaveRegion at the current layer and getSurfaceY
+            // is NO_SURFACE, this pixel is genuinely empty cave void — do not return a fake Y: -64.
+            if (CaveMapManager.getInstance().isChunkLiveAtLayer(layerY, bx >> 4, bz >> 4)) {
+                return null;
+            }
+
+            boolean isCaveDim = scanFromWorldTop;
+            boolean hasCeiling = level.dimensionType().hasCeiling();
+            boolean shouldEnterGround = fullView && !isCaveDim;
+            boolean underair = fullView && !hasCeiling;
+            boolean passedSolidRoof = fullView || isCaveDim;
+            boolean showFlowers = MapConfig.displayFlowers;
+
+            for (int y = scanMaximum; y >= scanMinimum; y--) {
+                pos.setY(y);
+                net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+                if (state.isAir()) {
+                    if (!shouldEnterGround) underair = true;
+                    continue;
+                }
+                if (shouldEnterGround) {
+                    if (CaveMode.isUndergroundSolidRoof(state)) {
+                        shouldEnterGround = false;
+                        underair = false;
+                        passedSolidRoof = true;
+                    }
+                    continue;
+                }
+                if (!underair) {
+                    if (CaveMode.isCaveOpenOrInvisible(state, showFlowers)) {
+                        underair = true;
+                        continue;
+                    }
+                    boolean isLavaFluid = state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA)
+                            || state.is(net.minecraft.world.level.block.Blocks.LAVA);
+                    boolean isOpenSkyWater = !fullView && !passedSolidRoof
+                            && state.getFluidState().is(net.minecraft.tags.FluidTags.WATER);
+                    if (isLavaFluid || isOpenSkyWater) {
+                        underair = true;
+                    } else if (!fullView && !passedSolidRoof
+                            && !CaveMode.isUndergroundSolidRoof(state)) {
+                        underair = true;
+                    } else {
+                        passedSolidRoof = true;
+                        continue;
+                    }
+                }
+                if (CaveMode.isCaveOpenOrInvisible(state, showFlowers)
+                        || (fullView && state.is(net.minecraft.tags.BlockTags.LEAVES))) {
+                    continue;
+                }
+                if (CaveMode.isShortFloorBlock(level, pos, state) && y > minBuildHeight) {
+                    String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                            .getKey(state.getBlock()).toString();
+                    return new BlockInfo(state.getBlock().getName().getString(),
+                            blockId, y - 1);
+                }
+                return createBlockInfo(level, pos, y);
+            }
+            return null;
+        }
+
+        int surfaceY = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE, bx, bz);
+        if (surfaceY <= minBuildHeight && scanFromWorldTop) {
+            surfaceY = level.getMaxBuildHeight() - 1;
+        }
+        int highestY = minBuildHeight;
+        for (int y = Math.min(level.getMaxBuildHeight() - 1, surfaceY); y >= minBuildHeight; y--) {
+            pos.setY(y);
+            net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+            if (!state.isAir()
+                    && !CaveMode.isCaveOpenOrInvisible(state, MapConfig.displayFlowers)
+                    && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE) {
+                highestY = y;
+                break;
+            }
+        }
+
+        if (highestY > minBuildHeight) {
+            pos.setY(highestY);
+            net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+            String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+            return createBlockInfo(level, pos, highestY);
+        }
+        return new BlockInfo("", "", minBuildHeight);
+    }
+
+    private boolean isRenderableSliceState(net.minecraft.world.level.Level level,
+            net.minecraft.core.BlockPos.MutableBlockPos pos,
+            net.minecraft.world.level.block.state.BlockState state) {
+        boolean openEmitter = state.getLightEmission() > 0
+                && state.getFluidState().isEmpty()
+                && (state.is(net.minecraft.world.level.block.Blocks.FIRE)
+                        || state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
+                        || caveStateClassifier.isCollisionEmpty(level, pos, state));
+        boolean flower = MapConfig.displayFlowers
+                && visualClassifier.info(state).flower();
+        if (openEmitter || flower || !state.getFluidState().isEmpty()) return true;
+        return !state.isAir()
+                && !caveStateClassifier.isCollisionEmpty(level, pos, state)
+                && state.getMapColor(level, pos) != net.minecraft.world.level.material.MapColor.NONE;
+    }
+
+    private BlockInfo getCaveBlockInfoAtY(net.minecraft.world.level.Level level,
+            net.minecraft.core.BlockPos.MutableBlockPos pos, int openY) {
+        pos.setY(openY);
+        net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+        boolean openEmitter = state.getLightEmission() > 0
+                && state.getFluidState().isEmpty()
+                && (state.is(net.minecraft.world.level.block.Blocks.FIRE)
+                        || state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
+                        || caveStateClassifier.isCollisionEmpty(level, pos, state));
+        if (openEmitter) {
+            String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                    .getKey(state.getBlock()).toString();
+            return new BlockInfo(state.getBlock().getName().getString(), blockId, openY);
+        }
+        if (state.getFluidState().isEmpty()) {
+            boolean openSpace = state.isAir() || caveStateClassifier.isCollisionEmpty(level, pos, state);
+            if (!openSpace || openY <= level.getMinBuildHeight()) return null;
+            pos.setY(openY - 1);
+            state = level.getBlockState(pos);
+            boolean floorOpen = state.isAir()
+                    || (caveStateClassifier.isCollisionEmpty(level, pos, state) && state.getFluidState().isEmpty());
+            if (floorOpen) return null;
+        }
+        String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                .getKey(state.getBlock()).toString();
+        return createBlockInfo(level, pos, pos.getY());
+    }
+
+    private BlockInfo createBlockInfo(net.minecraft.world.level.Level level,
+            net.minecraft.core.BlockPos.MutableBlockPos pos, int visibleY) {
+        pos.setY(visibleY);
+        net.minecraft.world.level.block.state.BlockState visibleState = level.getBlockState(pos);
+        if (visibleState.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) {
+            int waterSurfaceY = visibleY;
+            int bottomY = visibleY;
+            net.minecraft.world.level.block.state.BlockState bottomState = visibleState;
+            for (int y = visibleY - 1; y >= level.getMinBuildHeight(); y--) {
+                pos.setY(y);
+                net.minecraft.world.level.block.state.BlockState candidate = level.getBlockState(pos);
+                if (candidate.getFluidState().is(net.minecraft.tags.FluidTags.WATER)
+                        || candidate.isAir()
+                        || caveStateClassifier.isCollisionEmpty(level, pos, candidate)) continue;
+                bottomY = y;
+                bottomState = candidate;
+                break;
+            }
+            String bottomId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                    .getKey(bottomState.getBlock()).toString();
+            return new BlockInfo(bottomState.getBlock().getName().getString(), bottomId,
+                    bottomY, waterSurfaceY);
+        }
+        String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                .getKey(visibleState.getBlock()).toString();
+        return new BlockInfo(visibleState.getBlock().getName().getString(), blockId, visibleY);
+    }
+
+    private static String prettifyId(String id) {
+        String[] parts = id.split("_");
+        StringBuilder result = new StringBuilder();
+        for (String part : parts) {
+            if (part.isEmpty()) continue;
+            if (!result.isEmpty()) result.append(' ');
+            result.append(Character.toUpperCase(part.charAt(0))).append(part.substring(1));
+        }
+        return result.toString();
+    }
+
+    private String getPopupMenuHeaderText() {
+        if (clickedWaypoint != null) {
+            String rawName = clickedWaypoint.name != null && !clickedWaypoint.name.isBlank()
+                    ? clickedWaypoint.name : "Waypoint";
+            return rawName.length() > 26 ? rawName.substring(0, 24) + "..." : rawName;
+        }
+        int bx = (int) Math.floor(popupWorldX);
+        int bz = (int) Math.floor(popupWorldZ);
+        return String.format(Locale.ROOT, "X: %d, Z: %d", bx, bz);
+    }
+
+    private int getPopupMenuHeight() {
+        int rows = clickedWaypoint != null ? 5 : 3;
+        return POPUP_HEADER_HEIGHT + 1 + rows * POPUP_ROW_HEIGHT;
+    }
+
+    private int getPopupMenuWidth() {
+        Component optAddOrDelete = clickedWaypoint != null
+                ? Component.translatable("gui.simplemap.popup.delete_waypoint")
+                : Component.translatable("gui.simplemap.add_waypoint");
+        Component optTeleport = Component.translatable("gui.simplemap.teleport_here");
+        Component optShare = Component.translatable("gui.simplemap.popup.share_location");
+        int maxW = Math.max(this.font.width(optAddOrDelete),
+                Math.max(this.font.width(optTeleport), this.font.width(optShare)));
+        if (clickedWaypoint != null) {
+            Component optEdit = Component.translatable("gui.simplemap.edit_waypoint");
+            boolean isCurrentlyFollowing = MapConfig.pinActive &&
+                    Math.abs(MapConfig.pinWorldX - clickedWaypoint.x) < 0.01 &&
+                    Math.abs(MapConfig.pinWorldZ - clickedWaypoint.z) < 0.01;
+            Component optFollow = isCurrentlyFollowing
+                    ? Component.translatable("gui.simplemap.popup.stop_following")
+                    : Component.translatable("gui.simplemap.popup.follow_waypoint");
+            maxW = Math.max(maxW, Math.max(this.font.width(optEdit), this.font.width(optFollow)));
+        }
+        int headerW = this.font.width(getPopupMenuHeaderText()) + 14;
+        int desired = Math.max(116, Math.max(maxW + 18, headerW + 14));
+        if (this.width > POPUP_SCREEN_MARGIN * 2) {
+            return Math.min(desired, Math.max(100, this.width - POPUP_SCREEN_MARGIN * 2));
+        }
+        return desired;
+    }
+
+    private void clampPopupPosition(double anchorX, double anchorY) {
+        int menuWidth = getPopupMenuWidth();
+        int menuHeight = getPopupMenuHeight();
+        double targetX = anchorX;
+        double targetY = anchorY;
+        if (this.width > 0 && targetX + menuWidth + POPUP_SCREEN_MARGIN > this.width) {
+            targetX = anchorX - menuWidth - 2;
+        }
+        if (this.height > 0 && targetY + menuHeight + POPUP_SCREEN_MARGIN > this.height) {
+            targetY = anchorY - menuHeight - 2;
+        }
+        double maxAllowedX = Math.max(POPUP_SCREEN_MARGIN, this.width - menuWidth - POPUP_SCREEN_MARGIN);
+        double maxAllowedY = Math.max(POPUP_SCREEN_MARGIN, this.height - menuHeight - POPUP_SCREEN_MARGIN);
+        popupX = Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedX, targetX));
+        popupY = Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedY, targetY));
+    }
+
+    private void drawPopupMenuRow(GuiGraphics guiGraphics, int x, int rowY, int width,
+            Component label, boolean hovered, boolean enabled, int textColor, int accentColor) {
+        if (hovered && enabled) {
+            guiGraphics.fill(x + 1, rowY, x + width - 1, rowY + POPUP_ROW_HEIGHT - 1, 0xFF262B33);
+            guiGraphics.fill(x + 1, rowY + 2, x + 3, rowY + POPUP_ROW_HEIGHT - 3, accentColor);
+        }
+        guiGraphics.drawString(this.font, label, x + 8, rowY + 6,
+                enabled ? textColor : 0xFF6E737B, false);
+    }
+
+    private void drawPopupMenu(GuiGraphics guiGraphics, int mouseX, int mouseY) {
+        guiGraphics.pose().pushPose();
+        guiGraphics.pose().translate(0, 0, 100); // Draw on top of everything
+
+        int menuWidth = getPopupMenuWidth();
+        int menuHeight = getPopupMenuHeight();
+        double maxAllowedX = Math.max(POPUP_SCREEN_MARGIN, this.width - menuWidth - POPUP_SCREEN_MARGIN);
+        double maxAllowedY = Math.max(POPUP_SCREEN_MARGIN, this.height - menuHeight - POPUP_SCREEN_MARGIN);
+        int x = (int) Math.round(Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedX, popupX)));
+        int y = (int) Math.round(Math.max(POPUP_SCREEN_MARGIN, Math.min(maxAllowedY, popupY)));
+        popupX = x;
+        popupY = y;
+
+        // Subtle drop shadow + dark slate surface + crisp border
+        guiGraphics.fill(x + 2, y + 2, x + menuWidth + 2, y + menuHeight + 2, 0x66000000);
+        guiGraphics.fill(x, y, x + menuWidth, y + menuHeight, 0xF214171C);
+        guiGraphics.fill(x + 1, y + 1, x + menuWidth - 1, y + POPUP_HEADER_HEIGHT, 0xFF1D222A);
+        guiGraphics.fill(x + 1, y + POPUP_HEADER_HEIGHT, x + menuWidth - 1, y + POPUP_HEADER_HEIGHT + 1, 0xFF323842);
+        guiGraphics.renderOutline(x, y, menuWidth, menuHeight, 0xFF454C59);
+
+        // Header badge + title (Waypoint name or World X/Z coordinates)
+        int badgeColor = 0xFF00E5FF;
+        if (clickedWaypoint != null) {
+            badgeColor = clickedWaypoint.deathPoint ? 0xFFFF5252
+                    : (clickedWaypoint.iconType == 0 ? 0xFFFF3D00
+                    : (clickedWaypoint.iconType == 1 ? 0xFF00E676
+                    : (clickedWaypoint.iconType == 2 ? 0xFF2979FF
+                    : (clickedWaypoint.iconType == 3 ? 0xFFFFD600 : 0xFFFFD54F))));
+        }
+        guiGraphics.fill(x + 6, y + 6, x + 14, y + 14, 0xFF0B0D10);
+        guiGraphics.fill(x + 7, y + 7, x + 13, y + 13, badgeColor);
+        int headerColor = clickedWaypoint != null ? 0xFFFFE082 : 0xFFB0BEC5;
+        guiGraphics.drawString(this.font, getPopupMenuHeaderText(), x + 18, y + 6, headerColor, false);
+
+        int rowsStartY = y + POPUP_HEADER_HEIGHT + 1;
+        boolean insideMenuX = mouseX >= x && mouseX <= x + menuWidth;
+        boolean canTeleport = MapTeleportController.canTeleport(this.minecraft);
+
+        if (clickedWaypoint != null) {
+            boolean isCurrentlyFollowing = MapConfig.pinActive &&
+                    Math.abs(MapConfig.pinWorldX - clickedWaypoint.x) < 0.01 &&
+                    Math.abs(MapConfig.pinWorldZ - clickedWaypoint.z) < 0.01;
+            Component followText = isCurrentlyFollowing
+                    ? Component.translatable("gui.simplemap.popup.stop_following")
+                    : Component.translatable("gui.simplemap.popup.follow_waypoint");
+
+            Component[] labels = new Component[] {
+                    Component.translatable("gui.simplemap.edit_waypoint"),
+                    Component.translatable("gui.simplemap.popup.delete_waypoint"),
+                    Component.translatable("gui.simplemap.teleport_here"),
+                    Component.translatable("gui.simplemap.popup.share_location"),
+                    followText
+            };
+            boolean[] enabled = new boolean[] { true, true, canTeleport, true, true };
+            int[] textColors = new int[] { 0xFFFFFFFF, 0xFFFF8A80, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+            int[] accents = new int[] { 0xFF00E5FF, 0xFFFF5252, 0xFF00E5FF, 0xFF00E5FF, 0xFFFFD54F };
+
+            for (int i = 0; i < labels.length; i++) {
+                int rowY = rowsStartY + i * POPUP_ROW_HEIGHT;
+                boolean hovered = insideMenuX && mouseY >= rowY && mouseY < rowY + POPUP_ROW_HEIGHT;
+                drawPopupMenuRow(guiGraphics, x, rowY, menuWidth, labels[i],
+                        hovered, enabled[i], textColors[i], accents[i]);
+            }
+        } else {
+            Component[] labels = new Component[] {
+                    Component.translatable("gui.simplemap.add_waypoint"),
+                    Component.translatable("gui.simplemap.teleport_here"),
+                    Component.translatable("gui.simplemap.popup.share_location")
+            };
+            boolean[] enabled = new boolean[] { true, canTeleport, true };
+            for (int i = 0; i < labels.length; i++) {
+                int rowY = rowsStartY + i * POPUP_ROW_HEIGHT;
+                boolean hovered = insideMenuX && mouseY >= rowY && mouseY < rowY + POPUP_ROW_HEIGHT;
+                drawPopupMenuRow(guiGraphics, x, rowY, menuWidth, labels[i],
+                        hovered, enabled[i], 0xFFFFFFFF, 0xFF00E5FF);
+            }
+        }
+
+        guiGraphics.pose().popPose();
+    }
+
+    private void markViewportInteraction() {
+        long now = System.nanoTime();
+        if (lastViewportInteractionNanos == 0L
+                || now - lastViewportInteractionNanos
+                        >= VIEWPORT_INTERACTION_SETTLE_NANOS) {
+            MapViewportCoordinator.getInstance().beginFullscreenInteraction();
+        }
+        lastViewportInteractionNanos = now;
+    }
+
+    private boolean isViewportInteracting(long nowNanos) {
+        return isDragging
+                || (caveLayerSlider != null && caveLayerSlider.isDragging())
+                || Math.abs(momentumX) > 0.5 || Math.abs(momentumZ) > 0.5
+                || nowNanos - lastViewportInteractionNanos
+                        < ACTIVE_PAN_SETTLE_NANOS;
+    }
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (SimpleMap.ClientModEvents.OPEN_MAP_KEY.matches(keyCode, scanCode)) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.OPEN_MAP_KEY);
+            this.onClose();
+            return true;
+        }
+        if (SimpleMap.ClientModEvents.ZOOM_IN_KEY.matches(keyCode, scanCode)) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.ZOOM_IN_KEY);
+            markViewportInteraction();
+            this.scale = Math.min(12.0f, this.scale * 1.15f);
+            return true;
+        }
+        if (SimpleMap.ClientModEvents.ZOOM_OUT_KEY.matches(keyCode, scanCode)) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.ZOOM_OUT_KEY);
+            markViewportInteraction();
+            this.scale = Math.max(getMinimumStableScale(), this.scale / 1.15f);
+            return true;
+        }
+        if ((keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_HOME
+                || SimpleMap.ClientModEvents.CENTER_FULL_MAP_KEY.matches(keyCode, scanCode))
+                && this.minecraft != null && this.minecraft.player != null) {
+            consumeBufferedClicks(SimpleMap.ClientModEvents.CENTER_FULL_MAP_KEY);
+            markViewportInteraction();
+            this.centerX = this.minecraft.player.getX();
+            this.centerZ = this.minecraft.player.getZ();
+            this.scale = DEFAULT_MAP_SCALE;
+            return true;
+        }
+        if (MapDebugRecorder.DEBUG_ENABLED) {
+            if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F8
+                    || SimpleMap.ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY.matches(keyCode, scanCode)) {
+                consumeBufferedClicks(SimpleMap.ClientModEvents.TOGGLE_DEBUG_OVERLAY_KEY);
+                MapDebugRecorder.getInstance().toggleOverlay();
+                return true;
+            }
+            if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F9
+                    || SimpleMap.ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY.matches(keyCode, scanCode)) {
+                consumeBufferedClicks(SimpleMap.ClientModEvents.TOGGLE_DEBUG_RECORDING_KEY);
+                MapDebugRecorder.getInstance().toggleRecording(this.minecraft);
+                return true;
+            }
+            if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_F10
+                    || SimpleMap.ClientModEvents.MARK_DEBUG_ISSUE_KEY.matches(keyCode, scanCode)) {
+                consumeBufferedClicks(SimpleMap.ClientModEvents.MARK_DEBUG_ISSUE_KEY);
+                MapDebugRecorder.getInstance().markIssue(this.minecraft);
+                return true;
+            }
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    private static void consumeBufferedClicks(net.minecraft.client.KeyMapping mapping) {
+        while (mapping.consumeClick()) {
+            // Prevent Screen.keyPressed and the next client tick from handling the same key.
+        }
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        // If map is not unlocked, only allow clicking screen widgets (buttons)
+        if (!SimpleMap.isMapUnlocked(this.minecraft.player)) {
+            return super.mouseClicked(mouseX, mouseY, button);
+        }
+
+        // Click the visible bottom-right player-coordinate panel to share in chat.
+        if (this.minecraft != null && this.minecraft.player != null) {
+            String playerText = getPlayerCoordinatesText();
+            int panelWidth = this.font.width(playerText) + 10;
+            int panelRight = this.width - PLAYER_PANEL_MARGIN;
+            int panelBottom = this.height - PLAYER_PANEL_MARGIN;
+            int panelLeft = panelRight - panelWidth;
+            int panelTop = panelBottom - PLAYER_PANEL_HEIGHT;
+            if (isInside(mouseX, mouseY,
+                    panelLeft, panelTop, panelRight, panelBottom)) {
+                net.minecraft.world.entity.player.Player player = this.minecraft.player;
+                String shareText = Component.translatable("gui.simplemap.share_player_coords",
+                        (int) Math.floor(player.getX()),
+                        (int) Math.floor(player.getY()),
+                        (int) Math.floor(player.getZ())).getString();
+                // Copy to Clipboard
+                this.minecraft.keyboardHandler.setClipboard(shareText);
+                player.sendSystemMessage(Component.translatable("gui.simplemap.coords_copied"));
+
+                // Open Chat Screen with the pre-filled text
+                this.onClose();
+                this.minecraft.setScreen(new net.minecraft.client.gui.screens.ChatScreen(shareText));
+                return true;
+            }
+        }
+
+        // 1. If context menu is open, handle its options first
+        if (isPopupMenuOpen && button == 0) {
+            int menuWidth = getPopupMenuWidth();
+            int menuHeight = getPopupMenuHeight();
+            int rowsStartY = (int) Math.round(popupY) + POPUP_HEADER_HEIGHT + 1;
+            if (mouseX >= popupX && mouseX <= popupX + menuWidth
+                    && mouseY >= popupY && mouseY <= popupY + menuHeight) {
+                if (mouseY < rowsStartY) {
+                    // Clicked on the header bar: keep menu open without triggering a row
+                    return true;
+                }
+                int rowIndex = (int) Math.floor((mouseY - rowsStartY) / (double) POPUP_ROW_HEIGHT);
+                if (clickedWaypoint != null) {
+                    Waypoint targetWp = clickedWaypoint;
+                    if (rowIndex == 0) {
+                        // Row 0: Edit Waypoint
+                        isPopupMenuOpen = false;
+                        clickedWaypoint = null;
+                        if (this.minecraft != null) {
+                            this.minecraft.setScreen(new MapConfigScreen.WaypointListScreen.AddWaypointScreen(
+                                    this, targetWp));
+                        }
+                    } else if (rowIndex == 1) {
+                        // Row 1: Delete Waypoint
+                        WaypointManager.getInstance().removeWaypoint(targetWp);
+                        clickedWaypoint = null;
+                        isPopupMenuOpen = false;
+                    } else if (rowIndex == 2) {
+                        // Row 2: Teleport Here
+                        if (MapTeleportController.canTeleport(this.minecraft)) {
+                            isPopupMenuOpen = false;
+                            clickedWaypoint = null;
+                            int tpX = (int) Math.floor(targetWp.x);
+                            int tpZ = (int) Math.floor(targetWp.z);
+                            String targetDimension = targetWp.dimension != null && !targetWp.dimension.isBlank()
+                                    ? targetWp.dimension
+                                    : MapManager.getInstance().getCurrentDimensionResourceId();
+                            int tpY = (int) Math.floor(targetWp.y);
+                            if (MapTeleportController.teleport(this.minecraft, targetDimension,
+                                    tpX, tpY, tpZ)) {
+                                this.onClose();
+                            }
+                        }
+                    } else if (rowIndex == 3) {
+                        // Row 3: Share Location
+                        String dimension = targetWp.dimension != null && !targetWp.dimension.isBlank()
+                                ? targetWp.dimension
+                                : MapManager.getInstance().getCurrentDimensionResourceId();
+                        isPopupMenuOpen = false;
+                        clickedWaypoint = null;
+                        this.onClose();
+                        WaypointManager.shareLocation(this.minecraft, targetWp.name,
+                                targetWp.x, targetWp.y, targetWp.z, true, dimension);
+                    } else if (rowIndex == 4) {
+                        // Row 4: Follow / Stop Following Waypoint
+                        boolean isCurrentlyFollowing = MapConfig.pinActive &&
+                                Math.abs(MapConfig.pinWorldX - targetWp.x) < 0.01 &&
+                                Math.abs(MapConfig.pinWorldZ - targetWp.z) < 0.01;
+                        if (isCurrentlyFollowing) {
+                            PinNavigation.clear();
+                        } else {
+                            PinNavigation.activate(targetWp.x, targetWp.z);
+                        }
+                        MapManager.getInstance().savePin();
+                        isPopupMenuOpen = false;
+                        clickedWaypoint = null;
+                    }
+                } else {
+                    if (rowIndex == 0) {
+                        // Row 0: Add Waypoint
+                        isPopupMenuOpen = false;
+                        if (this.minecraft != null) {
+                            String waypointDimension = MapManager.getInstance()
+                                    .getCurrentDimensionResourceId();
+                            int waypointY = resolveTeleportTargetY(
+                                    (int) Math.floor(popupWorldX),
+                                    (int) Math.floor(popupWorldZ), waypointDimension);
+                            this.minecraft.setScreen(new MapConfigScreen.WaypointListScreen.AddWaypointScreen(this,
+                                    popupWorldX, waypointY, popupWorldZ,
+                                    waypointDimension));
+                        }
+                    } else if (rowIndex == 1) {
+                        // Row 1: Teleport Here
+                        if (MapTeleportController.canTeleport(this.minecraft)) {
+                            isPopupMenuOpen = false;
+                            int tpX = (int) Math.floor(popupWorldX);
+                            int tpZ = (int) Math.floor(popupWorldZ);
+                            String targetDimension = MapManager.getInstance()
+                                    .getCurrentDimensionResourceId();
+                            int targetY = resolveTeleportTargetY(tpX, tpZ, targetDimension);
+                            if (MapTeleportController.teleport(this.minecraft, targetDimension,
+                                    tpX, targetY, tpZ)) {
+                                this.onClose();
+                            }
+                        }
+                    } else if (rowIndex == 2) {
+                        // Row 2: Share Location
+                        String dimension = MapManager.getInstance()
+                                .getCurrentDimensionResourceId();
+                        int targetY = resolveTeleportTargetY(
+                                (int) Math.floor(popupWorldX),
+                                (int) Math.floor(popupWorldZ), dimension);
+                        isPopupMenuOpen = false;
+                        this.onClose();
+                        WaypointManager.shareLocation(this.minecraft, null,
+                                popupWorldX, targetY, popupWorldZ, true, dimension);
+                    }
+                }
+                return true;
+            }
+            isPopupMenuOpen = false; // Clicked outside the menu, close it
+            clickedWaypoint = null;
+        }
+
+        // 2. Standard button clicks
+        if (super.mouseClicked(mouseX, mouseY, button)) {
+            return true;
+        }
+
+        // 3. Left click: start drag tracking; determine if it's a click vs drag on mouseReleased
+        if (button == 0) {
+            cancelMotionAndOpenAnimation();
+            this.isDragging = true;
+            dragStartX = mouseX;
+            dragStartZ = mouseY;
+            lastDragSampleNanos = System.nanoTime();
+            return true;
+        }
+
+        // 4. Right click opens the popup context menu (clamped inside screen bounds)
+        if (button == 1) {
+            popupWorldX = centerX + (mouseX - this.width / 2.0) / currentRenderScale;
+            popupWorldZ = centerZ + (mouseY - this.height / 2.0) / currentRenderScale;
+
+            // Check if right-clicking on an existing waypoint
+            clickedWaypoint = null;
+            java.util.List<WaypointManager.Waypoint> waypoints = WaypointManager.getInstance()
+                    .getWaypointsForDimension(MapManager.getInstance()
+                            .getCurrentDimensionResourceId());
+            double nearestDistance = Double.POSITIVE_INFINITY;
+            for (WaypointManager.Waypoint wp : waypoints) {
+                double hoverRadius = MapRenderer.waypointHitRadiusWorld(
+                        wp, currentRenderScale);
+                if (Math.abs(popupWorldX - wp.x) <= hoverRadius && Math.abs(popupWorldZ - wp.z) <= hoverRadius) {
+                    double distance = Math.hypot(popupWorldX - wp.x,
+                            popupWorldZ - wp.z);
+                    if (distance < nearestDistance) {
+                        clickedWaypoint = wp;
+                        nearestDistance = distance;
+                    }
+                }
+            }
+
+            clampPopupPosition(mouseX, mouseY);
+            isPopupMenuOpen = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    private int resolveTeleportTargetY(int blockX, int blockZ, String targetDimension) {
+        MapManager manager = MapManager.getInstance();
+        int minimumY = this.minecraft != null && this.minecraft.level != null
+                ? this.minecraft.level.getMinBuildHeight() : -64;
+
+        // Only query ClientLevel blocks when the map is displaying that live level.
+        // A remotely viewed Nether/End/modded map must never sample Overworld chunks.
+        if (manager.isViewingLiveDimension() && this.minecraft != null
+                && this.minecraft.level != null) {
+            net.minecraft.world.level.Level level = this.minecraft.level;
+            if (level.hasChunk(blockX >> 4, blockZ >> 4)) {
+                BlockInfo live = getBlockInfoAt(level, blockX, blockZ);
+                if (live != null && live.y > level.getMinBuildHeight()) {
+                    int surfaceY = live.waterSurfaceY != Integer.MIN_VALUE
+                            ? live.waterSurfaceY : live.y;
+                    return surfaceY + 2;
+                }
+            }
+        }
+
+        BlockInfo cached = getCachedBlockInfoAt(blockX, blockZ);
+        if (cached != null && cached.y > minimumY) {
+            int surfaceY = cached.waterSurfaceY != Integer.MIN_VALUE
+                    ? cached.waterSurfaceY : cached.y;
+            return surfaceY + 2;
+        }
+        return MapTeleportController.defaultTargetY(targetDimension);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (button == 0) {
+            boolean wasDragging = this.isDragging;
+            this.isDragging = false;
+
+            // If mouse barely moved, treat as a click -> place/remove pin
+            double moved = Math.sqrt(Math.pow(mouseX - dragStartX, 2) + Math.pow(mouseY - dragStartZ, 2));
+            if (wasDragging && moved < 4.0 && !isPopupMenuOpen && MapManager.getInstance().hasLearnedMap()) {
+                momentumX = 0.0;
+                momentumZ = 0.0;
+                double clickWorldX = centerX + (mouseX - 1 - (this.width - 2) / 2.0) / currentRenderScale;
+                double clickWorldZ = centerZ + (mouseY - 1 - (this.height - 2) / 2.0) / currentRenderScale;
+
+                double snappedPinX = Math.floor(clickWorldX) + 0.5;
+                double snappedPinZ = Math.floor(clickWorldZ) + 0.5;
+
+                // Click same pin again within 4 screen-pixels -> remove
+                if (MapConfig.pinActive && Math.abs(snappedPinX - MapConfig.pinWorldX) < 4.0 / currentRenderScale && Math.abs(snappedPinZ - MapConfig.pinWorldZ) < 4.0 / currentRenderScale) {
+                    PinNavigation.clear();
+                } else {
+                    PinNavigation.activate(snappedPinX, snappedPinZ);
+                }
+                MapManager.getInstance().savePin();
+            }
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+        if (!MapManager.getInstance().hasLearnedMap()) {
+            return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+        }
+
+        if (this.isDragging) {
+            markViewportInteraction();
+            // Drag direction moves the map camera center in the opposite direction.
+            double deltaX = -dragX / this.scale;
+            double deltaZ = -dragY / this.scale;
+            this.centerX += deltaX;
+            this.centerZ += deltaZ;
+            long now = System.nanoTime();
+            double seconds = lastDragSampleNanos == 0L ? 0.0
+                    : Math.max(0.001, Math.min(0.050,
+                            (now - lastDragSampleNanos) / 1_000_000_000.0));
+            lastDragSampleNanos = now;
+            if (seconds > 0.0) {
+                double sampleX = deltaX / seconds;
+                double sampleZ = deltaZ / seconds;
+                momentumX = clampMomentum(momentumX * 0.35 + sampleX * 0.65);
+                momentumZ = clampMomentum(momentumZ * 0.35 + sampleZ * 0.65);
+            }
+            return true;
+        }
+        return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    private static double clampMomentum(double value) {
+        return Math.max(-MAX_MOMENTUM_BLOCKS_PER_SECOND,
+                Math.min(MAX_MOMENTUM_BLOCKS_PER_SECOND, value));
+    }
+
+    private float getMinimumStableScale() {
+        double guiScale = this.minecraft == null || this.minecraft.getWindow() == null
+                ? 1.0D : Math.max(1.0D, this.minecraft.getWindow().getGuiScale());
+        return Math.max(0.015625f, (float) (0.0625D / guiScale));
+    }
+
+    private void clampScaleForCurrentMode() {
+        float minimum = getMinimumStableScale();
+        if (this.scale >= minimum) return;
+        this.scale = minimum;
+        this.currentRenderScale = Math.max(this.currentRenderScale, minimum);
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        if (!MapManager.getInstance().hasLearnedMap()) {
+            return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        }
+
+        markViewportInteraction();
+        cancelMotionAndOpenAnimation();
+        float oldScale = this.scale;
+
+        float minimumScale = getMinimumStableScale();
+        this.scale = Math.max(minimumScale,
+                Math.min(12.0f, this.scale + (float) scrollY * 0.15f * this.scale));
+
+        // Viewport centre (viewport starts at x=1, y=1)
+        double vpCentreX = 1 + (this.width - 2) / 2.0;
+        double vpCentreZ = 1 + (this.height - 2) / 2.0;
+
+        // Adjust camera center so that zoom focuses on the mouse cursor location
+        double mouseWorldX = this.centerX + (mouseX - vpCentreX) / oldScale;
+        double mouseWorldZ = this.centerZ + (mouseY - vpCentreZ) / oldScale;
+
+        this.centerX = mouseWorldX - (mouseX - vpCentreX) / this.scale;
+        this.centerZ = mouseWorldZ - (mouseY - vpCentreZ) / this.scale;
+
+        return true;
+    }
+
+    private final class CaveLayerSlider extends AbstractSliderButton {
+        private static final double AUTO_ZONE = 0.045;
+        private int minimumY;
+        private int maximumY;
+        private boolean dragging;
+
+        private CaveLayerSlider(int x, int y, int width, int height,
+                int minimumY, int maximumY, double initialValue) {
+            super(x, y, width, height, Component.empty(), initialValue);
+            this.minimumY = minimumY;
+            this.maximumY = maximumY;
+            updateMessage();
+        }
+
+        private void syncFromMode() {
+            this.value = CaveMode.hasManualTopY(MapScreen.this.minecraft)
+                    ? normalizeNumeric(CaveMode.getSelectedTopY(MapScreen.this.minecraft), minimumY, maximumY)
+                    : 0.0;
+            updateMessage();
+        }
+
+        private void syncBoundsFromDimension() {
+            DimensionMapProfile profile = MapManager.getInstance()
+                    .getCurrentDimensionProfile();
+            if (profile != null) {
+                this.minimumY = profile.minY();
+                this.maximumY = profile.maxY();
+            } else if (MapScreen.this.minecraft != null
+                    && MapScreen.this.minecraft.level != null) {
+                this.minimumY = MapScreen.this.minecraft.level.getMinBuildHeight();
+                this.maximumY = MapScreen.this.minecraft.level.getMaxBuildHeight() - 1;
+            }
+            syncFromMode();
+        }
+
+        private boolean isDragging() {
+            return dragging;
+        }
+
+        private int selectedY() {
+            double numericValue = Math.max(0.0, Math.min(1.0,
+                    (this.value - AUTO_ZONE) / (1.0 - AUTO_ZONE)));
+            return minimumY + (int) Math.round(numericValue * (maximumY - minimumY));
+        }
+
+        private boolean isAutoSelection() {
+            return this.value <= AUTO_ZONE * 0.55;
+        }
+
+        @Override
+        protected void updateMessage() {
+            boolean fullCave = CaveMode.getCaveType(Minecraft.getInstance()) == CaveMode.CaveType.FULL;
+            Component label;
+            if (fullCave) {
+                if (isAutoSelection()) {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.full_auto_drag"
+                            : "gui.simplemap.cave_slider.full_auto");
+                } else {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.full_y_drag"
+                            : "gui.simplemap.cave_slider.full_y", selectedY());
+                }
+            } else {
+                if (isAutoSelection()) {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.layer_auto_drag"
+                            : "gui.simplemap.cave_slider.layer_auto");
+                } else {
+                    label = Component.translatable(dragging
+                            ? "gui.simplemap.cave_slider.layer_y_drag"
+                            : "gui.simplemap.cave_slider.layer_y", selectedY());
+                }
+            }
+            setMessage(label);
+        }
+
+        @Override
+        protected void applyValue() {
+            // Mouse dragging only previews the selected Y range. Committing here
+            // would swap caches and start a new vertical scan for every mouse pixel.
+            if (dragging) return;
+            commitLayer();
+        }
+
+        @Override
+        public void onClick(double mouseX, double mouseY) {
+            MapScreen.this.markViewportInteraction();
+            dragging = true;
+            super.onClick(mouseX, mouseY);
+        }
+
+        @Override
+        protected void onDrag(double mouseX, double mouseY, double dragX, double dragY) {
+            MapScreen.this.markViewportInteraction();
+            super.onDrag(mouseX, mouseY, dragX, dragY);
+        }
+
+        @Override
+        public void onRelease(double mouseX, double mouseY) {
+            boolean shouldCommit = dragging;
+            dragging = false;
+            if (shouldCommit) commitLayer();
+            super.onRelease(mouseX, mouseY);
+        }
+
+        private void commitLayer() {
+            MapScreen.this.lastViewportInteractionNanos = 0L;
+            MapPerformanceGovernor.getInstance().setFullscreenState(true, false);
+            if (isAutoSelection()) {
+                this.value = 0.0;
+                CaveMode.setAutoTopY(MapScreen.this.minecraft);
+            } else {
+                CaveMode.setManualLayer(MapScreen.this.minecraft, selectedY());
+            }
+            // Activate and stream the selected cache. Existing exact-layer data is
+            // preserved; only a genuinely uncached player region receives a small
+            // live prime, avoiding a circular rescan that overwrote warm pixels.
+            ChunkScanner.getInstance().requestImmediateCaveLayerRefresh(MapScreen.this.minecraft);
+            FullscreenMapFramebufferRenderer.getInstance().invalidate();
+            FullscreenMapFramebufferRenderer.getInstance().resetFailureState();
+            MapRenderer.getInstance().clearFullscreenFallback();
+            updateMessage();
+            if (MapScreen.this.caveLayerModeButton != null) {
+                MapScreen.this.updateCaveTooltip();
+            }
+        }
+
+        private static double normalizeNumeric(int layerY, int minimumY, int maximumY) {
+            if (maximumY <= minimumY) return 0.0;
+            int clamped = Math.max(minimumY, Math.min(maximumY, layerY));
+            double numeric = (double) (clamped - minimumY) / (maximumY - minimumY);
+            return AUTO_ZONE + numeric * (1.0 - AUTO_ZONE);
+        }
+    }
+
+    @Override
+    public void onClose() {
+        // Retain the selected dimension in MapManager when closing MapScreen so
+        // the Minimap can display the chosen dimension with proportional coordinate scaling
+        // (1:8 Nether <-> Overworld), cross-dimension scaling.
+        MapViewportCoordinator.getInstance().closeFullscreen();
+        FullscreenMapFramebufferRenderer.getInstance().destroy();
+        super.onClose();
+    }
+
+    @Override
+    public void removed() {
+        if (temporaryVsyncDisabled && this.minecraft != null) {
+            this.minecraft.getWindow().updateVsync(true);
+            temporaryVsyncDisabled = false;
+        }
+        super.removed();
+    }
+
+    @Override
+    public boolean isPauseScreen() {
+        return false; // Don't pause game in singleplayer
+    }
+
+    public static final class MapUiIcons {
+        private static final net.minecraft.resources.ResourceLocation ATLAS =
+                net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("simplemap", "gui/gui.png");
+        private static final int ATLAS_SIZE = 256;
+
+        public enum Icon {
+            SETTINGS(0, 0, 16, 15),
+            WAYPOINT_OUTLINE(0, 16, 12, 17),
+            WAYPOINT_FILLED(16, 16, 12, 17),
+            WAYPOINT_LIST(32, 16, 13, 17),
+            REFRESH(0, 80, 14, 15),
+            SUN(0, 48, 20, 20),
+            MOON(32, 48, 16, 16),
+            NIGHT_AUTO(48, 48, 19, 19),
+            DIMENSION_PORTAL(0, 96, 12, 13),
+            CAVE_ON(0, 112, 17, 14),
+            CAVE_OFF(32, 112, 17, 14);
+
+            final int u, v, width, height;
+
+            Icon(int u, int v, int width, int height) {
+                this.u = u;
+                this.v = v;
+                this.width = width;
+                this.height = height;
+            }
+        }
+
+        private MapUiIcons() { }
+
+        public static void draw(net.minecraft.client.gui.GuiGraphics graphics, Icon icon,
+                int centerX, int centerY, boolean enabled) {
+            drawScaled(graphics, icon, centerX, centerY, enabled, 1.0f);
+        }
+
+        public static void drawScaled(net.minecraft.client.gui.GuiGraphics graphics, Icon icon,
+                int centerX, int centerY, boolean enabled, float scale) {
+            float safeScale = Math.max(0.25f, Math.min(2.0f, scale));
+            int drawWidth = Math.max(1, Math.round(icon.width * safeScale));
+            int drawHeight = Math.max(1, Math.round(icon.height * safeScale));
+            float alpha = enabled ? 1.0f : 0.42f;
+            com.mojang.blaze3d.systems.RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, alpha);
+            graphics.blit(ATLAS,
+                    centerX - drawWidth / 2, centerY - drawHeight / 2,
+                    drawWidth, drawHeight,
+                    (float) icon.u, (float) icon.v,
+                    icon.width, icon.height, ATLAS_SIZE, ATLAS_SIZE);
+            com.mojang.blaze3d.systems.RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    }
+
+    /** Compact live view of the same immutable samples written to metrics.csv. */
+    public static final class MapDebugOverlay {
+        private MapDebugOverlay() { }
+
+        public static void render(GuiGraphics graphics) {
+            if (!MapDebugRecorder.DEBUG_ENABLED) return;
+            MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+            if (!recorder.isOverlayVisible()) return;
+            Minecraft minecraft = Minecraft.getInstance();
+            if (minecraft == null || minecraft.level == null || minecraft.player == null) return;
+            MapDebugRecorder.DebugSnapshot s = recorder.lastSnapshot();
+            if (s.timestampMs() == 0L) return;
+
+            List<Line> lines = new ArrayList<>();
+            String state = recorder.isRecording() ? (s.burst() ? "REC BURST" : "REC") : "PAUSED";
+            lines.add(new Line("SimpleMap Debug  " + state + "  F8:View F9:Log F10:Mark", 0xFFFFFFFF));
+            String tpsText = s.serverTps() < 0.0 ? "n/a" : String.format(Locale.ROOT, "%.1f (%.1f ms)", s.serverTps(), s.serverMspt());
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "FPS %d  TPS %s  frame %.1f ms  CPU %.0f%%",
+                    s.fps(), tpsText, s.frameAverageMs(), s.processCpuPercent()),
+                    s.governorPressure() ? 0xFFFFB45C : 0xFFD8D8D8));
+            String gpuText = s.gpuUtilizationPercent() < 0.0
+                    ? "n/a" : String.format(Locale.ROOT, "%.0f%%",
+                    s.gpuUtilizationPercent());
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "Heap %.0f/%.0f MiB  GC +%d / +%d ms  GPU %s",
+                    s.heapUsedMiB(), s.heapMaxMiB(), s.gcCountDelta(),
+                    s.gcTimeMsDelta(), gpuText), 0xFFD8D8D8));
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "Pos [%.0f, %.0f, %.0f]  Dim %s",
+                    s.playerX(), s.playerY(), s.playerZ(), s.dimension()),
+                    0xFFC9E6FF));
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "%s %s  center %.0f,%.0f  zoom %.3fx",
+                    s.screen(), s.mapMode(), s.mapCenterX(), s.mapCenterZ(), s.mapScale()),
+                    0xFFC9E6FF));
+
+            var p = s.pipeline();
+            boolean outputBroken = p.exactBuildQueued() > 0L
+                    && p.exactGpuReady() == 0L;
+            lines.add(new Line("Exact q/c/discard/gpu/draw "
+                    + p.exactBuildQueued() + '/' + p.exactBuildCompleted() + '/'
+                    + p.exactBuildDiscarded() + '/' + p.exactGpuReady() + '/'
+                    + p.exactPagesDrawn(), outputBroken ? 0xFFFF7676 : 0xFFD8D8D8));
+            var render = s.render();
+            lines.add(new Line("Current " + render.projection() + " L"
+                    + render.hierarchyLevel() + " exact/branch/legacy "
+                    + render.exactPages() + '/' + render.branchNodes() + '/'
+                    + render.legacyFallbacks() + " content " + bool(render.hadContent()),
+                    render.hadContent() ? 0xFFD8D8D8 : 0xFFFF7676));
+            var gpu = s.gpu();
+            var fullscreenFbo = FullscreenMapFramebufferRenderer.getInstance().snapshot();
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "Branch GPU %.3f ms deny/bootstrap %d/%d  Full FBO draw/reuse/coalesce/fallback %d/%d/%d/%d",
+                    gpu.branchPredictionNanos() / 1_000_000.0,
+                    gpu.branchDeniedReservations(), gpu.branchBootstrapAdmissions(),
+                    fullscreenFbo.redrawFrames(), fullscreenFbo.reuseFrames(),
+                    fullscreenFbo.coalescedFrames(), fullscreenFbo.fallbackFrames()),
+                    gpu.branchBootstrapAdmissions() > 0L || render.branchNodes() > 0
+                            ? 0xFFB9D7B0 : 0xFFFFB45C));
+            var minimapFbo = MinimapFramebufferRenderer.getInstance().snapshot();
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "Minimap FBO redraw/reuse/coalesce/fallback %d/%d/%d/%d  realloc %d",
+                    minimapFbo.redrawFrames(), minimapFbo.reuseFrames(),
+                    minimapFbo.coalescedFrames(), minimapFbo.fallbackFrames(),
+                    minimapFbo.reallocations()),
+                    minimapFbo.disabled() || minimapFbo.fallbackFrames() > 0L
+                            ? 0xFFFFB45C : 0xFFB9D7B0));
+            var demand = MapSurfaceDemandPolicy.snapshot();
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "Surface demand area %.0f%% trim L/R/V %.0f/%.0f/%.0f%% exactWindow %d",
+                    demand.areaRatio() * 100.0, demand.leftFraction() * 100.0,
+                    demand.rightFraction() * 100.0, demand.verticalFraction() * 100.0,
+                    demand.exactActiveWindow()), demand.trimmed()
+                            ? 0xFFB9D7B0 : 0xFFD8D8D8));
+            lines.add(new Line("Source present/absent/defer/fail "
+                    + p.sourcePresent() + '/' + p.sourceAbsent() + '/'
+                    + p.sourceDeferred() + '/' + p.sourceFailed()
+                    + "  noContent " + p.noContentRenderPasses(),
+                    p.sourceFailed() > 0L ? 0xFFFF7676 : 0xFFD8D8D8));
+
+            var scheduler = s.scheduler();
+            lines.add(new Line("Work CPU " + scheduler.cpuActive() + '/'
+                    + scheduler.cpuQueued() + " cost " + scheduler.cpuTotalCost()
+                    + "  IO " + scheduler.ioActive() + '/' + scheduler.ioQueued()
+                    + " cost " + scheduler.ioTotalCost(), 0xFFD8D8D8));
+
+            var texture = s.texture();
+            lines.add(new Line("Texture pages " + texture.initializedPages() + '/'
+                    + texture.pages() + " running/ready " + texture.pendingPages()
+                    + '/' + texture.completedPendingPages() + " dirty "
+                    + texture.dirtyPages() + " batches " + texture.pendingBatches(),
+                    texture.pendingBatches() == 0 && texture.dirtyPages() > 0
+                            ? 0xFFFFB45C : 0xFFD8D8D8));
+
+            var source = s.sourceDb();
+            boolean falseReady = source.lastPipelineReady() && !source.lastStrictReady();
+            lines.add(new Line("SourceDB regions/chunks/dirty/views " + source.regions()
+                    + '/' + source.residentChunks() + '/' + source.dirtyChunks()
+                    + '/' + source.pinnedViews() + " plans 1x/expanded "
+                    + source.focusedBatchPlans() + '/' + source.expandedBatchPlans(),
+                    0xFFD8D8D8));
+            lines.add(new Line("Last batch req/present/missing/dirty "
+                    + source.lastRequiredChunks() + '/' + source.lastPresentChunks() + '/'
+                    + source.lastMissingChunks() + '/' + source.lastDirtyChunks()
+                    + " ready " + bool(source.lastPipelineReady()) + '/'
+                    + bool(source.lastStrictReady()),
+                    falseReady || source.lastMissingChunks() > 0 ? 0xFFFF7676 : 0xFFD8D8D8));
+
+            var cave = s.cave();
+            lines.add(new Line("Cave pages/init/partial/resident " + cave.pages() + '/'
+                    + cave.initializedPages() + '/' + cave.partialPages() + '/'
+                    + cave.residentPages() + " req/pending/done " + cave.requests() + '/'
+                    + cave.pendingBuilds() + '/' + cave.completedBuilds(),
+                    cave.pendingBuilds() > 0 && cave.completedBuilds() > 0
+                            ? 0xFFFFB45C : 0xFFD8D8D8));
+
+            var exact = s.exactStates();
+            long requested = exact.pagesByState().getOrDefault(ExactPageState.REQUESTED, 0L);
+            long building = exact.pagesByState().getOrDefault(ExactPageState.BUILDING, 0L);
+            long upload = exact.pagesByState().getOrDefault(ExactPageState.UPLOAD_QUEUED, 0L);
+            long gpuReady = exact.pagesByState().getOrDefault(ExactPageState.GPU_READY, 0L);
+            long evicted = exact.pagesByState().getOrDefault(ExactPageState.GPU_EVICTED, 0L);
+            long failed = exact.pagesByState().getOrDefault(ExactPageState.FAILED_RETRYABLE, 0L);
+            long stale = exact.pagesByState().getOrDefault(ExactPageState.STALE_GENERATION, 0L);
+            lines.add(new Line("Page state req/build/upload/gpu/evict/fail/stale "
+                    + requested + '/' + building + '/' + upload + '/' + gpuReady + '/'
+                    + evicted + '/' + failed + '/' + stale + " old>5s "
+                    + exact.requestedOlderThan5s() + '/'
+                    + exact.buildingOlderThan5s() + '/'
+                    + exact.cpuReadyOlderThan5s(),
+                    failed > 0 || stale > 0 || exact.buildingOlderThan5s() > 0
+                            ? 0xFFFF7676 : 0xFFD8D8D8));
+
+            var graph = s.workGraph();
+            lines.add(new Line("Graph regions D/R/P/ready/pub " + graph.regions() + ' '
+                    + graph.dirtyStages() + '/' + graph.runningStages() + '/'
+                    + graph.preparedStages() + '/' + graph.readyStages() + '/'
+                    + graph.publishedStages(), 0xFFD8D8D8));
+
+            var lod = s.lodGraph();
+            lines.add(new Line("M4 graph nodes/L0/coarse D/R/P/pub " + lod.nodes()
+                    + '/' + lod.level0Nodes() + '/' + lod.coarseNodes() + ' '
+                    + lod.dirty() + '/' + lod.running() + '/' + lod.prepared()
+                    + '/' + lod.published(), 0xFFD8D8D8));
+
+            var architecture = s.architecture();
+            if (architecture != null) {
+                var pageTable = architecture.pageTable();
+                var uploads = architecture.uploads();
+                lines.add(new Line("M5 page table entries/storage/gen/swap/mismatch "
+                        + pageTable.entries() + '/' + pageTable.storages() + '/'
+                        + pageTable.generation() + '/' + pageTable.swaps() + '/'
+                        + pageTable.generationMismatches(),
+                        pageTable.generationMismatches() > 0L
+                                ? 0xFFFFB45C : 0xFFD8D8D8));
+                lines.add(new Line("M9 upload q/run/commit/reject/stale "
+                        + uploads.queued() + '/' + uploads.inFlight() + '/'
+                        + uploads.committed() + '/' + uploads.rejected() + '/'
+                        + uploads.stale() + " staging "
+                        + String.format(Locale.ROOT, "%.1f MiB",
+                                uploads.stagingBytes() / 1048576.0),
+                        uploads.rejected() > 0L || uploads.stale() > 0L
+                                ? 0xFFFFB45C : 0xFFD8D8D8));
+                var persistence = architecture.persistence();
+                lines.add(new Line("Persist q/ok/fail " + persistence.queued() + '/'
+                        + (persistence.surfaceCommitted() + persistence.caveCommitted())
+                        + '/' + persistence.failures(),
+                        persistence.failures() > 0L ? 0xFFFF7676 : 0xFFD8D8D8));
+            }
+
+            var residency = s.residency();
+            lines.add(new Line(String.format(Locale.ROOT,
+                    "Residency %d pinned %d  %.1f/%.1f MiB  evict/fail %d/%d",
+                    residency.residentEntries(), residency.pinnedEntries(),
+                    residency.estimatedBytes() / 1048576.0,
+                    residency.budgetBytes() / 1048576.0,
+                    residency.globalEvictions(), residency.budgetFailures()),
+                    residency.budgetFailures() > 0L ? 0xFFFF7676 : 0xFFD8D8D8));
+
+            Path directory = recorder.activeDirectory();
+            if (directory != null) {
+                lines.add(new Line("File: simplemap-debug/" + directory.getFileName(),
+                        0xFFB9D7B0));
+            }
+
+            int lineHeight = minecraft.font.lineHeight + 1;
+            int maxWidth = 0;
+            for (Line line : lines) maxWidth = Math.max(maxWidth, minecraft.font.width(line.text()));
+            int right = graphics.guiWidth() - 5;
+            int top = 5;
+            int left = Math.max(4, right - maxWidth - 8);
+            int bottom = top + lines.size() * lineHeight + 6;
+            graphics.fill(left, top, right, bottom, 0xC0101010);
+            graphics.renderOutline(left, top, right - left, bottom - top, 0x806A6A6A);
+            int y = top + 3;
+            for (Line line : lines) {
+                graphics.drawString(minecraft.font, line.text(), right - 4
+                        - minecraft.font.width(line.text()), y, line.color(), false);
+                y += lineHeight;
+            }
+        }
+
+        private static String bool(boolean value) {
+            return value ? "Y" : "N";
+        }
+
+        private record Line(String text, int color) { }
+    }
+
+    public static class MapConfigScreen extends Screen {
+    private final Screen parent;
+    private static com.mojang.blaze3d.pipeline.RenderTarget minimapTarget = null;
+    private boolean isDraggingMinimap = false;
+    private double dragOffsetX = 0;
+    private double dragOffsetY = 0;
+
+    // Coords dragging & selection state
+    private boolean selectedMinimap = false;
+    private boolean selectedCoords = false;
+    private boolean isDraggingCoords = false;
+    private double dragCoordsOffsetX = 0;
+    private double dragCoordsOffsetY = 0;
+
+    // UI Tab & Side Panel State
+    private int activeTab = 0; // 0 = Map, 1 = Coords, 2 = Colors, 3 = System
+    private Button tabMapButton;
+    private Button tabCoordsButton;
+    private Button tabColorsButton;
+    private Button tabSystemButton;
+    private Button doneButton;
+    private Button resetToDefaultButton;
+
+    // Minimap controls reference
+    private Button minimapToggleButton;
+    private Button minimapRotateButton;
+    private Button minimapShapeButton;
+    private SimpleSlider minimapSizeSlider;
+    private SimpleSlider minimapZoomSlider;
+
+    // Player marker controls reference
+    private Button pointerModeButton;
+    private SimpleSlider pointerScaleSlider;
+    private SimpleSlider pinScaleSlider;
+
+    // Coords controls reference
+    private Button coordsToggleButton;
+    private SimpleSlider coordsScaleSlider;
+    private Button compassLettersToggleButton;
+    private Button showInScreensButton;
+    private Button minimapWaypointsButton;
+    private Button mapStyleButton;
+    private Button displayFlowersButton;
+    private Button cursorBiomeButton;
+    private Button cursorBlockButton;
+
+    // Shared color editor: one input and a small reusable saved-color palette.
+    private static final String[] COLOR_TARGET_NAMES = { "Arrow", "Ring", "Compass", "Coords" };
+    private int selectedColorTarget = 0;
+    private Button colorTargetButton;
+    private Button presetColorButton;
+    private Button savePaletteColorButton;
+    private Button customBlockColorsButton;
+    private EditBox sharedColorInput;
+    private final List<ColorSwatchButton> paletteButtons = new ArrayList<>();
+
+    // Keep references so slider and editbox can sync each other
+    private SimpleSlider scanSlider;
+    private EditBox scanInputBox;
+
+    // Require Book toggle button
+    private Button requireBookButton;
+    private Button autoClearPinButton;
+    private Button deathWaypointButton;
+    private Button deathWaypointLimitButton;
+    private Button alwaysRescanButton;
+    private Button reloadAllRegionsButton;
+    private Button mapRevealModeButton;
+    private Button blockColourModeButton;
+    private Button terrainSlopesButton;
+    private Button fastFullscreenButton;
+    private Button caveScanButton;
+
+    // Shared responsive panel geometry. Init and render use the same numbers so
+    // controls cannot drift outside the card at different GUI scales.
+    private int panelLeft = 10;
+    private int panelTop = 15;
+    private int panelWidth = 240;
+    private int panelRight = 250;
+    private int panelBottom = 0;
+
+    private static final int SCAN_CHUNK_MIN = 4;
+    private static final int SCAN_CHUNK_MAX = 390; // 390 represents AUTO/MAX
+    private static final int PALETTE_LABEL_Y = 104;
+    private static final int PALETTE_SWATCH_Y = 116;
+
+    public MapConfigScreen(Screen parent) {
+        super(Component.translatable("gui.simplemap.settings_title"));
+        this.parent = parent;
+    }
+
+    @Override
+    protected void init() {
+        if (!(parent instanceof MapScreen)) {
+            // Global/server config screen opened from the Mods list.
+            int btnWidth = 176;
+            int btnHeight = 20;
+            boolean remoteServer = isRemoteServerSession();
+            boolean remoteExtension = remoteServer && MapConfig.serverExtensionAvailable;
+
+            requireBookButton = Button.builder(
+                    getServerRequireBookMessage(remoteServer, remoteExtension),
+                    button -> {
+                        ServerConfig.requireMapBook = !ServerConfig.requireMapBook;
+                        MapConfig.serverRequireMapBook = ServerConfig.requireMapBook;
+                        ServerConfig.save();
+                        syncIntegratedServerConfig();
+                        button.setMessage(getServerRequireBookMessage(false, false));
+                    }).bounds((this.width - btnWidth) / 2, this.height / 2 - 30, btnWidth, btnHeight)
+                    .tooltip(Tooltip.create(Component.translatable(
+                            remoteServer && !remoteExtension
+                                    ? "gui.simplemap.tooltip.server_book_ext_required"
+                                    : "gui.simplemap.tooltip.server_book")))
+                    .build();
+            requireBookButton.active = !remoteServer;
+            this.addRenderableWidget(requireBookButton);
+
+            caveScanButton = Button.builder(
+                    getServerCaveModeMessage(remoteServer, remoteExtension),
+                    button -> {
+                        if (remoteServer && !remoteExtension) {
+                            MapConfig.localCaveMapMode = (MapConfig.localCaveMapMode + 1) % 3;
+                            if (MapConfig.localCaveMapMode == 0) {
+                                CaveMapManager.getInstance().deactivate();
+                            }
+                            MapConfig.save();
+                            button.setMessage(getServerCaveModeMessage(true, false));
+                            return;
+                        }
+                        ServerConfig.caveMapMode = (ServerConfig.caveMapMode + 1) % 3;
+                        MapConfig.serverCaveMapMode = ServerConfig.caveMapMode;
+                        if (ServerConfig.caveMapMode == 0) {
+                            CaveMapManager.getInstance().deactivate();
+                        }
+                        ServerConfig.save();
+                        syncIntegratedServerConfig();
+                        button.setMessage(getServerCaveModeMessage(false, false));
+                    }).bounds((this.width - btnWidth) / 2, this.height / 2, btnWidth, btnHeight)
+                    .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.server_cave_scan")))
+                    .build();
+            caveScanButton.active = !remoteExtension;
+            this.addRenderableWidget(caveScanButton);
+
+            this.addRenderableWidget(Button.builder(
+                    Component.translatable("gui.simplemap.done"),
+                    button -> {
+                        ServerConfig.save();
+                        if (this.minecraft != null) {
+                            this.minecraft.setScreen(this.parent);
+                        }
+                    }).bounds((this.width - 88) / 2, this.height / 2 + 38, 88, btnHeight).build());
+            return;
+        }
+
+        // ==================== RESPONSIVE LEFT PANEL ====================
+        panelLeft = Math.max(4, Math.min(10, this.width / 24));
+        panelTop = 15;
+        panelWidth = Math.min(240, Math.max(180, this.width - panelLeft - 6));
+        panelRight = panelLeft + panelWidth;
+        panelBottom = Math.max(panelTop + 80, this.height - 10);
+
+        // ==================== TABS (Top of Left Panel) ====================
+        int tabY = 20;
+        int tabSpacing = 4;
+        int startX = panelLeft + 4;
+        int tabW = Math.max(38, (panelWidth - 8 - tabSpacing * 3) / 4);
+
+        tabMapButton = Button.builder(
+                getTabButtonLabel(0, "gui.simplemap.tab.map.name"),
+                button -> {
+                    activeTab = 0;
+                    updateTabButtons();
+                    updateWidgetVisibility();
+                }).bounds(startX, tabY, tabW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tab.minimap")))
+                .build();
+        this.addRenderableWidget(tabMapButton);
+
+        tabCoordsButton = Button.builder(
+                getTabButtonLabel(1, "gui.simplemap.tab.coords.name"),
+                button -> {
+                    activeTab = 1;
+                    updateTabButtons();
+                    updateWidgetVisibility();
+                }).bounds(startX + tabW + tabSpacing, tabY, tabW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tab.coords")))
+                .build();
+        this.addRenderableWidget(tabCoordsButton);
+
+        tabColorsButton = Button.builder(
+                getTabButtonLabel(2, "gui.simplemap.tab.colors.name"),
+                button -> {
+                    activeTab = 2;
+                    updateTabButtons();
+                    updateWidgetVisibility();
+                }).bounds(startX + (tabW + tabSpacing) * 2, tabY, tabW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tab.colors")))
+                .build();
+        this.addRenderableWidget(tabColorsButton);
+
+        tabSystemButton = Button.builder(
+                getTabButtonLabel(3, "gui.simplemap.tab.system.name"),
+                button -> {
+                    activeTab = 3;
+                    updateTabButtons();
+                    updateWidgetVisibility();
+                }).bounds(startX + (tabW + tabSpacing) * 3, tabY, tabW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tab.system")))
+                .build();
+        this.addRenderableWidget(tabSystemButton);
+
+        // ==================== CONTROLS GRID ====================
+        int col1X = panelLeft + 6;
+        int columnGap = 8;
+        int colW = Math.max(78, (panelWidth - 12 - columnGap) / 2);
+        int col2X = col1X + colW + columnGap;
+        int gridWidth = colW * 2 + columnGap;
+
+        // Row 1 (y = 52)
+        minimapToggleButton = Button.builder(
+                getToggleMessage(),
+                button -> {
+                    MapConfig.minimapEnabled = !MapConfig.minimapEnabled;
+                    button.setMessage(getToggleMessage());
+                }).bounds(col1X, 52, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_toggle")))
+                .build();
+        this.addRenderableWidget(minimapToggleButton);
+
+        double initialSizeVal = (double) (MapConfig.minimapSize - 16) / (150 - 16);
+        minimapSizeSlider = new SimpleSlider(
+                col2X, 52, colW, 20,
+                initialSizeVal,
+                val -> Component.translatable("gui.simplemap.option.size", 16 + (int) (val * (150 - 16))).getString(),
+                val -> MapConfig.minimapSize = 16 + (int) (val * (150 - 16)));
+        minimapSizeSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_size")));
+        this.addRenderableWidget(minimapSizeSlider);
+
+        // Row 2 (y = 77)
+        minimapShapeButton = Button.builder(
+                getShapeMessage(),
+                button -> {
+                    MapConfig.minimapCircle = !MapConfig.minimapCircle;
+                    button.setMessage(getShapeMessage());
+                }).bounds(col1X, 77, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_shape")))
+                .build();
+        this.addRenderableWidget(minimapShapeButton);
+
+        double initialZoomVal = (MapConfig.minimapZoom - MapConfig.MINIMUM_ZOOM_SCALE)
+                / (2.0 - MapConfig.MINIMUM_ZOOM_SCALE);
+        minimapZoomSlider = new SimpleSlider(
+                col2X, 77, colW, 20,
+                initialZoomVal,
+                val -> String.format(java.util.Locale.ROOT, "%.2fx",
+                        MapConfig.MINIMUM_ZOOM_SCALE + val * (2.0 - MapConfig.MINIMUM_ZOOM_SCALE)),
+                val -> MapConfig.minimapZoom = (float) (MapConfig.MINIMUM_ZOOM_SCALE
+                        + val * (2.0 - MapConfig.MINIMUM_ZOOM_SCALE)));
+        minimapZoomSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_zoom")));
+        this.addRenderableWidget(minimapZoomSlider);
+
+        // Row 3 (y = 102)
+        minimapRotateButton = Button.builder(
+                getRotateMessage(),
+                button -> {
+                    MapConfig.minimapRotate = !MapConfig.minimapRotate;
+                    button.setMessage(getRotateMessage());
+                }).bounds(col1X, 102, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.north_lock")))
+                .build();
+        this.addRenderableWidget(minimapRotateButton);
+
+        double initialPointerScaleVal = (MapConfig.playerMarkerScale - 0.1) / (1.0 - 0.1);
+        pointerScaleSlider = new SimpleSlider(
+                col2X, 102, colW, 20,
+                initialPointerScaleVal,
+                val -> Component.translatable("gui.simplemap.option.pointer_scale",
+                        String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (1.0 - 0.1))).getString(),
+                val -> MapConfig.playerMarkerScale = (float) (0.1 + val * (1.0 - 0.1)));
+        pointerScaleSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pointer_scale")));
+        this.addRenderableWidget(pointerScaleSlider);
+
+        // Row 4 (y = 127)
+        pointerModeButton = Button.builder(
+                getPointerModeMessage(),
+                button -> {
+                    MapConfig.playerMarkerMode = (MapConfig.playerMarkerMode + 1) % 2;
+                    button.setMessage(getPointerModeMessage());
+                }).bounds(col1X, 127, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pointer_mode")))
+                .build();
+        this.addRenderableWidget(pointerModeButton);
+
+        double initialPinScaleVal = (MapConfig.pinScale - 0.1) / (1.0 - 0.1);
+        pinScaleSlider = new SimpleSlider(
+                col2X, 127, colW, 20,
+                initialPinScaleVal,
+                val -> Component.translatable("gui.simplemap.option.pin_scale",
+                        String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (1.0 - 0.1))).getString(),
+                val -> {
+                    MapConfig.pinScale = (float) (0.1 + val * (1.0 - 0.1));
+                    MapConfig.save();
+                });
+        pinScaleSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pin_scale")));
+        this.addRenderableWidget(pinScaleSlider);
+
+        // ==================== SHARED COLOR EDITOR ====================
+        colorTargetButton = Button.builder(
+                getColorTargetMessage(),
+                button -> {
+                    selectedColorTarget = (selectedColorTarget + 1) % COLOR_TARGET_NAMES.length;
+                    button.setMessage(getColorTargetMessage());
+                    syncSharedColorInput();
+                }).bounds(col1X, 52, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.color_target")))
+                .build();
+        this.addRenderableWidget(colorTargetButton);
+
+        presetColorButton = Button.builder(
+                getSelectedPresetMessage(),
+                button -> {
+                    setSelectedTargetColor(nextPresetColor(getSelectedTargetColor()));
+                    syncSharedColorInput();
+                }).bounds(col2X, 52, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.color_preset")))
+                .build();
+        this.addRenderableWidget(presetColorButton);
+
+        int saveButtonWidth = Math.max(44, Math.min(56, colW / 2));
+        int colorInputWidth = Math.max(72, gridWidth - saveButtonWidth - columnGap);
+        int saveButtonX = col1X + colorInputWidth + columnGap;
+        sharedColorInput = new EditBox(this.font, col1X, 77, colorInputWidth, 20,
+                Component.translatable("gui.simplemap.narration.shared_hex_color"));
+        sharedColorInput.setMaxLength(9);
+        sharedColorInput.setValue(MapColorProfile.formatColor(getSelectedTargetColor()));
+        sharedColorInput.setHint(Component.literal("#RRGGBB"));
+        sharedColorInput.setResponder(this::previewSharedColor);
+        sharedColorInput.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.shared_color_input")));
+        this.addRenderableWidget(sharedColorInput);
+
+        savePaletteColorButton = Button.builder(
+                Component.translatable("gui.simplemap.save"),
+                button -> saveSharedColor())
+                .bounds(saveButtonX, 77, saveButtonWidth, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.save_palette_color")))
+                .build();
+        this.addRenderableWidget(savePaletteColorButton);
+
+        paletteButtons.clear();
+        int swatchGap = 4;
+        int swatchWidth = Math.max(28, (gridWidth - swatchGap * 3) / 4);
+        for (int i = 0; i < 8; i++) {
+            int swatchX = col1X + (i % 4) * (swatchWidth + swatchGap);
+            int swatchY = PALETTE_SWATCH_Y + (i / 4) * 25;
+            ColorSwatchButton swatch = new ColorSwatchButton(swatchX, swatchY, swatchWidth, 20, i);
+            paletteButtons.add(swatch);
+            this.addRenderableWidget(swatch);
+        }
+
+        // Row 5, col 2 (y = 152)
+        customBlockColorsButton = Button.builder(
+                Component.translatable("gui.simplemap.option.block_overrides", MapConfig.blockColorOverrides.size()),
+                b -> {
+                    if (this.minecraft != null) this.minecraft.setScreen(new BlockColorManagerScreen(this));
+                }).bounds(col1X, 166, gridWidth, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.block_overrides")))
+                .build();
+        this.addRenderableWidget(customBlockColorsButton);
+
+        compassLettersToggleButton = Button.builder(
+                getCompassLettersMessage(),
+                button -> {
+                    MapConfig.compassLettersVisible = !MapConfig.compassLettersVisible;
+                    button.setMessage(getCompassLettersMessage());
+                }).bounds(col2X, 152, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.compass_labels")))
+                .build();
+        this.addRenderableWidget(compassLettersToggleButton);
+
+        mapStyleButton = Button.builder(
+                getMapStyleMessage(),
+                button -> {
+                    MapConfig.mapColorProfile = (MapConfig.mapColorProfile + 1) % MapColorProfile.NAMES.length;
+                    MapConfig.save();
+                    button.setMessage(getMapStyleMessage());
+                    MapManager.getInstance().reloadAllRegions();
+                }).bounds(col1X, 152, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.map_style")))
+                .build();
+        this.addRenderableWidget(mapStyleButton);
+
+        showInScreensButton = Button.builder(
+                getShowInScreensMessage(),
+                button -> {
+                    MapConfig.showMinimapInScreens = !MapConfig.showMinimapInScreens;
+                    button.setMessage(getShowInScreensMessage());
+                }).bounds(col1X, 177, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.show_in_screens")))
+                .build();
+        this.addRenderableWidget(showInScreensButton);
+
+        minimapWaypointsButton = Button.builder(
+                getMinimapWaypointsMessage(),
+                button -> {
+                    MapConfig.minimapWaypointsVisible = !MapConfig.minimapWaypointsVisible;
+                    MapConfig.save();
+                    button.setMessage(getMinimapWaypointsMessage());
+                }).bounds(col2X, 177, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_waypoints")))
+                .build();
+        this.addRenderableWidget(minimapWaypointsButton);
+
+        // ==================== COORDS CONTROLS ====================
+        coordsToggleButton = Button.builder(
+                getCoordsToggleMessage(),
+                button -> {
+                    MapConfig.coordsEnabled = !MapConfig.coordsEnabled;
+                    button.setMessage(getCoordsToggleMessage());
+                }).bounds(col1X, 52, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.coordinates")))
+                .build();
+        this.addRenderableWidget(coordsToggleButton);
+
+        double initialCoordsScaleVal = (MapConfig.coordsScale - 0.1) / (2.0 - 0.1);
+        coordsScaleSlider = new SimpleSlider(
+                col2X, 52, colW, 20,
+                initialCoordsScaleVal,
+                val -> Component.translatable("gui.simplemap.option.coords_scale",
+                        String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (2.0 - 0.1))).getString(),
+                val -> MapConfig.coordsScale = (float) (0.1 + val * (2.0 - 0.1)));
+        coordsScaleSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.coords_scale")));
+        this.addRenderableWidget(coordsScaleSlider);
+
+        cursorBiomeButton = Button.builder(
+                getCursorBiomeMessage(),
+                button -> {
+                    MapConfig.cursorBiomeEnabled = !MapConfig.cursorBiomeEnabled;
+                    MapConfig.save();
+                    button.setMessage(getCursorBiomeMessage());
+                }).bounds(col1X, 77, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cursor_biome")))
+                .build();
+        this.addRenderableWidget(cursorBiomeButton);
+
+        cursorBlockButton = Button.builder(
+                getCursorBlockMessage(),
+                button -> {
+                    MapConfig.cursorBlockEnabled = !MapConfig.cursorBlockEnabled;
+                    MapConfig.save();
+                    button.setMessage(getCursorBlockMessage());
+                }).bounds(col2X, 77, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cursor_block")))
+                .build();
+        this.addRenderableWidget(cursorBlockButton);
+
+        // ==================== SYSTEM CONTROLS ====================
+        mapRevealModeButton = Button.builder(
+                getMapRevealModeMessage(),
+                button -> {
+                    MapConfig.mapRevealMode = 1;
+                    ChunkScanner.getInstance().requestRefresh(this.minecraft);
+                    MapConfig.save();
+                    button.setMessage(getMapRevealModeMessage());
+                }).bounds(col1X, 52, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.mapping_mode")))
+                .build();
+        this.addRenderableWidget(mapRevealModeButton);
+
+        autoClearPinButton = Button.builder(
+                getAutoClearPinMessage(),
+                button -> {
+                    MapConfig.autoClearPin = !MapConfig.autoClearPin;
+                    MapConfig.save();
+                    button.setMessage(getAutoClearPinMessage());
+                }).bounds(col1X, 102, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.auto_clear_pin")))
+                .build();
+        this.addRenderableWidget(autoClearPinButton);
+
+        int initialChunks = pointsToChunkBudget(MapConfig.scanPointsPerTick);
+        double initialScanVal = (double) (initialChunks - SCAN_CHUNK_MIN)
+                / (SCAN_CHUNK_MAX - SCAN_CHUNK_MIN);
+        scanSlider = new SimpleSlider(
+                col2X, 52, colW, 20,
+                initialScanVal,
+                val -> formatScanBudget(sliderToChunkBudget(val)),
+                val -> {
+                    int chunks = sliderToChunkBudget(val);
+                    MapConfig.scanPointsPerTick = chunkBudgetToPoints(chunks);
+                    if (scanInputBox != null) {
+                        scanInputBox.setValue(chunks >= SCAN_CHUNK_MAX
+                                ? "AUTO" : String.valueOf(chunks));
+                    }
+                });
+        scanSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.scan_slider")));
+        this.addRenderableWidget(scanSlider);
+
+        alwaysRescanButton = Button.builder(
+                getAlwaysRescanMessage(),
+                button -> {
+                    MapConfig.alwaysRescanExplored = !MapConfig.alwaysRescanExplored;
+                    MapConfig.save();
+                    button.setMessage(getAlwaysRescanMessage());
+                }).bounds(col1X, 77, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.rescan_loaded")))
+                .build();
+        this.addRenderableWidget(alwaysRescanButton);
+
+        scanInputBox = new EditBox(this.font,
+                col2X, 77, colW - 1, 20,
+                Component.translatable("gui.simplemap.narration.scan_points"));
+        scanInputBox.setMaxLength(6);
+        scanInputBox.setValue(initialChunks >= SCAN_CHUNK_MAX
+                ? "AUTO" : String.valueOf(initialChunks));
+        scanInputBox.setHint(Component.translatable("gui.simplemap.hint.scan_input"));
+        scanInputBox.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.scan_input")));
+        scanInputBox.setResponder(text -> {
+            String normalized = text.trim();
+            if (normalized.equalsIgnoreCase("AUTO") || normalized.equalsIgnoreCase("MAX")) {
+                MapConfig.scanPointsPerTick = 100000;
+                if (scanSlider != null) scanSlider.setValue(1.0);
+                scanInputBox.setTextColor(0xFFFFFF);
+                return;
+            }
+            try {
+                int chunks = Integer.parseInt(normalized);
+                if (chunks >= SCAN_CHUNK_MIN && chunks < SCAN_CHUNK_MAX) {
+                    MapConfig.scanPointsPerTick = chunkBudgetToPoints(chunks);
+                    if (scanSlider != null) {
+                        scanSlider.setValue((double) (chunks - SCAN_CHUNK_MIN)
+                                / (SCAN_CHUNK_MAX - SCAN_CHUNK_MIN));
+                    }
+                    scanInputBox.setTextColor(0xFFFFFF);
+                } else {
+                    scanInputBox.setTextColor(0xFF5555);
+                }
+            } catch (NumberFormatException ignored) {
+                scanInputBox.setTextColor(0xFF5555);
+            }
+        });
+        this.addRenderableWidget(scanInputBox);
+
+        fastFullscreenButton = Button.builder(
+                getFastFullscreenMessage(),
+                b -> {
+                    MapConfig.fastFullscreenLoading = !MapConfig.fastFullscreenLoading;
+                    b.setMessage(getFastFullscreenMessage());
+                    MapConfig.save();
+                }).bounds(col2X, 152, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.fast_fullscreen")))
+                .build();
+        this.addRenderableWidget(fastFullscreenButton);
+
+        deathWaypointButton = Button.builder(
+                getDeathWaypointMessage(),
+                b -> {
+                    MapConfig.createDeathWaypoint = !MapConfig.createDeathWaypoint;
+                    b.setMessage(getDeathWaypointMessage());
+                    if (deathWaypointLimitButton != null) deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
+                    MapConfig.save();
+                }).bounds(col1X, 177, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.death_points")))
+                .build();
+        this.addRenderableWidget(deathWaypointButton);
+
+        deathWaypointLimitButton = Button.builder(
+                getDeathWaypointLimitMessage(),
+                b -> {
+                    MapConfig.maxDeathWaypoints = switch (MapConfig.maxDeathWaypoints) {
+                        case 0 -> 1;
+                        case 1 -> 3;
+                        case 3 -> 5;
+                        case 5 -> 10;
+                        default -> 0;
+                    };
+                    b.setMessage(getDeathWaypointLimitMessage());
+                    MapConfig.save();
+                }).bounds(col2X, 177, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.death_limit")))
+                .build();
+        deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
+        this.addRenderableWidget(deathWaypointLimitButton);
+
+        resetToDefaultButton = Button.builder(
+                Component.translatable("gui.simplemap.restore_defaults"),
+                button -> openResetConfirmation())
+                .bounds(col1X, 202, gridWidth, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.restore_defaults")))
+                .build();
+        this.addRenderableWidget(resetToDefaultButton);
+
+        reloadAllRegionsButton = Button.builder(
+                Component.translatable("gui.simplemap.reload_regions"),
+                button -> {
+                    MapManager.getInstance().reloadAllRegions();
+                    button.setMessage(Component.translatable("gui.simplemap.reloading"));
+                }).bounds(col2X, 102, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.reload_regions")))
+                .build();
+        this.addRenderableWidget(reloadAllRegionsButton);
+
+        displayFlowersButton = Button.builder(
+                getDisplayFlowersMessage(),
+                button -> {
+                    MapConfig.displayFlowers = !MapConfig.displayFlowers;
+                    button.setMessage(getDisplayFlowersMessage());
+                    refreshLoadedMapData();
+                }).bounds(col1X, 127, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.map_flowers")))
+                .build();
+        this.addRenderableWidget(displayFlowersButton);
+
+        blockColourModeButton = Button.builder(
+                getBlockColourModeMessage(),
+                button -> {
+                    MapConfig.blockColourMode = (MapConfig.blockColourMode + 1) % 2;
+                    button.setMessage(getBlockColourModeMessage());
+                    refreshLoadedMapData();
+                }).bounds(col2X, 127, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.block_colors")))
+                .build();
+        this.addRenderableWidget(blockColourModeButton);
+
+        terrainSlopesButton = Button.builder(
+                getTerrainSlopesMessage(),
+                button -> {
+                    MapConfig.terrainSlopes = (MapConfig.terrainSlopes + 1) % 3;
+                    button.setMessage(getTerrainSlopesMessage());
+                    refreshLoadedMapData();
+                }).bounds(col1X, 152, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.terrain_shading")))
+                .build();
+        this.addRenderableWidget(terrainSlopesButton);
+
+        // ==================== DONE BUTTON ====================
+        doneButton = Button.builder(
+                Component.translatable("gui.simplemap.done"),
+                button -> {
+                    MapConfig.save();
+                    if (this.minecraft != null)
+                        this.minecraft.setScreen(this.parent);
+                }).bounds(col1X, this.height - 30, gridWidth, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.done_settings")))
+                .build();
+        this.addRenderableWidget(doneButton);
+
+        // Sync visibility at startup
+        updateWidgetVisibility();
+    }
+
+    private void openResetConfirmation() {
+        if (this.minecraft == null) return;
+        this.minecraft.setScreen(new ConfirmScreen(confirmed -> {
+            if (confirmed) {
+                applyDefaultPreferences();
+            }
+            if (this.minecraft != null) {
+                this.minecraft.setScreen(this);
+            }
+        }, Component.translatable("gui.simplemap.confirm_restore.title"),
+                Component.translatable("gui.simplemap.confirm_restore.message"),
+                Component.translatable("gui.simplemap.confirm_restore.confirm"),
+                Component.translatable("gui.simplemap.cancel")));
+    }
+
+    private void applyDefaultPreferences() {
+        MapConfig.resetPreferencesToDefaults();
+        selectedMinimap = false;
+        selectedCoords = false;
+        isDraggingMinimap = false;
+        isDraggingCoords = false;
+        CaveMode.clearManualLayer();
+        CaveMapManager.getInstance().deactivate();
+        ChunkScanner.getInstance().reset();
+        MapManager.getInstance().reloadAllRegions();
+        CaveTextureManager.getInstance().invalidateStyle();
+    }
+
+    private Component getTabButtonLabel(int tabIndex, String key) {
+        String label = Component.translatable(key).getString();
+        return Component.literal(activeTab == tabIndex ? "§6§l" + label : label);
+    }
+
+    private void updateTabButtons() {
+        if (tabMapButton != null)
+            tabMapButton.setMessage(getTabButtonLabel(0, "gui.simplemap.tab.map.name"));
+        if (tabCoordsButton != null)
+            tabCoordsButton.setMessage(getTabButtonLabel(1, "gui.simplemap.tab.coords.name"));
+        if (tabColorsButton != null)
+            tabColorsButton.setMessage(getTabButtonLabel(2, "gui.simplemap.tab.colors.name"));
+        if (tabSystemButton != null)
+            tabSystemButton.setMessage(getTabButtonLabel(3, "gui.simplemap.tab.system.name"));
+    }
+
+    private void updateWidgetVisibility() {
+        boolean hideAll = selectedMinimap || selectedCoords;
+        boolean showMap = activeTab == 0 && !hideAll;
+        boolean showCoords = activeTab == 1 && !hideAll;
+        boolean showColors = activeTab == 2 && !hideAll;
+        boolean showSystem = activeTab == 3 && !hideAll;
+
+        if (tabMapButton != null) tabMapButton.visible = !hideAll;
+        if (tabCoordsButton != null) tabCoordsButton.visible = !hideAll;
+        if (tabColorsButton != null) tabColorsButton.visible = !hideAll;
+        if (tabSystemButton != null) tabSystemButton.visible = !hideAll;
+        if (doneButton != null) doneButton.visible = !hideAll;
+
+        if (minimapToggleButton != null)
+            minimapToggleButton.visible = showMap;
+        if (minimapRotateButton != null)
+            minimapRotateButton.visible = showMap;
+        if (minimapShapeButton != null)
+            minimapShapeButton.visible = showMap;
+        if (minimapSizeSlider != null)
+            minimapSizeSlider.visible = showMap;
+        if (minimapZoomSlider != null)
+            minimapZoomSlider.visible = showMap;
+        if (pointerModeButton != null)
+            pointerModeButton.visible = showMap;
+        if (pointerScaleSlider != null)
+            pointerScaleSlider.visible = showMap;
+        if (pinScaleSlider != null)
+            pinScaleSlider.visible = showMap;
+        if (colorTargetButton != null)
+            colorTargetButton.visible = showColors;
+        if (presetColorButton != null)
+            presetColorButton.visible = showColors;
+        if (sharedColorInput != null)
+            sharedColorInput.visible = showColors;
+        if (savePaletteColorButton != null)
+            savePaletteColorButton.visible = showColors;
+        if (customBlockColorsButton != null) {
+            customBlockColorsButton.visible = showColors;
+            customBlockColorsButton.setMessage(Component.translatable(
+                    "gui.simplemap.option.block_overrides", MapConfig.blockColorOverrides.size()));
+        }
+        refreshPaletteButtons();
+        if (compassLettersToggleButton != null)
+            compassLettersToggleButton.visible = showMap;
+        if (showInScreensButton != null)
+            showInScreensButton.visible = showMap;
+        if (minimapWaypointsButton != null)
+            minimapWaypointsButton.visible = showMap;
+        if (mapStyleButton != null)
+            mapStyleButton.visible = showMap;
+
+        if (coordsToggleButton != null)
+            coordsToggleButton.visible = showCoords;
+        if (coordsScaleSlider != null)
+            coordsScaleSlider.visible = showCoords;
+        if (cursorBiomeButton != null)
+            cursorBiomeButton.visible = showCoords;
+        if (cursorBlockButton != null)
+            cursorBlockButton.visible = showCoords;
+
+        if (autoClearPinButton != null)
+            autoClearPinButton.visible = showSystem;
+        if (alwaysRescanButton != null)
+            alwaysRescanButton.visible = showSystem;
+        if (reloadAllRegionsButton != null)
+            reloadAllRegionsButton.visible = showSystem;
+        if (mapRevealModeButton != null)
+            mapRevealModeButton.visible = showSystem;
+        if (resetToDefaultButton != null)
+            resetToDefaultButton.visible = showSystem;
+        if (scanSlider != null)
+            scanSlider.visible = showSystem;
+        if (scanInputBox != null)
+            scanInputBox.visible = showSystem;
+        if (displayFlowersButton != null)
+            displayFlowersButton.visible = showSystem;
+        if (blockColourModeButton != null)
+            blockColourModeButton.visible = showSystem;
+        if (terrainSlopesButton != null)
+            terrainSlopesButton.visible = showSystem;
+        if (fastFullscreenButton != null)
+            fastFullscreenButton.visible = showSystem;
+        if (deathWaypointButton != null)
+            deathWaypointButton.visible = showSystem;
+        if (deathWaypointLimitButton != null) {
+            deathWaypointLimitButton.visible = showSystem;
+            deathWaypointLimitButton.active = showSystem && MapConfig.createDeathWaypoint;
+        }
+    }
+
+    private static Component onOffComponent(boolean value) {
+        return Component.translatable(value ? "gui.simplemap.value.on" : "gui.simplemap.value.off");
+    }
+
+    private Component getToggleMessage() {
+        return Component.translatable("gui.simplemap.option.minimap",
+                Component.translatable(MapConfig.minimapEnabled
+                        ? "gui.simplemap.value.enabled"
+                        : "gui.simplemap.value.disabled"));
+    }
+
+    private Component getRotateMessage() {
+        return Component.translatable("gui.simplemap.option.north_lock",
+                onOffComponent(!MapConfig.minimapRotate));
+    }
+
+    private Component getShapeMessage() {
+        return Component.translatable("gui.simplemap.option.shape",
+                Component.translatable(MapConfig.minimapCircle
+                        ? "gui.simplemap.value.circle"
+                        : "gui.simplemap.value.square"));
+    }
+
+    private Component getCoordsToggleMessage() {
+        return Component.translatable("gui.simplemap.option.coordinates",
+                onOffComponent(MapConfig.coordsEnabled));
+    }
+
+    private Component getDeathWaypointMessage() {
+        return Component.translatable("gui.simplemap.option.death_points",
+                onOffComponent(MapConfig.createDeathWaypoint));
+    }
+
+    private Component getDeathWaypointLimitMessage() {
+        return Component.translatable("gui.simplemap.option.death_limit", MapConfig.maxDeathWaypoints);
+    }
+
+    private Component getAutoClearPinMessage() {
+        return Component.translatable("gui.simplemap.option.auto_clear_pin",
+                onOffComponent(MapConfig.autoClearPin));
+    }
+
+    private Component getPointerModeMessage() {
+        return Component.translatable("gui.simplemap.option.marker",
+                Component.translatable(MapConfig.playerMarkerMode == 1
+                        ? "gui.simplemap.value.arrow"
+                        : "gui.simplemap.value.skin"));
+    }
+
+    private Component getCompassLettersMessage() {
+        return Component.translatable("gui.simplemap.option.compass_labels",
+                onOffComponent(MapConfig.compassLettersVisible));
+    }
+
+    private Component getShowInScreensMessage() {
+        return Component.translatable("gui.simplemap.option.show_in_screens",
+                onOffComponent(MapConfig.showMinimapInScreens));
+    }
+
+    private Component getMinimapWaypointsMessage() {
+        return Component.translatable("gui.simplemap.option.minimap_waypoints",
+                onOffComponent(MapConfig.minimapWaypointsVisible));
+    }
+
+    private Component getMapStyleMessage() {
+        int index = Math.max(0, Math.min(MapColorProfile.NAMES.length - 1, MapConfig.mapColorProfile));
+        Component styleName = switch (index) {
+            case 1 -> Component.translatable("gui.simplemap.style.vibrant");
+            case 2 -> Component.translatable("gui.simplemap.style.natural");
+            case 3 -> Component.translatable("gui.simplemap.style.contrast");
+            default -> Component.translatable("gui.simplemap.style.balanced");
+        };
+        return Component.translatable("gui.simplemap.option.style", styleName);
+    }
+
+    private Component getColorTargetMessage() {
+        Component targetName = switch (selectedColorTarget) {
+            case 1 -> Component.translatable("gui.simplemap.color_target.ring");
+            case 2 -> Component.translatable("gui.simplemap.color_target.compass");
+            case 3 -> Component.translatable("gui.simplemap.color_target.coords");
+            default -> Component.translatable("gui.simplemap.color_target.arrow");
+        };
+        return Component.translatable("gui.simplemap.option.edit_color", targetName);
+    }
+
+    private Component getSelectedPresetMessage() {
+        return Component.translatable("gui.simplemap.option.color_preset",
+                getPresetColorName(getSelectedTargetColor()));
+    }
+
+    private int getSelectedTargetColor() {
+        return switch (selectedColorTarget) {
+            case 1 -> MapConfig.minimapRingColor;
+            case 2 -> MapConfig.compassLetterColor;
+            case 3 -> MapConfig.coordsTextColor;
+            default -> MapConfig.playerPointerColor;
+        };
+    }
+
+    private void setSelectedTargetColor(int color) {
+        switch (selectedColorTarget) {
+            case 1 -> MapConfig.minimapRingColor = color;
+            case 2 -> MapConfig.compassLetterColor = color;
+            case 3 -> MapConfig.coordsTextColor = color;
+            default -> MapConfig.playerPointerColor = color;
+        }
+        if (presetColorButton != null) presetColorButton.setMessage(getSelectedPresetMessage());
+    }
+
+    private void syncSharedColorInput() {
+        if (sharedColorInput != null) {
+            sharedColorInput.setValue(MapColorProfile.formatColor(getSelectedTargetColor()));
+            sharedColorInput.setTextColor(0xFFFFFFFF);
+        }
+        if (presetColorButton != null) presetColorButton.setMessage(getSelectedPresetMessage());
+    }
+
+    private void previewSharedColor(String value) {
+        try {
+            setSelectedTargetColor(MapColorProfile.parseColor(value));
+            sharedColorInput.setTextColor(0xFFFFFFFF);
+        } catch (IllegalArgumentException ignored) {
+            sharedColorInput.setTextColor(0xFFFF5555);
+        }
+    }
+
+    private void saveSharedColor() {
+        try {
+            int color = MapColorProfile.parseColor(sharedColorInput.getValue());
+            setSelectedTargetColor(color);
+            MapConfig.savedColors.remove(Integer.valueOf(color));
+            MapConfig.savedColors.add(0, color);
+            while (MapConfig.savedColors.size() > 8) {
+                MapConfig.savedColors.remove(MapConfig.savedColors.size() - 1);
+            }
+            MapConfig.save();
+            refreshPaletteButtons();
+        } catch (IllegalArgumentException ignored) {
+            sharedColorInput.setTextColor(0xFFFF5555);
+        }
+    }
+
+    private void applySavedColor(int slot) {
+        if (slot < 0 || slot >= MapConfig.savedColors.size()) return;
+        setSelectedTargetColor(MapConfig.savedColors.get(slot));
+        syncSharedColorInput();
+    }
+
+    private void refreshPaletteButtons() {
+        for (int i = 0; i < paletteButtons.size(); i++) {
+            ColorSwatchButton swatch = paletteButtons.get(i);
+            boolean hasColor = i < MapConfig.savedColors.size();
+            if (hasColor) swatch.setColor(MapConfig.savedColors.get(i));
+            swatch.visible = activeTab == 2 && hasColor;
+        }
+    }
+
+    private int nextPresetColor(int currentColor) {
+        for (int i = 0; i < MapConfig.POINTER_COLORS.length; i++) {
+            if (currentColor == MapConfig.POINTER_COLORS[i]) {
+                return MapConfig.POINTER_COLORS[(i + 1) % MapConfig.POINTER_COLORS.length];
+            }
+        }
+        return MapConfig.POINTER_COLORS[0];
+    }
+
+    private String getPresetColorName(int color) {
+        for (int i = 0; i < MapConfig.POINTER_COLORS.length; i++) {
+            if (color == MapConfig.POINTER_COLORS[i]) {
+                return switch (i) {
+                    case 0 -> Component.translatable("gui.simplemap.color.cyan").getString();
+                    case 1 -> Component.translatable("gui.simplemap.color.green").getString();
+                    case 2 -> Component.translatable("gui.simplemap.color.red").getString();
+                    case 3 -> Component.translatable("gui.simplemap.color.yellow").getString();
+                    case 4 -> Component.translatable("gui.simplemap.color.purple").getString();
+                    case 5 -> Component.translatable("gui.simplemap.color.orange").getString();
+                    case 6 -> Component.translatable("gui.simplemap.color.white").getString();
+                    case 7 -> Component.translatable("gui.simplemap.color.rainbow").getString();
+                    default -> MapConfig.POINTER_COLOR_NAMES[i];
+                };
+            }
+        }
+        return Component.translatable("gui.simplemap.color.custom").getString();
+    }
+
+    private Component getFastFullscreenMessage() {
+        return Component.translatable("gui.simplemap.option.loading",
+                Component.translatable(MapConfig.fastFullscreenLoading
+                        ? "gui.simplemap.value.fast"
+                        : "gui.simplemap.value.balanced"));
+    }
+
+    private Component getAlwaysRescanMessage() {
+        return Component.translatable("gui.simplemap.option.rescan_loaded",
+                onOffComponent(MapConfig.alwaysRescanExplored));
+    }
+
+    private static int pointsToChunkBudget(int points) {
+        if (points >= 100000) return SCAN_CHUNK_MAX;
+        return Math.max(SCAN_CHUNK_MIN,
+                Math.min(SCAN_CHUNK_MAX - 1, (points + 255) / 256));
+    }
+
+    private static int chunkBudgetToPoints(int chunks) {
+        if (chunks >= SCAN_CHUNK_MAX) return 100000;
+        return Math.max(1000, Math.min(99999, chunks * 256));
+    }
+
+    private static int sliderToChunkBudget(double value) {
+        return SCAN_CHUNK_MIN + (int) Math.round(value
+                * (SCAN_CHUNK_MAX - SCAN_CHUNK_MIN));
+    }
+
+    private static String formatScanBudget(int chunks) {
+        return chunks >= SCAN_CHUNK_MAX
+                ? Component.translatable("gui.simplemap.option.scan_auto").getString()
+                : Component.translatable("gui.simplemap.option.scan_chunks", chunks).getString();
+    }
+
+    private Component getMapRevealModeMessage() {
+        return Component.translatable("gui.simplemap.option.mapping_mode",
+                Component.translatable("gui.simplemap.value.stream"));
+    }
+
+    private Component getDisplayFlowersMessage() {
+        return Component.translatable("gui.simplemap.option.map_flowers",
+                onOffComponent(MapConfig.displayFlowers));
+    }
+
+    private Component getBlockColourModeMessage() {
+        return Component.translatable("gui.simplemap.option.block_colors",
+                Component.translatable(MapConfig.blockColourMode == 1
+                        ? "gui.simplemap.value.vanilla"
+                        : "gui.simplemap.value.accurate"));
+    }
+
+    private Component getTerrainSlopesMessage() {
+        Component mode = switch (MapConfig.terrainSlopes) {
+            case 0 -> Component.translatable("gui.simplemap.value.off");
+            case 1 -> Component.translatable("gui.simplemap.value.2d");
+            default -> Component.translatable("gui.simplemap.value.3d");
+        };
+        return Component.translatable("gui.simplemap.option.terrain_shading", mode);
+    }
+
+    private Component getCursorBiomeMessage() {
+        return Component.translatable("gui.simplemap.option.cursor_biome",
+                onOffComponent(MapConfig.cursorBiomeEnabled));
+    }
+
+    private Component getCursorBlockMessage() {
+        return Component.translatable("gui.simplemap.option.cursor_block",
+                onOffComponent(MapConfig.cursorBlockEnabled));
+    }
+
+    private void refreshLoadedMapData() {
+        MapConfig.save();
+        MapManager.getInstance().reloadAllRegions();
+        if (this.minecraft == null || this.minecraft.player == null) return;
+        ChunkScanner.getInstance().requestRefresh(this.minecraft);
+        MapTextureManager.getInstance().invalidateStyle();
+        CaveTextureManager.getInstance().invalidateStyle();
+    }
+
+    private boolean isRemoteServerSession() {
+        return this.minecraft != null && this.minecraft.getConnection() != null && !this.minecraft.isLocalServer();
+    }
+
+    private void syncIntegratedServerConfig() {
+        if (this.minecraft == null || this.minecraft.getSingleplayerServer() == null) return;
+        net.minecraft.server.MinecraftServer server = this.minecraft.getSingleplayerServer();
+        SyncConfigPayload payload = new SyncConfigPayload(ServerConfig.requireMapBook, ServerConfig.caveMapMode);
+        server.execute(() -> {
+            for (net.minecraft.server.level.ServerPlayer player : server.getPlayerList().getPlayers()) {
+                NetworkHandler.sendToPlayer(player, payload);
+            }
+        });
+    }
+
+    private Component getServerRequireBookMessage(boolean remoteServer, boolean remoteExtension) {
+        if (remoteServer && !remoteExtension) {
+            return Component.translatable("gui.simplemap.server.book_mod_required");
+        }
+        boolean enabled = remoteServer ? MapConfig.serverRequireMapBook : ServerConfig.requireMapBook;
+        Component val = Component.translatable(enabled
+                ? "gui.simplemap.value.required"
+                : "gui.simplemap.value.optional");
+        String suffix = remoteServer
+                ? Component.translatable("gui.simplemap.server.suffix_server").getString()
+                : "";
+        return Component.translatable("gui.simplemap.server.book", val, suffix);
+    }
+
+    private Component getServerCaveModeMessage(boolean remoteServer, boolean remoteExtension) {
+        int mode = remoteServer
+                ? (remoteExtension ? MapConfig.serverCaveMapMode : MapConfig.localCaveMapMode)
+                : ServerConfig.caveMapMode;
+        Component name = switch (mode) {
+            case 1 -> Component.translatable("gui.simplemap.value.auto");
+            case 2 -> Component.translatable("gui.simplemap.value.on");
+            default -> Component.translatable("gui.simplemap.value.off");
+        };
+        String authority = remoteServer
+                ? Component.translatable(remoteExtension
+                        ? "gui.simplemap.server.suffix_server"
+                        : "gui.simplemap.server.suffix_local").getString()
+                : "";
+        return Component.translatable("gui.simplemap.server.cave_scan", name, authority);
+    }
+
+    @Override
+    public void renderBackground(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+        // The in-map editor suppresses Minecraft's default blur. The global Mod
+        // Config branch invokes the superclass explicitly to get the normal blurred
+        // game backdrop.
+    }
+
+    @Override
+    public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+        if (!(parent instanceof MapScreen)) {
+            // Global Mod Config uses Minecraft's blurred in-game background and a
+            // compact translucent card. The map's own settings screen deliberately
+            // keeps its existing custom preview background below.
+            super.renderBackground(guiGraphics, mouseX, mouseY, partialTick);
+            int panelWidth = 216;
+            int panelHeight = 140;
+            int panelLeft = (this.width - panelWidth) / 2;
+            int panelTop = (this.height - panelHeight) / 2 - 10;
+            guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + panelHeight, 0xA818191C);
+            guiGraphics.renderOutline(panelLeft, panelTop, panelWidth, panelHeight, 0xB8666A70);
+            guiGraphics.drawCenteredString(this.font, Component.translatable("gui.simplemap.server_settings_title"),
+                    this.width / 2, panelTop + 16, 0xFFF2F2F2);
+            super.render(guiGraphics, mouseX, mouseY, partialTick);
+            return;
+        }
+
+        if (!selectedMinimap && !selectedCoords) {
+            // Semi-transparent dark overlay — game view shows through behind
+            guiGraphics.fill(0, 0, this.width, this.height, 0xAA000000);
+
+            // Draw the same responsive card geometry used by init().
+            panelBottom = Math.max(panelTop + 80, this.height - 10);
+            guiGraphics.fill(panelLeft, panelTop, panelRight, panelBottom, 0xDD111215);
+            guiGraphics.renderOutline(panelLeft - 1, panelTop - 1,
+                    panelWidth + 2, panelBottom - panelTop + 2, 0xFF2D3033);
+            guiGraphics.fill(panelLeft, 58, panelRight, 59, 0xFF2D3033);
+        } else {
+            guiGraphics.fill(0, 0, this.width, this.height, 0x30000000);
+        }
+
+        int size = MapConfig.minimapSize;
+        int[] minimapPosition = MinimapPosition.resolve(this.width, this.height, size);
+        int x = minimapPosition[0];
+        int y = minimapPosition[1];
+
+        boolean isHovered = mouseX >= x && mouseX < x + size && mouseY >= y && mouseY < y + size;
+
+        // 1. Render Minimap
+        if (MapConfig.minimapEnabled) {
+            int borderColor = isHovered || isDraggingMinimap || selectedMinimap
+                    ? 0xFF00C8FF : MapConfig.minimapRingColor;
+            float cx = x + size / 2.0f;
+            float cy = y + size / 2.0f;
+            float radius = size / 2.0f;
+            int borderThickness = Math.max(2, size / 32);
+
+            if (MapConfig.minimapCircle) {
+                int tHalf = Math.max(1, borderThickness / 2);
+                cx = x + radius;
+                cy = y + radius;
+                float clipRadius = radius - tHalf;
+                int circleBorderColor = isHovered || isDraggingMinimap || selectedMinimap
+                        ? 0xFF00C8FF : 0xE0000000;
+
+                drawSolidCircleHelper(guiGraphics, cx, cy, radius, 64, 0xFF080A0C, 0.0f);
+                guiGraphics.flush();
+
+                if (this.minecraft != null && this.minecraft.player != null) {
+                    double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
+                    double interpX = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.xo,
+                            this.minecraft.player.getX()) * dimScale;
+                    double interpZ = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.zo,
+                            this.minecraft.player.getZ()) * dimScale;
+                    boolean rendered = MinimapFramebufferRenderer.getInstance().render(
+                            guiGraphics, x, y, size, interpX, interpZ,
+                            MapConfig.minimapZoom, MapConfig.minimapRotate, partialTick);
+                    if (!rendered) {
+                        MapRenderer.getInstance().drawMap(
+                                guiGraphics, x, y, size, size,
+                                interpX, interpZ,
+                                MapConfig.minimapZoom,
+                                false, MapConfig.minimapRotate, true, 0, 0,
+                                partialTick);
+                    }
+                    MapRenderer.getInstance().drawMinimapPlayerOverlay(
+                            guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
+                }
+
+                float ringWidth = Math.max(1.5f, size / 72.0f);
+                float innerRingR = radius - 0.5f;
+                float outerRingR = innerRingR + ringWidth;
+                drawCircleRing(guiGraphics, cx, cy, innerRingR - 0.5f, innerRingR, 64, 0x77000000);
+                drawCircleRing(guiGraphics, cx, cy, innerRingR, outerRingR, 64, MapConfig.minimapRingColor);
+                drawCircleRing(guiGraphics, cx, cy, outerRingR, outerRingR + 0.75f, 64, circleBorderColor);
+
+                if (isHovered || isDraggingMinimap || selectedMinimap) {
+                    drawSolidCircleHelper(guiGraphics, cx, cy, clipRadius, 64, 0x4400C8FF, 0.3f);
+                }
+                guiGraphics.flush();
+
+                if (this.minecraft != null && this.minecraft.player != null) {
+                    drawCompassDirectionsHelper(guiGraphics, this.minecraft, cx, cy, radius, ringWidth,
+                            this.minecraft.player, true, partialTick);
+                }
+            } else {
+                // SQUARE PREVIEW
+                guiGraphics.fill(x - 1, y - 1, x + size + 1, y, borderColor);
+                guiGraphics.fill(x - 1, y + size, x + size + 1, y + size + 1, borderColor);
+                guiGraphics.fill(x - 1, y, x, y + size, borderColor);
+                guiGraphics.fill(x + size, y, x + size + 1, y + size, borderColor);
+
+                if (this.minecraft != null && this.minecraft.player != null) {
+                    double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
+                    double interpX = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.xo,
+                            this.minecraft.player.getX()) * dimScale;
+                    double interpZ = net.minecraft.util.Mth.lerp(partialTick, this.minecraft.player.zo,
+                            this.minecraft.player.getZ()) * dimScale;
+                    boolean rendered = MinimapFramebufferRenderer.getInstance().render(
+                            guiGraphics, x, y, size, interpX, interpZ,
+                            MapConfig.minimapZoom, MapConfig.minimapRotate, partialTick);
+                    if (!rendered) {
+                        MapRenderer.getInstance().drawMap(
+                                guiGraphics, x, y, size, size,
+                                interpX, interpZ,
+                                MapConfig.minimapZoom,
+                                true, MapConfig.minimapRotate, true, 0, 0,
+                                partialTick);
+                    }
+                    MapRenderer.getInstance().drawMinimapPlayerOverlay(
+                            guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
+                }
+
+                // Draw directions (square)
+                if (this.minecraft != null && this.minecraft.player != null) {
+                    drawCompassDirectionsHelper(guiGraphics, this.minecraft, cx, cy, radius, borderThickness,
+                            this.minecraft.player, false, partialTick);
+                }
+
+                if (isHovered || isDraggingMinimap || selectedMinimap) {
+                    guiGraphics.fill(x, y, x + size, y + size, 0x4400C8FF);
+                }
+            }
+        } else {
+            int borderColor = isHovered || selectedMinimap ? 0xFF00C8FF : 0xFF666666;
+            guiGraphics.fill(x, y, x + size, y + size, 0x55000000);
+            guiGraphics.renderOutline(x, y, size, size, borderColor);
+            String text = Component.translatable("gui.simplemap.preview.minimap_disabled").getString();
+            guiGraphics.drawString(this.font, text, x + (size - this.font.width(text)) / 2, y + (size - 9) / 2,
+                    0xAAAAAA, false);
+        }
+
+        // 2. Render Coordinates (Coords)
+        String coords = "0, 80, 0";
+        if (this.minecraft != null && this.minecraft.player != null) {
+            coords = String.format("%d, %d, %d",
+                    (int) Math.floor(this.minecraft.player.getX()),
+                    (int) Math.floor(this.minecraft.player.getY()),
+                    (int) Math.floor(this.minecraft.player.getZ()));
+        }
+
+        int cx, cy;
+        if (MapConfig.coordsEnabled) {
+            int textWidth = (int) (this.font.width(coords) * MapConfig.coordsScale);
+            int textHeight = (int) (9 * MapConfig.coordsScale);
+
+            if (MapConfig.coordsXPercent < 0 || MapConfig.coordsYPercent < 0) {
+                cx = x + (size - textWidth) / 2;
+                cy = y + size + 4;
+            } else {
+                cx = (int) (this.width * MapConfig.coordsXPercent);
+                cy = (int) (this.height * MapConfig.coordsYPercent);
+            }
+
+            cx = Math.max(2, Math.min(cx, this.width - textWidth - 2));
+            cy = Math.max(2, Math.min(cy, this.height - textHeight - 2));
+
+            guiGraphics.pose().pushPose();
+            guiGraphics.pose().translate(cx, cy, 0);
+            guiGraphics.pose().scale(MapConfig.coordsScale, MapConfig.coordsScale, 1.0f);
+
+            int rawWidth = this.font.width(coords);
+            guiGraphics.fill(-3, -2, rawWidth + 3, 9, 0x88000000);
+            int coordsColor = MapRenderer.getInstance().getActualPointerColor(MapConfig.coordsTextColor);
+            guiGraphics.drawString(this.font, coords, 0, 0, coordsColor, false);
+            guiGraphics.pose().popPose();
+
+            boolean isCoordsHovered = mouseX >= cx - 3 && mouseX < cx + textWidth + 3 && mouseY >= cy - 2
+                    && mouseY < cy + textHeight + 2;
+            if (isCoordsHovered || selectedCoords || isDraggingCoords) {
+                int borderColor = isCoordsHovered || isDraggingCoords ? 0xFF00C8FF : 0xFF2D3033;
+                guiGraphics.renderOutline(cx - 4, cy - 3, textWidth + 8, textHeight + 6, borderColor);
+            }
+        } else {
+            String text = Component.translatable("gui.simplemap.preview.coords_disabled").getString();
+            int rawWidth = this.font.width(text);
+            int placeholderW = (int) (rawWidth * MapConfig.coordsScale);
+            int placeholderH = (int) (9 * MapConfig.coordsScale);
+
+            if (MapConfig.coordsXPercent < 0 || MapConfig.coordsYPercent < 0) {
+                cx = x + (size - placeholderW) / 2;
+                cy = y + size + 4;
+            } else {
+                cx = (int) (this.width * MapConfig.coordsXPercent);
+                cy = (int) (this.height * MapConfig.coordsYPercent);
+            }
+
+            cx = Math.max(2, Math.min(cx, this.width - placeholderW - 2));
+            cy = Math.max(2, Math.min(cy, this.height - placeholderH - 2));
+
+            guiGraphics.fill(cx - 3, cy - 2, cx + placeholderW + 3, cy + placeholderH + 2, 0x55000000);
+            guiGraphics.renderOutline(cx - 4, cy - 3, placeholderW + 8, placeholderH + 6, 0xFF666666);
+
+            guiGraphics.pose().pushPose();
+            guiGraphics.pose().translate(cx, cy, 0);
+            guiGraphics.pose().scale(MapConfig.coordsScale, MapConfig.coordsScale, 1.0f);
+            guiGraphics.drawString(this.font, text, 0, 0, 0xAAAAAA, false);
+            guiGraphics.pose().popPose();
+
+            boolean isCoordsHovered = mouseX >= cx - 3 && mouseX < cx + placeholderW + 3 && mouseY >= cy - 2
+                    && mouseY < cy + placeholderH + 2;
+            if (isCoordsHovered || selectedCoords || isDraggingCoords) {
+                int borderColor = isCoordsHovered || isDraggingCoords ? 0xFF00C8FF : 0xFF2D3033;
+                guiGraphics.renderOutline(cx - 4, cy - 3, placeholderW + 8, placeholderH + 6, borderColor);
+            }
+        }
+
+        if (activeTab == 2) {
+            String paletteLabel = Component.translatable(MapConfig.savedColors.isEmpty()
+                    ? "gui.simplemap.palette.empty_hint"
+                    : "gui.simplemap.palette.saved_hint").getString();
+            guiGraphics.drawString(this.font, paletteLabel, panelLeft + 6,
+                    PALETTE_LABEL_Y, 0xFFB0B0B0, false);
+        }
+
+        // Draw widgets (sliders, buttons, editbox)
+        super.render(guiGraphics, mouseX, mouseY, partialTick);
+
+        // Simple hint above Done button
+        int panelCenterX = doneButton.getX() + doneButton.getWidth() / 2;
+        int hintY = doneButton.getY() - 18;
+
+        String hint = activeTab == 2 ? Component.translatable("gui.simplemap.hint.color_tab").getString()
+                : ((selectedMinimap || selectedCoords)
+                        ? Component.translatable("gui.simplemap.hint.drag_move").getString()
+                        : (activeTab <= 1 ? Component.translatable("gui.simplemap.hint.click_drag").getString() : ""));
+        if (!hint.isEmpty()) {
+            guiGraphics.drawCenteredString(this.font, hint, panelCenterX, hintY, 0x808080);
+        }
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (!(parent instanceof MapScreen)) {
+            return super.mouseClicked(mouseX, mouseY, button);
+        }
+        if (button == 0) {
+            int size = MapConfig.minimapSize;
+            int[] minimapPosition = MinimapPosition.resolve(this.width, this.height, size);
+            int x = minimapPosition[0];
+            int y = minimapPosition[1];
+
+            String coords = MapConfig.coordsEnabled ? "0, 80, 0"
+                    : Component.translatable("gui.simplemap.preview.coords_disabled").getString();
+            if (MapConfig.coordsEnabled && this.minecraft != null && this.minecraft.player != null) {
+                coords = String.format("%d, %d, %d",
+                        (int) Math.floor(this.minecraft.player.getX()),
+                        (int) Math.floor(this.minecraft.player.getY()),
+                        (int) Math.floor(this.minecraft.player.getZ()));
+            }
+            int textWidth = (int) (this.font.width(coords) * MapConfig.coordsScale);
+            int textHeight = (int) (9 * MapConfig.coordsScale);
+            int cx;
+            int cy;
+            if (MapConfig.coordsXPercent < 0 || MapConfig.coordsYPercent < 0) {
+                cx = x + (size - textWidth) / 2;
+                cy = y + size + 4;
+            } else {
+                cx = (int) (this.width * MapConfig.coordsXPercent);
+                cy = (int) (this.height * MapConfig.coordsYPercent);
+            }
+            cx = Math.max(2, Math.min(cx, this.width - textWidth - 2));
+            cy = Math.max(2, Math.min(cy, this.height - textHeight - 2));
+
+            boolean insideMinimap = mouseX >= x && mouseX < x + size && mouseY >= y && mouseY < y + size;
+            boolean insideCoords = mouseX >= cx - 3 && mouseX < cx + textWidth + 3
+                    && mouseY >= cy - 2 && mouseY < cy + textHeight + 2;
+
+            if ((selectedMinimap && !insideMinimap) || (selectedCoords && !insideCoords)) {
+                selectedMinimap = false;
+                selectedCoords = false;
+                isDraggingMinimap = false;
+                isDraggingCoords = false;
+                MapConfig.save();
+                updateWidgetVisibility();
+                return true;
+            }
+
+            // 1. Check Minimap click
+            if (insideMinimap) {
+                this.selectedMinimap = true;
+                this.selectedCoords = false;
+                updateWidgetVisibility();
+                if (MapConfig.minimapEnabled) {
+                    this.isDraggingMinimap = true;
+                    this.dragOffsetX = mouseX - x;
+                    this.dragOffsetY = mouseY - y;
+                }
+                return true;
+            }
+
+            // 2. Check Coords click
+            if (insideCoords) {
+                this.selectedCoords = true;
+                this.selectedMinimap = false;
+                updateWidgetVisibility();
+                this.isDraggingCoords = true;
+                this.dragCoordsOffsetX = mouseX - cx;
+                this.dragCoordsOffsetY = mouseY - cy;
+                return true;
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (!(parent instanceof MapScreen)) {
+            return super.mouseReleased(mouseX, mouseY, button);
+        }
+        if (button == 0) {
+            isDraggingMinimap = false;
+            isDraggingCoords = false;
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+        if (!(parent instanceof MapScreen)) {
+            return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+        }
+        if (isDraggingMinimap) {
+            int requestedX = (int) Math.round(mouseX - dragOffsetX);
+            int requestedY = (int) Math.round(mouseY - dragOffsetY);
+            MinimapPosition.setFromTopLeft(requestedX, requestedY, this.width, this.height, MapConfig.minimapSize);
+            return true;
+        }
+        if (isDraggingCoords) {
+            MapConfig.coordsXPercent = Math.max(0f, Math.min(1f, (float) (mouseX - dragCoordsOffsetX) / this.width));
+            MapConfig.coordsYPercent = Math.max(0f, Math.min(1f, (float) (mouseY - dragCoordsOffsetY) / this.height));
+            return true;
+        }
+        return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    @Override
+    public void onClose() {
+        MapConfig.save();
+        if (this.minecraft != null) {
+            this.minecraft.setScreen(this.parent);
+        } else {
+            super.onClose();
+        }
+    }
+
+    @Override
+    public boolean isPauseScreen() {
+        return false;
+    }
+
+    private class ColorSwatchButton extends AbstractButton {
+        private final int slot;
+        private int color;
+
+        ColorSwatchButton(int x, int y, int width, int height, int slot) {
+            super(x, y, width, height, Component.translatable("gui.simplemap.palette.saved_color"));
+            this.slot = slot;
+        }
+
+        void setColor(int color) {
+            this.color = color;
+            String formatted = MapColorProfile.formatColor(color);
+            setMessage(Component.translatable("gui.simplemap.palette.use_color", formatted));
+            setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.palette_swatch", formatted)));
+        }
+
+        @Override
+        public void onPress() {
+            if (Screen.hasShiftDown() && slot < MapConfig.savedColors.size()) {
+                MapConfig.savedColors.remove(slot);
+                MapConfig.save();
+                refreshPaletteButtons();
+            } else {
+                applySavedColor(slot);
+            }
+        }
+
+        @Override
+        protected void renderWidget(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+            int border = isHoveredOrFocused() || color == getSelectedTargetColor() ? 0xFFFFFFFF : 0xFF55585D;
+            guiGraphics.fill(getX(), getY(), getX() + getWidth(), getY() + getHeight(), 0xFF161719);
+            guiGraphics.fill(getX() + 3, getY() + 3, getX() + getWidth() - 3, getY() + getHeight() - 3,
+                    0xFF000000 | (color & 0x00FFFFFF));
+            guiGraphics.renderOutline(getX(), getY(), getWidth(), getHeight(), border);
+        }
+
+        @Override
+        public void updateWidgetNarration(NarrationElementOutput output) {
+            defaultButtonNarrationText(output);
+        }
+    }
+
+    // Custom slider with public setValue() for external sync from EditBox
+    private static class SimpleSlider extends AbstractSliderButton {
+        private final java.util.function.Consumer<Double> onChange;
+        private final java.util.function.Function<Double, String> labelProvider;
+
+        public SimpleSlider(int x, int y, int width, int height, double defaultValue,
+                java.util.function.Function<Double, String> labelProvider,
+                java.util.function.Consumer<Double> onChange) {
+            super(x, y, width, height, Component.literal(labelProvider.apply(defaultValue)), defaultValue);
+            this.labelProvider = labelProvider;
+            this.onChange = onChange;
+        }
+
+        /**
+         * Called from the EditBox responder to push a new normalised value (0..1)
+         * into the slider WITHOUT triggering applyValue() to avoid a feedback loop.
+         */
+        public void setValue(double newValue) {
+            this.value = Math.max(0.0, Math.min(1.0, newValue));
+            updateMessage();
+        }
+
+        @Override
+        protected void updateMessage() {
+            setMessage(Component.literal(labelProvider.apply(this.value)));
+        }
+
+        @Override
+        protected void applyValue() {
+            onChange.accept(this.value);
+        }
+    }
+
+    private void fillFloat(GuiGraphics guiGraphics, float minX, float minY, float maxX, float maxY, int color) {
+        float a = ((color >> 24) & 0xFF) / 255.0f;
+        float r = ((color >> 16) & 0xFF) / 255.0f;
+        float g = ((color >> 8) & 0xFF) / 255.0f;
+        float b = (color & 0xFF) / 255.0f;
+
+        org.joml.Matrix4f matrix = guiGraphics.pose().last().pose();
+        com.mojang.blaze3d.vertex.VertexConsumer consumer = guiGraphics.bufferSource()
+                .getBuffer(net.minecraft.client.renderer.RenderType.gui());
+
+        consumer.addVertex(matrix, minX, minY, 0.0f).setColor(r, g, b, a);
+        consumer.addVertex(matrix, minX, maxY, 0.0f).setColor(r, g, b, a);
+        consumer.addVertex(matrix, maxX, maxY, 0.0f).setColor(r, g, b, a);
+        consumer.addVertex(matrix, maxX, minY, 0.0f).setColor(r, g, b, a);
+    }
+
+    private void drawCompassDirectionsHelper(GuiGraphics guiGraphics, Minecraft mc, float cx, float cy, float radius,
+            float borderThickness, net.minecraft.world.entity.player.Player player, boolean isCircle,
+            float partialTick) {
+        if (!MapConfig.compassLettersVisible) {
+            return;
+        }
+
+        float playerYaw;
+        if (MapConfig.minimapRotate) {
+            playerYaw = net.minecraft.util.Mth.rotLerp(partialTick, player.yRotO, player.getYRot());
+        } else {
+            playerYaw = 180.0f;
+        }
+
+        float angleN = -playerYaw + 90.0f;
+        float angleE = -playerYaw + 180.0f;
+        float angleS = -playerYaw + 270.0f;
+        float angleW = -playerYaw;
+
+        float limit;
+        if (isCircle) {
+            limit = radius * 0.915f;
+        } else {
+            limit = radius + borderThickness / 2.0f;
+        }
+
+        int letterColor = MapRenderer.getInstance().getActualPointerColor(MapConfig.compassLetterColor);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleN, Component.translatable("gui.simplemap.compass.n").getString(), letterColor, isCircle);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleE, Component.translatable("gui.simplemap.compass.e").getString(), letterColor, isCircle);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleS, Component.translatable("gui.simplemap.compass.s").getString(), letterColor, isCircle);
+        drawDirectionLetterHelper(guiGraphics, mc, cx, cy, limit, angleW, Component.translatable("gui.simplemap.compass.w").getString(), letterColor, isCircle);
+    }
+
+    private void drawDirectionLetterHelper(GuiGraphics guiGraphics, Minecraft mc, float cx, float cy, float limit,
+            float angleDegrees, String letter, int color, boolean isCircle) {
+        float rad = (float) Math.toRadians(angleDegrees);
+        float cos = (float) Math.cos(rad);
+        float sin = (float) Math.sin(rad);
+
+        float x, y;
+        if (isCircle) {
+            x = cx + limit * cos;
+            y = cy + limit * sin;
+        } else {
+            float scale = 1.0f / Math.max(Math.abs(cos), Math.abs(sin));
+            x = cx + limit * cos * scale;
+            y = cy + limit * sin * scale;
+        }
+
+        guiGraphics.pose().pushPose();
+        guiGraphics.pose().translate(x, y, 0);
+        guiGraphics.pose().scale(0.7f, 0.7f, 1.0f);
+
+        int textWidth = mc.font.width(letter);
+        guiGraphics.drawString(mc.font, letter, -textWidth / 2, -4, color, true);
+        guiGraphics.pose().popPose();
+    }
+
+    /** Searchable editor for every per-block custom color override. */
+    public static final class BlockColorManagerScreen extends Screen {
+        private static final int ROWS = 8;
+        private static final int CONTENT_WIDTH = 420;
+        private static final int PANEL_PADDING = 8;
+        private final Screen parent;
+        private final List<java.util.Map.Entry<String, Integer>> filtered = new ArrayList<>();
+        private EditBox search;
+        private int page;
+        private boolean confirmClear;
+
+        public BlockColorManagerScreen(Screen parent) {
+            super(Component.translatable("gui.simplemap.block_colors_title"));
+            this.parent = parent;
+        }
+
+        @Override
+        protected void init() {
+            int left = panelLeft();
+            int top = panelTop();
+            search = new EditBox(font, left, top + 24, 300, 20, Component.translatable("gui.simplemap.search_blocks"));
+            search.setHint(Component.translatable("gui.simplemap.hint.search_registry_id"));
+            search.setResponder(value -> {
+                page = 0;
+                rebuildRows();
+            });
+            addRenderableWidget(search);
+            addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.done"), b -> closeToParent())
+                    .bounds(left + 322, top + 24, 98, 20).build());
+            rebuildRows();
+        }
+
+        private void rebuildRows() {
+            String query = search == null ? "" : search.getValue().trim().toLowerCase(Locale.ROOT);
+            filtered.clear();
+            MapConfig.blockColorOverrides.entrySet().stream()
+                    .filter(entry -> query.isEmpty() || entry.getKey().toLowerCase(Locale.ROOT).contains(query))
+                    .sorted(Comparator.comparing(java.util.Map.Entry::getKey))
+                    .forEach(filtered::add);
+            int maxPage = Math.max(0, (filtered.size() - 1) / ROWS);
+            page = Math.max(0, Math.min(page, maxPage));
+
+            clearWidgets();
+            int left = panelLeft();
+            int top = panelTop();
+            addRenderableWidget(search);
+            addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.done"), b -> closeToParent())
+                    .bounds(left + 322, top + 24, 98, 20).build());
+
+            int start = page * ROWS;
+            for (int row = 0; row < ROWS && start + row < filtered.size(); row++) {
+                java.util.Map.Entry<String, Integer> entry = filtered.get(start + row);
+                String id = entry.getKey();
+                int y = top + 52 + row * 23;
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.edit"), b -> edit(id))
+                        .bounds(left + 306, y, 52, 20).build());
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.reset"), b -> {
+                    MapColorProfile.resetBlockOverride(id);
+                    rebuildRows();
+                }).bounds(left + 364, y, 56, 20).build());
+            }
+
+            addRenderableWidget(Button.builder(Component.literal("<"), b -> {
+                if (page > 0) { page--; rebuildRows(); }
+            }).bounds(left, top + 241, 36, 20).build());
+            addRenderableWidget(Button.builder(Component.literal(">"), b -> {
+                if ((page + 1) * ROWS < filtered.size()) { page++; rebuildRows(); }
+            }).bounds(left + 42, top + 241, 36, 20).build());
+            addRenderableWidget(Button.builder(Component.translatable(confirmClear ? "gui.simplemap.confirm_clear_all" : "gui.simplemap.clear_all"), b -> {
+                if (!confirmClear) {
+                    confirmClear = true;
+                    rebuildRows();
+                } else {
+                    confirmClear = false;
+                    MapColorProfile.clearAllBlockOverrides();
+                    rebuildRows();
+                }
+            }).bounds(left + 280, top + 241, 140, 20).build());
+        }
+
+        private void edit(String blockId) {
+            int automatic = MapTextureManager.getInstance().resolveAutomaticBlockColor(blockId);
+            String displayName = blockId;
+            ResourceLocation loc = ResourceLocation.tryParse(blockId);
+            if (loc != null && BuiltInRegistries.BLOCK.containsKey(loc)) {
+                displayName = BuiltInRegistries.BLOCK.get(loc).getName().getString();
+            }
+            if (minecraft != null) minecraft.setScreen(new BlockColorScreen(this, blockId, displayName, 0, 0, automatic));
+        }
+
+        @Override
+        public void renderBackground(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+            graphics.fill(0, 0, width, height, 0xCC080A0C);
+        }
+
+        @Override
+        public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+            int left = panelLeft();
+            int top = panelTop();
+            graphics.fill(left - PANEL_PADDING, top - PANEL_PADDING, left + CONTENT_WIDTH + PANEL_PADDING, top + 270, 0xF0111215);
+            graphics.renderOutline(left - PANEL_PADDING, top - PANEL_PADDING, CONTENT_WIDTH + PANEL_PADDING * 2, 278, 0xFF3B3E44);
+            graphics.drawString(font, title, left, top, 0xFFFFFFFF, false);
+
+            int start = page * ROWS;
+            for (int row = 0; row < ROWS && start + row < filtered.size(); row++) {
+                java.util.Map.Entry<String, Integer> entry = filtered.get(start + row);
+                int y = top + 52 + row * 23;
+                int color = 0xFF000000 | (entry.getValue() & 0x00FFFFFF);
+                graphics.fill(left, y + 2, left + 18, y + 18, color);
+                graphics.renderOutline(left, y + 2, 18, 16, 0xFFFFFFFF);
+                graphics.drawString(font, entry.getKey(), left + 25, y + 6, 0xFFE0E0E0, false);
+            }
+            int pages = Math.max(1, (filtered.size() + ROWS - 1) / ROWS);
+            graphics.drawString(font,
+                    Component.translatable("gui.simplemap.block_colors.page_info", filtered.size(), page + 1, pages),
+                    left + 88, top + 247, 0xFF9A9A9A, false);
+            super.render(graphics, mouseX, mouseY, partialTick);
+        }
+
+        @Override
+        public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+            if (scrollY > 0 && page > 0) { page--; rebuildRows(); return true; }
+            if (scrollY < 0 && (page + 1) * ROWS < filtered.size()) { page++; rebuildRows(); return true; }
+            return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        }
+
+        private int panelLeft() {
+            return Math.max(10, (width - CONTENT_WIDTH) / 2);
+        }
+
+        private int panelTop() {
+            return Math.max(10, Math.min(height - 270, height / 2 - 132));
+        }
+
+        private void closeToParent() {
+            if (minecraft != null) minecraft.setScreen(parent);
+        }
+
+        @Override
+        public void onClose() { closeToParent(); }
+
+        @Override
+        public boolean isPauseScreen() { return false; }
+
+        /** Small editor for a single registry-backed surface-block color override. */
+        public static class BlockColorScreen extends Screen {
+            private final Screen parent;
+            private final String blockId;
+            private final String blockName;
+            private final int blockX;
+            private final int blockZ;
+            private final int automaticColor;
+            private final List<PaletteSwatch> swatches = new ArrayList<>();
+            private EditBox colorInput;
+
+            public BlockColorScreen(Screen parent, String blockId, String blockName,
+                    int blockX, int blockZ, int automaticColor) {
+                super(Component.translatable("gui.simplemap.block_color_editor_title"));
+                this.parent = parent;
+                this.blockId = blockId;
+                this.blockName = blockName;
+                this.blockX = blockX;
+                this.blockZ = blockZ;
+                this.automaticColor = automaticColor;
+            }
+
+            @Override
+            protected void init() {
+                int left = this.width / 2 - 120;
+                int top = Math.max(14, this.height / 2 - 90);
+                int currentColor = MapConfig.blockColorOverrides.getOrDefault(blockId, automaticColor);
+
+                colorInput = new EditBox(this.font, left, top + 48, 160, 20, Component.translatable("gui.simplemap.narration.block_hex_color"));
+                colorInput.setMaxLength(9);
+                colorInput.setValue(MapColorProfile.formatColor(currentColor));
+                colorInput.setHint(Component.literal("#RRGGBB"));
+                colorInput.setResponder(value -> {
+                    try {
+                        MapColorProfile.parseColor(value);
+                        colorInput.setTextColor(0xFFFFFFFF);
+                    } catch (IllegalArgumentException ignored) {
+                        colorInput.setTextColor(0xFFFF5555);
+                    }
+                });
+                addRenderableWidget(colorInput);
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.save"), button -> saveOverride())
+                        .bounds(left + 166, top + 48, 74, 20).build());
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.automatic"), button -> resetOverride())
+                        .bounds(left, top + 128, 116, 20).build());
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.cancel"), button -> closeToParent())
+                        .bounds(left + 124, top + 128, 116, 20).build());
+
+                swatches.clear();
+                for (int i = 0; i < Math.min(8, MapConfig.savedColors.size()); i++) {
+                    int x = left + (i % 4) * 60;
+                    int y = top + 76 + (i / 4) * 24;
+                    PaletteSwatch swatch = new PaletteSwatch(x, y, 56, 18, i, MapConfig.savedColors.get(i));
+                    swatches.add(swatch);
+                    addRenderableWidget(swatch);
+                }
+            }
+
+            private void saveOverride() {
+                try {
+                    int color = MapColorProfile.parseColor(colorInput.getValue());
+                    rememberColor(color);
+                    MapColorProfile.applyBlockOverride(blockId, color);
+                    closeToParent();
+                } catch (IllegalArgumentException ignored) {
+                    colorInput.setTextColor(0xFFFF5555);
+                }
+            }
+
+            private void resetOverride() {
+                MapColorProfile.resetBlockOverride(blockId);
+                closeToParent();
+            }
+
+            private void rememberColor(int color) {
+                MapConfig.savedColors.remove(Integer.valueOf(color));
+                MapConfig.savedColors.add(0, color);
+                while (MapConfig.savedColors.size() > 8) {
+                    MapConfig.savedColors.remove(MapConfig.savedColors.size() - 1);
+                }
+            }
+
+            private void closeToParent() {
+                if (this.minecraft != null) this.minecraft.setScreen(parent);
+            }
+
+            @Override
+            public void onClose() {
+                closeToParent();
+            }
+
+            @Override
+            public boolean isPauseScreen() {
+                return false;
+            }
+
+            @Override
+            public void renderBackground(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+            }
+
+            @Override
+            public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+                int left = this.width / 2 - 126;
+                int top = Math.max(8, this.height / 2 - 96);
+                guiGraphics.fill(0, 0, this.width, this.height, 0x88000000);
+                guiGraphics.fill(left, top, left + 252, top + 166, 0xF0111215);
+                guiGraphics.renderOutline(left, top, 252, 166, 0xFF3B3E44);
+                guiGraphics.drawCenteredString(this.font, blockName, this.width / 2, top + 10, 0xFFFFFFFF);
+                guiGraphics.drawCenteredString(this.font, blockId, this.width / 2, top + 23, 0xFF9A9A9A);
+                guiGraphics.drawString(this.font,
+                        Component.translatable(MapConfig.savedColors.isEmpty()
+                                ? "gui.simplemap.block_color.enter_color"
+                                : "gui.simplemap.block_color.saved_palette"),
+                        left + 6, top + 63, 0xFF9A9A9A, false);
+
+                int previewColor = automaticColor;
+                if (colorInput != null) {
+                    try {
+                        previewColor = MapColorProfile.parseColor(colorInput.getValue());
+                    } catch (IllegalArgumentException ignored) {
+                    }
+                }
+                guiGraphics.fill(left + 218, top + 7, left + 244, top + 33,
+                        0xFF000000 | (previewColor & 0x00FFFFFF));
+                guiGraphics.renderOutline(left + 217, top + 6, 28, 28, 0xFFFFFFFF);
+                super.render(guiGraphics, mouseX, mouseY, partialTick);
+            }
+
+            private class PaletteSwatch extends AbstractButton {
+                private final int slot;
+                private final int color;
+
+                PaletteSwatch(int x, int y, int width, int height, int slot, int color) {
+                    super(x, y, width, height, Component.translatable("gui.simplemap.palette.use_color", MapColorProfile.formatColor(color)));
+                    this.slot = slot;
+                    this.color = color;
+                }
+
+                @Override
+                public void onPress() {
+                    if (Screen.hasShiftDown() && slot < MapConfig.savedColors.size()) {
+                        MapConfig.savedColors.remove(slot);
+                        MapConfig.save();
+                        if (BlockColorScreen.this.minecraft != null) {
+                            BlockColorScreen.this.init(BlockColorScreen.this.minecraft,
+                                    BlockColorScreen.this.width, BlockColorScreen.this.height);
+                        }
+                    } else {
+                        colorInput.setValue(MapColorProfile.formatColor(color));
+                    }
+                }
+
+                @Override
+                protected void renderWidget(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+                    int border = isHoveredOrFocused() ? 0xFFFFFFFF : 0xFF55585D;
+                    guiGraphics.fill(getX(), getY(), getX() + getWidth(), getY() + getHeight(),
+                            0xFF000000 | (color & 0x00FFFFFF));
+                    guiGraphics.renderOutline(getX(), getY(), getWidth(), getHeight(), border);
+                }
+
+                @Override
+                public void updateWidgetNarration(NarrationElementOutput output) {
+                    defaultButtonNarrationText(output);
+                }
+            }
+        }
+    }
+
+
+    public static class WaypointListScreen extends Screen {
+    private static final String DIM_OVERWORLD = "minecraft:overworld";
+    private static final String DIM_NETHER = "minecraft:the_nether";
+    private static final String DIM_END = "minecraft:the_end";
+    private static final int ROW_HEIGHT = 38;
+
+    private final Screen parent;
+    private final String previousViewDimension;
+    private final boolean previousViewWasLive;
+    private boolean previousViewRestored;
+    private final List<WaypointManager.Waypoint> filteredWaypoints = new ArrayList<>();
+    private final List<Button> tabButtons = new ArrayList<>();
+    private int selectedTab;
+    private double scrollAmount;
+    private EditBox searchBox;
+    private WaypointManager.Waypoint pendingDelete;
+    private long pendingDeleteUntilNanos;
+    private WaypointManager.Waypoint focusedWaypoint;
+
+    private int panelLeft;
+    private int panelTop;
+    private int panelWidth;
+    private int panelHeight;
+    private double previewCenterX;
+    private double previewCenterZ;
+    private String previewDimension;
+    private float previewScale = 0.55f;
+    private boolean previewInitialized;
+    private boolean draggingMap;
+    private double dragStartX;
+    private double dragStartY;
+
+    public WaypointListScreen(Screen parent) {
+        super(Component.translatable("gui.simplemap.waypoint_manager_title"));
+        this.parent = parent;
+        this.previousViewDimension = MapManager.getInstance().getCurrentDimensionResourceId();
+        this.previousViewWasLive = MapManager.getInstance().isViewingLiveDimension();
+        this.previewDimension = this.previousViewDimension;
+    }
+
+    @Override
+    protected void init() {
+        tabButtons.clear();
+
+        if (!previewInitialized) {
+            previewInitialized = true;
+            if (parent instanceof MapScreen mapScreen && mapScreen.scale > 0.05f) {
+                previewScale = mapScreen.scale;
+                previewCenterX = mapScreen.centerX;
+                previewCenterZ = mapScreen.centerZ;
+            } else if (minecraft != null && minecraft.player != null) {
+                previewScale = Math.max(0.35f, Math.min(0.85f, (this.width - 2) / 1200.0f));
+                previewCenterX = minecraft.player.getX();
+                previewCenterZ = minecraft.player.getZ();
+            }
+        }
+
+        // Sleek, translucent left-docked glass panel matching AddWaypointScreen
+        panelWidth = Math.min(256, Math.max(220, this.width - 24));
+        panelLeft = Math.max(8, Math.min(14, this.width / 28));
+        panelTop = Math.max(8, Math.min(14, this.height / 24));
+        panelHeight = Math.max(184, this.height - panelTop * 2);
+
+        int leftX = panelLeft + 8;
+        int fieldWidth = panelWidth - 16;
+
+        String[] tabs = {
+            Component.translatable("gui.simplemap.waypoint_tab.all").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.overworld").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.nether").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.end").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.modded").getString()
+        };
+        int tabGap = 2;
+        int tabWidth = Math.max(28, (fieldWidth - tabGap * (tabs.length - 1)) / tabs.length);
+        int tabY = panelTop + 21;
+        for (int index = 0; index < tabs.length; index++) {
+            final int tab = index;
+            Button button = Button.builder(Component.literal(tabs[index]), b -> setTab(tab))
+                    .bounds(leftX + index * (tabWidth + tabGap), tabY, tabWidth, 16).build();
+            tabButtons.add(button);
+            addRenderableWidget(button);
+        }
+
+        searchBox = new EditBox(font, leftX, panelTop + 40, fieldWidth, 16,
+                Component.translatable("gui.simplemap.search_waypoints"));
+        searchBox.setHint(Component.literal("Search name, coords or dim..."));
+        searchBox.setResponder(value -> refreshWaypoints());
+        addRenderableWidget(searchBox);
+
+        int halfButton = (fieldWidth - 4) / 2;
+        int bottomY = panelTop + panelHeight - 23;
+        addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.add_waypoint"), button -> openAddScreen())
+                .bounds(leftX, bottomY, halfButton, 18).build());
+        addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.done"), button -> onClose())
+                .bounds(leftX + halfButton + 4, bottomY, halfButton, 18).build());
+
+        refreshWaypoints();
+        updateTabLabels();
+    }
+
+    private void openAddScreen() {
+        if (minecraft == null || minecraft.player == null) return;
+        double targetX = focusedWaypoint != null ? focusedWaypoint.x : minecraft.player.getX();
+        double targetY = focusedWaypoint != null && focusedWaypoint.hasY
+                ? focusedWaypoint.y : minecraft.player.getY();
+        double targetZ = focusedWaypoint != null ? focusedWaypoint.z : minecraft.player.getZ();
+        String targetDim = focusedWaypoint != null && focusedWaypoint.dimension != null
+                ? focusedWaypoint.dimension
+                : MapManager.getInstance().getLiveDimensionResourceId();
+        minecraft.setScreen(new AddWaypointScreen(this, targetX, targetY, targetZ, targetDim));
+    }
+
+    private void setTab(int tab) {
+        selectedTab = tab;
+        scrollAmount = 0;
+        pendingDelete = null;
+        refreshWaypoints();
+        updateTabLabels();
+    }
+
+    private void updateTabLabels() {
+        String[] tabs = {
+            Component.translatable("gui.simplemap.waypoint_tab.all").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.overworld").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.nether").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.end").getString(),
+            Component.translatable("gui.simplemap.waypoint_tab.modded").getString()
+        };
+        for (int index = 0; index < tabButtons.size(); index++) {
+            tabButtons.get(index).setMessage(Component.literal(
+                    index == selectedTab ? "§b" + tabs[index] : tabs[index]));
+        }
+    }
+
+    private void refreshWaypoints() {
+        filteredWaypoints.clear();
+        String filter = searchBox == null ? ""
+                : searchBox.getValue().trim().toLowerCase(Locale.ROOT);
+        for (WaypointManager.Waypoint waypoint : WaypointManager.getInstance().getAllWaypoints()) {
+            if (!matchesTab(waypoint)) continue;
+            String y = waypoint.hasY ? Integer.toString((int) Math.floor(waypoint.y)) : "";
+            String searchable = (waypoint.name + " " + (int) Math.floor(waypoint.x) + " "
+                    + y + " " + (int) Math.floor(waypoint.z) + " " + waypoint.dimension)
+                    .toLowerCase(Locale.ROOT);
+            if (filter.isEmpty() || searchable.contains(filter)) filteredWaypoints.add(waypoint);
+        }
+        filteredWaypoints.sort(Comparator
+                .comparing((WaypointManager.Waypoint waypoint) -> waypoint.dimension)
+                .thenComparing(waypoint -> waypoint.name.toLowerCase(Locale.ROOT)));
+        if (focusedWaypoint != null && !filteredWaypoints.contains(focusedWaypoint)) {
+            focusedWaypoint = filteredWaypoints.isEmpty() ? null : filteredWaypoints.get(0);
+        } else if (focusedWaypoint == null && !filteredWaypoints.isEmpty()) {
+            focusedWaypoint = filteredWaypoints.get(0);
+        }
+        clampScroll();
+    }
+
+    private boolean matchesTab(WaypointManager.Waypoint waypoint) {
+        return switch (selectedTab) {
+            case 1 -> isVanillaDimension(waypoint.dimension, "overworld");
+            case 2 -> isVanillaDimension(waypoint.dimension, "the_nether");
+            case 3 -> isVanillaDimension(waypoint.dimension, "the_end");
+            case 4 -> !isVanillaDimension(waypoint.dimension, "overworld")
+                    && !isVanillaDimension(waypoint.dimension, "the_nether")
+                    && !isVanillaDimension(waypoint.dimension, "the_end");
+            default -> true;
+        };
+    }
+
+    private int listTop() {
+        return panelTop + 60;
+    }
+
+    private int listBottom() {
+        return panelTop + panelHeight - 28;
+    }
+
+    private int listWidth() {
+        return panelWidth - 16;
+    }
+
+    private int listLeft() {
+        return panelLeft + 8;
+    }
+
+    private boolean isInsidePanel(double mouseX, double mouseY) {
+        return mouseX >= panelLeft && mouseX <= panelLeft + panelWidth
+                && mouseY >= panelTop && mouseY <= panelTop + panelHeight;
+    }
+
+    private double getMapAreaCenterX() {
+        int rightAreaLeft = panelLeft + panelWidth;
+        int rightAreaWidth = Math.max(40, this.width - rightAreaLeft);
+        return rightAreaLeft + rightAreaWidth * 0.5;
+    }
+
+    private void focusWaypointOnPreview(WaypointManager.Waypoint waypoint) {
+        if (waypoint == null) return;
+        focusedWaypoint = waypoint;
+        previewCenterX = waypoint.x;
+        previewCenterZ = waypoint.z;
+        String targetDim = MapManager.getInstance().resolveDimensionResourceId(waypoint.dimension);
+        previewDimension = targetDim;
+        ensurePreviewDimensionViewed(targetDim);
+        if (parent instanceof MapScreen mapScreen) {
+            mapScreen.centerX = waypoint.x;
+            mapScreen.centerZ = waypoint.z;
+        }
+    }
+
+    private void ensurePreviewDimensionViewed(String dimension) {
+        if (minecraft == null || dimension == null || dimension.isBlank()) return;
+        MapManager manager = MapManager.getInstance();
+        String target = manager.resolveDimensionResourceId(dimension);
+        if (target.equals(manager.getCurrentDimensionResourceId())) return;
+        if (target.equals(manager.getLiveDimensionResourceId())) {
+            manager.returnToLiveDimension(minecraft);
+        } else {
+            manager.switchToDimension(target);
+        }
+    }
+
+    private void restorePreviousMapView() {
+        if (previousViewRestored || minecraft == null) return;
+        previousViewRestored = true;
+        MapManager manager = MapManager.getInstance();
+        if (previousViewWasLive) manager.returnToLiveDimension(minecraft);
+        else if (previousViewDimension != null) manager.switchToDimension(previousViewDimension);
+    }
+
+    private int maximumScroll() {
+        return Math.max(0, filteredWaypoints.size() * ROW_HEIGHT
+                - (listBottom() - listTop() - 4));
+    }
+
+    private void clampScroll() {
+        scrollAmount = Math.max(0, Math.min(maximumScroll(), scrollAmount));
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX,
+            double scrollY) {
+        if (isInsidePanel(mouseX, mouseY)) {
+            if (mouseY >= listTop() && mouseY <= listBottom()) {
+                scrollAmount -= scrollY * 22.0;
+                clampScroll();
+                return true;
+            }
+            return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        }
+        previewScale = Math.max(0.0625f,
+                Math.min(8.0f, previewScale + (float) scrollY * 0.15f * previewScale));
+        return true;
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (super.mouseClicked(mouseX, mouseY, button)) return true;
+        if (!isInsidePanel(mouseX, mouseY)) {
+            if (button == 0) {
+                draggingMap = true;
+                dragStartX = mouseX;
+                dragStartY = mouseY;
+                return true;
+            } else if (button == 1 && minecraft != null) {
+                float backgroundScale = Math.max(0.0625f, previewScale);
+                double anchorScreenX = getMapAreaCenterX();
+                double anchorScreenY = this.height * 0.5;
+                double mapCenterX = previewCenterX - (anchorScreenX - this.width * 0.5) / backgroundScale;
+                double mapCenterZ = previewCenterZ - (anchorScreenY - this.height * 0.5) / backgroundScale;
+                double clickedX = Math.floor(mapCenterX + (mouseX - this.width * 0.5) / backgroundScale) + 0.5;
+                double clickedZ = Math.floor(mapCenterZ + (mouseY - this.height * 0.5) / backgroundScale) + 0.5;
+                String dim = MapManager.getInstance().getCurrentDimensionResourceId();
+                minecraft.setScreen(new AddWaypointScreen(this, clickedX, clickedZ, dim));
+                return true;
+            }
+            return false;
+        }
+        if (button != 0 || mouseY < listTop() || mouseY > listBottom()) return false;
+
+        int left = listLeft();
+        int width = listWidth();
+        if (mouseX < left || mouseX > left + width) return false;
+
+        int startY = listTop() + 2 - (int) scrollAmount;
+        for (int index = 0; index < filteredWaypoints.size(); index++) {
+            int rowY = startY + index * ROW_HEIGHT;
+            if (rowY + ROW_HEIGHT < listTop() || rowY > listBottom()) continue;
+            if (mouseY < rowY || mouseY >= rowY + ROW_HEIGHT) continue;
+
+            WaypointManager.Waypoint waypoint = filteredWaypoints.get(index);
+            RowActions actions = rowActions(rowY);
+            if (mouseY >= actions.buttonY && mouseY <= actions.buttonY + actions.buttonHeight) {
+                if (inside(mouseX, actions.pinX, actions.pinWidth)) {
+                    toggleTracked(waypoint);
+                    return true;
+                }
+                if (inside(mouseX, actions.editX, actions.editWidth)) {
+                    if (minecraft != null) minecraft.setScreen(new AddWaypointScreen(this, waypoint));
+                    return true;
+                }
+                if (inside(mouseX, actions.shareX, actions.shareWidth)) {
+                    share(waypoint);
+                    return true;
+                }
+                if (inside(mouseX, actions.teleportX, actions.teleportWidth)) {
+                    teleport(waypoint);
+                    return true;
+                }
+                if (inside(mouseX, actions.deleteX, actions.deleteWidth)) {
+                    confirmDelete(waypoint);
+                    return true;
+                }
+            }
+            focusWaypointOnPreview(waypoint);
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+        if (draggingMap && button == 0) {
+            previewCenterX -= dragX / Math.max(0.01f, previewScale);
+            previewCenterZ -= dragY / Math.max(0.01f, previewScale);
+            return true;
+        }
+        return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (draggingMap && button == 0) {
+            draggingMap = false;
+            return true;
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    private static boolean inside(double mouseX, int x, int width) {
+        return mouseX >= x && mouseX <= x + width;
+    }
+
+    private RowActions rowActions(int rowY) {
+        int right = listLeft() + listWidth() - 5;
+        int gap = 2;
+        int buttonHeight = 13;
+        int buttonY = rowY + ROW_HEIGHT - buttonHeight - 3;
+        int deleteWidth = 28;
+        int teleportWidth = 18;
+        int shareWidth = 26;
+        int editWidth = 22;
+        int pinWidth = 24;
+        int deleteX = right - deleteWidth;
+        int teleportX = deleteX - gap - teleportWidth;
+        int shareX = teleportX - gap - shareWidth;
+        int editX = shareX - gap - editWidth;
+        int pinX = editX - gap - pinWidth;
+        return new RowActions(pinX, editX, shareX, teleportX, deleteX,
+                pinWidth, editWidth, shareWidth, teleportWidth, deleteWidth,
+                buttonY, buttonHeight);
+    }
+
+    private void toggleTracked(WaypointManager.Waypoint waypoint) {
+        boolean tracked = isTracked(waypoint);
+        if (tracked) {
+            PinNavigation.clear();
+        } else {
+            PinNavigation.activate(waypoint.x, waypoint.z);
+        }
+        MapManager.getInstance().savePin();
+        if (!tracked) openOnMap(waypoint);
+    }
+
+    private void openOnMap(WaypointManager.Waypoint waypoint) {
+        if (minecraft == null) return;
+        previousViewRestored = true;
+        MapScreen map = parent instanceof MapScreen parentMap
+                ? parentMap : new MapScreen();
+        minecraft.setScreen(map);
+        map.focusOnWaypoint(waypoint);
+    }
+
+    private void share(WaypointManager.Waypoint waypoint) {
+        restorePreviousMapView();
+        if (parent instanceof MapScreen map) {
+            map.onClose();
+        } else if (minecraft != null
+                && !MapManager.getInstance().isViewingLiveDimension()) {
+            MapManager.getInstance().returnToLiveDimension(minecraft);
+        }
+        WaypointManager.shareLocation(minecraft, waypoint.name,
+                waypoint.x, waypoint.y, waypoint.z, waypoint.hasY,
+                waypoint.dimension);
+    }
+
+    private boolean isTracked(WaypointManager.Waypoint waypoint) {
+        return MapConfig.pinActive
+                && Math.abs(MapConfig.pinWorldX - waypoint.x) < 0.01
+                && Math.abs(MapConfig.pinWorldZ - waypoint.z) < 0.01;
+    }
+
+    private void teleport(WaypointManager.Waypoint waypoint) {
+        if (minecraft == null) return;
+        String targetDimension = MapManager.getInstance()
+                .resolveDimensionResourceId(waypoint.dimension);
+        int targetY = waypoint.hasY
+                ? (int) Math.floor(waypoint.y)
+                : MapTeleportController.defaultTargetY(targetDimension);
+        if (MapTeleportController.teleport(minecraft, targetDimension,
+                (int) Math.floor(waypoint.x), targetY, (int) Math.floor(waypoint.z))) {
+            previousViewRestored = true;
+            MapManager.getInstance().returnToLiveDimension(minecraft);
+            MapViewportCoordinator.getInstance().closeFullscreen();
+            minecraft.setScreen(null);
+        }
+    }
+
+    private void confirmDelete(WaypointManager.Waypoint waypoint) {
+        long now = System.nanoTime();
+        if (pendingDelete == waypoint && now <= pendingDeleteUntilNanos) {
+            WaypointManager.getInstance().removeWaypoint(waypoint);
+            pendingDelete = null;
+            refreshWaypoints();
+            return;
+        }
+        pendingDelete = waypoint;
+        pendingDeleteUntilNanos = now + 3_000_000_000L;
+    }
+
+    @Override
+    public void renderBackground(GuiGraphics guiGraphics, int mouseX, int mouseY,
+            float partialTick) {
+    }
+
+    @Override
+    public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+        if (pendingDelete != null && System.nanoTime() > pendingDeleteUntilNanos) {
+            pendingDelete = null;
+        }
+
+        float backgroundScale = Math.max(0.0625f, previewScale);
+        double anchorScreenX = getMapAreaCenterX();
+        double anchorScreenY = height * 0.5;
+        double mapCenterX = previewCenterX - (anchorScreenX - width * 0.5) / backgroundScale;
+        double mapCenterZ = previewCenterZ - (anchorScreenY - height * 0.5) / backgroundScale;
+        double mouseWorldX = mapCenterX + (mouseX - width * 0.5) / backgroundScale;
+        double mouseWorldZ = mapCenterZ + (mouseY - height * 0.5) / backgroundScale;
+
+        // 1. Render unobstructed live map + all waypoints in the background
+        MapRenderer.getInstance().drawMap(guiGraphics, 0, 0, width, height,
+                mapCenterX, mapCenterZ, backgroundScale,
+                MapManager.getInstance().isViewingLiveDimension(), false, false,
+                mouseWorldX, mouseWorldZ, partialTick, false);
+
+        RenderSystem.disableDepthTest();
+        RenderSystem.enableBlend();
+        RenderSystem.defaultBlendFunc();
+        RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+
+        // 2. Highlight currently focused waypoint on the map
+        if (focusedWaypoint != null) {
+            int markerScreenX = (int) Math.round(width * 0.5 + (focusedWaypoint.x - mapCenterX) * backgroundScale);
+            int markerScreenY = (int) Math.round(height * 0.5 + (focusedWaypoint.z - mapCenterZ) * backgroundScale);
+            guiGraphics.renderOutline(markerScreenX - 11, markerScreenY - 11, 22, 22, 0xD000E5FF);
+            guiGraphics.renderOutline(markerScreenX - 12, markerScreenY - 12, 24, 24, 0x5500E5FF);
+        }
+
+        // 3. Subtle interaction hint at the top of the open map area
+        String mapHint = "Click row: focus · Drag map: pan · Scroll: zoom · Right-click map: +waypoint";
+        int hintW = font.width(mapHint);
+        int hintX = Math.max(panelLeft + panelWidth + 8, (int) Math.round(anchorScreenX) - hintW / 2);
+        if (hintX + hintW + 6 < width) {
+            guiGraphics.fill(hintX - 5, 6, hintX + hintW + 5, 19, 0x680C0E12);
+            guiGraphics.drawString(font, mapHint, hintX, 9, 0xFFD0D8E0, false);
+        }
+
+        // 4. Sleek translucent glass panel on the left (matching AddWaypointScreen)
+        guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
+                panelTop + panelHeight, 0x7A101318);
+        guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
+                panelTop + 18, 0x88181D24);
+        guiGraphics.renderOutline(panelLeft, panelTop, panelWidth, panelHeight, 0x984A5462);
+
+        // Header with title and waypoint count badge
+        guiGraphics.drawString(font, title, panelLeft + 8, panelTop + 5, 0xFFFFFFFF, false);
+        String countBadge = Integer.toString(filteredWaypoints.size());
+        int countW = font.width(countBadge);
+        guiGraphics.fill(panelLeft + panelWidth - countW - 12, panelTop + 3,
+                panelLeft + panelWidth - 6, panelTop + 15, 0x6600E5FF);
+        guiGraphics.drawString(font, countBadge, panelLeft + panelWidth - countW - 9,
+                panelTop + 5, 0xFFFFFFFF, false);
+
+        int left = listLeft();
+        int top = listTop();
+        int bottom = listBottom();
+        int listW = listWidth();
+        guiGraphics.fill(left, top, left + listW, bottom, 0x480A0C10);
+        guiGraphics.renderOutline(left, top, listW, bottom - top, 0x7838424E);
+
+        guiGraphics.enableScissor(left + 1, top + 1, left + listW - 1, bottom - 1);
+        int startY = top + 2 - (int) scrollAmount;
+        for (int index = 0; index < filteredWaypoints.size(); index++) {
+            int rowY = startY + index * ROW_HEIGHT;
+            if (rowY + ROW_HEIGHT < top || rowY > bottom) continue;
+            WaypointManager.Waypoint waypoint = filteredWaypoints.get(index);
+            boolean hover = mouseX >= left && mouseX <= left + listW
+                    && mouseY >= rowY && mouseY < rowY + ROW_HEIGHT
+                    && mouseY >= top && mouseY <= bottom;
+            boolean focused = waypoint == focusedWaypoint;
+            int background = focused
+                    ? (hover ? 0x961E3648 : 0x82182C3C)
+                    : (hover ? 0x7A242C38 : (index % 2 == 0 ? 0x58141820 : 0x66181D26));
+            guiGraphics.fill(left + 2, rowY + 1, left + listW - 2,
+                    rowY + ROW_HEIGHT - 1, background);
+            if (focused) {
+                guiGraphics.renderOutline(left + 2, rowY + 1, listW - 4,
+                        ROW_HEIGHT - 2, 0x9800E5FF);
+            }
+
+            renderWaypointIcon(guiGraphics, waypoint, left + 6, rowY + 5);
+            String rawName = waypoint.deathPoint ? waypoint.name + " [Death]" : waypoint.name;
+            String dimShort = shortDimensionLabel(waypoint.dimension);
+            int dimW = font.width(dimShort);
+            int maxNameW = Math.max(40, listW - 34 - dimW - 10);
+            String trimmedName = font.plainSubstrByWidth(rawName, maxNameW);
+            guiGraphics.drawString(font, trimmedName, left + 27, rowY + 4,
+                    waypoint.deathPoint ? 0xFFFF8A80 : 0xFFFFFFFF, false);
+            guiGraphics.drawString(font, dimShort, left + listW - dimW - 5, rowY + 4,
+                    0xFF8CA0B5, false);
+
+            String yText = waypoint.hasY ? Integer.toString((int) Math.floor(waypoint.y)) : "—";
+            String coordinates = String.format(Locale.ROOT, "%d, %s, %d",
+                    (int) Math.floor(waypoint.x), yText, (int) Math.floor(waypoint.z));
+            RowActions actions = rowActions(rowY);
+            int maxCoordW = Math.max(30, actions.pinX - (left + 27) - 3);
+            String trimmedCoords = font.plainSubstrByWidth(coordinates, maxCoordW);
+            guiGraphics.drawString(font, trimmedCoords, left + 27, rowY + 22,
+                    0xFFA8B2BD, false);
+
+            boolean tracked = isTracked(waypoint);
+            drawCompactButton(guiGraphics, actions.pinX, actions.buttonY,
+                    actions.pinWidth, actions.buttonHeight,
+                    tracked ? "Stop" : "Pin", tracked ? 0x881E5E3A : 0x66242C36, mouseX, mouseY);
+            drawCompactButton(guiGraphics, actions.editX, actions.buttonY,
+                    actions.editWidth, actions.buttonHeight,
+                    "Edit", 0x66242C36, mouseX, mouseY);
+            drawCompactButton(guiGraphics, actions.shareX, actions.buttonY,
+                    actions.shareWidth, actions.buttonHeight,
+                    "Share", 0x66242C36, mouseX, mouseY);
+            drawCompactButton(guiGraphics, actions.teleportX, actions.buttonY,
+                    actions.teleportWidth, actions.buttonHeight,
+                    "TP", 0x6622384A, mouseX, mouseY);
+            boolean confirming = pendingDelete == waypoint;
+            drawCompactButton(guiGraphics, actions.deleteX, actions.buttonY,
+                    actions.deleteWidth, actions.buttonHeight,
+                    confirming ? "Sure?" : "Del",
+                    confirming ? 0xAA8B2626 : 0x663A2226, mouseX, mouseY);
+        }
+        guiGraphics.disableScissor();
+
+        // Thin scrollbar indicator inside the list well
+        int maxScroll = maximumScroll();
+        if (maxScroll > 0) {
+            int trackH = bottom - top - 4;
+            int thumbH = Math.max(14, (int) ((double) trackH * trackH / (trackH + maxScroll)));
+            int thumbY = top + 2 + (int) ((trackH - thumbH) * (scrollAmount / maxScroll));
+            guiGraphics.fill(left + listW - 3, thumbY, left + listW - 1, thumbY + thumbH, 0x9900E5FF);
+        }
+
+        if (filteredWaypoints.isEmpty()) {
+            String empty = "No matching waypoints";
+            guiGraphics.drawCenteredString(font, empty, panelLeft + panelWidth / 2,
+                    top + (bottom - top) / 2 - 4, 0xFFA8B2BD);
+        }
+
+        super.render(guiGraphics, mouseX, mouseY, partialTick);
+        RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+    }
+
+    private static String shortDimensionLabel(String dimension) {
+        if (isVanillaDimension(dimension, "overworld")) return "Overworld";
+        if (isVanillaDimension(dimension, "the_nether")) return "Nether";
+        if (isVanillaDimension(dimension, "the_end")) return "End";
+        return MapManager.displayDimensionName(dimension);
+    }
+
+    private void renderWaypointIcon(GuiGraphics guiGraphics,
+            WaypointManager.Waypoint waypoint, int x, int y) {
+        guiGraphics.fill(x - 1, y - 1, x + 17, y + 17, 0x660C0F14);
+        guiGraphics.renderOutline(x - 1, y - 1, 18, 18, 0x804A5462);
+        String itemId = WaypointManager.resolveIconItemId(waypoint);
+        ResourceLocation location = ResourceLocation.tryParse(itemId);
+        Item item = location == null ? Items.COMPASS : BuiltInRegistries.ITEM.get(location);
+        if (item == null || item == Items.AIR) item = Items.COMPASS;
+        guiGraphics.renderFakeItem(new ItemStack(item), x, y);
+        RenderSystem.disableDepthTest();
+        RenderSystem.enableBlend();
+        RenderSystem.defaultBlendFunc();
+        RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+    }
+
+    private void drawCompactButton(GuiGraphics guiGraphics, int x, int y,
+            int width, int height, String text, int baseColor, int mouseX, int mouseY) {
+        boolean hover = mouseX >= x && mouseX <= x + width
+                && mouseY >= y && mouseY <= y + height;
+        int background = hover ? 0x9938485C : baseColor;
+        guiGraphics.fill(x, y, x + width, y + height, background);
+        guiGraphics.renderOutline(x, y, width, height,
+                hover ? 0xFF00E5FF : 0x805A6675);
+        guiGraphics.pose().pushPose();
+        float scale = 0.78f;
+        int textWidth = Math.round(font.width(text) * scale);
+        float drawX = x + (width - textWidth) * 0.5f;
+        float drawY = y + (height - 8 * scale) * 0.5f + 0.5f;
+        guiGraphics.pose().translate(drawX, drawY, 0.0f);
+        guiGraphics.pose().scale(scale, scale, 1.0f);
+        guiGraphics.drawString(font, text, 0, 0, 0xFFFFFFFF, false);
+        guiGraphics.pose().popPose();
+    }
+
+    private static boolean isVanillaDimension(String dimension, String path) {
+        if (dimension == null) return false;
+        String normalized = dimension.toLowerCase(Locale.ROOT);
+        return normalized.equals(path) || normalized.equals("minecraft:" + path)
+                || (path.equals("the_nether") && normalized.equals("nether"))
+                || (path.equals("the_end") && normalized.equals("end"));
+    }
+
+    @Override
+    public void onClose() {
+        restorePreviousMapView();
+        if (minecraft != null) minecraft.setScreen(parent);
+    }
+
+    @Override
+    public boolean isPauseScreen() {
+        return false;
+    }
+
+    private record RowActions(int pinX, int editX, int shareX,
+            int teleportX, int deleteX, int pinWidth, int editWidth, int shareWidth,
+            int teleportWidth, int deleteWidth, int buttonY, int buttonHeight) {
+    }
+
+    /**
+     * Dedicated create/edit workflow for waypoints.
+     */
+    public static class AddWaypointScreen extends Screen {
+        private static final String[] MINING_ITEMS = {
+                "minecraft:iron_pickaxe", "minecraft:iron_axe", "minecraft:minecart",
+                "minecraft:raw_iron", "minecraft:diamond", "minecraft:chest"
+        };
+        private static final String[] COMBAT_ITEMS = {
+                "minecraft:iron_sword", "minecraft:bow", "minecraft:shield",
+                "minecraft:nether_star", "minecraft:experience_bottle", "minecraft:target"
+        };
+        private static final String[] TRAVEL_ITEMS = {
+                "minecraft:compass", "minecraft:ender_eye", "minecraft:elytra",
+                "minecraft:red_bed", "minecraft:recovery_compass", "minecraft:lodestone"
+        };
+        private static final String[] FOOD_ITEMS = {
+                "minecraft:golden_apple", "minecraft:bread", "minecraft:cooked_beef",
+                "minecraft:carrot", "minecraft:cake", "minecraft:honey_bottle"
+        };
+
+        private final Screen parent;
+        private final WaypointManager.Waypoint original;
+        private final String previousViewDimension;
+        private final boolean previousViewWasLive;
+        private final List<String> dimensions = new ArrayList<>();
+        private final List<ItemIconButton> iconButtons = new ArrayList<>();
+        private final List<ItemIconButton> searchButtons = new ArrayList<>();
+        private final List<String> searchResults = new ArrayList<>();
+        private final List<Button> tabButtons = new ArrayList<>();
+
+        private double draftX;
+        private double draftY;
+        private double draftZ;
+        private String draftDimension;
+        private String draftName;
+        private float waypointScale;
+        private int selectedIconType = -1;
+        private String selectedIconItem;
+        private int activeTab;
+        private String validationMessage = "";
+        private boolean previousViewRestored;
+
+        private EditBox nameInput;
+        private EditBox xInput;
+        private EditBox yInput;
+        private EditBox zInput;
+        private EditBox searchBox;
+        private Button dimensionButton;
+        private SimpleSlider localScaleSlider;
+
+        private int panelLeft;
+        private int panelTop;
+        private int panelWidth;
+        private int panelHeight;
+        private float previewScale = 0.55f;
+        private double mapPanOffsetX = 0.0;
+        private double mapPanOffsetZ = 0.0;
+        private boolean draggingMap = false;
+        private double dragStartX = 0.0;
+        private double dragStartY = 0.0;
+
+        public AddWaypointScreen(Screen parent, double worldX, double worldZ, String dimension) {
+            this(parent, worldX, defaultY(dimension), worldZ, dimension);
+        }
+
+        public AddWaypointScreen(Screen parent, double worldX, double worldY, double worldZ,
+                String dimension) {
+            super(Component.translatable("gui.simplemap.add_waypoint"));
+            this.parent = parent;
+            this.original = null;
+            this.draftX = worldX;
+            this.draftY = worldY;
+            this.draftZ = worldZ;
+            this.draftDimension = normalizeDimension(dimension);
+            this.draftName = "";
+            this.waypointScale = 1.0f;
+            this.selectedIconItem = "minecraft:compass";
+            this.previousViewDimension = MapManager.getInstance()
+                    .getCurrentDimensionResourceId();
+            this.previousViewWasLive = MapManager.getInstance().isViewingLiveDimension();
+            rebuildDimensions();
+        }
+
+        public AddWaypointScreen(Screen parent, WaypointManager.Waypoint waypoint) {
+            super(Component.translatable("gui.simplemap.edit_waypoint"));
+            this.parent = parent;
+            this.original = waypoint;
+            this.draftX = waypoint.x;
+            this.draftY = waypoint.hasY ? waypoint.y : defaultY(waypoint.dimension);
+            this.draftZ = waypoint.z;
+            this.draftDimension = normalizeDimension(waypoint.dimension);
+            this.draftName = waypoint.name;
+            this.waypointScale = waypoint.scale;
+            this.selectedIconType = -1;
+            this.selectedIconItem = WaypointManager.resolveIconItemId(waypoint);
+            this.previousViewDimension = MapManager.getInstance()
+                    .getCurrentDimensionResourceId();
+            this.previousViewWasLive = MapManager.getInstance().isViewingLiveDimension();
+            rebuildDimensions();
+        }
+
+        private static double defaultY(String dimension) {
+            Minecraft mc = Minecraft.getInstance();
+            String normalized = normalizeDimension(dimension);
+            if (mc.player != null && MapManager.getInstance().getLiveDimensionResourceId()
+                    .equals(normalized)) {
+                return mc.player.getY();
+            }
+            return MapTeleportController.defaultTargetY(normalized);
+        }
+
+        private static String normalizeDimension(String dimension) {
+            if (dimension == null || dimension.isBlank()) return "minecraft:overworld";
+            return MapManager.getInstance().resolveDimensionResourceId(dimension);
+        }
+
+        private void rebuildDimensions() {
+            Set<String> ordered = new LinkedHashSet<>();
+            ordered.add(draftDimension);
+            ordered.add(normalizeDimension(MapManager.getInstance().getCurrentDimensionId()));
+            ordered.add(normalizeDimension(MapManager.getInstance().getLiveDimensionResourceId()));
+            for (String dimension : MapManager.getInstance().getSelectableDimensions()) {
+                ordered.add(normalizeDimension(dimension));
+            }
+            for (WaypointManager.Waypoint waypoint : WaypointManager.getInstance().getAllWaypoints()) {
+                ordered.add(normalizeDimension(waypoint.dimension));
+            }
+            dimensions.clear();
+            dimensions.addAll(ordered);
+        }
+
+        @Override
+        protected void init() {
+            ensureDraftDimensionViewed();
+            iconButtons.clear();
+            searchButtons.clear();
+            tabButtons.clear();
+
+            if (parent instanceof MapScreen mapScreen && mapScreen.scale > 0.05f) {
+                previewScale = mapScreen.scale;
+            } else {
+                previewScale = Math.max(0.35f, Math.min(0.85f, (this.width - 2) / 1200.0f));
+            }
+
+            // Compact, translucent left-docked card so the live map and waypoints
+            // remain unobstructed across the screen.
+            panelWidth = Math.min(216, Math.max(188, this.width - 24));
+            panelHeight = Math.min(212, Math.max(198, this.height - 12));
+            panelLeft = Math.max(8, Math.min(14, this.width / 28));
+            panelTop = Math.max(6, (this.height - panelHeight) / 2);
+
+            int leftX = panelLeft + 8;
+            int fieldWidth = panelWidth - 16;
+            int top = panelTop + 22;
+
+            nameInput = new EditBox(this.font, leftX, top, fieldWidth, 18,
+                    Component.translatable("gui.simplemap.narration.waypoint_name"));
+            nameInput.setMaxLength(64);
+            nameInput.setValue(draftName);
+            nameInput.setHint(Component.literal(defaultName()));
+            addRenderableWidget(nameInput);
+
+            int coordinateY = top + 28;
+            int coordinateGap = 4;
+            int coordinateWidth = (fieldWidth - coordinateGap * 2) / 3;
+            xInput = coordinateBox(leftX, coordinateY, coordinateWidth, draftX, "gui.simplemap.narration.x_coord");
+            yInput = coordinateBox(leftX + coordinateWidth + coordinateGap, coordinateY,
+                    coordinateWidth, draftY, "gui.simplemap.narration.y_coord");
+            zInput = coordinateBox(leftX + (coordinateWidth + coordinateGap) * 2,
+                    coordinateY, coordinateWidth, draftZ, "gui.simplemap.narration.z_coord");
+
+            int halfButton = (fieldWidth - 4) / 2;
+            int row3Y = top + 50;
+            dimensionButton = Button.builder(dimensionLabel(), button -> cycleDimension())
+                    .bounds(leftX, row3Y, halfButton, 18).build();
+            addRenderableWidget(dimensionButton);
+
+            double sliderValue = (waypointScale - 0.5) / 1.5;
+            localScaleSlider = new SimpleSlider(leftX + halfButton + 4, row3Y, halfButton, 18,
+                    Math.max(0.0, Math.min(1.0, sliderValue)),
+                    value -> Component.translatable("gui.simplemap.waypoint.size_slider",
+                            String.format(Locale.ROOT, "%.1f", 0.5 + value * 1.5)).getString(),
+                    value -> waypointScale = (float) (0.5 + value * 1.5));
+            addRenderableWidget(localScaleSlider);
+
+            int row4Y = top + 71;
+            addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.waypoint.player_pos"), button -> usePlayerPosition())
+                    .bounds(leftX, row4Y, halfButton, 18).build());
+            addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.waypoint.pick_on_map"), button -> openMapPicker())
+                    .bounds(leftX + halfButton + 4, row4Y, halfButton, 18).build());
+
+            String[] tabKeys = {
+                    "gui.simplemap.icon_tab.mine",
+                    "gui.simplemap.icon_tab.fight",
+                    "gui.simplemap.icon_tab.move",
+                    "gui.simplemap.icon_tab.food",
+                    "gui.simplemap.icon_tab.find"
+            };
+            int tabGap = 2;
+            int tabWidth = Math.max(28, (fieldWidth - tabGap * 4) / 5);
+            int tabY = top + 93;
+            for (int index = 0; index < tabKeys.length; index++) {
+                final int tab = index;
+                Button button = Button.builder(Component.translatable(tabKeys[index]), b -> setTab(tab))
+                        .bounds(leftX + index * (tabWidth + tabGap), tabY, tabWidth, 16).build();
+                tabButtons.add(button);
+                addRenderableWidget(button);
+            }
+
+            int iconStartY = top + 113;
+            addItemGroupButtons(MINING_ITEMS, 0, leftX, iconStartY, fieldWidth);
+            addItemGroupButtons(COMBAT_ITEMS, 1, leftX, iconStartY, fieldWidth);
+            addItemGroupButtons(TRAVEL_ITEMS, 2, leftX, iconStartY, fieldWidth);
+            addItemGroupButtons(FOOD_ITEMS, 3, leftX, iconStartY, fieldWidth);
+
+            searchBox = new EditBox(this.font, leftX, iconStartY, fieldWidth, 16,
+                    Component.translatable("gui.simplemap.narration.search_waypoint_icon"));
+            searchBox.setMaxLength(48);
+            searchBox.setHint(Component.translatable("gui.simplemap.hint.search_item_id"));
+            searchBox.setResponder(value -> updateSearchResults());
+            addRenderableWidget(searchBox);
+
+            int searchY = iconStartY + 19;
+            int iconSlotStep = Math.max(24, fieldWidth / 6);
+            int iconOffsetX = leftX + Math.max(0, (fieldWidth - (5 * iconSlotStep + 22)) / 2);
+            for (int index = 0; index < 6; index++) {
+                final int resultIndex = index;
+                ItemIconButton button = new ItemIconButton(
+                        iconOffsetX + index * iconSlotStep,
+                        searchY,
+                        22, 22, "", () -> selectedIconItem, b -> {
+                            if (resultIndex < searchResults.size()) {
+                                selectIcon(searchResults.get(resultIndex));
+                            }
+                        });
+                searchButtons.add(button);
+                addRenderableWidget(button);
+            }
+
+            int bottomY = panelTop + panelHeight - 23;
+            addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.cancel"), button -> onClose())
+                    .bounds(leftX, bottomY, halfButton, 18).build());
+            addRenderableWidget(Button.builder(Component.translatable(original == null ? "gui.simplemap.add" : "gui.simplemap.save"),
+                    button -> saveWaypoint())
+                    .bounds(leftX + halfButton + 4, bottomY, halfButton, 18).build());
+
+            updateTabVisibility();
+        }
+
+        private EditBox coordinateBox(int x, int y, int width, double value, String narrationKey) {
+            EditBox box = new EditBox(this.font, x, y, width, 18, Component.translatable(narrationKey));
+            box.setMaxLength(18);
+            box.setValue(formatCoordinate(value));
+            addRenderableWidget(box);
+            return box;
+        }
+
+        private static String formatCoordinate(double value) {
+            if (Math.abs(value - Math.rint(value)) < 0.0001) {
+                return Long.toString(Math.round(value));
+            }
+            return String.format(Locale.ROOT, "%.2f", value);
+        }
+
+        private String defaultName() {
+            int count = WaypointManager.getInstance().getWaypointsForDimension(draftDimension).size() + 1;
+            return Component.translatable("gui.simplemap.waypoint.default_name", count).getString();
+        }
+
+        private Component dimensionLabel() {
+            return Component.translatable("gui.simplemap.waypoint.dim_label",
+                    MapManager.displayDimensionName(draftDimension));
+        }
+
+        private void cycleDimension() {
+            syncDraftQuietly();
+            int index = Math.max(0, dimensions.indexOf(draftDimension));
+            draftDimension = dimensions.get((index + 1) % dimensions.size());
+            ensureDraftDimensionViewed();
+            dimensionButton.setMessage(dimensionLabel());
+        }
+
+        private void usePlayerPosition() {
+            if (minecraft == null || minecraft.player == null) return;
+            draftX = minecraft.player.getX();
+            draftY = minecraft.player.getY();
+            draftZ = minecraft.player.getZ();
+            mapPanOffsetX = 0.0;
+            mapPanOffsetZ = 0.0;
+            draftDimension = normalizeDimension(MapManager.getInstance().getLiveDimensionResourceId());
+            ensureDraftDimensionViewed();
+            ensureDimensionPresent(draftDimension);
+            updateCoordinateInputs();
+            dimensionButton.setMessage(dimensionLabel());
+            validationMessage = "";
+        }
+
+        private void openMapPicker() {
+            if (!syncDraftFromFields()) return;
+            if (minecraft != null) {
+                minecraft.setScreen(new WaypointMapPickerScreen(this, draftX, draftZ));
+            }
+        }
+
+        void acceptPickedLocation(double x, double z, String dimension) {
+            draftX = x;
+            draftZ = z;
+            mapPanOffsetX = 0.0;
+            mapPanOffsetZ = 0.0;
+            draftDimension = normalizeDimension(dimension);
+            ensureDimensionPresent(draftDimension);
+            if (minecraft != null && minecraft.player != null
+                    && draftDimension.equals(normalizeDimension(MapManager.getInstance().getLiveDimensionResourceId()))) {
+                draftY = minecraft.player.getY();
+            }
+            updateCoordinateInputs();
+            validationMessage = "";
+        }
+
+        private void ensureDimensionPresent(String dimension) {
+            if (!dimensions.contains(dimension)) dimensions.add(0, dimension);
+        }
+
+        private void ensureDraftDimensionViewed() {
+            if (minecraft == null) return;
+            MapManager manager = MapManager.getInstance();
+            String target = normalizeDimension(draftDimension);
+            if (target.equals(manager.getCurrentDimensionResourceId())) return;
+            if (target.equals(manager.getLiveDimensionResourceId())) {
+                manager.returnToLiveDimension(minecraft);
+            } else {
+                manager.switchToDimension(target);
+            }
+        }
+
+        private void restorePreviousMapView() {
+            if (previousViewRestored || minecraft == null) return;
+            previousViewRestored = true;
+            MapManager manager = MapManager.getInstance();
+            if (previousViewWasLive) manager.returnToLiveDimension(minecraft);
+            else manager.switchToDimension(previousViewDimension);
+        }
+
+        private void updateCoordinateInputs() {
+            if (xInput != null) xInput.setValue(formatCoordinate(draftX));
+            if (yInput != null) yInput.setValue(formatCoordinate(draftY));
+            if (zInput != null) zInput.setValue(formatCoordinate(draftZ));
+        }
+
+        private boolean syncDraftFromFields() {
+            try {
+                draftX = parseCoordinate(xInput.getValue(), "X");
+                draftY = parseCoordinate(yInput.getValue(), "Y");
+                draftZ = parseCoordinate(zInput.getValue(), "Z");
+                draftName = nameInput.getValue().trim();
+                validationMessage = "";
+                return true;
+            } catch (IllegalArgumentException exception) {
+                validationMessage = exception.getMessage();
+                return false;
+            }
+        }
+
+        private void syncDraftQuietly() {
+            try {
+                draftX = Double.parseDouble(xInput.getValue().trim());
+                draftY = Double.parseDouble(yInput.getValue().trim());
+                draftZ = Double.parseDouble(zInput.getValue().trim());
+            } catch (RuntimeException ignored) {
+            }
+            draftName = nameInput.getValue().trim();
+        }
+
+        private static double parseCoordinate(String text, String axis) {
+            try {
+                double value = Double.parseDouble(text.trim());
+                if (!Double.isFinite(value) || Math.abs(value) > 30_000_000.0) {
+                    throw new NumberFormatException();
+                }
+                return value;
+            } catch (RuntimeException exception) {
+                throw new IllegalArgumentException(
+                        Component.translatable("gui.simplemap.waypoint.invalid_coord", axis).getString());
+            }
+        }
+
+        private void saveWaypoint() {
+            if (!syncDraftFromFields()) return;
+            String name = draftName.isBlank() ? defaultName() : draftName;
+            WaypointManager.Waypoint replacement = new WaypointManager.Waypoint(
+                    name, draftX, draftY, draftZ, selectedIconType, selectedIconItem,
+                    waypointScale, draftDimension, original != null && original.deathPoint);
+
+            boolean trackedOriginal = original != null && MapConfig.pinActive
+                    && Math.abs(MapConfig.pinWorldX - original.x) < 0.01
+                    && Math.abs(MapConfig.pinWorldZ - original.z) < 0.01;
+            if (original == null) {
+                WaypointManager.getInstance().addWaypoint(replacement);
+            } else if (!WaypointManager.getInstance().updateWaypoint(original, replacement)) {
+                validationMessage = Component.translatable("gui.simplemap.waypoint.not_found").getString();
+                return;
+            }
+            if (trackedOriginal) {
+                PinNavigation.updateDestination(replacement.x, replacement.z);
+                MapManager.getInstance().savePin();
+            }
+            restorePreviousMapView();
+            if (minecraft != null) minecraft.setScreen(parent);
+        }
+
+        private void setTab(int tab) {
+            activeTab = tab;
+            updateTabVisibility();
+        }
+
+        private void addItemGroupButtons(String[] items, int tab, int startX, int startY, int fieldWidth) {
+            int slotStep = Math.max(24, fieldWidth / 6);
+            int offsetX = startX + Math.max(0, (fieldWidth - (5 * slotStep + 22)) / 2);
+            for (int index = 0; index < items.length; index++) {
+                String itemId = items[index];
+                ItemIconButton button = new ItemIconButton(
+                        offsetX + (index % 6) * slotStep,
+                        startY + (index / 6) * 24 + 8,
+                        22, 22, itemId, () -> selectedIconItem, b -> selectIcon(itemId));
+                button.tab = tab;
+                iconButtons.add(button);
+                addRenderableWidget(button);
+            }
+        }
+
+        private void selectIcon(String itemId) {
+            selectedIconType = -1;
+            selectedIconItem = itemId == null || itemId.isBlank() ? "minecraft:compass" : itemId;
+        }
+
+        private void updateTabVisibility() {
+            for (int index = 0; index < tabButtons.size(); index++) {
+                Button button = tabButtons.get(index);
+                String plain = Component.translatable(switch (index) {
+                    case 0 -> "gui.simplemap.icon_tab.mine";
+                    case 1 -> "gui.simplemap.icon_tab.fight";
+                    case 2 -> "gui.simplemap.icon_tab.move";
+                    case 3 -> "gui.simplemap.icon_tab.food";
+                    default -> "gui.simplemap.icon_tab.find";
+                }).getString();
+                button.setMessage(Component.literal(index == activeTab ? "§b" + plain : plain));
+            }
+            for (ItemIconButton button : iconButtons) button.visible = button.tab == activeTab;
+            boolean searching = activeTab == 4;
+            if (searchBox != null) searchBox.visible = searching;
+            for (ItemIconButton button : searchButtons) button.visible = false;
+            if (searching) updateSearchResults();
+        }
+
+        private void updateSearchResults() {
+            searchResults.clear();
+            if (activeTab != 4 || searchBox == null) return;
+            String query = searchBox.getValue().trim().toLowerCase(Locale.ROOT);
+            for (ResourceLocation key : BuiltInRegistries.ITEM.keySet()) {
+                if (key.getPath().equals("air")) continue;
+                String id = key.toString();
+                if (query.isEmpty() || id.toLowerCase(Locale.ROOT).contains(query)) {
+                    searchResults.add(id);
+                    if (searchResults.size() >= searchButtons.size()) break;
+                }
+            }
+            for (int index = 0; index < searchButtons.size(); index++) {
+                ItemIconButton button = searchButtons.get(index);
+                if (index < searchResults.size()) {
+                    button.itemId = searchResults.get(index);
+                    button.visible = true;
+                } else {
+                    button.itemId = "";
+                    button.visible = false;
+                }
+            }
+        }
+
+        private boolean isInsidePanel(double mouseX, double mouseY) {
+            return mouseX >= panelLeft && mouseX <= panelLeft + panelWidth
+                    && mouseY >= panelTop && mouseY <= panelTop + panelHeight;
+        }
+
+        private double getMapAreaCenterX() {
+            int rightAreaLeft = panelLeft + panelWidth;
+            int rightAreaWidth = Math.max(40, this.width - rightAreaLeft);
+            return rightAreaLeft + rightAreaWidth * 0.5;
+        }
+
+        @Override
+        public boolean mouseClicked(double mouseX, double mouseY, int button) {
+            if (super.mouseClicked(mouseX, mouseY, button)) return true;
+            if (!isInsidePanel(mouseX, mouseY)) {
+                if (button == 0) {
+                    draggingMap = true;
+                    dragStartX = mouseX;
+                    dragStartY = mouseY;
+                    return true;
+                } else if (button == 1) {
+                    double anchorScreenX = getMapAreaCenterX();
+                    double anchorScreenY = this.height * 0.5;
+                    double mapCenterX = (draftX + mapPanOffsetX)
+                            - (anchorScreenX - this.width * 0.5) / previewScale;
+                    double mapCenterZ = (draftZ + mapPanOffsetZ)
+                            - (anchorScreenY - this.height * 0.5) / previewScale;
+                    draftX = Math.floor(mapCenterX + (mouseX - this.width * 0.5) / previewScale) + 0.5;
+                    draftZ = Math.floor(mapCenterZ + (mouseY - this.height * 0.5) / previewScale) + 0.5;
+                    mapPanOffsetX = 0.0;
+                    mapPanOffsetZ = 0.0;
+                    updateCoordinateInputs();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+            if (draggingMap && button == 0) {
+                mapPanOffsetX -= dragX / Math.max(0.01f, previewScale);
+                mapPanOffsetZ -= dragY / Math.max(0.01f, previewScale);
+                return true;
+            }
+            return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+        }
+
+        @Override
+        public boolean mouseReleased(double mouseX, double mouseY, int button) {
+            if (draggingMap && button == 0) {
+                draggingMap = false;
+                if (Math.hypot(mouseX - dragStartX, mouseY - dragStartY) < 4.0
+                        && !isInsidePanel(mouseX, mouseY)) {
+                    double anchorScreenX = getMapAreaCenterX();
+                    double anchorScreenY = this.height * 0.5;
+                    double mapCenterX = (draftX + mapPanOffsetX)
+                            - (anchorScreenX - this.width * 0.5) / previewScale;
+                    double mapCenterZ = (draftZ + mapPanOffsetZ)
+                            - (anchorScreenY - this.height * 0.5) / previewScale;
+                    draftX = Math.floor(mapCenterX + (mouseX - this.width * 0.5) / previewScale) + 0.5;
+                    draftZ = Math.floor(mapCenterZ + (mouseY - this.height * 0.5) / previewScale) + 0.5;
+                    mapPanOffsetX = 0.0;
+                    mapPanOffsetZ = 0.0;
+                    updateCoordinateInputs();
+                }
+                return true;
+            }
+            return super.mouseReleased(mouseX, mouseY, button);
+        }
+
+        @Override
+        public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+            if (!isInsidePanel(mouseX, mouseY)) {
+                previewScale = Math.max(0.0625f,
+                        Math.min(8.0f, previewScale + (float) scrollY * 0.15f * previewScale));
+                return true;
+            }
+            return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        }
+
+        @Override
+        public void renderBackground(GuiGraphics guiGraphics, int mouseX, int mouseY,
+                float partialTick) {
+        }
+
+        @Override
+        public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+            syncDraftQuietly();
+            float backgroundScale = Math.max(0.0625f, previewScale);
+            double anchorScreenX = getMapAreaCenterX();
+            double anchorScreenY = height * 0.5;
+            double mapCenterX = (draftX + mapPanOffsetX)
+                    - (anchorScreenX - width * 0.5) / backgroundScale;
+            double mapCenterZ = (draftZ + mapPanOffsetZ)
+                    - (anchorScreenY - height * 0.5) / backgroundScale;
+            double mouseWorldX = mapCenterX
+                    + (mouseX - width * 0.5) / backgroundScale;
+            double mouseWorldZ = mapCenterZ
+                    + (mouseY - height * 0.5) / backgroundScale;
+
+            // Render full, unobstructed live map + existing waypoints in the background
+            // without any full-screen dark veil so terrain and markers stay crystal clear.
+            MapRenderer.getInstance().drawMap(guiGraphics, 0, 0, width, height,
+                    mapCenterX, mapCenterZ, backgroundScale,
+                    MapManager.getInstance().isViewingLiveDimension(), false, false,
+                    mouseWorldX, mouseWorldZ, partialTick, false);
+
+            // Draw the live target waypoint marker at its exact world position on the map
+            int markerScreenX = (int) Math.round(width * 0.5 + (draftX - mapCenterX) * backgroundScale);
+            int markerScreenY = (int) Math.round(height * 0.5 + (draftZ - mapCenterZ) * backgroundScale);
+            guiGraphics.renderOutline(markerScreenX - 10, markerScreenY - 10, 20, 20, 0xB000E5FF);
+            renderScaledItem(guiGraphics, selectedIconItem,
+                    markerScreenX, markerScreenY,
+                    0.20f * MapConfig.waypointScale * waypointScale);
+            String liveName = (draftName == null || draftName.isBlank()) ? defaultName() : draftName;
+            String mapPreview = liveName + " [" + Math.round(draftX) + ", " + Math.round(draftZ) + "]";
+            int labelW = font.width(mapPreview);
+            int labelY = (int) Math.round(markerScreenY + 13.0 * Math.max(0.8f, waypointScale));
+            guiGraphics.fill(markerScreenX - labelW / 2 - 3, labelY - 2,
+                    markerScreenX + labelW / 2 + 3, labelY + 9, 0x78000000);
+            guiGraphics.drawCenteredString(font, mapPreview, markerScreenX, labelY, 0xFFFFFFFF);
+
+            // Subtle map interaction hint at top of the open map area
+            String mapHint = Component.translatable("gui.simplemap.waypoint.map_hint").getString();
+            int hintW = font.width(mapHint);
+            int hintX = (int) Math.round(anchorScreenX) - hintW / 2;
+            guiGraphics.fill(hintX - 5, 6, hintX + hintW + 5, 19, 0x680C0E12);
+            guiGraphics.drawString(font, mapHint, hintX, 9, 0xFFD0D8E0, false);
+
+            // Sleek translucent glass panel on the left (map remains visible behind & around it)
+            guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
+                    panelTop + panelHeight, 0x7A101318);
+            guiGraphics.fill(panelLeft, panelTop, panelLeft + panelWidth,
+                    panelTop + 18, 0x88181D24);
+            guiGraphics.renderOutline(panelLeft, panelTop, panelWidth, panelHeight, 0x984A5462);
+
+            // Header with title and inline selected icon preview
+            renderScaledItem(guiGraphics, selectedIconItem,
+                    panelLeft + 12, panelTop + 9, 0.75f);
+            guiGraphics.drawString(font, title, panelLeft + 24, panelTop + 5, 0xFFFFFFFF, false);
+
+            int leftX = panelLeft + 8;
+            int top = panelTop + 22;
+            int fieldWidth = panelWidth - 16;
+            int coordinateGap = 4;
+            int coordinateWidth = (fieldWidth - coordinateGap * 2) / 3;
+            guiGraphics.drawString(font, "X", leftX + 1, top + 20, 0xFFA8B2BD, false);
+            guiGraphics.drawString(font, "Y", leftX + coordinateWidth + coordinateGap + 1,
+                    top + 20, 0xFFA8B2BD, false);
+            guiGraphics.drawString(font, "Z", leftX + (coordinateWidth + coordinateGap) * 2 + 1,
+                    top + 20, 0xFFA8B2BD, false);
+
+            if (!validationMessage.isBlank()) {
+                guiGraphics.drawString(font, validationMessage, leftX,
+                        panelTop + panelHeight - 34, 0xFFFF6B6B, false);
+            }
+
+            super.render(guiGraphics, mouseX, mouseY, partialTick);
+        }
+
+        private static void renderItem(GuiGraphics guiGraphics, String itemId, int x, int y) {
+            ResourceLocation location = ResourceLocation.tryParse(itemId);
+            Item item = location == null ? Items.COMPASS : BuiltInRegistries.ITEM.get(location);
+            if (item == null || item == Items.AIR) item = Items.COMPASS;
+            guiGraphics.renderFakeItem(new ItemStack(item), x, y);
+        }
+
+        private static void renderScaledItem(GuiGraphics guiGraphics, String itemId,
+                int centerX, int centerY, float scale) {
+            guiGraphics.pose().pushPose();
+            guiGraphics.pose().translate(centerX, centerY, 80.0);
+            float safeScale = Math.max(0.35f, Math.min(2.2f, scale));
+            guiGraphics.pose().scale(safeScale, safeScale, 1.0f);
+            renderItem(guiGraphics, itemId, -8, -8);
+            guiGraphics.pose().popPose();
+            com.mojang.blaze3d.systems.RenderSystem.disableDepthTest();
+            com.mojang.blaze3d.systems.RenderSystem.enableBlend();
+            com.mojang.blaze3d.systems.RenderSystem.defaultBlendFunc();
+            com.mojang.blaze3d.systems.RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+
+        @Override
+        public void onClose() {
+            restorePreviousMapView();
+            if (minecraft != null) minecraft.setScreen(parent);
+        }
+
+        @Override
+        public boolean isPauseScreen() {
+            return false;
+        }
+
+        private static class SimpleSlider extends AbstractSliderButton {
+            private final java.util.function.Consumer<Double> onChange;
+            private final java.util.function.Function<Double, String> labelProvider;
+
+            SimpleSlider(int x, int y, int width, int height, double defaultValue,
+                    java.util.function.Function<Double, String> labelProvider,
+                    java.util.function.Consumer<Double> onChange) {
+                super(x, y, width, height,
+                        Component.literal(labelProvider.apply(defaultValue)), defaultValue);
+                this.labelProvider = labelProvider;
+                this.onChange = onChange;
+            }
+
+            @Override
+            protected void updateMessage() {
+                setMessage(Component.literal(labelProvider.apply(value)));
+            }
+
+            @Override
+            protected void applyValue() {
+                onChange.accept(value);
+            }
+        }
+
+        private static class ItemIconButton extends Button {
+            private String itemId;
+            private int tab = -1;
+            private final java.util.function.Supplier<String> selectedSupplier;
+
+            ItemIconButton(int x, int y, int width, int height, String itemId,
+                    java.util.function.Supplier<String> selectedSupplier, OnPress onPress) {
+                super(x, y, width, height, Component.empty(), onPress, DEFAULT_NARRATION);
+                this.itemId = itemId;
+                this.selectedSupplier = selectedSupplier;
+            }
+
+            @Override
+            public void renderWidget(GuiGraphics guiGraphics, int mouseX, int mouseY,
+                    float partialTick) {
+                if (!visible) return;
+                boolean selected = itemId != null && !itemId.isBlank()
+                        && selectedSupplier != null && itemId.equals(selectedSupplier.get());
+                int bg = selected ? 0x88243B52 : (isHoveredOrFocused() ? 0x70222830 : 0x4812161C);
+                int border = selected ? 0xCC00D4FF : (isHoveredOrFocused() ? 0xAA9098A4 : 0x66404854);
+                guiGraphics.fill(getX(), getY(), getX() + getWidth(), getY() + getHeight(), bg);
+                guiGraphics.renderOutline(getX(), getY(), getWidth(), getHeight(), border);
+                if (itemId != null && !itemId.isBlank()) {
+                    renderItem(guiGraphics, itemId, getX() + (width - 16) / 2,
+                            getY() + (height - 16) / 2);
+                }
+            }
+        }
+
+        public static final class WaypointMapPickerScreen extends Screen {
+            private static final float MIN_SCALE = 0.015625f;
+            private static final float MAX_SCALE = 12.0f;
+
+            private final AddWaypointScreen parent;
+            private double centerX;
+            private double centerZ;
+            private float scale = 0.5f;
+            private boolean dragging;
+            private double pressX;
+            private double pressY;
+
+            public WaypointMapPickerScreen(AddWaypointScreen parent, double centerX,
+                    double centerZ) {
+                super(Component.translatable("gui.simplemap.waypoint.picker_title"));
+                this.parent = parent;
+                this.centerX = centerX;
+                this.centerZ = centerZ;
+            }
+
+            @Override
+            protected void init() {
+                addRenderableWidget(Button.builder(Component.translatable("gui.simplemap.cancel"), button -> onClose())
+                        .bounds(width / 2 - 45, height - 27, 90, 20).build());
+            }
+
+            @Override
+            public void renderBackground(GuiGraphics guiGraphics, int mouseX, int mouseY,
+                    float partialTick) {
+            }
+
+            @Override
+            public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
+                guiGraphics.fill(0, 0, width, height, 0xFF0D0D0D);
+                int vx = 1;
+                int vy = 1;
+                int vw = width - 2;
+                int vh = height - 2;
+                double mouseWorldX = centerX + (mouseX - vx - vw / 2.0) / scale;
+                double mouseWorldZ = centerZ + (mouseY - vy - vh / 2.0) / scale;
+
+                MapRenderer.getInstance().drawMap(guiGraphics, vx, vy, vw, vh,
+                        centerX, centerZ, scale,
+                        MapManager.getInstance().isViewingLiveDimension(), false, false,
+                        mouseWorldX, mouseWorldZ, partialTick, false);
+
+                String instruction = Component.translatable("gui.simplemap.waypoint.picker_instruction").getString();
+                int instructionWidth = font.width(instruction);
+                int boxLeft = (width - instructionWidth) / 2 - 7;
+                guiGraphics.fill(boxLeft, 7, boxLeft + instructionWidth + 14, 25, 0xD0101010);
+                guiGraphics.renderOutline(boxLeft, 7, instructionWidth + 14, 18, 0xFF707070);
+                guiGraphics.drawString(font, instruction, boxLeft + 7, 12, 0xFFFFFFFF, false);
+
+                String cursor = String.format("X: %d  Z: %d",
+                        (int) Math.floor(mouseWorldX), (int) Math.floor(mouseWorldZ));
+                int cursorWidth = font.width(cursor);
+                guiGraphics.fill(width - cursorWidth - 13, height - 26,
+                        width - 5, height - 8, 0xD0101010);
+                guiGraphics.drawString(font, cursor, width - cursorWidth - 9,
+                        height - 21, 0xFFFFFFFF, false);
+
+                super.render(guiGraphics, mouseX, mouseY, partialTick);
+            }
+
+            @Override
+            public boolean mouseClicked(double mouseX, double mouseY, int button) {
+                if (super.mouseClicked(mouseX, mouseY, button)) return true;
+                if (button == 0) {
+                    dragging = true;
+                    pressX = mouseX;
+                    pressY = mouseY;
+                    return true;
+                }
+                if (button == 1) {
+                    onClose();
+                    return true;
+                }
+                return false;
+            }
+
+            @Override
+            public boolean mouseDragged(double mouseX, double mouseY, int button,
+                    double dragX, double dragY) {
+                if (dragging && button == 0) {
+                    centerX -= dragX / scale;
+                    centerZ -= dragY / scale;
+                    return true;
+                }
+                return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+            }
+
+            @Override
+            public boolean mouseReleased(double mouseX, double mouseY, int button) {
+                if (button == 0 && dragging) {
+                    dragging = false;
+                    double moved = Math.hypot(mouseX - pressX, mouseY - pressY);
+                    if (moved < 4.0) {
+                        double worldX = centerX + (mouseX - 1 - (width - 2) / 2.0) / scale;
+                        double worldZ = centerZ + (mouseY - 1 - (height - 2) / 2.0) / scale;
+                        double selectedX = Math.floor(worldX) + 0.5;
+                        double selectedZ = Math.floor(worldZ) + 0.5;
+                        parent.acceptPickedLocation(selectedX, selectedZ,
+                                MapManager.getInstance().getCurrentDimensionResourceId());
+                        MapViewportCoordinator.getInstance().closeFullscreen();
+                        if (minecraft != null) minecraft.setScreen(parent);
+                        return true;
+                    }
+                }
+                return super.mouseReleased(mouseX, mouseY, button);
+            }
+
+            @Override
+            public boolean mouseScrolled(double mouseX, double mouseY, double scrollX,
+                    double scrollY) {
+                float oldScale = scale;
+                float factor = scrollY > 0 ? 1.15f : 1.0f / 1.15f;
+                scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale * factor));
+                if (oldScale != scale) {
+                    double beforeX = centerX + (mouseX - width / 2.0) / oldScale;
+                    double beforeZ = centerZ + (mouseY - height / 2.0) / oldScale;
+                    centerX = beforeX - (mouseX - width / 2.0) / scale;
+                    centerZ = beforeZ - (mouseY - height / 2.0) / scale;
+                }
+                return true;
+            }
+
+            @Override
+            public void onClose() {
+                MapViewportCoordinator.getInstance().closeFullscreen();
+                if (minecraft != null) minecraft.setScreen(parent);
+            }
+
+            @Override
+            public boolean isPauseScreen() {
+                return false;
+            }
+        }
+    }
+}
+
+}
+
+}
