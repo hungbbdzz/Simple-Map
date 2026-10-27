@@ -741,6 +741,8 @@ public final class MinimapFramebufferRenderer {
         compositionYaw = yaw;
         compositionValid = true;
 
+        boolean cullWasEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+        RenderSystem.disableCull();
         guiGraphics.pose().pushPose();
         try {
             guiGraphics.pose().translate(x + size * 0.5f,
@@ -755,16 +757,47 @@ public final class MinimapFramebufferRenderer {
             RenderSystem.defaultBlendFunc();
             RenderSystem.setShader(GameRenderer::getPositionTexShader);
             RenderSystem.setShaderTexture(0, frontTarget.getColorTextureId());
-            BufferBuilder buffer = Tesselator.getInstance().getBuilder();
-            buffer.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX);
-            buffer.vertex(matrix, -half, -half, 0.0f).uv(u0, vTop).endVertex();
-            buffer.vertex(matrix, -half, half, 0.0f).uv(u0, vBottom).endVertex();
-            buffer.vertex(matrix, half, half, 0.0f).uv(u1, vBottom).endVertex();
-            buffer.vertex(matrix, half, -half, 0.0f).uv(u1, vTop).endVertex();
-            BufferUploader.drawWithShader(buffer.end());
+            if (MapConfig.minimapCircle) {
+                float circleRadius = Math.min(half, size * 0.5f);
+                float uCenter = (u0 + u1) * 0.5f;
+                float vCenter = (vTop + vBottom) * 0.5f;
+                float uHalf = (u1 - u0) * 0.5f;
+                float vHalf = (vBottom - vTop) * 0.5f;
+                float invHalf = half > 0.0001f ? (1.0f / half) : 0.0f;
+                int segments = 64;
+                BufferBuilder buffer = Tesselator.getInstance().getBuilder();
+                buffer.begin(VertexFormat.Mode.TRIANGLES, DefaultVertexFormat.POSITION_TEX);
+                double step = (Math.PI * 2.0) / segments;
+                for (int i = 0; i < segments; i++) {
+                    double a0 = i * step;
+                    double a1 = (i + 1) * step;
+                    float x0 = (float) Math.cos(a0) * circleRadius;
+                    float y0 = (float) Math.sin(a0) * circleRadius;
+                    float x1 = (float) Math.cos(a1) * circleRadius;
+                    float y1 = (float) Math.sin(a1) * circleRadius;
+                    float tu0 = uCenter + (x0 * invHalf) * uHalf;
+                    float tv0 = vCenter + (y0 * invHalf) * vHalf;
+                    float tu1 = uCenter + (x1 * invHalf) * uHalf;
+                    float tv1 = vCenter + (y1 * invHalf) * vHalf;
+                    buffer.vertex(matrix, 0.0f, 0.0f, 0.0f).uv(uCenter, vCenter).endVertex();
+                    buffer.vertex(matrix, x1, y1, 0.0f).uv(tu1, tv1).endVertex();
+                    buffer.vertex(matrix, x0, y0, 0.0f).uv(tu0, tv0).endVertex();
+                }
+                BufferUploader.drawWithShader(buffer.end());
+            } else {
+                BufferBuilder buffer = Tesselator.getInstance().getBuilder();
+                buffer.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX);
+                buffer.vertex(matrix, -half, -half, 0.0f).uv(u0, vTop).endVertex();
+                buffer.vertex(matrix, -half, half, 0.0f).uv(u0, vBottom).endVertex();
+                buffer.vertex(matrix, half, half, 0.0f).uv(u1, vBottom).endVertex();
+                buffer.vertex(matrix, half, -half, 0.0f).uv(u1, vTop).endVertex();
+                BufferUploader.drawWithShader(buffer.end());
+            }
         } finally {
             guiGraphics.pose().popPose();
             guiGraphics.disableScissor();
+            if (cullWasEnabled) RenderSystem.enableCull();
+            else RenderSystem.disableCull();
         }
     }
 }
