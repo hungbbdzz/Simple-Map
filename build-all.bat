@@ -126,7 +126,11 @@ function Copy-ReleaseJar(
 
     # Copy to global workspace mods folder if available
     if (Test-Path $GlobalModsDir) {
-        $destGlobal = Join-Path $GlobalModsDir $Jar.Name
+        $destGlobalDir = Join-Path $GlobalModsDir 'simplemap'
+        if (-not (Test-Path $destGlobalDir)) {
+            New-Item -ItemType Directory -Path $destGlobalDir -Force | Out-Null
+        }
+        $destGlobal = Join-Path $destGlobalDir $Jar.Name
         $destGlobalResolved = if (Test-Path $destGlobal) { (Resolve-Path $destGlobal).Path } else { $null }
         if ($null -eq $destGlobalResolved -or $sourceResolved -ne $destGlobalResolved) {
             Copy-Item -Path $Jar.FullName -Destination $destGlobal -Force
