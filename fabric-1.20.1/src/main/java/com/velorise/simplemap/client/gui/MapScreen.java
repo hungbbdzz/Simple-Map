@@ -2624,6 +2624,9 @@ public class MapScreen extends Screen {
 
     public static class MapConfigScreen extends Screen {
     private final Screen parent;
+    private static final ResourceLocation VANILLA_MAP_BACKGROUND =
+            new ResourceLocation("minecraft", "textures/map/map_background.png");
+    private Button minimapFrameButton;
     private static com.mojang.blaze3d.pipeline.RenderTarget minimapTarget = null;
     private boolean isDraggingMinimap = false;
     private double dragOffsetX = 0;
@@ -2699,7 +2702,7 @@ public class MapScreen extends Screen {
     // controls cannot drift outside the card at different GUI scales.
     private int panelLeft = 10;
     private int panelTop = 15;
-    private int panelWidth = 240;
+    private int panelWidth = 330;
     private int panelRight = 250;
     private int panelBottom = 0;
 
@@ -2779,15 +2782,15 @@ public class MapScreen extends Screen {
         // ==================== RESPONSIVE LEFT PANEL ====================
         panelLeft = Math.max(4, Math.min(10, this.width / 24));
         panelTop = 15;
-        panelWidth = Math.min(240, Math.max(180, this.width - panelLeft - 6));
+        panelWidth = Math.min(270, Math.max(210, this.width / 2 - 10));
         panelRight = panelLeft + panelWidth;
-        panelBottom = Math.max(panelTop + 80, this.height - 10);
+        panelBottom = Math.max(240, Math.min(252, this.height - 10));
 
         // ==================== TABS (Top of Left Panel) ====================
-        int tabY = 20;
+        int tabY = 16;
         int tabSpacing = 4;
         int startX = panelLeft + 4;
-        int tabW = Math.max(38, (panelWidth - 8 - tabSpacing * 3) / 4);
+        int tabW = Math.max(48, (panelWidth - 8 - tabSpacing * 3) / 4);
 
         tabMapButton = Button.builder(
                 getTabButtonLabel(0, "gui.simplemap.tab.map.name"),
@@ -2836,9 +2839,18 @@ public class MapScreen extends Screen {
         // ==================== CONTROLS GRID ====================
         int col1X = panelLeft + 6;
         int columnGap = 8;
-        int colW = Math.max(78, (panelWidth - 12 - columnGap) / 2);
+        int colW = Math.max(90, (panelWidth - 12 - columnGap) / 2);
         int col2X = col1X + colW + columnGap;
         int gridWidth = colW * 2 + columnGap;
+
+        int r1Y = 44;
+        int r2Y = 68;
+        int r3Y = 92;
+        int r4Y = 116;
+        int r5Y = 140;
+        int r6Y = 164;
+        int r7Y = 188;
+        int doneY = r7Y + 24;
 
         // Row 1 (y = 52)
         minimapToggleButton = Button.builder(
@@ -2846,14 +2858,14 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.minimapEnabled = !MapConfig.minimapEnabled;
                     button.setMessage(getToggleMessage());
-                }).bounds(col1X, 52, colW, 20)
+                }).bounds(col1X, r1Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_toggle")))
                 .build();
         this.addRenderableWidget(minimapToggleButton);
 
         double initialSizeVal = (double) (MapConfig.minimapSize - 16) / (150 - 16);
         minimapSizeSlider = new SimpleSlider(
-                col2X, 52, colW, 20,
+                col2X, r1Y, colW, 20,
                 initialSizeVal,
                 val -> Component.translatable("gui.simplemap.option.size", 16 + (int) (val * (150 - 16))).getString(),
                 val -> MapConfig.minimapSize = 16 + (int) (val * (150 - 16)));
@@ -2866,7 +2878,7 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.minimapCircle = !MapConfig.minimapCircle;
                     button.setMessage(getShapeMessage());
-                }).bounds(col1X, 77, colW, 20)
+                }).bounds(col1X, r2Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_shape")))
                 .build();
         this.addRenderableWidget(minimapShapeButton);
@@ -2874,7 +2886,7 @@ public class MapScreen extends Screen {
         double initialZoomVal = (MapConfig.minimapZoom - MapConfig.MINIMUM_ZOOM_SCALE)
                 / (2.0 - MapConfig.MINIMUM_ZOOM_SCALE);
         minimapZoomSlider = new SimpleSlider(
-                col2X, 77, colW, 20,
+                col2X, r2Y, colW, 20,
                 initialZoomVal,
                 val -> String.format(java.util.Locale.ROOT, "%.2fx",
                         MapConfig.MINIMUM_ZOOM_SCALE + val * (2.0 - MapConfig.MINIMUM_ZOOM_SCALE)),
@@ -2889,14 +2901,14 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.minimapRotate = !MapConfig.minimapRotate;
                     button.setMessage(getRotateMessage());
-                }).bounds(col1X, 102, colW, 20)
+                }).bounds(col1X, r3Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.north_lock")))
                 .build();
         this.addRenderableWidget(minimapRotateButton);
 
         double initialPointerScaleVal = (MapConfig.playerMarkerScale - 0.1) / (1.0 - 0.1);
         pointerScaleSlider = new SimpleSlider(
-                col2X, 102, colW, 20,
+                col2X, r3Y, colW, 20,
                 initialPointerScaleVal,
                 val -> Component.translatable("gui.simplemap.option.pointer_scale",
                         String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (1.0 - 0.1))).getString(),
@@ -2910,14 +2922,14 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.playerMarkerMode = (MapConfig.playerMarkerMode + 1) % 2;
                     button.setMessage(getPointerModeMessage());
-                }).bounds(col1X, 127, colW, 20)
+                }).bounds(col1X, r4Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pointer_mode")))
                 .build();
         this.addRenderableWidget(pointerModeButton);
 
         double initialPinScaleVal = (MapConfig.pinScale - 0.1) / (1.0 - 0.1);
         pinScaleSlider = new SimpleSlider(
-                col2X, 127, colW, 20,
+                col2X, r4Y, colW, 20,
                 initialPinScaleVal,
                 val -> Component.translatable("gui.simplemap.option.pin_scale",
                         String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (1.0 - 0.1))).getString(),
@@ -2928,6 +2940,18 @@ public class MapScreen extends Screen {
         pinScaleSlider.setTooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.pin_scale")));
         this.addRenderableWidget(pinScaleSlider);
 
+        // Row 5 (y = 152)
+        minimapFrameButton = Button.builder(
+                getFrameMessage(),
+                button -> {
+                    MapConfig.minimapFrameStyle = (MapConfig.minimapFrameStyle + 1) % 3;
+                    button.setMessage(getFrameMessage());
+                    MapConfig.save();
+                }).bounds(col1X, r5Y, colW, 20)
+                .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_frame")))
+                .build();
+        this.addRenderableWidget(minimapFrameButton);
+
         // ==================== SHARED COLOR EDITOR ====================
         colorTargetButton = Button.builder(
                 getColorTargetMessage(),
@@ -2935,7 +2959,7 @@ public class MapScreen extends Screen {
                     selectedColorTarget = (selectedColorTarget + 1) % COLOR_TARGET_NAMES.length;
                     button.setMessage(getColorTargetMessage());
                     syncSharedColorInput();
-                }).bounds(col1X, 52, colW, 20)
+                }).bounds(col1X, r1Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.color_target")))
                 .build();
         this.addRenderableWidget(colorTargetButton);
@@ -2945,7 +2969,7 @@ public class MapScreen extends Screen {
                 button -> {
                     setSelectedTargetColor(nextPresetColor(getSelectedTargetColor()));
                     syncSharedColorInput();
-                }).bounds(col2X, 52, colW, 20)
+                }).bounds(col2X, r1Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.color_preset")))
                 .build();
         this.addRenderableWidget(presetColorButton);
@@ -2953,7 +2977,7 @@ public class MapScreen extends Screen {
         int saveButtonWidth = Math.max(44, Math.min(56, colW / 2));
         int colorInputWidth = Math.max(72, gridWidth - saveButtonWidth - columnGap);
         int saveButtonX = col1X + colorInputWidth + columnGap;
-        sharedColorInput = new EditBox(this.font, col1X, 77, colorInputWidth, 20,
+        sharedColorInput = new EditBox(this.font, col1X, r2Y, colorInputWidth, 20,
                 Component.translatable("gui.simplemap.narration.shared_hex_color"));
         sharedColorInput.setMaxLength(9);
         sharedColorInput.setValue(MapColorProfile.formatColor(getSelectedTargetColor()));
@@ -2965,7 +2989,7 @@ public class MapScreen extends Screen {
         savePaletteColorButton = Button.builder(
                 Component.translatable("gui.simplemap.save"),
                 button -> saveSharedColor())
-                .bounds(saveButtonX, 77, saveButtonWidth, 20)
+                .bounds(saveButtonX, r2Y, saveButtonWidth, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.save_palette_color")))
                 .build();
         this.addRenderableWidget(savePaletteColorButton);
@@ -2975,7 +2999,7 @@ public class MapScreen extends Screen {
         int swatchWidth = Math.max(28, (gridWidth - swatchGap * 3) / 4);
         for (int i = 0; i < 8; i++) {
             int swatchX = col1X + (i % 4) * (swatchWidth + swatchGap);
-            int swatchY = PALETTE_SWATCH_Y + (i / 4) * 25;
+            int swatchY = r3Y + (i / 4) * 24;
             ColorSwatchButton swatch = new ColorSwatchButton(swatchX, swatchY, swatchWidth, 20, i);
             paletteButtons.add(swatch);
             this.addRenderableWidget(swatch);
@@ -2986,7 +3010,7 @@ public class MapScreen extends Screen {
                 Component.translatable("gui.simplemap.option.block_overrides", MapConfig.blockColorOverrides.size()),
                 b -> {
                     if (this.minecraft != null) this.minecraft.setScreen(new BlockColorManagerScreen(this));
-                }).bounds(col1X, 166, gridWidth, 20)
+                }).bounds(col1X, r6Y, gridWidth, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.block_overrides")))
                 .build();
         this.addRenderableWidget(customBlockColorsButton);
@@ -2996,7 +3020,7 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.compassLettersVisible = !MapConfig.compassLettersVisible;
                     button.setMessage(getCompassLettersMessage());
-                }).bounds(col2X, 152, colW, 20)
+                }).bounds(col2X, r5Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.compass_labels")))
                 .build();
         this.addRenderableWidget(compassLettersToggleButton);
@@ -3008,7 +3032,7 @@ public class MapScreen extends Screen {
                     MapConfig.save();
                     button.setMessage(getMapStyleMessage());
                     MapManager.getInstance().reloadAllRegions();
-                }).bounds(col1X, 152, colW, 20)
+                }).bounds(col1X, r5Y, gridWidth, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.map_style")))
                 .build();
         this.addRenderableWidget(mapStyleButton);
@@ -3018,7 +3042,7 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.showMinimapInScreens = !MapConfig.showMinimapInScreens;
                     button.setMessage(getShowInScreensMessage());
-                }).bounds(col1X, 177, colW, 20)
+                }).bounds(col1X, r6Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.show_in_screens")))
                 .build();
         this.addRenderableWidget(showInScreensButton);
@@ -3029,7 +3053,7 @@ public class MapScreen extends Screen {
                     MapConfig.minimapWaypointsVisible = !MapConfig.minimapWaypointsVisible;
                     MapConfig.save();
                     button.setMessage(getMinimapWaypointsMessage());
-                }).bounds(col2X, 177, colW, 20)
+                }).bounds(col2X, r6Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.minimap_waypoints")))
                 .build();
         this.addRenderableWidget(minimapWaypointsButton);
@@ -3040,14 +3064,14 @@ public class MapScreen extends Screen {
                 button -> {
                     MapConfig.coordsEnabled = !MapConfig.coordsEnabled;
                     button.setMessage(getCoordsToggleMessage());
-                }).bounds(col1X, 52, colW, 20)
+                }).bounds(col1X, r1Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.coordinates")))
                 .build();
         this.addRenderableWidget(coordsToggleButton);
 
         double initialCoordsScaleVal = (MapConfig.coordsScale - 0.1) / (2.0 - 0.1);
         coordsScaleSlider = new SimpleSlider(
-                col2X, 52, colW, 20,
+                col2X, r1Y, colW, 20,
                 initialCoordsScaleVal,
                 val -> Component.translatable("gui.simplemap.option.coords_scale",
                         String.format(java.util.Locale.ROOT, "%.2f", 0.1 + val * (2.0 - 0.1))).getString(),
@@ -3061,7 +3085,7 @@ public class MapScreen extends Screen {
                     MapConfig.cursorBiomeEnabled = !MapConfig.cursorBiomeEnabled;
                     MapConfig.save();
                     button.setMessage(getCursorBiomeMessage());
-                }).bounds(col1X, 77, colW, 20)
+                }).bounds(col1X, r2Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cursor_biome")))
                 .build();
         this.addRenderableWidget(cursorBiomeButton);
@@ -3072,7 +3096,7 @@ public class MapScreen extends Screen {
                     MapConfig.cursorBlockEnabled = !MapConfig.cursorBlockEnabled;
                     MapConfig.save();
                     button.setMessage(getCursorBlockMessage());
-                }).bounds(col2X, 77, colW, 20)
+                }).bounds(col2X, r2Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.cursor_block")))
                 .build();
         this.addRenderableWidget(cursorBlockButton);
@@ -3085,7 +3109,7 @@ public class MapScreen extends Screen {
                     ChunkScanner.getInstance().requestRefresh(this.minecraft);
                     MapConfig.save();
                     button.setMessage(getMapRevealModeMessage());
-                }).bounds(col1X, 52, colW, 20)
+                }).bounds(col1X, r1Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.mapping_mode")))
                 .build();
         this.addRenderableWidget(mapRevealModeButton);
@@ -3096,7 +3120,7 @@ public class MapScreen extends Screen {
                     MapConfig.autoClearPin = !MapConfig.autoClearPin;
                     MapConfig.save();
                     button.setMessage(getAutoClearPinMessage());
-                }).bounds(col1X, 102, colW, 20)
+                }).bounds(col1X, r3Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.auto_clear_pin")))
                 .build();
         this.addRenderableWidget(autoClearPinButton);
@@ -3105,7 +3129,7 @@ public class MapScreen extends Screen {
         double initialScanVal = (double) (initialChunks - SCAN_CHUNK_MIN)
                 / (SCAN_CHUNK_MAX - SCAN_CHUNK_MIN);
         scanSlider = new SimpleSlider(
-                col2X, 52, colW, 20,
+                col2X, r1Y, colW, 20,
                 initialScanVal,
                 val -> formatScanBudget(sliderToChunkBudget(val)),
                 val -> {
@@ -3125,13 +3149,13 @@ public class MapScreen extends Screen {
                     MapConfig.alwaysRescanExplored = !MapConfig.alwaysRescanExplored;
                     MapConfig.save();
                     button.setMessage(getAlwaysRescanMessage());
-                }).bounds(col1X, 77, colW, 20)
+                }).bounds(col1X, r2Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.rescan_loaded")))
                 .build();
         this.addRenderableWidget(alwaysRescanButton);
 
         scanInputBox = new EditBox(this.font,
-                col2X, 77, colW - 1, 20,
+                col2X, r2Y, colW - 1, 20,
                 Component.translatable("gui.simplemap.narration.scan_points"));
         scanInputBox.setMaxLength(6);
         scanInputBox.setValue(initialChunks >= SCAN_CHUNK_MAX
@@ -3170,7 +3194,7 @@ public class MapScreen extends Screen {
                     MapConfig.fastFullscreenLoading = !MapConfig.fastFullscreenLoading;
                     b.setMessage(getFastFullscreenMessage());
                     MapConfig.save();
-                }).bounds(col2X, 152, colW, 20)
+                }).bounds(col2X, r5Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.fast_fullscreen")))
                 .build();
         this.addRenderableWidget(fastFullscreenButton);
@@ -3182,7 +3206,7 @@ public class MapScreen extends Screen {
                     b.setMessage(getDeathWaypointMessage());
                     if (deathWaypointLimitButton != null) deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
                     MapConfig.save();
-                }).bounds(col1X, 177, colW, 20)
+                }).bounds(col1X, r6Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.death_points")))
                 .build();
         this.addRenderableWidget(deathWaypointButton);
@@ -3199,7 +3223,7 @@ public class MapScreen extends Screen {
                     };
                     b.setMessage(getDeathWaypointLimitMessage());
                     MapConfig.save();
-                }).bounds(col2X, 177, colW, 20)
+                }).bounds(col2X, r6Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.death_limit")))
                 .build();
         deathWaypointLimitButton.active = MapConfig.createDeathWaypoint;
@@ -3208,7 +3232,7 @@ public class MapScreen extends Screen {
         resetToDefaultButton = Button.builder(
                 Component.translatable("gui.simplemap.restore_defaults"),
                 button -> openResetConfirmation())
-                .bounds(col1X, 202, gridWidth, 20)
+                .bounds(col1X, r7Y, gridWidth, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.restore_defaults")))
                 .build();
         this.addRenderableWidget(resetToDefaultButton);
@@ -3218,7 +3242,7 @@ public class MapScreen extends Screen {
                 button -> {
                     MapManager.getInstance().reloadAllRegions();
                     button.setMessage(Component.translatable("gui.simplemap.reloading"));
-                }).bounds(col2X, 102, colW, 20)
+                }).bounds(col2X, r3Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.reload_regions")))
                 .build();
         this.addRenderableWidget(reloadAllRegionsButton);
@@ -3229,7 +3253,7 @@ public class MapScreen extends Screen {
                     MapConfig.displayFlowers = !MapConfig.displayFlowers;
                     button.setMessage(getDisplayFlowersMessage());
                     refreshLoadedMapData();
-                }).bounds(col1X, 127, colW, 20)
+                }).bounds(col1X, r4Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.map_flowers")))
                 .build();
         this.addRenderableWidget(displayFlowersButton);
@@ -3240,7 +3264,7 @@ public class MapScreen extends Screen {
                     MapConfig.blockColourMode = (MapConfig.blockColourMode + 1) % 2;
                     button.setMessage(getBlockColourModeMessage());
                     refreshLoadedMapData();
-                }).bounds(col2X, 127, colW, 20)
+                }).bounds(col2X, r4Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.block_colors")))
                 .build();
         this.addRenderableWidget(blockColourModeButton);
@@ -3251,7 +3275,7 @@ public class MapScreen extends Screen {
                     MapConfig.terrainSlopes = (MapConfig.terrainSlopes + 1) % 3;
                     button.setMessage(getTerrainSlopesMessage());
                     refreshLoadedMapData();
-                }).bounds(col1X, 152, colW, 20)
+                }).bounds(col1X, r5Y, colW, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.terrain_shading")))
                 .build();
         this.addRenderableWidget(terrainSlopesButton);
@@ -3263,7 +3287,7 @@ public class MapScreen extends Screen {
                     MapConfig.save();
                     if (this.minecraft != null)
                         this.minecraft.setScreen(this.parent);
-                }).bounds(col1X, this.height - 30, gridWidth, 20)
+                }).bounds(col1X, doneY, gridWidth, 20)
                 .tooltip(Tooltip.create(Component.translatable("gui.simplemap.tooltip.done_settings")))
                 .build();
         this.addRenderableWidget(doneButton);
@@ -3345,6 +3369,8 @@ public class MapScreen extends Screen {
             pointerScaleSlider.visible = showMap;
         if (pinScaleSlider != null)
             pinScaleSlider.visible = showMap;
+        if (minimapFrameButton != null)
+            minimapFrameButton.visible = showMap;
         if (colorTargetButton != null)
             colorTargetButton.visible = showColors;
         if (presetColorButton != null)
@@ -3366,7 +3392,7 @@ public class MapScreen extends Screen {
         if (minimapWaypointsButton != null)
             minimapWaypointsButton.visible = showMap;
         if (mapStyleButton != null)
-            mapStyleButton.visible = showMap;
+            mapStyleButton.visible = showColors;
 
         if (coordsToggleButton != null)
             coordsToggleButton.visible = showCoords;
@@ -3416,6 +3442,16 @@ public class MapScreen extends Screen {
                 Component.translatable(MapConfig.minimapEnabled
                         ? "gui.simplemap.value.enabled"
                         : "gui.simplemap.value.disabled"));
+    }
+
+    private Component getFrameMessage() {
+        String styleKey = switch (MapConfig.minimapFrameStyle) {
+            case 1 -> "gui.simplemap.value.frame_vanilla";
+            case 2 -> "gui.simplemap.value.frame_frameless";
+            default -> "gui.simplemap.value.frame_minimal";
+        };
+        return Component.translatable("gui.simplemap.option.frame",
+                Component.translatable(styleKey));
     }
 
     private Component getRotateMessage() {
@@ -3744,17 +3780,7 @@ public class MapScreen extends Screen {
         }
 
         if (!selectedMinimap && !selectedCoords) {
-            // Semi-transparent dark overlay — game view shows through behind
-            guiGraphics.fill(0, 0, this.width, this.height, 0xAA000000);
-
-            // Draw the same responsive card geometry used by init().
-            panelBottom = Math.max(panelTop + 80, this.height - 10);
-            guiGraphics.fill(panelLeft, panelTop, panelRight, panelBottom, 0xDD111215);
-            guiGraphics.renderOutline(panelLeft - 1, panelTop - 1,
-                    panelWidth + 2, panelBottom - panelTop + 2, 0xFF2D3033);
-            guiGraphics.fill(panelLeft, 58, panelRight, 59, 0xFF2D3033);
-        } else {
-            guiGraphics.fill(0, 0, this.width, this.height, 0x30000000);
+            panelBottom = Math.max(240, Math.min(252, this.height - 10));
         }
 
         int size = MapConfig.minimapSize;
@@ -3805,12 +3831,16 @@ public class MapScreen extends Screen {
                             guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
                 }
 
-                float ringWidth = Math.max(1.5f, size / 72.0f);
+                float ringWidth = 1.0f;
                 float innerRingR = radius - 0.5f;
                 float outerRingR = innerRingR + ringWidth;
-                drawCircleRing(guiGraphics, cx, cy, innerRingR - 0.5f, innerRingR, 64, 0x77000000);
-                drawCircleRing(guiGraphics, cx, cy, innerRingR, outerRingR, 64, MapConfig.minimapRingColor);
-                drawCircleRing(guiGraphics, cx, cy, outerRingR, outerRingR + 0.75f, 64, circleBorderColor);
+                if (MapConfig.minimapFrameStyle == 1) {
+                    drawCircleRing(guiGraphics, cx, cy, innerRingR - 0.5f, innerRingR + 0.5f, 64, 0xFF99876C);
+                    drawCircleRing(guiGraphics, cx, cy, innerRingR + 0.5f, outerRingR - 0.5f, 64, 0xFFD6BE96);
+                    drawCircleRing(guiGraphics, cx, cy, outerRingR - 0.5f, outerRingR + 0.5f, 64, 0xFF99876C);
+                } else if (MapConfig.minimapFrameStyle == 0 || isHovered || isDraggingMinimap || selectedMinimap) {
+                    drawCircleRing(guiGraphics, cx, cy, innerRingR, outerRingR, 64, borderColor);
+                }
 
                 if (isHovered || isDraggingMinimap || selectedMinimap) {
                     drawSolidCircleHelper(guiGraphics, cx, cy, clipRadius, 64, 0x4400C8FF, 0.3f);
@@ -3823,10 +3853,16 @@ public class MapScreen extends Screen {
                 }
             } else {
                 // SQUARE PREVIEW
-                guiGraphics.fill(x - 1, y - 1, x + size + 1, y, borderColor);
-                guiGraphics.fill(x - 1, y + size, x + size + 1, y + size + 1, borderColor);
-                guiGraphics.fill(x - 1, y, x, y + size, borderColor);
-                guiGraphics.fill(x + size, y, x + size + 1, y + size, borderColor);
+                if (MapConfig.minimapFrameStyle == 1) {
+                    int pad = Math.max(5, Math.round(size * 0.08f));
+                    guiGraphics.blit(VANILLA_MAP_BACKGROUND, x - pad, y - pad, size + pad * 2, size + pad * 2, 0.0f, 0.0f, 64, 64, 64, 64);
+                    int innerBorder = isHovered || isDraggingMinimap || selectedMinimap ? 0xFF00C8FF : 0xBB99876C;
+                    guiGraphics.renderOutline(x - 1, y - 1, size + 2, size + 2, innerBorder);
+                } else if (MapConfig.minimapFrameStyle == 0) {
+                    guiGraphics.renderOutline(x - 1, y - 1, size + 2, size + 2, borderColor);
+                } else if (isHovered || isDraggingMinimap || selectedMinimap) {
+                    guiGraphics.renderOutline(x - 1, y - 1, size + 2, size + 2, borderColor);
+                }
 
                 if (this.minecraft != null && this.minecraft.player != null) {
                     double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
@@ -3956,7 +3992,7 @@ public class MapScreen extends Screen {
 
         // Simple hint above Done button
         int panelCenterX = doneButton.getX() + doneButton.getWidth() / 2;
-        int hintY = doneButton.getY() - 18;
+        int hintY = doneButton.getY() - 14;
 
         String hint = activeTab == 2 ? Component.translatable("gui.simplemap.hint.color_tab").getString()
                 : ((selectedMinimap || selectedCoords)
@@ -4083,6 +4119,12 @@ public class MapScreen extends Screen {
     }
 
     @Override
+    public void removed() {
+        MapConfig.save();
+        super.removed();
+    }
+
+    @Override
     public boolean isPauseScreen() {
         return false;
     }
@@ -4159,6 +4201,12 @@ public class MapScreen extends Screen {
         @Override
         protected void applyValue() {
             onChange.accept(this.value);
+        }
+
+        @Override
+        public void onRelease(double mouseX, double mouseY) {
+            super.onRelease(mouseX, mouseY);
+            MapConfig.save();
         }
     }
 

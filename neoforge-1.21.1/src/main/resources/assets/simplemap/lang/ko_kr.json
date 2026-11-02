@@ -325,5 +325,11 @@
   "gui.simplemap.book.learn_success": "§a지도를 성공적으로 학습했습니다! 지도가 업데이트되었습니다.",
   "gui.simplemap.chat.click_to_open_map": "클릭하여 지도에서 [%s, %s] 위치 보기",
   "gui.simplemap.option.minimap_waypoints": "경유지: %s",
-  "gui.simplemap.tooltip.minimap_waypoints": "미니맵 HUD 및 테두리에 경유지 아이템 아이콘을 표시하거나 숨깁니다."
+  "gui.simplemap.tooltip.minimap_waypoints": "미니맵 HUD 및 테두리에 경유지 아이템 아이콘을 표시하거나 숨깁니다.",
+  "gui.simplemap.option.frame": "Frame: %s",
+  "gui.simplemap.value.frame_minimal": "Minimal",
+  "gui.simplemap.value.frame_vanilla": "Vanilla Map",
+  "gui.simplemap.value.frame_frameless": "Frameless",
+  "gui.simplemap.tooltip.minimap_frame": "Switch between sleek minimal border, vanilla parchment map frame, and frameless mode.",
+  "gui.simplemap.msg.minimap_frame": "Minimap frame: %s"
 }

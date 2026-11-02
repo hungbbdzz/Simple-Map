@@ -596,11 +596,15 @@ public final class MapViewportCoordinator {
                 Request activeMinimap = minimapRequest;
                 if (activeMinimap != null
                         && now - activeMinimap.submittedNanos <= 500_000_000L) {
+                    double guiScale = minecraft.getWindow() == null
+                            ? 1.0D : Math.max(1.0D, minecraft.getWindow().getGuiScale());
+                    float physicalMinimapScale = MapLodPolicy.MapRenderScalePolicy
+                            .physicalPixelsPerBlock(activeMinimap.scale, guiScale);
                     minX = Math.min(minX, activeMinimap.minX);
                     maxX = Math.max(maxX, activeMinimap.maxX);
                     minZ = Math.min(minZ, activeMinimap.minZ);
                     maxZ = Math.max(maxZ, activeMinimap.maxZ);
-                    demandScale = Math.min(demandScale, activeMinimap.scale);
+                    demandScale = Math.min(demandScale, physicalMinimapScale);
                 }
                 submitSurfaceDemand(
                         minX, maxX,
@@ -732,6 +736,10 @@ public final class MapViewportCoordinator {
         boolean cave = CaveMode.isActive(minecraft);
         boolean full = cave && CaveMode.isFullView(minecraft);
         int layerY = cave ? CaveMode.getLayerY(minecraft) : Integer.MIN_VALUE;
+        double guiScale = minecraft == null || minecraft.getWindow() == null
+                ? 1.0D : Math.max(1.0D, minecraft.getWindow().getGuiScale());
+        float physicalScale = MapLodPolicy.MapRenderScalePolicy.physicalPixelsPerBlock(
+                request.scale, guiScale);
 
         if (cave) {
             // Cave page projection is much heavier than a cached leaf load.
@@ -743,10 +751,6 @@ public final class MapViewportCoordinator {
             double schedulingFocusX = (request.minX + request.maxX) * 0.5;
             double schedulingFocusZ = (request.minZ + request.maxZ) * 0.5;
             int targetLayer = full ? Integer.MIN_VALUE : layerY;
-            double guiScale = minecraft == null || minecraft.getWindow() == null
-                    ? 1.0D : Math.max(1.0D, minecraft.getWindow().getGuiScale());
-            float physicalScale = MapLodPolicy.MapRenderScalePolicy.physicalPixelsPerBlock(
-                    request.scale, guiScale);
             CaveMapManager.getInstance().setActiveLayer(targetLayer);
             requestLayerRegions(request, targetLayer);
             CaveTextureManager.getInstance().requestVisiblePages(
@@ -765,7 +769,7 @@ public final class MapViewportCoordinator {
                 request.minZ, request.maxZ,
                 (request.minX + request.maxX) * 0.5,
                 (request.minZ + request.maxZ) * 0.5,
-                request.scale, request.lane,
+                physicalScale, request.lane,
                 request.lane == MapRequestLane.FULLSCREEN);
         return false;
     }

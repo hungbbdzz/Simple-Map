@@ -325,5 +325,11 @@
   "gui.simplemap.book.learn_success": "§aКарта успешно изучена! Ваша карта обновлена.",
   "gui.simplemap.chat.click_to_open_map": "Нажмите, чтобы показать [%s, %s] на карте",
   "gui.simplemap.option.minimap_waypoints": "Точки маршрута: %s",
-  "gui.simplemap.tooltip.minimap_waypoints": "Показывать или скрывать значки точек маршрута на HUD миникарты и её границе."
+  "gui.simplemap.tooltip.minimap_waypoints": "Показывать или скрывать значки точек маршрута на HUD миникарты и её границе.",
+  "gui.simplemap.option.frame": "Frame: %s",
+  "gui.simplemap.value.frame_minimal": "Minimal",
+  "gui.simplemap.value.frame_vanilla": "Vanilla Map",
+  "gui.simplemap.value.frame_frameless": "Frameless",
+  "gui.simplemap.tooltip.minimap_frame": "Switch between sleek minimal border, vanilla parchment map frame, and frameless mode.",
+  "gui.simplemap.msg.minimap_frame": "Minimap frame: %s"
 }

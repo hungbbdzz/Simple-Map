@@ -325,5 +325,11 @@
   "gui.simplemap.book.learn_success": "§aマップの学習に成功しました！マップが更新されました。",
   "gui.simplemap.chat.click_to_open_map": "クリックしてマップ上の [%s, %s] を表示",
   "gui.simplemap.option.minimap_waypoints": "ウェイポイント: %s",
-  "gui.simplemap.tooltip.minimap_waypoints": "ミニマップHUDとその枠線上のウェイポイントアイコンを表示または非表示にします。"
+  "gui.simplemap.tooltip.minimap_waypoints": "ミニマップHUDとその枠線上のウェイポイントアイコンを表示または非表示にします。",
+  "gui.simplemap.option.frame": "Frame: %s",
+  "gui.simplemap.value.frame_minimal": "Minimal",
+  "gui.simplemap.value.frame_vanilla": "Vanilla Map",
+  "gui.simplemap.value.frame_frameless": "Frameless",
+  "gui.simplemap.tooltip.minimap_frame": "Switch between sleek minimal border, vanilla parchment map frame, and frameless mode.",
+  "gui.simplemap.msg.minimap_frame": "Minimap frame: %s"
 }

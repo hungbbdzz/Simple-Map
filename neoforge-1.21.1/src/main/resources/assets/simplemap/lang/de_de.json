@@ -325,5 +325,11 @@
   "gui.simplemap.book.learn_success": "§aKarte erfolgreich erlernt! Deine Karte wurde aktualisiert.",
   "gui.simplemap.chat.click_to_open_map": "Klicken, um [%s, %s] auf der Karte anzuzeigen",
   "gui.simplemap.option.minimap_waypoints": "Wegpunkte: %s",
-  "gui.simplemap.tooltip.minimap_waypoints": "Wegpunktsymbole auf dem Minimap-HUD und seinem Rand ein- oder ausblenden."
+  "gui.simplemap.tooltip.minimap_waypoints": "Wegpunktsymbole auf dem Minimap-HUD und seinem Rand ein- oder ausblenden.",
+  "gui.simplemap.option.frame": "Frame: %s",
+  "gui.simplemap.value.frame_minimal": "Minimal",
+  "gui.simplemap.value.frame_vanilla": "Vanilla Map",
+  "gui.simplemap.value.frame_frameless": "Frameless",
+  "gui.simplemap.tooltip.minimap_frame": "Switch between sleek minimal border, vanilla parchment map frame, and frameless mode.",
+  "gui.simplemap.msg.minimap_frame": "Minimap frame: %s"
 }

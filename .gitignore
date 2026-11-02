@@ -40,6 +40,7 @@ ENGINE_NOTES*.md
 # Local performance investigation and reference sources
 .simplemap-sandbox-gradle-home/
 temp_ref/
+mats/
 
 javac.*.args
 
