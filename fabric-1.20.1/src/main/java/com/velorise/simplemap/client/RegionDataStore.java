@@ -274,29 +274,32 @@ public final class RegionDataStore {
                 MapRequestLane.BACKGROUND, MapWorkScheduler.WorkType.DISK_WRITE,
                 0, 20, () -> true, () -> {
             boolean failed = false;
-            SaveRequest request = null;
             try {
-                var iterator = PENDING_SAVES.values().iterator();
-                if (iterator.hasNext()) request = iterator.next();
-                if (request == null || !PENDING_SAVES.remove(request.key(), request)) return;
-                IN_FLIGHT_SAVES.put(request.key(), request);
-                try {
-                    writeAtomic(new File(request.directory(), fileName(request.rx(), request.rz())),
-                            request.storedRegionView());
-                    request.notifyResult(SaveStatus.COMMITTED, null);
-                } catch (IOException exception) {
-                    failed = true;
-                    // A newer snapshot wins. Otherwise retain this exact snapshot
-                    // and retry later; a transient disk error must not clear dirty data.
-                    SaveRequest newer = PENDING_SAVES.putIfAbsent(
-                            request.key(), request);
-                    request.notifyResult(newer == null
-                                    ? SaveStatus.FAILED_RETRYING
-                                    : SaveStatus.SUPERSEDED,
-                            exception);
-                    LOGGER.error("Failed to save region {},{}", request.rx(), request.rz(), exception);
-                } finally {
-                    IN_FLIGHT_SAVES.remove(request.key(), request);
+                while (!failed) {
+                    SaveRequest request = null;
+                    var iterator = PENDING_SAVES.values().iterator();
+                    if (iterator.hasNext()) request = iterator.next();
+                    if (request == null) break;
+                    if (!PENDING_SAVES.remove(request.key(), request)) continue;
+                    IN_FLIGHT_SAVES.put(request.key(), request);
+                    try {
+                        writeAtomic(new File(request.directory(), fileName(request.rx(), request.rz())),
+                                request.storedRegionView());
+                        request.notifyResult(SaveStatus.COMMITTED, null);
+                    } catch (IOException exception) {
+                        failed = true;
+                        // A newer snapshot wins. Otherwise retain this exact snapshot
+                        // and retry later; a transient disk error must not clear dirty data.
+                        SaveRequest newer = PENDING_SAVES.putIfAbsent(
+                                request.key(), request);
+                        request.notifyResult(newer == null
+                                        ? SaveStatus.FAILED_RETRYING
+                                        : SaveStatus.SUPERSEDED,
+                                exception);
+                        LOGGER.error("Failed to save region {},{}", request.rx(), request.rz(), exception);
+                    } finally {
+                        IN_FLIGHT_SAVES.remove(request.key(), request);
+                    }
                 }
             } finally {
                 SAVE_DRAIN_SCHEDULED.set(false);

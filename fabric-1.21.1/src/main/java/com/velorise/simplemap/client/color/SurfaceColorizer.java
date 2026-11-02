@@ -1268,6 +1268,15 @@ public static final class MapVisualClassifier {
         return !geometry.isCollisionEmpty(level, pos, state);
     }
 
+    public boolean isVisibleSurfaceId(String blockId, boolean showFlowers) {
+        VisualInfo info = info(blockId);
+        if (info.role() == Role.INVISIBLE || info.invisibleDecoration()) return false;
+        if (info.leaves()) return true;
+        if (info.flower()) return showFlowers;
+        if (info.fluid() || info.role() == Role.OPAQUE_BASE) return true;
+        return info.overlayOpacity() >= 112;
+    }
+
     public boolean isOverlay(BlockState state) {
         Role role = info(state).role();
         return role == Role.TRANSPARENT_OVERLAY

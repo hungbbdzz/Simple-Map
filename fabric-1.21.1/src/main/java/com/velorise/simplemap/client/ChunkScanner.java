@@ -742,6 +742,7 @@ public class ChunkScanner {
             foregroundObservedLevel = minecraft.level;
             foregroundLastFrameNanos = now;
             foregroundCreditNanos = 0L;
+            forcedRescanUntilNanos = Math.max(forcedRescanUntilNanos, now + 3_000_000_000L);
             return;
         }
         long previous = foregroundLastFrameNanos;
@@ -2665,18 +2666,20 @@ public class ChunkScanner {
         if (!level.isClientSide()
                 || !MapManager.getInstance().acceptsLiveLevel(level)) return;
         try {
-            GeneratedChunkIndex.getInstance().markLive(level, blockX >> 4, blockZ >> 4);
-            MapBlockData data = buildBlockData(level, blockX, blockZ);
-            if (data != null) {
-                long existing = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
-                if (MapBlockData.isEmpty(existing) || !data.isEmpty()) {
-                    MapManager.getInstance().setBlockData(blockX, blockZ, data,
-                            resolveSurfaceTint(level, blockX, blockZ, data));
+            if (isSurfaceChunkReady(level, blockX >> 4, blockZ >> 4)) {
+                GeneratedChunkIndex.getInstance().markLive(level, blockX >> 4, blockZ >> 4);
+                MapBlockData data = buildBlockData(level, blockX, blockZ);
+                if (data != null) {
+                    long existing = MapManager.getInstance().getPackedBlockData(blockX, blockZ);
+                    if (MapBlockData.isEmpty(existing) || !data.isEmpty()) {
+                        MapManager.getInstance().setBlockData(blockX, blockZ, data,
+                                resolveSurfaceTint(level, blockX, blockZ, data));
+                    }
                 }
+                int surfaceY = data != null && !data.isEmpty() ? data.topY
+                        : getHighestY(level, blockX, blockZ);
+                updateSurfaceLight(level, blockX, surfaceY, blockZ);
             }
-            int surfaceY = data != null && !data.isEmpty() ? data.topY
-                    : getHighestY(level, blockX, blockZ);
-            updateSurfaceLight(level, blockX, surfaceY, blockZ);
             if (invalidateCave && CaveMode.isActive(Minecraft.getInstance())) {
                 Minecraft client = Minecraft.getInstance();
                 int layerY = CaveMode.getLayerY(client);
