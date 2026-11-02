@@ -218,6 +218,12 @@ public final class CaveTextureManager {
         return CaveMapManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint, biome);
     }
 
+    public static int resolveCaveBlockBaseColor(BlockState state, int grassTint,
+            int foliageTint, net.minecraft.world.level.biome.Biome biome,
+            net.minecraft.core.BlockPos pos) {
+        return CaveMapManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint, biome, pos);
+    }
+
     public static boolean requiresCaveBiomeTint(BlockState state) {
         return CaveMapManager.requiresCaveBiomeTint(state);
     }
@@ -3620,7 +3626,8 @@ public final class CaveTextureManager {
             }
         }
 
-        public static boolean requiresCaveBiomeTint(BlockState state) {
+
+    public static boolean requiresCaveBiomeTint(BlockState state) {
             if (state == null || state.isAir() || MapConfig.blockColourMode != 0) return false;
             SurfaceColorizer.MapVisualClassifier.VisualInfo visual =
                     SurfaceColorizer.MapVisualClassifier.getInstance().info(state);
@@ -3637,6 +3644,12 @@ public final class CaveTextureManager {
 
         public static int resolveCaveBlockBaseColor(BlockState state, int grassTint,
                 int foliageTint, net.minecraft.world.level.biome.Biome biome) {
+            return resolveCaveBlockBaseColor(state, grassTint, foliageTint, biome, null);
+        }
+
+        public static int resolveCaveBlockBaseColor(BlockState state, int grassTint,
+                int foliageTint, net.minecraft.world.level.biome.Biome biome,
+                BlockPos pos) {
             if (state == null || state.isAir()) return 0;
             SurfaceColorizer.MapVisualClassifier visualClassifier = SurfaceColorizer.MapVisualClassifier.getInstance();
             SurfaceColorizer.MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
@@ -3653,7 +3666,10 @@ public final class CaveTextureManager {
                 if (tintInfo.kind() == SurfaceColorizer.BlockTextureColorSampler.ProviderKind.CONSTANT_RGB) {
                     customTint = tintInfo.constantRgb();
                 } else if (tintInfo.kind() == SurfaceColorizer.BlockTextureColorSampler.ProviderKind.CUSTOM_PROVIDER) {
-                    customTint = SurfaceColorizer.BlockTextureColorSampler.sampleBiomeProviderTint(name, biome);
+                    customTint = pos != null
+                            ? SurfaceColorizer.BlockTextureColorSampler.sampleCustomProviderTintAt(
+                                    name, biome, pos.getX(), pos.getY(), pos.getZ())
+                            : SurfaceColorizer.BlockTextureColorSampler.sampleBiomeProviderTint(name, biome);
                 }
                 if (customTint != -1) {
                     argb = SurfaceColorizer.applyBiomeTint(argb, 0xFF000000 | customTint, strength);

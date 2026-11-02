@@ -2028,8 +2028,8 @@ public class MapRenderer {
         int maxNodeZ = Math.floorDiv(maxPageZ, pageSpan);
         surfaceHierarchyVisitsRemaining = SURFACE_HIERARCHY_MAX_VISITS;
         if (!centerOutTraversal) {
-            for (int nodeX = minNodeX; nodeX <= maxNodeX; nodeX++) {
-                for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
+            for (int nodeX = minNodeX; nodeX <= maxNodeX && surfaceHierarchyVisitsRemaining > 0; nodeX++) {
+                for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ && surfaceHierarchyVisitsRemaining > 0; nodeZ++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, nodeZ, minPageX, maxPageX,
                             minPageZ, maxPageZ, scale, manager, collectPending, false);
@@ -2041,14 +2041,14 @@ public class MapRenderer {
         int centerZ = clamp(Math.floorDiv(focusPageZ, pageSpan), minNodeZ, maxNodeZ);
         int maximumRadius = gridRadius(minNodeX, maxNodeX, minNodeZ, maxNodeZ,
                 centerX, centerZ);
-        for (int radius = 0; radius <= maximumRadius; radius++) {
+        for (int radius = 0; radius <= maximumRadius && surfaceHierarchyVisitsRemaining > 0; radius++) {
             int left = centerX - radius;
             int right = centerX + radius;
             int top = centerZ - radius;
             int bottom = centerZ + radius;
             if (top >= minNodeZ && top <= maxNodeZ) {
                 for (int nodeX = Math.max(minNodeX, left);
-                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
+                        nodeX <= Math.min(maxNodeX, right) && surfaceHierarchyVisitsRemaining > 0; nodeX++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, top, minPageX, maxPageX,
                             minPageZ, maxPageZ, scale, manager, collectPending, false);
@@ -2056,13 +2056,13 @@ public class MapRenderer {
             }
             if (radius == 0) continue;
             for (int nodeZ = Math.max(minNodeZ, top + 1);
-                    nodeZ <= Math.min(maxNodeZ, bottom - 1); nodeZ++) {
+                    nodeZ <= Math.min(maxNodeZ, bottom - 1) && surfaceHierarchyVisitsRemaining > 0; nodeZ++) {
                 if (left >= minNodeX && left <= maxNodeX) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, left, nodeZ, minPageX, maxPageX,
                             minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
-                if (right != left && right >= minNodeX && right <= maxNodeX) {
+                if (right != left && right >= minNodeX && right <= maxNodeX && surfaceHierarchyVisitsRemaining > 0) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, right, nodeZ, minPageX, maxPageX,
                             minPageZ, maxPageZ, scale, manager, collectPending, false);
@@ -2070,7 +2070,7 @@ public class MapRenderer {
             }
             if (bottom >= minNodeZ && bottom <= maxNodeZ) {
                 for (int nodeX = Math.max(minNodeX, left);
-                        nodeX <= Math.min(maxNodeX, right); nodeX++) {
+                        nodeX <= Math.min(maxNodeX, right) && surfaceHierarchyVisitsRemaining > 0; nodeX++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, bottom, minPageX, maxPageX,
                             minPageZ, maxPageZ, scale, manager, collectPending, false);
@@ -2093,17 +2093,21 @@ public class MapRenderer {
         int lastPageZ = firstPageZ + pageSpan - 1;
         if (lastPageX < minPageX || firstPageX > maxPageX
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
-        if (surfaceHierarchyVisitsRemaining-- <= 0) return;
+        if (surfaceHierarchyVisitsRemaining <= 0) return;
 
+        // Check O(1) region source availability before touching SurfaceLodTree maps
+        // or consuming traversal budget so ultra-wide 500k-page views skip empty void
+        // regions in O(1) without HashMap allocations.
         boolean exactResident = surfaceTextures.hasResidentPageInNode(
                 level, nodeX, nodeZ);
-        boolean branchResident = overviewTextures.hasResidentSurfaceBranchInSubtree(
-                level, nodeX, nodeZ);
-        boolean sourceAvailable = exactResident || branchResident
+        boolean sourceAvailable = exactResident
                 || surfaceNodeHasSource(builder, manager,
                         Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
                         Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
-        if (!exactResident && !branchResident && !sourceAvailable) return;
+        if (!exactResident && !sourceAvailable) return;
+        if (surfaceHierarchyVisitsRemaining-- <= 0) return;
+        boolean branchResident = overviewTextures.hasResidentSurfaceBranchInSubtree(
+                level, nodeX, nodeZ);
         CaveAtlasRegion branch = overviewTextures.peekSurfaceBranch(level, nodeX, nodeZ);
         CaveAtlasRegion ancestor = null;
         boolean nodeCovered = inheritedCoverage;

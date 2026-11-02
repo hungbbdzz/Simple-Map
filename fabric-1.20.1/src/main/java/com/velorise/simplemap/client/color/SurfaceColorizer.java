@@ -117,7 +117,7 @@ public final class SurfaceColorizer {
 
                 int baseColor = resolveBaseColor(packed, tints[index], blockPalette, blockColors, tintPolicies,
                         tintDisabledBlocks, biomeLookup, pixels, px, pz,
-                        SIZE, SIZE, colourMode);
+                        SIZE, SIZE, px, pz, colourMode);
                 if (baseColor == 0)
                     continue;
 
@@ -278,7 +278,9 @@ public final class SurfaceColorizer {
 
                 int baseColor = resolveBaseColor(packed, tints[index], blockPalette,
                         blockColors, tintPolicies, tintDisabledBlocks, biomeLookup,
-                        pixels, px, pz, stride, stride, colourMode);
+                        pixels, px, pz, stride, stride,
+                        worldPageStartX + localX, worldPageStartZ + localZ,
+                        colourMode);
                 if (baseColor == 0) continue;
 
                 int red = (baseColor >>> 16) & 0xFF;
@@ -374,7 +376,10 @@ public final class SurfaceColorizer {
                 int baseColor = resolveBaseColor(packed, tints[index],
                         blockPalette, blockColors, tintPolicies,
                         tintDisabledBlocks, biomeLookup, pixels, px, pz,
-                        stride, stride, colourMode);
+                        stride, stride,
+                        worldStartX + localX * worldSampleStep,
+                        worldStartZ + localZ * worldSampleStep,
+                        colourMode);
                 if (baseColor == 0) continue;
                 int red = (baseColor >>> 16) & 0xFF;
                 int green = (baseColor >>> 8) & 0xFF;
@@ -434,6 +439,7 @@ public final class SurfaceColorizer {
             long[] allPixels,
             int px, int pz,
             int sampleWidth, int sampleHeight,
+            int worldX, int worldZ,
             int colourMode) {
         String blockName = blockId(packed, blockPalette);
 
@@ -524,17 +530,22 @@ public final class SurfaceColorizer {
             }
             if (tintInfo != null
                     && tintInfo.kind() == BlockTextureColorSampler.ProviderKind.CUSTOM_PROVIDER) {
+                // Never allow coordinate-dependent CUSTOM_PROVIDER blocks (e.g.
+                // Regions Unexplored prismoss / prismarite) to fall through to
+                // BiomeColors.blendGrass/blendFoliage. Always honor storedTint first,
+                // or evaluate the provider at the pixel's exact world (x, y, z).
                 if (SurfaceTintData.hasColor(storedTint)) {
                     return applyBiomeTint(texture,
                             0xFF000000 | SurfaceTintData.rgb(storedTint), customStrength);
                 }
                 Biome selfBiome = resolvePixelBiome(packed, biomeLookup);
-                int customTint = BlockTextureColorSampler.sampleBiomeProviderTint(
-                        blockName, selfBiome);
+                int customTint = BlockTextureColorSampler.sampleCustomProviderTintAt(
+                        blockName, selfBiome, worldX, MapBlockData.topY(packed), worldZ);
                 if (customTint != -1) {
                     return applyBiomeTint(texture,
                             0xFF000000 | customTint, customStrength);
                 }
+                return texture;
             }
             if (usesStoredProviderTint(policy)) {
                 if (SurfaceTintData.hasColor(storedTint)) {
@@ -1733,6 +1744,34 @@ public static final class MapVisualClassifier {
             return evaluated;
         }
 
+        public static int sampleCustomProviderTintAt(String blockIdText, Biome biome,
+                int worldX, int worldY, int worldZ) {
+            if (blockIdText == null || blockIdText.isBlank() || isBrokenTint(blockIdText)) {
+                return -1;
+            }
+            TintInfo info = getTintInfo(blockIdText);
+            if (info.kind() == ProviderKind.NONE) return -1;
+            if (info.kind() == ProviderKind.CONSTANT_RGB) return info.constantRgb();
+            try {
+                Minecraft minecraft = Minecraft.getInstance();
+                if (minecraft != null && minecraft.getBlockColors() != null) {
+                    ResourceLocation blockId = new ResourceLocation(blockIdText);
+                    Block block = BuiltInRegistries.BLOCK.get(blockId);
+                    if (block != null && block != Blocks.AIR) {
+                        BlockState state = block.defaultBlockState();
+                        SingleBiomeTintGetter getter = new SingleBiomeTintGetter(biome, state);
+                        int tint = minecraft.getBlockColors().getColor(
+                                state, getter, new BlockPos(worldX, worldY, worldZ), 0);
+                        if (tint != -1) {
+                            return tint & 0x00FFFFFF;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return sampleBiomeProviderTint(blockIdText, biome);
+        }
+
         private static int evaluateBiomeProviderTint(String blockIdText, Biome biome, int fallbackRgb) {
             try {
                 Minecraft minecraft = Minecraft.getInstance();
@@ -1769,12 +1808,22 @@ public static final class MapVisualClassifier {
                 int c2 = minecraft.getBlockColors().getColor(
                         state, probe2, new BlockPos(96, 64, 96), 0);
 
-                if (c1 == -1 && c2 == -1 && !probe1.calledBlockTint && !probe2.calledBlockTint) {
+                // Probe a third non-diagonal, coprime coordinate so periodic or (x - z)
+                // rainbow providers (e.g. prismoss / prismarite) are never misclassified
+                // as CONSTANT_RGB when (0, 64, 0) and (96, 64, 96) happen to alias.
+                ProbeTintGetter probe3 = new ProbeTintGetter(state, 0x619961);
+                int c3 = minecraft.getBlockColors().getColor(
+                        state, probe3, new BlockPos(37, 71, -53), 0);
+
+                if (c1 == -1 && c2 == -1 && c3 == -1
+                        && !probe1.calledBlockTint && !probe2.calledBlockTint && !probe3.calledBlockTint) {
                     return TintInfo.NONE;
                 }
                 int rgb1 = c1 == -1 ? -1 : (c1 & 0x00FFFFFF);
                 int rgb2 = c2 == -1 ? -1 : (c2 & 0x00FFFFFF);
-                if (!probe1.calledBlockTint && !probe2.calledBlockTint && rgb1 != -1 && rgb1 == rgb2) {
+                int rgb3 = c3 == -1 ? -1 : (c3 & 0x00FFFFFF);
+                if (!probe1.calledBlockTint && !probe2.calledBlockTint && !probe3.calledBlockTint
+                        && rgb1 != -1 && rgb1 == rgb2 && rgb1 == rgb3) {
                     return new TintInfo(ProviderKind.CONSTANT_RGB, rgb1);
                 }
                 if (probe1.calledBlockTint

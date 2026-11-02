@@ -505,7 +505,6 @@ public class SimpleMap implements ModInitializer {
         public static void onRenderScreen(Screen screen, GuiGraphics guiGraphics, float partialTick) {
             MapPerformanceGovernor.getInstance().onFrame();
             Minecraft mc = Minecraft.getInstance();
-
             if (MinimapRenderer.isAllowedScreenForMinimap(screen)) {
                 MinimapRenderer.getInstance().renderHUD(guiGraphics, partialTick, true);
             }

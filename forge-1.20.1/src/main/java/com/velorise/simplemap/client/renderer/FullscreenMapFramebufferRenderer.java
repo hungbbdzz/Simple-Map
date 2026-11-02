@@ -59,9 +59,9 @@ public final class FullscreenMapFramebufferRenderer {
      * cover normal drag/momentum while streaming revisions are frozen, reducing
      * anchor handoffs without returning to the area cost of the old 128px halo.
      */
-    private static final int OVERSCAN = 256;
+    private static final int OVERSCAN = 96;
     /** Only the near halo is admitted as visible demand; the outer guard is reuse. */
-    private static final int DEMAND_OVERSCAN = 64;
+    private static final int DEMAND_OVERSCAN = 32;
     private static final float TRANSLATION_REUSE_LIMIT = OVERSCAN - 1.0f;
     /** Exact page-table replay is cheap and should expose new publications quickly. */
     private static final long EXACT_STREAMING_REDRAW_NANOS = 125_000_000L;

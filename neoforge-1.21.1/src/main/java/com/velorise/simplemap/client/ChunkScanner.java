@@ -335,10 +335,30 @@ public class ChunkScanner {
                 && !MapManager.getInstance().acceptsLiveLevel(mc.level)) {
             return;
         }
+        enqueueSingleSurfaceChunk(chunkX, chunkZ, packetAuthoritative);
+        // 8-Neighbor Rule wake-up: when a frontier chunk finishes loading, it completes
+        // the 8-neighbor ring for adjacent interior chunks that were waiting for feature
+        // generation (trees/canopies). Wake those newly ready neighbors immediately.
+        if (packetAuthoritative && mc != null && mc.level != null) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dz == 0) continue;
+                    int nx = chunkX + dx;
+                    int nz = chunkZ + dz;
+                    long neighborKey = packChunk(nx, nz);
+                    if (!liveSurfacePublishedChunks.contains(neighborKey)
+                            && isSurfaceChunkReady(mc.level, nx, nz)) {
+                        enqueueSingleSurfaceChunk(nx, nz, true);
+                    }
+                }
+            }
+        }
+    }
+
+    private void enqueueSingleSurfaceChunk(int chunkX, int chunkZ,
+            boolean packetAuthoritative) {
         long key = packChunk(chunkX, chunkZ);
         if (packetAuthoritative) {
-            // A packet arriving at TAIL is newer than any seed scan or persisted
-            // completion bit. Restart this one bounded transaction from column 0.
             forcedSurfaceChunkRefresh.add(key);
             loadedSurfaceChunkCursors.remove(key);
             surfaceChunkStages.remove(key);
@@ -379,11 +399,32 @@ public class ChunkScanner {
      * chunks arrive. The exact page remains atomic, so no partially scanned body is
      * ever exposed.</p>
      */
-    private static LevelChunk readySurfaceChunk(Level level, int chunkX, int chunkZ) {
+    private static LevelChunk loadedSurfaceChunk(Level level, int chunkX, int chunkZ) {
         if (level == null) return null;
-        var center = level.getChunk(chunkX, chunkZ, ChunkStatus.FULL, false);
-        return center instanceof LevelChunk loaded
+        var chunk = level.getChunk(chunkX, chunkZ, ChunkStatus.FULL, false);
+        return chunk instanceof LevelChunk loaded
                 && !(loaded instanceof EmptyLevelChunk) ? loaded : null;
+    }
+
+    /**
+     * 8-Neighbor Rule (Feature Cascade Protection):
+     * Only scan and commit a Surface chunk when the center chunk AND all 8 surrounding
+     * neighbor chunks are loaded as FULL non-empty chunks. This guarantees that outer-rim
+     * chunks whose trees/structures have not populated yet are held back until all 8
+     * neighbors arrive, eliminating "bald grass" rim chunks.
+     */
+    private static LevelChunk readySurfaceChunk(Level level, int chunkX, int chunkZ) {
+        LevelChunk center = loadedSurfaceChunk(level, chunkX, chunkZ);
+        if (center == null) return null;
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dz == 0) continue;
+                if (loadedSurfaceChunk(level, chunkX + dx, chunkZ + dz) == null) {
+                    return null;
+                }
+            }
+        }
+        return center;
     }
 
     private static boolean isSurfaceChunkReady(Level level, int chunkX, int chunkZ) {
@@ -442,7 +483,7 @@ public class ChunkScanner {
         // PASS110: reconcile the complete square of client-loaded FULL chunks.
         // Edge-dependent styling is repaired separately when neighbours publish;
         // never reserve a permanent one-chunk black rim around the render distance.
-        int stableSurfaceRadiusChunks = Math.max(1, effectiveRenderDistance);
+        int stableSurfaceRadiusChunks = Math.max(1, effectiveRenderDistance - 1);
         int renderRadiusBlocks = stableSurfaceRadiusChunks * 16;
         long now = System.nanoTime();
         boolean teleportSeed = teleportRecoverySeedPending;
@@ -488,10 +529,7 @@ public class ChunkScanner {
             int chunkX = foregroundSeedChunkX + (short) (packed >>> 16);
             int chunkZ = foregroundSeedChunkZ + (short) packed;
             long key = packChunk(chunkX, chunkZ);
-            var center = minecraft.level.getChunk(
-                    chunkX, chunkZ, ChunkStatus.FULL, false);
-            boolean live = center instanceof LevelChunk liveChunk
-                    && !(liveChunk instanceof EmptyLevelChunk);
+            boolean live = isSurfaceChunkReady(minecraft.level, chunkX, chunkZ);
             if (live) {
                 if (!liveSurfacePublishedChunks.contains(key)) {
                     if (teleportSeed) enqueueTeleportRecoveryChunk(chunkX, chunkZ);
@@ -692,7 +730,7 @@ public class ChunkScanner {
     public void onForegroundFrame(Minecraft minecraft, boolean mapUnlocked) {
         long now = System.nanoTime();
         boolean supportedScreen = minecraft != null
-                && (minecraft.screen == null);
+                && (minecraft.screen == null || minecraft.screen instanceof MapScreen);
         if (minecraft == null || minecraft.level == null || minecraft.player == null
                 || !mapUnlocked || !supportedScreen) {
             foregroundLastFrameNanos = now;
@@ -713,7 +751,7 @@ public class ChunkScanner {
             foregroundCreditNanos = 0L;
             return;
         }
-        if (minecraft.screen instanceof MapScreen) {
+        if (minecraft.screen instanceof MapScreen && CaveMode.isActive(minecraft)) {
             foregroundCreditNanos = 0L;
             return;
         }
@@ -817,7 +855,7 @@ public class ChunkScanner {
     private void scanColumnIfLoaded(Minecraft mc, int blockX, int blockZ) {
         if (mc == null || mc.level == null
                 || !MapManager.getInstance().acceptsLiveLevel(mc.level)) return;
-        if (mc.level.hasChunk(blockX >> 4, blockZ >> 4)) {
+        if (isSurfaceChunkReady(mc.level, blockX >> 4, blockZ >> 4)) {
             GeneratedChunkIndex.getInstance().markLive(
                     mc.level, blockX >> 4, blockZ >> 4);
             MapBlockData data = buildBlockData(mc.level, blockX, blockZ);
@@ -2378,7 +2416,7 @@ public class ChunkScanner {
         try {
             LevelChunk effectiveChunk = chunk != null
                     ? chunk
-                    : readySurfaceChunk(level, pos.getX() >> 4, pos.getZ() >> 4);
+                    : loadedSurfaceChunk(level, pos.getX() >> 4, pos.getZ() >> 4);
             var holder = effectiveChunk != null
                     ? effectiveChunk.getNoiseBiome(pos.getX() >> 2, pos.getY() >> 2, pos.getZ() >> 2)
                     : level.getNoiseBiome(pos.getX() >> 2, pos.getY() >> 2, pos.getZ() >> 2);
@@ -2398,7 +2436,7 @@ public class ChunkScanner {
         if (biome != null) {
             int grassTint = SurfaceColorizer.BiomeColors.getGrassColor(biome);
             int foliageTint = SurfaceColorizer.BiomeColors.getFoliageColor(biome);
-            return CaveTextureManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint, biome);
+            return CaveTextureManager.resolveCaveBlockBaseColor(state, grassTint, foliageTint, biome, pos);
         }
         return CaveTextureManager.resolveCaveBlockBaseColor(state);
     }
@@ -2698,7 +2736,8 @@ public class ChunkScanner {
             return SurfaceTintData.NONE;
         }
         try {
-            BlockPos samplePos = clampTintPositionToLoadedChunk(level, pos, scanScratch.get());
+            BlockPos samplePos = BlockTextureColorSampler.usesCustomProviderTint(blockId)
+                    ? pos : clampTintPositionToLoadedChunk(level, pos, scanScratch.get());
             int tint = Minecraft.getInstance().getBlockColors().getColor(
                     state, level, samplePos, 0);
             return SurfaceTintData.fromProviderResult(tint);
@@ -2736,7 +2775,8 @@ public class ChunkScanner {
             return SurfaceTintData.NONE;
         }
         try {
-            BlockPos samplePos = clampTintPositionToLoadedChunk(level, pos, scanScratch.get());
+            BlockPos samplePos = BlockTextureColorSampler.usesCustomProviderTint(blockId)
+                    ? pos : clampTintPositionToLoadedChunk(level, pos, scanScratch.get());
             int tint = Minecraft.getInstance().getBlockColors().getColor(
                     visibleState, level, samplePos, 0);
             return SurfaceTintData.fromProviderResult(tint);
@@ -2759,13 +2799,13 @@ public class ChunkScanner {
         if (nx == 0 && nz == 0) return pos;
         int sampleX = blockX;
         int sampleZ = blockZ;
-        if (nx != 0 && readySurfaceChunk(level, chunkX + nx, chunkZ) == null) {
+        if (nx != 0 && loadedSurfaceChunk(level, chunkX + nx, chunkZ) == null) {
             sampleX = (chunkX << 4) + (nx < 0 ? 3 : 12);
         }
-        if (nz != 0 && readySurfaceChunk(level, chunkX, chunkZ + nz) == null) {
+        if (nz != 0 && loadedSurfaceChunk(level, chunkX, chunkZ + nz) == null) {
             sampleZ = (chunkZ << 4) + (nz < 0 ? 3 : 12);
         }
-        if (nx != 0 && nz != 0 && readySurfaceChunk(level, chunkX + nx, chunkZ + nz) == null) {
+        if (nx != 0 && nz != 0 && loadedSurfaceChunk(level, chunkX + nx, chunkZ + nz) == null) {
             sampleX = (chunkX << 4) + (nx < 0 ? 3 : 12);
             sampleZ = (chunkZ << 4) + (nz < 0 ? 3 : 12);
         }
@@ -3022,7 +3062,7 @@ public class ChunkScanner {
     private String resolveSurfaceBiomeId(Level level,
             BlockPos.MutableBlockPos position, ScanScratch scratch) {
         return resolveSurfaceBiomeId(level,
-                readySurfaceChunk(level, position.getX() >> 4, position.getZ() >> 4),
+                loadedSurfaceChunk(level, position.getX() >> 4, position.getZ() >> 4),
                 position, scratch);
     }
 
@@ -3051,7 +3091,7 @@ public class ChunkScanner {
         int localZ = blockZ & 15;
 
         LevelChunk ownChunk = loadedChunk != null
-                ? loadedChunk : readySurfaceChunk(level, chunkX, chunkZ);
+                ? loadedChunk : loadedSurfaceChunk(level, chunkX, chunkZ);
 
         int sampleX = blockX;
         int sampleZ = blockZ;
@@ -3059,16 +3099,16 @@ public class ChunkScanner {
         int nz = localZ < 2 ? -1 : (localZ > 13 ? 1 : 0);
         boolean clampedBorder = false;
 
-        if (nx != 0 && readySurfaceChunk(level, chunkX + nx, chunkZ) == null) {
+        if (nx != 0 && loadedSurfaceChunk(level, chunkX + nx, chunkZ) == null) {
             sampleX = (chunkX << 4) + (nx < 0 ? 2 : 13);
             clampedBorder = true;
         }
-        if (nz != 0 && readySurfaceChunk(level, chunkX, chunkZ + nz) == null) {
+        if (nz != 0 && loadedSurfaceChunk(level, chunkX, chunkZ + nz) == null) {
             sampleZ = (chunkZ << 4) + (nz < 0 ? 2 : 13);
             clampedBorder = true;
         }
         if (nx != 0 && nz != 0
-                && readySurfaceChunk(level, chunkX + nx, chunkZ + nz) == null) {
+                && loadedSurfaceChunk(level, chunkX + nx, chunkZ + nz) == null) {
             sampleX = (chunkX << 4) + (nx < 0 ? 2 : 13);
             sampleZ = (chunkZ << 4) + (nz < 0 ? 2 : 13);
             clampedBorder = true;
