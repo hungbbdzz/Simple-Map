@@ -505,10 +505,7 @@ public class SimpleMap implements ModInitializer {
         public static void onRenderScreen(Screen screen, GuiGraphics guiGraphics, float partialTick) {
             MapPerformanceGovernor.getInstance().onFrame();
             Minecraft mc = Minecraft.getInstance();
-            if (screen instanceof MapScreen) {
-                ChunkScanner.getInstance().onForegroundFrame(mc,
-                        SimpleMap.isMapUnlocked(mc.player));
-            }
+
             if (MinimapRenderer.isAllowedScreenForMinimap(screen)) {
                 MinimapRenderer.getInstance().renderHUD(guiGraphics, partialTick, true);
             }

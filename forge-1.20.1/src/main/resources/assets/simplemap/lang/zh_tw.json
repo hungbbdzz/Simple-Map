@@ -325,5 +325,11 @@
   "gui.simplemap.book.learn_success": "§a成功學習地圖！你的地圖已更新。",
   "gui.simplemap.chat.click_to_open_map": "點擊在地圖上查看 [%s, %s]",
   "gui.simplemap.option.minimap_waypoints": "路徑點：%s",
-  "gui.simplemap.tooltip.minimap_waypoints": "在小地圖HUD及其邊框上顯示或隱藏路徑點物品圖示。"
+  "gui.simplemap.tooltip.minimap_waypoints": "在小地圖HUD及其邊框上顯示或隱藏路徑點物品圖示。",
+  "gui.simplemap.option.frame": "Frame: %s",
+  "gui.simplemap.value.frame_minimal": "Minimal",
+  "gui.simplemap.value.frame_vanilla": "Vanilla Map",
+  "gui.simplemap.value.frame_frameless": "Frameless",
+  "gui.simplemap.tooltip.minimap_frame": "Switch between sleek minimal border, vanilla parchment map frame, and frameless mode.",
+  "gui.simplemap.msg.minimap_frame": "Minimap frame: %s"
 }

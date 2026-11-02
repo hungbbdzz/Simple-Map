@@ -1410,7 +1410,7 @@ public final class RegionSurfaceLodService {
         public static final int MAX_LEVEL = 3;
         public static final float DIRECT_PROJECTION_THRESHOLD = 0.50f;
         /** At this density the level-3 region texel (64 blocks) is screen-correct. */
-        public static final float REGION_ONLY_THRESHOLD = 0.015625f;
+        public static final float REGION_ONLY_THRESHOLD = 0.0625f;
 
         private MapRegionLodPolicy() { }
 
@@ -1447,7 +1447,7 @@ public final class RegionSurfaceLodService {
         public static boolean regionAuthorityOnly(float logicalScale) {
             return Float.isFinite(logicalScale)
                     && logicalScale > 0.0f
-                    && logicalScale < REGION_ONLY_THRESHOLD;
+                    && logicalScale <= REGION_ONLY_THRESHOLD;
         }
 
         public static int targetLevel(float logicalScale) {

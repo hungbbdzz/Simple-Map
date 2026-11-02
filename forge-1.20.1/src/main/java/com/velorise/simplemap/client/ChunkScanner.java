@@ -692,7 +692,7 @@ public class ChunkScanner {
     public void onForegroundFrame(Minecraft minecraft, boolean mapUnlocked) {
         long now = System.nanoTime();
         boolean supportedScreen = minecraft != null
-                && (minecraft.screen == null || minecraft.screen instanceof MapScreen);
+                && (minecraft.screen == null);
         if (minecraft == null || minecraft.level == null || minecraft.player == null
                 || !mapUnlocked || !supportedScreen) {
             foregroundLastFrameNanos = now;
@@ -713,7 +713,7 @@ public class ChunkScanner {
             foregroundCreditNanos = 0L;
             return;
         }
-        if (minecraft.screen instanceof MapScreen && CaveMode.isActive(minecraft)) {
+        if (minecraft.screen instanceof MapScreen) {
             foregroundCreditNanos = 0L;
             return;
         }

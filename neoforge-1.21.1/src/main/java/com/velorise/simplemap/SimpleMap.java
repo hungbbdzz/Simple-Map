@@ -565,10 +565,7 @@ public class SimpleMap {
         public static void onRenderScreen(ScreenEvent.Render.Post event) {
             MapPerformanceGovernor.getInstance().onFrame();
             Minecraft mc = Minecraft.getInstance();
-            if (event.getScreen() instanceof MapScreen) {
-                ChunkScanner.getInstance().onForegroundFrame(mc,
-                        SimpleMap.isMapUnlocked(mc.player));
-            }
+
             if (MinimapRenderer.isAllowedScreenForMinimap(event.getScreen())) {
                 MinimapRenderer.getInstance().renderHUD(
                         event.getGuiGraphics(), event.getPartialTick(), true);

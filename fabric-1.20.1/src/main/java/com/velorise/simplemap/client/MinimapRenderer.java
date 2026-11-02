@@ -27,6 +27,32 @@ public class MinimapRenderer {
     private static final ResourceLocation RED_X_TEXTURE =
             new ResourceLocation(
                     "simplemap", "textures/gui/red_x.png");
+    private static final ResourceLocation CUSTOM_FRAME_TEXTURE =
+            new ResourceLocation(
+                    "simplemap", "textures/gui/minimap_frame.png");
+    private static final ResourceLocation VANILLA_MAP_BACKGROUND =
+            new ResourceLocation(
+                    "minecraft", "textures/map/map_background.png");
+
+    private ResourceLocation cachedFrameTexture = null;
+    private long lastFrameTextureCheckTime = 0L;
+
+    private ResourceLocation resolveFrameTexture(Minecraft mc) {
+        long now = System.currentTimeMillis();
+        if (now - lastFrameTextureCheckTime < 2000L && cachedFrameTexture != null) {
+            return cachedFrameTexture;
+        }
+        lastFrameTextureCheckTime = now;
+        if (mc == null || mc.getResourceManager() == null) {
+            return cachedFrameTexture = null;
+        }
+        try {
+            if (mc.getResourceManager().getResource(CUSTOM_FRAME_TEXTURE).isPresent()) {
+                return cachedFrameTexture = CUSTOM_FRAME_TEXTURE;
+            }
+        } catch (Exception ignored) {}
+        return cachedFrameTexture = null;
+    }
     private static final int CIRCLE_SEGMENTS = 64;
     private static final float[] CIRCLE_COS = new float[CIRCLE_SEGMENTS + 1];
     private static final float[] CIRCLE_SIN = new float[CIRCLE_SEGMENTS + 1];
@@ -159,8 +185,8 @@ public class MinimapRenderer {
         int x = position[0];
         int y = position[1];
 
-        int borderThickness = Math.max(2, size / 32);
-        int tHalf = Math.max(1, borderThickness / 2);
+        int borderThickness = 2;
+        int tHalf = 1;
         double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
         double interpX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX()) * dimScale;
         double interpZ = net.minecraft.util.Mth.lerp(partialTick, player.zo, player.getZ()) * dimScale;
@@ -183,25 +209,18 @@ public class MinimapRenderer {
                     interpX, interpZ, effectiveZoom, partialTick);
         } else {
             // ==========================================
-            // SQUARE MINIMAP (Original Sleek Borders)
+            // SQUARE MINIMAP (Sleek Minimal 1px Border / Vanilla Map / Frameless / Resource Pack)
             // ==========================================
-            guiGraphics.renderOutline(x - borderThickness - 1, y - borderThickness - 1,
-                    size + borderThickness * 2 + 2, size + borderThickness * 2 + 2, 0xFF000000);
-            // Main colored border
-            guiGraphics.fill(x - borderThickness, y - borderThickness, x + size + borderThickness, y - tHalf,
-                    MapConfig.minimapRingColor); // Top
-            guiGraphics.fill(x - borderThickness, y + size + tHalf, x + size + borderThickness,
-                    y + size + borderThickness, MapConfig.minimapRingColor); // Bottom
-            guiGraphics.fill(x - borderThickness, y - tHalf, x - tHalf, y + size + tHalf,
-                    MapConfig.minimapRingColor); // Left
-            guiGraphics.fill(x + size + tHalf, y - tHalf, x + size + borderThickness, y + size + tHalf,
-                    MapConfig.minimapRingColor); // Right
-
-            // Inner slate outline (thickness tHalf)
-            guiGraphics.fill(x - tHalf, y - tHalf, x + size + tHalf, y, MapConfig.minimapRingColor); // Top
-            guiGraphics.fill(x - tHalf, y + size, x + size + tHalf, y + size + tHalf, MapConfig.minimapRingColor); // Bottom
-            guiGraphics.fill(x - tHalf, y, x, y + size, MapConfig.minimapRingColor); // Left
-            guiGraphics.fill(x + size, y, x + size + tHalf, y + size, MapConfig.minimapRingColor); // Right
+            ResourceLocation frameTexture = resolveFrameTexture(mc);
+            if (frameTexture != null) {
+                guiGraphics.blit(frameTexture, x - 2, y - 2, 0, 0, size + 4, size + 4, size + 4, size + 4);
+            } else if (MapConfig.minimapFrameStyle == 1) {
+                int pad = Math.max(5, Math.round(size * 0.08f));
+                guiGraphics.blit(VANILLA_MAP_BACKGROUND, x - pad, y - pad, size + pad * 2, size + pad * 2, 0.0f, 0.0f, 64, 64, 64, 64);
+                guiGraphics.renderOutline(x - 1, y - 1, size + 2, size + 2, 0xBB99876C);
+            } else if (MapConfig.minimapFrameStyle == 0) {
+                guiGraphics.renderOutline(x - 1, y - 1, size + 2, size + 2, MapConfig.minimapRingColor);
+            }
 
             // Draw map through the fixed-resolution minimap target. If the GPU or
             // another renderer rejects the FBO path, direct rendering remains a
@@ -319,7 +338,7 @@ public class MinimapRenderer {
         float radius = size / 2.0f;
         float cx = x + radius;
         float cy = y + radius;
-        float ringWidth = Math.max(1.5f, size / 72.0f);
+        float ringWidth = 1.0f;
         float innerRingRadius = radius - 0.5f;
         float outerRingRadius = innerRingRadius + ringWidth;
 
@@ -376,12 +395,19 @@ public class MinimapRenderer {
 
         MapRenderer.getInstance().drawMinimapPlayerOverlay(
                 guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
-        // Sleek, thin circular bezel ring
-        drawCircleRing(guiGraphics, cx, cy, innerRingRadius - 0.5f, innerRingRadius, CIRCLE_SEGMENTS, 0x77000000);
-        drawCircleRing(guiGraphics, cx, cy, innerRingRadius, outerRingRadius, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
-        drawCircleRing(guiGraphics, cx, cy, outerRingRadius, outerRingRadius + 0.75f, CIRCLE_SEGMENTS, 0xE0000000);
+        ResourceLocation frameTexture = resolveFrameTexture(mc);
+        if (frameTexture != null) {
+            guiGraphics.blit(frameTexture, x - 2, y - 2, 0, 0, size + 4, size + 4, size + 4, size + 4);
+        } else if (MapConfig.minimapFrameStyle == 1) {
+            drawCircleRing(guiGraphics, cx, cy, innerRingRadius - 0.5f, innerRingRadius + 0.5f, CIRCLE_SEGMENTS, 0xFF99876C);
+            drawCircleRing(guiGraphics, cx, cy, innerRingRadius + 0.5f, outerRingRadius - 0.5f, CIRCLE_SEGMENTS, 0xFFD6BE96);
+            drawCircleRing(guiGraphics, cx, cy, outerRingRadius - 0.5f, outerRingRadius + 0.5f, CIRCLE_SEGMENTS, 0xFF99876C);
+        } else if (MapConfig.minimapFrameStyle == 0) {
+            // Sleek, thin circular bezel ring (matching Xaero\'s ultra-clean 1.0px ring)
+            drawCircleRing(guiGraphics, cx, cy, innerRingRadius, outerRingRadius, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
+        }
         guiGraphics.flush();
-        drawCompassDirections(guiGraphics, mc, cx, cy, radius, ringWidth, player, true, partialTick);
+        drawCompassDirections(guiGraphics, mc, cx, cy, radius, 1.0f, player, true, partialTick);
     }
 
     private void drawCompassDirections(GuiGraphics guiGraphics, Minecraft mc, float cx, float cy, float radius,

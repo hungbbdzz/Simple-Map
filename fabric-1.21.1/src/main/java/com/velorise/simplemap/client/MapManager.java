@@ -994,8 +994,7 @@ public class MapManager {
         long key = key(regionX, regionZ);
         synchronized (regionFileExists) {
             if (regionFileExists.containsKey(key)) {
-                boolean cached = regionFileExists.get(key);
-                if (cached) return true;
+                return regionFileExists.get(key);
             }
             if (RegionDataStore.hasFile(directory, regionX, regionZ)
                     || ("minecraft:overworld".equals(currentDimensionResourceId)
@@ -3363,8 +3362,13 @@ public class MapManager {
     private static void moveReplacing(Path source, Path target) throws IOException {
         try {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException atomicFailed) {
+            try {
+                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException moveFailed) {
+                Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+                Files.deleteIfExists(source);
+            }
         }
     }
 
@@ -3826,6 +3830,7 @@ public class MapManager {
     // Minimap rotation config
     public static boolean minimapRotate = true; // Toggle whether minimap rotates with player
     public static boolean minimapCircle = false; // Toggle whether minimap is circular
+    public static int minimapFrameStyle = 0; // 0 = MINIMAL, 1 = VANILLA_MAP, 2 = FRAMELESS
     public static boolean showMinimapInScreens = true;
     public static int minimapNightMode = 1; // 0 = OFF, 1 = AUTO, 2 = ON
     public static int minimapRingColor = 0xFF2D3033;
@@ -3963,6 +3968,7 @@ public class MapManager {
 
             minimapRotate = data.minimapRotate;
             minimapCircle = data.minimapCircle;
+            minimapFrameStyle = data.minimapFrameStyle == null ? 0 : Math.max(0, Math.min(2, data.minimapFrameStyle));
             showMinimapInScreens = data.showMinimapInScreens == null || data.showMinimapInScreens;
             minimapNightMode = data.minimapNightMode == null
                     ? 1
@@ -4088,6 +4094,7 @@ public class MapManager {
 
                 data.minimapRotate = minimapRotate;
                 data.minimapCircle = minimapCircle;
+                data.minimapFrameStyle = minimapFrameStyle;
                 data.showMinimapInScreens = showMinimapInScreens;
                 data.minimapNightMode = minimapNightMode;
                 data.minimapRingColor = minimapRingColor;
@@ -4120,8 +4127,13 @@ public class MapManager {
     private static void moveReplacing(Path source, Path target) throws IOException {
         try {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException atomicFailed) {
+            try {
+                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException moveFailed) {
+                Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+                Files.deleteIfExists(source);
+            }
         }
     }
 
@@ -4186,6 +4198,7 @@ public class MapManager {
         autoClearPin = true;
         minimapRotate = true;
         minimapCircle = false;
+        minimapFrameStyle = 0;
         showMinimapInScreens = true;
         minimapNightMode = 1;
         minimapRingColor = 0xFF2D3033;
@@ -4239,6 +4252,7 @@ public class MapManager {
 
         boolean minimapRotate = true;
         boolean minimapCircle = false;
+        Integer minimapFrameStyle = 0;
         Boolean showMinimapInScreens = true;
         Integer minimapNightMode = 1;
         Integer minimapRingColor = 0xFF2D3033;
