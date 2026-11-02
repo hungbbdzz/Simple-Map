@@ -567,7 +567,6 @@ public class SimpleMap {
         public static void onRenderScreen(ScreenEvent.Render.Post event) {
             MapPerformanceGovernor.getInstance().onFrame();
             Minecraft mc = Minecraft.getInstance();
-
             if (MinimapRenderer.isAllowedScreenForMinimap(event.getScreen())) {
                 MinimapRenderer.getInstance().renderHUD(
                         event.getGuiGraphics(), event.getPartialTick(), true);

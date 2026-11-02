@@ -311,7 +311,14 @@ public class MapTextureManager {
             }
             BlockTextureColorSampler.TintInfo tintInfo =
                     BlockTextureColorSampler.getTintInfo(blockIdText);
-            if (tintInfo.kind() == BlockTextureColorSampler.ProviderKind.BIOME_GRASS) {
+            if (tintInfo.kind() == BlockTextureColorSampler.ProviderKind.CUSTOM_PROVIDER
+                    || tintInfo.kind() == BlockTextureColorSampler.ProviderKind.CONSTANT_RGB) {
+                // Coordinate-dependent or constant custom BlockColors providers (e.g.
+                // Regions Unexplored prismoss / prismarite) must keep BlockTintPolicy.NONE
+                // so BiomeColors.blendGrass/blendFoliage never overwrites their per-block tint.
+                tintPolicyCache.put(blockIdText, BlockTintPolicy.NONE);
+                return BlockTintPolicy.NONE;
+            } else if (tintInfo.kind() == BlockTextureColorSampler.ProviderKind.BIOME_GRASS) {
                 resolved = BlockTintPolicy.GRASS;
             } else if (tintInfo.kind() == BlockTextureColorSampler.ProviderKind.BIOME_FOLIAGE) {
                 resolved = BlockTintPolicy.FOLIAGE;

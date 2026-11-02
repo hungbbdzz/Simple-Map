@@ -170,8 +170,7 @@ public final class SurfaceLodTree {
      */
     public boolean hasResidentBranchInSubtree(String dimension, int level,
             int nodeX, int nodeZ) {
-        drainDiskLoads();
-        if (level < 1 || level > MAX_LEVEL) return false;
+        if (level < 1 || level > MAX_LEVEL || nodes.isEmpty()) return false;
         for (int candidateLevel = level; candidateLevel >= 1; candidateLevel--) {
             int shift = level - candidateLevel;
             int minX = nodeX << shift;
