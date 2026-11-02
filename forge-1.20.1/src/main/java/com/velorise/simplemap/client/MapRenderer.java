@@ -416,8 +416,10 @@ public class MapRenderer {
         }
         MapRequestLane renderLane = isMinimap
                 ? MapRequestLane.MINIMAP : MapRequestLane.FULLSCREEN;
-        boolean caveBranchOnly = caveMode
-                && CaveMode.branchOnly(activePolicyScale, renderLane);
+        boolean caveBranchOnly = (caveMode
+                && CaveMode.branchOnly(activePolicyScale, renderLane))
+                || (!caveMode && renderLane == MapRequestLane.FULLSCREEN
+                        && activePolicyScale <= 0.25f && hierarchyLevel >= 2);
         /*
          * Both visible-map pipelines are anchored to their viewport. The cursor is
          * reserved for coordinate inspection, waypoint interaction and tooltips;
@@ -1239,36 +1241,44 @@ public class MapRenderer {
             }
         } else {
             MapManager manager = MapManager.getInstance();
+            MapManager.KnownRegionBounds knownBounds = manager.knownRegionBounds();
+            if (knownBounds.empty()) {
+                return builder.build(topologyRevision);
+            }
+            int clampedMinRx = Math.max(minRegionX, knownBounds.minRegionX());
+            int clampedMaxRx = Math.min(maxRegionX, knownBounds.maxRegionX());
+            int clampedMinRz = Math.max(minRegionZ, knownBounds.minRegionZ());
+            int clampedMaxRz = Math.min(maxRegionZ, knownBounds.maxRegionZ());
+            if (clampedMinRx > clampedMaxRx || clampedMinRz > clampedMaxRz) {
+                return builder.build(topologyRevision);
+            }
+            minRegionX = clampedMinRx;
+            maxRegionX = clampedMaxRx;
+            minRegionZ = clampedMinRz;
+            maxRegionZ = clampedMaxRz;
+            minVisiblePageX = Math.max(minVisiblePageX,
+                    minRegionX * MapPageLayout.PAGES_PER_REGION);
+            maxVisiblePageX = Math.min(maxVisiblePageX,
+                    (maxRegionX + 1) * MapPageLayout.PAGES_PER_REGION - 1);
+            minVisiblePageZ = Math.max(minVisiblePageZ,
+                    minRegionZ * MapPageLayout.PAGES_PER_REGION);
+            maxVisiblePageZ = Math.min(maxVisiblePageZ,
+                    (maxRegionZ + 1) * MapPageLayout.PAGES_PER_REGION - 1);
+            if (minVisiblePageX > maxVisiblePageX || minVisiblePageZ > maxVisiblePageZ) {
+                return builder.build(topologyRevision);
+            }
             boolean regionOnly = MapRegionLodPolicy.regionAuthorityOnly(scale);
-            /*
-             * The engine never lets a finer texture become the sole visual authority.
-             * World Map crops a loaded root texture into a child that is still cold,
-             * while Minimap keeps its completed loadedBlocks grid visible until the
-             * loadingBlocks grid completes. Surface follows both invariants here:
-             * M4/root coverage remains underneath exact refinement in fullscreen and
-             * the minimap plan also carries logical M4 roots so an exact-page burst
-             * can never expose the framebuffer clear colour. The legacy 512x512
-             * compatibility path is deliberately not the authority; M4 is the
-             * retained representation actually published by RegionSurfaceLodService.
-             */
+            LongKeySet regionLodCoveredRegions = new LongKeySet();
             boolean minimapLogicalSurface = !collectPending
                     && centerOutTraversal && logicalExactCoverage;
             if (minimapLogicalSurface) {
-                /*
-                 * The minimap writer keeps a loaded grid active while a loading
-                 * grid is refreshed. Give the retained FBO the equivalent stable
-                 * parent geometry: one logical M4 level-0 tile for every visible
-                 * 512x512 region. The TileKey may be non-resident now; replay will
-                 * resolve it as soon as RegionSurfaceLodService publishes it, so a
-                 * cached minimap plan does not need to rebuild merely to discover a
-                 * newly-ready root. Exact 64x64 pages refine this root at PHASE_EXACT.
-                 */
                 collectMinimapRegionRootCoverage(builder,
                         minRegionX, maxRegionX, minRegionZ, maxRegionZ);
             } else if (collectPending || !centerOutTraversal) {
                 collectRegionSurfaceCoverage(builder, overviewTextures,
                         minRegionX, maxRegionX, minRegionZ, maxRegionZ,
-                        scale, attentionPageX, attentionPageZ, regionOnly);
+                        scale, attentionPageX, attentionPageZ, regionOnly,
+                        regionLodCoveredRegions);
             }
             if (hierarchyLevel > 0) {
                 if (!regionOnly) {
@@ -1277,7 +1287,8 @@ public class MapRenderer {
                             minVisiblePageX, maxVisiblePageX,
                             minVisiblePageZ, maxVisiblePageZ,
                             hierarchyLevel, scale, attentionPageX, attentionPageZ,
-                            manager, collectPending, centerOutTraversal);
+                            manager, collectPending, centerOutTraversal,
+                            regionLodCoveredRegions);
                 }
             } else {
                 if (centerOutTraversal) {
@@ -1924,27 +1935,38 @@ public class MapRenderer {
     private void collectRegionSurfaceCoverage(MapRenderPlan.Builder builder,
             MapOverviewTextureManager overviewTextures,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
-            float scale, int focusPageX, int focusPageZ, boolean regionOnly) {
+            float scale, int focusPageX, int focusPageZ, boolean regionOnly,
+            LongKeySet coveredRegions) {
         int level = MapRegionLodPolicy.targetLevel(scale);
         int span = MapRegionLodPolicy.regionSpan(level);
         int minNodeX = Math.floorDiv(minRegionX, span);
         int maxNodeX = Math.floorDiv(maxRegionX, span);
         int minNodeZ = Math.floorDiv(minRegionZ, span);
         int maxNodeZ = Math.floorDiv(maxRegionZ, span);
-        /*
-         * Missing target-level M4 nodes may fall back to already-resident finer M4
-         * descendants while their coarser parent warms. This preserves coverage
-         * across zoom transitions instead of making a loaded level-0 root vanish
-         * merely because level 1/2 was selected. Bound both emitted quads and failed
-         * hierarchy lookups so very wide views remain finite.
-         */
+        boolean markRegionAuthority = scale <= 0.125f;
         regionFallbackVisitsRemaining = REGION_ONLY_FALLBACK_VISIT_CAP;
         for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
             for (int nodeX = minNodeX; nodeX <= maxNodeX; nodeX++) {
                 if (builder.entryCount() >= REGION_ONLY_PLAN_QUAD_CAP) return;
                 if (collectRegionSurfaceNode(builder, overviewTextures, level,
                         nodeX, nodeZ, minRegionX, maxRegionX,
-                        minRegionZ, maxRegionZ, true)) continue;
+                        minRegionZ, maxRegionZ, true, markRegionAuthority,
+                        coveredRegions)) continue;
+            }
+        }
+    }
+
+    private void markCoveredRegionBox(LongKeySet coveredRegions,
+            int firstRx, int lastRx, int firstRz, int lastRz,
+            int minRx, int maxRx, int minRz, int maxRz) {
+        if (coveredRegions == null) return;
+        int startX = Math.max(firstRx, minRx);
+        int endX = Math.min(lastRx, maxRx);
+        int startZ = Math.max(firstRz, minRz);
+        int endZ = Math.min(lastRz, maxRz);
+        for (int rz = startZ; rz <= endZ; rz++) {
+            for (int rx = startX; rx <= endX; rx++) {
+                coveredRegions.add(packRegion(rx, rz));
             }
         }
     }
@@ -1952,7 +1974,8 @@ public class MapRenderer {
     private boolean collectRegionSurfaceNode(MapRenderPlan.Builder builder,
             MapOverviewTextureManager overviewTextures, int level,
             int nodeX, int nodeZ, int minRegionX, int maxRegionX,
-            int minRegionZ, int maxRegionZ, boolean allowDescendants) {
+            int minRegionZ, int maxRegionZ, boolean allowDescendants,
+            boolean markRegionAuthority, LongKeySet coveredRegions) {
         if (regionFallbackVisitsRemaining-- <= 0) return false;
         int span = MapRegionLodPolicy.regionSpan(level);
         int firstRegionX = nodeX * span;
@@ -1967,17 +1990,35 @@ public class MapRenderer {
                 .peekRegionSurfaceBranch(level, nodeX, nodeZ);
         if (branch != null) {
             addRegionLodQuad(builder, branch, nodeX, nodeZ);
+            if (markRegionAuthority && branch.knownMask() != 0L) {
+                markCoveredRegionBox(coveredRegions, firstRegionX, lastRegionX,
+                        firstRegionZ, lastRegionZ,
+                        minRegionX, maxRegionX, minRegionZ, maxRegionZ);
+            }
             return true;
         }
-        if (level == 0
-                && !builder.sourceRegionAvailable(MapManager.getInstance(), nodeX, nodeZ)
-                && !MapTextureManager.getInstance().hasAnyPageTexture(nodeX, nodeZ)) {
+        MapManager manager = MapManager.getInstance();
+        if (level == 0) {
+            if (!builder.sourceRegionAvailable(manager, nodeX, nodeZ)
+                    && !MapTextureManager.getInstance().hasAnyPageTexture(nodeX, nodeZ)) {
+                return false;
+            }
+        } else if (!manager.hasKnownRegionInBounds(
+                Math.max(firstRegionX, minRegionX),
+                Math.min(lastRegionX, maxRegionX),
+                Math.max(firstRegionZ, minRegionZ),
+                Math.min(lastRegionZ, maxRegionZ))) {
             return false;
         }
         CaveAtlasRegion ancestor = findRegionSurfaceAncestor(
                 overviewTextures, level, nodeX, nodeZ);
         if (ancestor != null) {
             addRegionLodAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
+            if (markRegionAuthority && ancestor.knownMask() != 0L) {
+                markCoveredRegionBox(coveredRegions, firstRegionX, lastRegionX,
+                        firstRegionZ, lastRegionZ,
+                        minRegionX, maxRegionX, minRegionZ, maxRegionZ);
+            }
             return true;
         }
         if (!allowDescendants || level <= 0) return false;
@@ -1988,7 +2029,8 @@ public class MapRenderer {
                 if (builder.entryCount() >= REGION_ONLY_PLAN_QUAD_CAP) return drew;
                 drew |= collectRegionSurfaceNode(builder, overviewTextures,
                         childLevel, nodeX * 2 + childX, nodeZ * 2 + childZ,
-                        minRegionX, maxRegionX, minRegionZ, maxRegionZ, true);
+                        minRegionX, maxRegionX, minRegionZ, maxRegionZ, true,
+                        markRegionAuthority, coveredRegions);
             }
         }
         return drew;
@@ -2016,7 +2058,7 @@ public class MapRenderer {
             int minVisiblePageZ, int maxVisiblePageZ,
             int level, float scale, int focusPageX, int focusPageZ,
             MapManager manager, boolean collectPending,
-            boolean centerOutTraversal) {
+            boolean centerOutTraversal, LongKeySet regionLodCoveredRegions) {
         int minPageX = minVisiblePageX;
         int maxPageX = maxVisiblePageX;
         int minPageZ = minVisiblePageZ;
@@ -2026,13 +2068,16 @@ public class MapRenderer {
         int maxNodeX = Math.floorDiv(maxPageX, pageSpan);
         int minNodeZ = Math.floorDiv(minPageZ, pageSpan);
         int maxNodeZ = Math.floorDiv(maxPageZ, pageSpan);
-        surfaceHierarchyVisitsRemaining = SURFACE_HIERARCHY_MAX_VISITS;
+        surfaceHierarchyVisitsRemaining = scale <= 0.125f
+                ? Math.min(1_024, SURFACE_HIERARCHY_MAX_VISITS)
+                : SURFACE_HIERARCHY_MAX_VISITS;
         if (!centerOutTraversal) {
             for (int nodeX = minNodeX; nodeX <= maxNodeX && surfaceHierarchyVisitsRemaining > 0; nodeX++) {
                 for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ && surfaceHierarchyVisitsRemaining > 0; nodeZ++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false,
+                            regionLodCoveredRegions);
                 }
             }
             return;
@@ -2051,7 +2096,8 @@ public class MapRenderer {
                         nodeX <= Math.min(maxNodeX, right) && surfaceHierarchyVisitsRemaining > 0; nodeX++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, top, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false,
+                            regionLodCoveredRegions);
                 }
             }
             if (radius == 0) continue;
@@ -2060,12 +2106,14 @@ public class MapRenderer {
                 if (left >= minNodeX && left <= maxNodeX) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, left, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false,
+                            regionLodCoveredRegions);
                 }
                 if (right != left && right >= minNodeX && right <= maxNodeX && surfaceHierarchyVisitsRemaining > 0) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, right, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false,
+                            regionLodCoveredRegions);
                 }
             }
             if (bottom >= minNodeZ && bottom <= maxNodeZ) {
@@ -2073,7 +2121,8 @@ public class MapRenderer {
                         nodeX <= Math.min(maxNodeX, right) && surfaceHierarchyVisitsRemaining > 0; nodeX++) {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, bottom, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending, false);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false,
+                            regionLodCoveredRegions);
                 }
             }
         }
@@ -2085,7 +2134,7 @@ public class MapRenderer {
             int level, int nodeX, int nodeZ,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
             float scale, MapManager manager, boolean collectPending,
-            boolean inheritedCoverage) {
+            boolean inheritedCoverage, LongKeySet regionLodCoveredRegions) {
         int pageSpan = MapLodPolicy.pageSpanForBranch(level);
         int firstPageX = nodeX * pageSpan;
         int firstPageZ = nodeZ * pageSpan;
@@ -2095,17 +2144,26 @@ public class MapRenderer {
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
         if (surfaceHierarchyVisitsRemaining <= 0) return;
 
-        // Check O(1) region source availability before touching SurfaceLodTree maps
-        // or consuming traversal budget so ultra-wide 500k-page views skip empty void
-        // regions in O(1) without HashMap allocations.
+        int nodeRegionX = Math.floorDiv(firstPageX, MapPageLayout.PAGES_PER_REGION);
+        int nodeRegionZ = Math.floorDiv(firstPageZ, MapPageLayout.PAGES_PER_REGION);
+        if (scale <= 0.125f && regionLodCoveredRegions != null
+                && regionLodCoveredRegions.contains(packRegion(nodeRegionX, nodeRegionZ))) {
+            // At scale <= 0.125f (1 region <= 64x64 physical pixels), RegionSurfaceLodService
+            // L0/L1/L2/L3 already provides density-matched 64x64 coverage. Skipping redundant
+            // sub-region SurfaceLodTree and 1-pixel exact page overlays prevents far-zoom
+            // sub-pixel aliasing/blur and matches CaveMode's branch-only speed.
+            return;
+        }
+
+        // Check O(1) region source availability before touching synchronized SurfaceLodTree
+        // or MapTextureManager maps.
+        if (surfaceHierarchyVisitsRemaining-- <= 0) return;
+        boolean sourceAvailable = surfaceNodeHasSource(builder, manager,
+                Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
+                Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
         boolean exactResident = surfaceTextures.hasResidentPageInNode(
                 level, nodeX, nodeZ);
-        boolean sourceAvailable = exactResident
-                || surfaceNodeHasSource(builder, manager,
-                        Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
-                        Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
         if (!exactResident && !sourceAvailable) return;
-        if (surfaceHierarchyVisitsRemaining-- <= 0) return;
         boolean branchResident = overviewTextures.hasResidentSurfaceBranchInSubtree(
                 level, nodeX, nodeZ);
         CaveAtlasRegion branch = overviewTextures.peekSurfaceBranch(level, nodeX, nodeZ);
@@ -2191,7 +2249,8 @@ public class MapRenderer {
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level - 1, childNodeX, childNodeZ,
                             minPageX, maxPageX, minPageZ, maxPageZ,
-                            scale, manager, collectPending, false);
+                            scale, manager, collectPending, false,
+                            regionLodCoveredRegions);
                 }
             }
             return;
@@ -2224,7 +2283,8 @@ public class MapRenderer {
                 collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                         level - 1, childNodeX, childNodeZ,
                         minPageX, maxPageX, minPageZ, maxPageZ,
-                        scale, manager, collectPending, nodeCovered);
+                        scale, manager, collectPending, nodeCovered,
+                        regionLodCoveredRegions);
             }
         }
     }

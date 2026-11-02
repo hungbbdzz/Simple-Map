@@ -88,7 +88,74 @@ public class MapManager {
     private final LongOpenHashSet dirtyRegions = new LongOpenHashSet();
     private final Long2BooleanOpenHashMap regionFileExists =
             new Long2BooleanOpenHashMap();
+    private volatile int knownMinRegionX = Integer.MAX_VALUE;
+    private volatile int knownMaxRegionX = Integer.MIN_VALUE;
+    private volatile int knownMinRegionZ = Integer.MAX_VALUE;
+    private volatile int knownMaxRegionZ = Integer.MIN_VALUE;
+    private volatile boolean hasKnownRegions = false;
     private final AtomicLong worldGeneration = new AtomicLong(1L);
+
+    public record KnownRegionBounds(int minRegionX, int maxRegionX,
+            int minRegionZ, int maxRegionZ, boolean empty) {
+        private static final KnownRegionBounds EMPTY = new KnownRegionBounds(
+                0, -1, 0, -1, true);
+    }
+
+    private void resetKnownRegionBoundsLocked() {
+        knownMinRegionX = Integer.MAX_VALUE;
+        knownMaxRegionX = Integer.MIN_VALUE;
+        knownMinRegionZ = Integer.MAX_VALUE;
+        knownMaxRegionZ = Integer.MIN_VALUE;
+        hasKnownRegions = false;
+    }
+
+    private void expandKnownRegionBoundsLocked(int rx, int rz) {
+        if (!hasKnownRegions) {
+            knownMinRegionX = rx;
+            knownMaxRegionX = rx;
+            knownMinRegionZ = rz;
+            knownMaxRegionZ = rz;
+            hasKnownRegions = true;
+            return;
+        }
+        if (rx < knownMinRegionX) knownMinRegionX = rx;
+        if (rx > knownMaxRegionX) knownMaxRegionX = rx;
+        if (rz < knownMinRegionZ) knownMinRegionZ = rz;
+        if (rz > knownMaxRegionZ) knownMaxRegionZ = rz;
+    }
+
+    public KnownRegionBounds knownRegionBounds() {
+        if (!hasKnownRegions) {
+            File dir = currentDimensionDir;
+            if (dir != null && lastRegionDirectoryScanMs == 0L) {
+                scanRegionFiles(dir);
+            }
+        }
+        if (!hasKnownRegions) return KnownRegionBounds.EMPTY;
+        return new KnownRegionBounds(knownMinRegionX, knownMaxRegionX,
+                knownMinRegionZ, knownMaxRegionZ, false);
+    }
+
+    public boolean hasKnownRegionInBounds(int minRx, int maxRx, int minRz, int maxRz) {
+        KnownRegionBounds bounds = knownRegionBounds();
+        if (bounds.empty()) return false;
+        int clampedMinX = Math.max(minRx, bounds.minRegionX());
+        int clampedMaxX = Math.min(maxRx, bounds.maxRegionX());
+        int clampedMinZ = Math.max(minRz, bounds.minRegionZ());
+        int clampedMaxZ = Math.min(maxRz, bounds.maxRegionZ());
+        if (clampedMinX > clampedMaxX || clampedMinZ > clampedMaxZ) return false;
+        long span = (long) (clampedMaxX - clampedMinX + 1)
+                * (long) (clampedMaxZ - clampedMinZ + 1);
+        if (span > 64L) return true;
+        for (int rz = clampedMinZ; rz <= clampedMaxZ; rz++) {
+            for (int rx = clampedMinX; rx <= clampedMaxX; rx++) {
+                if (hasRegionFile(rx, rz) || isRegionLoadedInCache(rx, rz)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     private volatile File currentDimensionDir;
     private volatile File currentWorldDir;
@@ -393,7 +460,11 @@ public class MapManager {
         synchronized (dirtyRegions) {
             dirtyRegions.clear();
         }
-        regionFileExists.clear();
+        synchronized (regionFileExists) {
+            regionFileExists.clear();
+            resetKnownRegionBoundsLocked();
+            lastRegionDirectoryScanMs = 0L;
+        }
         currentDimensionDir = null;
     }
 
@@ -650,6 +721,7 @@ public class MapManager {
     private void scanRegionFiles(File directory) {
         synchronized (regionFileExists) {
             regionFileExists.clear();
+            resetKnownRegionBoundsLocked();
             lastRegionDirectoryScanMs = System.currentTimeMillis();
             if (directory != null && directory.isDirectory()) {
                 String[] files = directory.list();
@@ -662,6 +734,7 @@ public class MapManager {
                                     int rx = Integer.parseInt(parts[1]);
                                     int rz = Integer.parseInt(parts[2]);
                                     regionFileExists.put(key(rx, rz), true);
+                                    expandKnownRegionBoundsLocked(rx, rz);
                                 } catch (NumberFormatException ignored) {}
                             }
                         }
@@ -680,6 +753,7 @@ public class MapManager {
                                     int rx = Integer.parseInt(parts[1]);
                                     int rz = Integer.parseInt(parts[2]);
                                     regionFileExists.put(key(rx, rz), true);
+                                    expandKnownRegionBoundsLocked(rx, rz);
                                 } catch (NumberFormatException ignored) {}
                             }
                         }
@@ -698,10 +772,19 @@ public class MapManager {
                                     int rx = Integer.parseInt(parts[1]);
                                     int rz = Integer.parseInt(parts[2]);
                                     regionFileExists.put(key(rx, rz), true);
+                                    expandKnownRegionBoundsLocked(rx, rz);
                                 } catch (NumberFormatException ignored) {}
                             }
                         }
                     }
+                }
+            }
+            synchronized (dirtyRegions) {
+                var iterator = dirtyRegions.iterator();
+                while (iterator.hasNext()) {
+                    long dirtyKey = iterator.nextLong();
+                    regionFileExists.put(dirtyKey, true);
+                    expandKnownRegionBoundsLocked((int) (dirtyKey >> 32), (int) dirtyKey);
                 }
             }
         }
@@ -931,7 +1014,10 @@ public class MapManager {
         synchronized (dirtyRegions) {
             dirtyRegions.add(key);
         }
-        regionFileExists.put(key, true);
+        synchronized (regionFileExists) {
+            regionFileExists.put(key, true);
+            expandKnownRegionBoundsLocked(regionX, regionZ);
+        }
     }
 
     public Region getRegion(int regionX, int regionZ, boolean loadIfMissing) {
@@ -943,6 +1029,9 @@ public class MapManager {
             long generation = worldGeneration.get();
             Region created = new Region(regionX, regionZ, generation);
             loadedRegions.putAndMoveToLast(key, created);
+            synchronized (regionFileExists) {
+                expandKnownRegionBoundsLocked(regionX, regionZ);
+            }
             File directory = currentDimensionDir;
             if (hasRegionFile(regionX, regionZ)) {
                 loadRegionAsync(created, directory, generation);
@@ -980,39 +1069,50 @@ public class MapManager {
         synchronized (dirtyRegions) {
             dirtyRegions.remove(key);
         }
-        regionFileExists.remove(key);
+        synchronized (regionFileExists) {
+            regionFileExists.remove(key);
+            lastRegionDirectoryScanMs = 0L;
+        }
         if (removed != null) removed.close();
     }
 
     public void invalidateRegionFile(int regionX, int regionZ) {
-        regionFileExists.remove(key(regionX, regionZ));
+        synchronized (regionFileExists) {
+            regionFileExists.remove(key(regionX, regionZ));
+            lastRegionDirectoryScanMs = 0L;
+        }
     }
 
+    /**
+     * O(1) directory-indexed region existence check synchronized with CaveMapManager's
+     * cache design. Never executes per-coordinate File.isFile() OS syscalls on the
+     * Render Thread for empty void regions; directory listings are refreshed at most
+     * once every 3,000 ms while in-memory pending saves are checked in O(1).
+     */
     public boolean hasRegionFile(int regionX, int regionZ) {
         File directory = currentDimensionDir;
         if (directory == null) return false;
         long key = key(regionX, regionZ);
         synchronized (regionFileExists) {
-            if (regionFileExists.containsKey(key)) {
-                boolean cached = regionFileExists.get(key);
-                if (cached) return true;
-            }
-            if (RegionDataStore.hasFile(directory, regionX, regionZ)
-                    || ("minecraft:overworld".equals(currentDimensionResourceId)
-                            && currentWorldDir != null
-                            && RegionDataStore.hasFile(currentWorldDir, regionX, regionZ))
-                    || hasMcaRegionFile(currentDimensionResourceId, regionX, regionZ)) {
-                regionFileExists.put(key, true);
-                return true;
-            }
             long now = System.currentTimeMillis();
             if (now - lastRegionDirectoryScanMs >= 3_000L) {
                 scanRegionFiles(directory);
-                if (regionFileExists.containsKey(key)) return regionFileExists.get(key);
             }
-            regionFileExists.put(key, false);
-            return false;
+            if (regionFileExists.get(key)) {
+                return true;
+            }
         }
+        if (RegionDataStore.hasPending(directory, regionX, regionZ)
+                || ("minecraft:overworld".equals(currentDimensionResourceId)
+                        && currentWorldDir != null
+                        && RegionDataStore.hasPending(currentWorldDir, regionX, regionZ))) {
+            synchronized (regionFileExists) {
+                regionFileExists.put(key, true);
+                expandKnownRegionBoundsLocked(regionX, regionZ);
+            }
+            return true;
+        }
+        return false;
     }
 
     public boolean isRegionLoadedInCache(int regionX, int regionZ) {
@@ -1939,7 +2039,11 @@ public class MapManager {
         synchronized (dirtyRegions) {
             dirtyRegions.clear();
         }
-        regionFileExists.clear();
+        synchronized (regionFileExists) {
+            regionFileExists.clear();
+            resetKnownRegionBoundsLocked();
+            lastRegionDirectoryScanMs = 0L;
+        }
         currentDimensionDir = null;
         currentWorldDir = null;
         currentWorldId = "";

@@ -188,9 +188,10 @@ public final class MapRenderPlan {
         private final long[] pendingSet = new long[512];
         private final boolean[] pendingSetUsed = new boolean[512];
         /** One-plan region availability cache; avoids repeated synchronized/file-cache probes. */
-        private final long[] sourceRegionKeys = new long[4096];
-        private final byte[] sourceRegionStates = new byte[4096];
-        private final boolean[] sourceRegionUsed = new boolean[4096];
+        private long[] sourceRegionKeys = new long[8192];
+        private byte[] sourceRegionStates = new byte[8192];
+        private boolean[] sourceRegionUsed = new boolean[8192];
+        private int sourceRegionCount;
         private int pendingCount;
         private int instanceCount;
         private int exactPages;
@@ -259,23 +260,47 @@ public final class MapRenderPlan {
 
         boolean sourceRegionAvailable(MapManager manager, int regionX, int regionZ) {
             if (manager == null) return false;
+            if ((sourceRegionCount + 1) * 10 >= sourceRegionKeys.length * 7) {
+                growSourceRegionCache();
+            }
             long packed = ((long) regionX << 32) ^ (regionZ & 0xFFFFFFFFL);
-            int slot = (int) mixPendingKey(packed) & (sourceRegionKeys.length - 1);
-            int probes = 0;
-            while (sourceRegionUsed[slot] && probes++ < sourceRegionKeys.length) {
+            int mask = sourceRegionKeys.length - 1;
+            int slot = (int) mixPendingKey(packed) & mask;
+            while (sourceRegionUsed[slot]) {
                 if (sourceRegionKeys[slot] == packed) {
                     return sourceRegionStates[slot] == 2;
                 }
-                slot = (slot + 1) & (sourceRegionKeys.length - 1);
+                slot = (slot + 1) & mask;
             }
             boolean available = manager.hasRegionFile(regionX, regionZ)
                     || manager.isRegionLoadedInCache(regionX, regionZ);
-            if (probes < sourceRegionKeys.length) {
-                sourceRegionUsed[slot] = true;
-                sourceRegionKeys[slot] = packed;
-                sourceRegionStates[slot] = (byte) (available ? 2 : 1);
-            }
+            sourceRegionUsed[slot] = true;
+            sourceRegionKeys[slot] = packed;
+            sourceRegionStates[slot] = (byte) (available ? 2 : 1);
+            sourceRegionCount++;
             return available;
+        }
+
+        private void growSourceRegionCache() {
+            int newCap = sourceRegionKeys.length << 1;
+            long[] oldKeys = sourceRegionKeys;
+            byte[] oldStates = sourceRegionStates;
+            boolean[] oldUsed = sourceRegionUsed;
+            sourceRegionKeys = new long[newCap];
+            sourceRegionStates = new byte[newCap];
+            sourceRegionUsed = new boolean[newCap];
+            int mask = newCap - 1;
+            for (int i = 0; i < oldKeys.length; i++) {
+                if (!oldUsed[i]) continue;
+                long k = oldKeys[i];
+                int slot = (int) mixPendingKey(k) & mask;
+                while (sourceRegionUsed[slot]) {
+                    slot = (slot + 1) & mask;
+                }
+                sourceRegionUsed[slot] = true;
+                sourceRegionKeys[slot] = k;
+                sourceRegionStates[slot] = oldStates[i];
+            }
         }
 
         void pending(int regionX, int regionZ) {

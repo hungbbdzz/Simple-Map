@@ -15,7 +15,7 @@ import org.spongepowered.asm.mixin.injection.ModifyVariable;
 @Mixin(GameRenderer.class)
 public abstract class SimpleMapGameRendererMixin {
     @ModifyVariable(method = "render", at = @At("HEAD"),
-            argsOnly = true, ordinal = 0)
+            argsOnly = true, ordinal = 0, require = 0)
     private boolean simplemap$skipLevelBehindFullscreenMap(boolean renderLevel) {
         Minecraft minecraft = Minecraft.getInstance();
         return renderLevel && !(minecraft.screen instanceof MapScreen);

@@ -14,7 +14,8 @@ public abstract class SimpleMapChatComponentMixin {
             method = "addMessage(Lnet/minecraft/network/chat/Component;Lnet/minecraft/network/chat/MessageSignature;Lnet/minecraft/client/GuiMessageTag;)V",
             at = @At("HEAD"),
             argsOnly = true,
-            ordinal = 0)
+            ordinal = 0,
+            require = 0)
     private Component simplemap$enhanceChatCoordinates(Component message) {
         return SimpleMap.ClientGameEvents.enhanceIncomingChatMessage(message);
     }

@@ -779,13 +779,34 @@ public class MapTextureManager {
         int maxRx = MapPageLayout.regionFromGlobalPage(maxGlobalPageX);
         int minRz = MapPageLayout.regionFromGlobalPage(minGlobalPageZ);
         int maxRz = MapPageLayout.regionFromGlobalPage(maxGlobalPageZ);
-        int focusRx = clamp((int) Math.floor(focusX) >> 9, minRx, maxRx);
-        int focusRz = clamp((int) Math.floor(focusZ) >> 9, minRz, maxRz);
-        if (effectiveLane == MapRequestLane.MINIMAP) {
-            markVisibleRegionsCenterOut(minRx, maxRx, minRz, maxRz,
-                    focusRx, focusRz);
-        } else {
-            markVisibleRegionsStable(minRx, maxRx, minRz, maxRz);
+        MapManager.KnownRegionBounds knownBounds =
+                MapManager.getInstance().knownRegionBounds();
+        if (!knownBounds.empty()) {
+            minRx = Math.max(minRx, knownBounds.minRegionX());
+            maxRx = Math.min(maxRx, knownBounds.maxRegionX());
+            minRz = Math.max(minRz, knownBounds.minRegionZ());
+            maxRz = Math.min(maxRz, knownBounds.maxRegionZ());
+            minGlobalPageX = Math.max(minGlobalPageX,
+                    knownBounds.minRegionX() * MapPageLayout.PAGES_PER_REGION);
+            maxGlobalPageX = Math.min(maxGlobalPageX,
+                    (knownBounds.maxRegionX() + 1) * MapPageLayout.PAGES_PER_REGION - 1);
+            minGlobalPageZ = Math.max(minGlobalPageZ,
+                    knownBounds.minRegionZ() * MapPageLayout.PAGES_PER_REGION);
+            maxGlobalPageZ = Math.min(maxGlobalPageZ,
+                    (knownBounds.maxRegionZ() + 1) * MapPageLayout.PAGES_PER_REGION - 1);
+        }
+        if (minRx <= maxRx && minRz <= maxRz) {
+            int focusRx = clamp((int) Math.floor(focusX) >> 9, minRx, maxRx);
+            int focusRz = clamp((int) Math.floor(focusZ) >> 9, minRz, maxRz);
+            if (effectiveLane == MapRequestLane.MINIMAP) {
+                markVisibleRegionsCenterOut(minRx, maxRx, minRz, maxRz,
+                        focusRx, focusRz);
+            } else {
+                markVisibleRegionsStable(minRx, maxRx, minRz, maxRz);
+            }
+        }
+        if (minGlobalPageX > maxGlobalPageX || minGlobalPageZ > maxGlobalPageZ) {
+            return;
         }
 
         int focusPageX = clamp(Math.floorDiv((int) Math.floor(focusX),
@@ -831,13 +852,18 @@ public class MapTextureManager {
         }
 
         if (effectiveLane == MapRequestLane.FULLSCREEN) {
-            /*
-             * Fullscreen admission is a cyclic fixed-coordinate traversal, not a
-             * completion frontier. One page waiting for a region file or for its
-             * first complete 16x16 source tile must never pin every later row. The
-             * planner still gives stable ordinals for priority, but advances after
-             * inspecting each slice and revisits unresolved leaves on the next lap.
-             */
+            int visiblePageCount = Math.max(1,
+                    (maxGlobalPageX - minGlobalPageX + 1)
+                            * (maxGlobalPageZ - minGlobalPageZ + 1));
+            int exactWindow = fullscreenActiveWindow(scale, visiblePageCount);
+            if (exactWindow <= 0) {
+                if (!fullscreenExactSuppressed) {
+                    clearAllPageDemandLane(MapRequestLane.FULLSCREEN);
+                    fullscreenExactSuppressed = true;
+                }
+                return;
+            }
+            fullscreenExactSuppressed = false;
             MapViewLoadPlanner.State planner =
                     visiblePagePlanners[effectiveLane.ordinal()];
             boolean viewportChanged = planner.configure(
@@ -859,18 +885,6 @@ public class MapTextureManager {
 
             long nowMs = System.currentTimeMillis();
             int active = activeDemandCount(effectiveLane, nowMs);
-            int visiblePageCount = Math.max(1,
-                    (maxGlobalPageX - minGlobalPageX + 1)
-                            * (maxGlobalPageZ - minGlobalPageZ + 1));
-            int exactWindow = fullscreenActiveWindow(scale, visiblePageCount);
-            if (exactWindow <= 0) {
-                if (!fullscreenExactSuppressed) {
-                    clearAllPageDemandLane(MapRequestLane.FULLSCREEN);
-                    fullscreenExactSuppressed = true;
-                }
-                return;
-            }
-            fullscreenExactSuppressed = false;
             int available = Math.max(0, exactWindow - active);
             boolean coarseCoverageAccepted =
                     MapRegionLodPolicy.directProjectionEnabled(scale,

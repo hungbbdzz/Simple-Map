@@ -114,6 +114,15 @@ public final class MapOverviewTextureManager {
         int maxRx = (int) Math.floor(maxX + 1.0) >> 9;
         int minRz = (int) Math.floor(minZ - 1.0) >> 9;
         int maxRz = (int) Math.floor(maxZ + 1.0) >> 9;
+        MapManager.KnownRegionBounds knownBounds =
+                MapManager.getInstance().knownRegionBounds();
+        if (!knownBounds.empty()) {
+            minRx = Math.max(minRx, knownBounds.minRegionX());
+            maxRx = Math.min(maxRx, knownBounds.maxRegionX());
+            minRz = Math.max(minRz, knownBounds.minRegionZ());
+            maxRz = Math.min(maxRz, knownBounds.maxRegionZ());
+            if (minRx > maxRx || minRz > maxRz) return;
+        }
         long now = System.currentTimeMillis();
 
         boolean changed = !dimension.equals(streamDimension)
@@ -519,14 +528,12 @@ public final class MapOverviewTextureManager {
                 governor.textureUploadBudgetNanos(focus) / 2);
         long nowNanos = System.nanoTime();
         long deadline = nowNanos + totalSliceNanos;
+        long regionDeadline = nowNanos + (totalSliceNanos * 3) / 5;
+        regionLodService.publish(focus, Math.max(regionDeadline, deadline));
         int legacyBudget = regionLodService.legacyPublishBudget(focus);
-        if (legacyBudget > 0) {
-            long treeDeadline = nowNanos + (totalSliceNanos * 3) / 5;
-            surfaceLodTree.publish(legacyBudget, treeDeadline,
+        if (legacyBudget > 0 && System.nanoTime() < deadline) {
+            surfaceLodTree.publish(legacyBudget, deadline,
                     preferredSurfaceBranchLevel);
-        }
-        if (System.nanoTime() < deadline) {
-            regionLodService.publish(focus, deadline);
         }
     }
 
@@ -549,15 +556,15 @@ public final class MapOverviewTextureManager {
                 styleRefresh ? governor.textureUploadBudgetNanos(true)
                         : governor.textureUploadBudgetNanos(focus) / 2);
 
+        if (System.nanoTime() < deadline) {
+            long regionDeadline = System.nanoTime() + Math.max(350_000L,
+                    (deadline - System.nanoTime()) * 3 / 5);
+            regionLodService.publish(focus, Math.max(regionDeadline, deadline));
+        }
         int legacyBudget = regionLodService.legacyPublishBudget(focus);
         if (legacyBudget > 0 && System.nanoTime() < deadline) {
-            long treeDeadline = System.nanoTime() + Math.max(350_000L,
-                    (deadline - System.nanoTime()) * 3 / 5);
-            surfaceLodTree.publish(legacyBudget, treeDeadline,
+            surfaceLodTree.publish(legacyBudget, deadline,
                     preferredSurfaceBranchLevel);
-        }
-        if (System.nanoTime() < deadline) {
-            regionLodService.publish(focus, deadline);
         }
         if (System.nanoTime() >= deadline) return;
 

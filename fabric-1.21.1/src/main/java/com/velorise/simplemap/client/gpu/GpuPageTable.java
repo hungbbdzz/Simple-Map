@@ -417,12 +417,15 @@ public static final class MapGpuInstanceRenderer {
                     requiredCoverage == MapGpuInstancePlan.DYNAMIC_SURFACE_SUBTILES;
             if (!dynamicSurfaceCoverage && requiredCoverage != 0
                     && (coverage & requiredCoverage) != requiredCoverage) continue;
-            if (dynamicSurfaceCoverage && coverage == 0) continue;
+            if (dynamicSurfaceCoverage && (coverage & 0xFFFF) == 0) continue;
 
             if (!texture.equals(activeTexture)) {
                 if (buffer != null) {
-                    BufferUploader.drawWithShader(buffer.buildOrThrow());
-                    submissions++;
+                    var meshData = buffer.build();
+                    if (meshData != null) {
+                        BufferUploader.drawWithShader(meshData);
+                        submissions++;
+                    }
                 }
                 activeTexture = texture;
                 RenderSystem.setShaderTexture(0, texture);
@@ -487,8 +490,11 @@ public static final class MapGpuInstanceRenderer {
                     u0, v0, u1, v1);
         }
         if (buffer != null) {
-            BufferUploader.drawWithShader(buffer.buildOrThrow());
-            submissions++;
+            var meshData = buffer.build();
+            if (meshData != null) {
+                BufferUploader.drawWithShader(meshData);
+                submissions++;
+            }
         }
         MapPipelineTelemetry.getInstance().recordRawBatchSubmissions(submissions);
     }
