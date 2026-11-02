@@ -1187,14 +1187,18 @@ public class MapScreen extends Screen {
 
         int regionX = x >> 9;
         int regionZ = z >> 9;
-        if ((resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId))
+        boolean viewportMoving = isViewportInteracting(System.nanoTime());
+        if (!viewportMoving && currentRenderScale >= 0.125f
+                && (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId))
                 && mapManager.hasRegionFile(regionX, regionZ)
                 && !mapManager.isRegionLoadedInCache(regionX, regionZ)) {
             mapManager.getRegion(regionX, regionZ, true);
             MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
         }
 
-        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+        if ((resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId))
+                && (caveActive || CaveMapManager.getInstance().getRegion(
+                        Integer.MIN_VALUE, regionX, regionZ, false) != null)) {
             String caveBiome = CaveMapManager.getInstance().getBiomeId(
                     caveActive ? targetLayer : Integer.MIN_VALUE, x, z);
             if (caveBiome != null && !caveBiome.isBlank()
@@ -1207,9 +1211,10 @@ public class MapScreen extends Screen {
         }
 
         // In Singleplayer / LAN host, query the integrated server's thread-safe noise
-        // BiomeSource + BiomeManager zoom math whenever the cached region was evicted,
-        // not yet loaded, or had an older render-border "minecraft:plains" fallback baked in.
-        if (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId)) {
+        // BiomeSource + BiomeManager zoom math only when stationary so panning at far
+        // zoom never stalls on server noise evaluation.
+        if (!viewportMoving
+                && (resolvedId == null || resolvedId.isBlank() || "minecraft:plains".equals(resolvedId))) {
             String generatorBiome = resolveSingleplayerGeneratorBiomeId(currentDim, x, y, z);
             if (generatorBiome != null && !generatorBiome.isBlank()
                     && !isInvalidPlainsForDimension(generatorBiome, isNether, isEnd)) {
@@ -1379,27 +1384,32 @@ public class MapScreen extends Screen {
         }
 
         MapBlockData data = manager.getBlockData(bx, bz);
+        int regionX = bx >> 9;
+        int regionZ = bz >> 9;
         if (data == null) {
-            int regionX = bx >> 9;
-            int regionZ = bz >> 9;
-            if (manager.hasRegionFile(regionX, regionZ)
+            boolean viewportMoving = isViewportInteracting(System.nanoTime());
+            if (!viewportMoving && currentRenderScale >= 0.125f
+                    && manager.hasRegionFile(regionX, regionZ)
                     && !manager.isRegionLoadedInCache(regionX, regionZ)) {
                 manager.getRegion(regionX, regionZ, true);
                 MapProcessor.getInstance().enqueueSurfaceLoad(regionX, regionZ, 120_000);
             }
-            // In ceiling dimensions (or when Full Cave is already materialized from .mca),
-            // allow immediate fallback while the .smdat region loads asynchronously.
-            int caveY = caveManager.getSurfaceY(Integer.MIN_VALUE, bx, bz);
-            if (caveY != CaveMapManager.NO_SURFACE) {
-                String blockId = caveManager.getBlockId(Integer.MIN_VALUE, bx, bz);
-                String blockName = formatBlockDisplayName(blockId);
-                return new BlockInfo(blockName, blockId != null ? blockId : "", caveY, Integer.MIN_VALUE, true);
+            // Only query Full Cave in Surface mode if the CaveRegion is already resident in memory;
+            // otherwise CaveMapManager.getSurfaceY triggers background .mca Anvil slicing!
+            if (caveManager.getRegion(Integer.MIN_VALUE, regionX, regionZ, false) != null) {
+                int caveY = caveManager.getSurfaceY(Integer.MIN_VALUE, bx, bz);
+                if (caveY != CaveMapManager.NO_SURFACE) {
+                    String blockId = caveManager.getBlockId(Integer.MIN_VALUE, bx, bz);
+                    String blockName = formatBlockDisplayName(blockId);
+                    return new BlockInfo(blockName, blockId != null ? blockId : "", caveY, Integer.MIN_VALUE, true);
+                }
             }
             return null;
         }
         if (data.isEmpty()) return null;
         String blockId = manager.getBlockId(bx, bz);
-        if (blockId == null || blockId.isBlank()) {
+        if ((blockId == null || blockId.isBlank())
+                && caveManager.getRegion(Integer.MIN_VALUE, regionX, regionZ, false) != null) {
             blockId = caveManager.getBlockId(Integer.MIN_VALUE, bx, bz);
         }
         String blockName = formatBlockDisplayName(blockId);

@@ -174,6 +174,25 @@ public final class RegionSurfaceLodService {
                 MapPageLayout.PAGES_PER_REGION);
         int focusRegionZ = Math.floorDiv(focusPageZ,
                 MapPageLayout.PAGES_PER_REGION);
+        MapManager.KnownRegionBounds knownBounds =
+                MapManager.getInstance().knownRegionBounds();
+        if (!knownBounds.empty()) {
+            int clampedMinX = Math.max(minRegionX, knownBounds.minRegionX());
+            int clampedMaxX = Math.min(maxRegionX, knownBounds.maxRegionX());
+            int clampedMinZ = Math.max(minRegionZ, knownBounds.minRegionZ());
+            int clampedMaxZ = Math.min(maxRegionZ, knownBounds.maxRegionZ());
+            if (clampedMinX <= clampedMaxX && clampedMinZ <= clampedMaxZ) {
+                minRegionX = clampedMinX;
+                maxRegionX = clampedMaxX;
+                minRegionZ = clampedMinZ;
+                maxRegionZ = clampedMaxZ;
+            } else {
+                minRegionX = focusRegionX;
+                maxRegionX = focusRegionX - 1;
+                minRegionZ = focusRegionZ;
+                maxRegionZ = focusRegionZ - 1;
+            }
+        }
         /*
          * Both visible Surface owners feed this service. Keep one
          * cheap M4 level-0/root authority for every visible region at every zoom.
@@ -226,14 +245,18 @@ public final class RegionSurfaceLodService {
             long scheduleDeadline = styleRefresh
                     ? deadlineNanos
                     : now + Math.max(240_000L, remaining * 2L / 3L);
-            admitVisibleRegionLoads(focused,
-                    Math.min(deadlineNanos, scheduleDeadline));
+            long l0Deadline = Math.min(deadlineNanos, scheduleDeadline);
+            admitVisibleRegionLoads(focused, l0Deadline);
             // Coarse source coverage is the first visible result. Exact-derived
             // replacement must not exhaust the tiny admission slice before this
             // fallback gets a chance to start.
-            scheduleDirectLevel0(focused, Math.min(deadlineNanos, scheduleDeadline));
-            scheduleExactLevel0(focused, Math.min(deadlineNanos, scheduleDeadline));
-            scheduleParents(focused, Math.min(deadlineNanos, scheduleDeadline));
+            scheduleDirectLevel0(focused, l0Deadline);
+            scheduleExactLevel0(focused, l0Deadline);
+            // Always grant parent L1/L2/L3 derivation at least 200 us so L0
+            // snapshot copies never starve coarse parent hierarchy construction.
+            long parentDeadline = Math.max(l0Deadline,
+                    System.nanoTime() + 200_000L);
+            scheduleParents(focused, parentDeadline);
         }
         drainCompletions();
         publishPrepared(focused, deadlineNanos);
@@ -656,45 +679,45 @@ public final class RegionSurfaceLodService {
                 : PARENT_SCHEDULE_BACKGROUND;
         int scheduled = 0;
 
-        // Build the density-selected visible parent first. This mirrors the
-        // selected-level update slice and avoids a full graph snapshot + stream +
-        // sort on every far-zoom frame.
+        // Build bottom-up (L1 -> L2 -> L3) so higher-level parent nodes always
+        // find their immediate child level already prepared. Sorting top-down
+        // (-level) with .limit(budget) previously deadlocked L1 behind L2/L3.
         int targetLevel = MapRegionLodPolicy.targetLevel(view.scale);
-        if (targetLevel > 0) {
-            int span = MapRegionLodPolicy.regionSpan(targetLevel);
-            List<RegionLodGraph.Lease> visible = graph.claimLevelRowMajor(
-                    view.stamp.sessionId(), PROJECTION_SURFACE, targetLevel,
-                    Math.floorDiv(view.minRegionX, span),
-                    Math.floorDiv(view.maxRegionX, span),
-                    Math.floorDiv(view.minRegionZ, span),
-                    Math.floorDiv(view.maxRegionZ, span), budget);
-            scheduled += scheduleParentLeases(visible, focused, deadlineNanos);
+        if (targetLevel > 0 && view.minRegionX <= view.maxRegionX
+                && view.minRegionZ <= view.maxRegionZ) {
+            for (int lvl = 1; lvl <= targetLevel && scheduled < budget
+                    && System.nanoTime() < deadlineNanos; lvl++) {
+                int span = MapRegionLodPolicy.regionSpan(lvl);
+                List<RegionLodGraph.Lease> visible = graph.claimLevelRowMajor(
+                        view.stamp.sessionId(), PROJECTION_SURFACE, lvl,
+                        Math.floorDiv(view.minRegionX, span),
+                        Math.floorDiv(view.maxRegionX, span),
+                        Math.floorDiv(view.minRegionZ, span),
+                        Math.floorDiv(view.maxRegionZ, span),
+                        budget - scheduled);
+                scheduled += scheduleParentLeases(visible, focused, deadlineNanos);
+            }
         }
         if (scheduled >= budget || System.nanoTime() >= deadlineNanos) return;
 
-        // Remaining capacity maintains coarser ancestors and off-target durable
-        // nodes. This path is intentionally small; the selected level above owns
-        // foreground throughput.
+        // Remaining capacity maintains all dirty parent levels bottom-up (L1 -> L2 -> L3).
         List<RegionLodGraph.NodeSnapshot> candidates = graph.snapshots(
                 view.stamp.sessionId(), PROJECTION_SURFACE).stream()
                 .filter(node -> node.key().level() > 0
-                        && node.key().level() != targetLevel
                         && node.state() == RegionLodGraph.State.DIRTY
                         && node.knownMask() != 0L)
                 .sorted(Comparator
                         .comparingInt((RegionLodGraph.NodeSnapshot node) ->
-                                -node.key().level())
+                                node.key().level())
                         .thenComparingLong(node -> distanceToView(node.key(), view)))
-                .limit(Math.max(0, budget - scheduled))
                 .toList();
-        List<RegionLodGraph.Lease> leases = new ArrayList<>(candidates.size());
         for (RegionLodGraph.NodeSnapshot candidate : candidates) {
-            if (System.nanoTime() >= deadlineNanos) break;
+            if (scheduled >= budget || System.nanoTime() >= deadlineNanos) break;
             if (isPending(candidate.key())) continue;
             RegionLodGraph.Lease lease = graph.tryBegin(candidate.key());
-            if (lease != null) leases.add(lease);
+            if (lease == null) continue;
+            scheduled += scheduleParentLeases(List.of(lease), focused, deadlineNanos);
         }
-        scheduleParentLeases(leases, focused, deadlineNanos);
     }
 
     private int scheduleParentLeases(Collection<RegionLodGraph.Lease> leases,
@@ -712,7 +735,7 @@ public final class RegionSurfaceLodService {
             }
             Collection<RegionLodDeriver.ChildSnapshot> children =
                     childSnapshots(lease);
-            if (children == null) {
+            if (children == null || children.isEmpty()) {
                 graph.defer(lease);
                 continue;
             }
@@ -756,17 +779,17 @@ public final class RegionSurfaceLodService {
                         childLevel, childX, childZ);
                 NodeRecord record = records.get(childKey);
                 if (record == null || record.prepared == null
-                        || record.prepared.knownMask() == 0L) return null;
+                        || record.prepared.knownMask() == 0L) continue;
                 PreparedBranch prepared = record.prepared;
                 if (!prepared.stamp().equals(lease.stamp())) {
-                    return null;
+                    continue;
                 }
                 children.add(new RegionLodDeriver.ChildSnapshot(child,
                         expected[child], prepared.pixels(),
                         prepared.knownRows(), prepared.completeRows()));
             }
         }
-        return children;
+        return children.isEmpty() ? null : children;
     }
 
     private void registerPending(PendingTask task) {
@@ -1768,13 +1791,17 @@ public static final class RegionLodGraph {
                         node.childVersionSums);
         boolean expandsCoverage = (prepared.knownMask() & ~node.knownMask) != 0L
                 || (prepared.completeMask() & ~node.completeMask) != 0L;
-        if (current) {
+        long unbuiltKnownChildren = node.key.level() > 0
+                ? (node.knownMask & ~prepared.knownMask()) : 0L;
+        if (current && unbuiltKnownChildren == 0L) {
             node.knownMask = prepared.knownMask();
             node.completeMask = prepared.completeMask();
             node.dirtyChildMask &= ~lease.dirtyChildMask();
-        } else if (expandsCoverage) {
+        } else if (current || expandsCoverage) {
             node.knownMask |= prepared.knownMask();
             node.completeMask |= prepared.completeMask();
+            node.dirtyChildMask = (node.dirtyChildMask & ~prepared.knownMask())
+                    | unbuiltKnownChildren;
         }
         node.state = node.dirtyChildMask == 0L
                 && node.preparedRevision >= node.targetRevision
@@ -1799,7 +1826,9 @@ public static final class RegionLodGraph {
                 prepared.revision());
         node.publishedRevision = Math.max(node.publishedRevision,
                 prepared.revision());
-        if (current) {
+        long unbuiltKnownChildren = node.key.level() > 0
+                ? (node.knownMask & ~prepared.knownMask()) : 0L;
+        if (current && unbuiltKnownChildren == 0L) {
             node.knownMask = prepared.knownMask();
             node.completeMask = prepared.completeMask();
             node.dirtyChildMask = 0L;
@@ -1807,6 +1836,7 @@ public static final class RegionLodGraph {
         } else {
             node.knownMask |= prepared.knownMask();
             node.completeMask |= prepared.completeMask();
+            node.dirtyChildMask |= unbuiltKnownChildren;
             node.state = State.DIRTY;
         }
         node.gpuResident = node.knownMask != 0L;
@@ -2409,12 +2439,7 @@ public static final class RegionLodGraph {
                 check(valid);
                 long bit = 1L << childIndex;
                 ChildSnapshot child = indexed[childIndex];
-                boolean expectedKnown = (lease.knownMask() & bit) != 0L;
                 if (child == null) {
-                    if (expectedKnown) {
-                        throw new IllegalArgumentException(
-                                "Missing authoritative LOD child " + childIndex);
-                    }
                     continue;
                 }
                 long expectedRevision = expectedVersions[childIndex];

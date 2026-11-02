@@ -555,6 +555,9 @@ public final class MapDebugRecorder {
             // recurring 1 Hz scans are refreshed by the writer thread afterward.
             refreshDeepSnapshots();
             deep = deepSnapshots;
+            if (deep == null) {
+                return DebugSnapshot.empty();
+            }
         }
         MapSession session = MapSessionManager.getInstance().active();
         RevisionStamp stamp = session == null ? null : session.stamp();
