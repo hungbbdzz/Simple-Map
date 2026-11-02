@@ -141,10 +141,13 @@ public final class RegionSurfaceLodService {
                 }
             }
         }
-        if (complete == total) return 0;
-        if (covered * 4 >= total * 3) return 1;
-        if (covered * 2 >= total) return focused ? 2 : 1;
-        return focused ? 4 : 1;
+        if (view.scale >= 0.0625f) {
+            return focused ? 6 : 2;
+        }
+        if (complete == total) return focused ? 2 : 1;
+        if (covered * 4 >= total * 3) return focused ? 3 : 1;
+        if (covered * 2 >= total) return focused ? 4 : 2;
+        return focused ? 6 : 2;
     }
 
     /** Updates only priority metadata; no durable dirty state is discarded. */
@@ -1410,7 +1413,7 @@ public final class RegionSurfaceLodService {
         public static final int MAX_LEVEL = 3;
         public static final float DIRECT_PROJECTION_THRESHOLD = 0.50f;
         /** At this density the level-3 region texel (64 blocks) is screen-correct. */
-        public static final float REGION_ONLY_THRESHOLD = 0.0625f;
+        public static final float REGION_ONLY_THRESHOLD = 0.015625f;
 
         private MapRegionLodPolicy() { }
 
@@ -1447,7 +1450,7 @@ public final class RegionSurfaceLodService {
         public static boolean regionAuthorityOnly(float logicalScale) {
             return Float.isFinite(logicalScale)
                     && logicalScale > 0.0f
-                    && logicalScale <= REGION_ONLY_THRESHOLD;
+                    && logicalScale < REGION_ONLY_THRESHOLD;
         }
 
         public static int targetLevel(float logicalScale) {
@@ -2501,39 +2504,8 @@ public static final class RegionLodGraph {
 
         private static ReducedColor reduceBlock(ChildSnapshot child,
                 int sourceStartX, int sourceStartY, int sampleSpan) {
-            int knownCount = 0;
-            int coloredCount = 0;
-            long redTotal = 0L;
-            long greenTotal = 0L;
-            long blueTotal = 0L;
-            for (int y = 0; y < sampleSpan; y++) {
-                int sourceY = sourceStartY + y;
-                long knownRow = child.knownRows[sourceY];
-                int sourceRow = sourceY * TEXTURE_SIZE;
-                for (int x = 0; x < sampleSpan; x++) {
-                    int sourceX = sourceStartX + x;
-                    if ((knownRow & (1L << sourceX)) == 0L) continue;
-                    knownCount++;
-                    int color = child.pixels[sourceRow + sourceX];
-                    int a = color >>> 24;
-                    if (a == 0) continue;
-                    int r = color & 0xFF;
-                    int g = (color >>> 8) & 0xFF;
-                    int b = (color >>> 16) & 0xFF;
-                    int lum = Math.max(r, Math.max(g, b));
-                    int w = (r + g + b >= 380 || lum >= 195) ? 6 : 1;
-                    coloredCount += w;
-                    redTotal += (long) r * w;
-                    greenTotal += (long) g * w;
-                    blueTotal += (long) b * w;
-                }
-            }
-            if (knownCount == 0) return ReducedColor.UNKNOWN;
-            if (coloredCount == 0) return new ReducedColor(true, 0);
-            return new ReducedColor(true, packMeanColor(
-                    (int) (redTotal / coloredCount),
-                    (int) (greenTotal / coloredCount),
-                    (int) (blueTotal / coloredCount)));
+            return reduceBlock(child.pixels, child.knownRows,
+                    sourceStartX, sourceStartY, sampleSpan);
         }
 
         private static ReducedColor reduceBlock(int[] pixels, long[] knownRows,
@@ -2543,6 +2515,8 @@ public static final class RegionLodGraph {
             long redTotal = 0L;
             long greenTotal = 0L;
             long blueTotal = 0L;
+            int salientColor = 0;
+            int bestChroma = Integer.MIN_VALUE;
             for (int y = 0; y < sampleSpan; y++) {
                 int sourceY = sourceStartY + y;
                 long knownRow = knownRows[sourceY];
@@ -2557,20 +2531,27 @@ public static final class RegionLodGraph {
                     int r = color & 0xFF;
                     int g = (color >>> 8) & 0xFF;
                     int b = (color >>> 16) & 0xFF;
-                    int lum = Math.max(r, Math.max(g, b));
-                    int w = (r + g + b >= 380 || lum >= 195) ? 6 : 1;
-                    coloredCount += w;
-                    redTotal += (long) r * w;
-                    greenTotal += (long) g * w;
-                    blueTotal += (long) b * w;
+                    int chroma = Math.max(r, Math.max(g, b))
+                            - Math.min(r, Math.min(g, b));
+                    if (chroma > bestChroma) {
+                        bestChroma = chroma;
+                        salientColor = color;
+                    }
+                    coloredCount++;
+                    redTotal += r;
+                    greenTotal += g;
+                    blueTotal += b;
                 }
             }
             if (knownCount == 0) return ReducedColor.UNKNOWN;
             if (coloredCount == 0) return new ReducedColor(true, 0);
-            return new ReducedColor(true, packMeanColor(
-                    (int) (redTotal / coloredCount),
-                    (int) (greenTotal / coloredCount),
-                    (int) (blueTotal / coloredCount)));
+            int meanRed = (int) (redTotal / coloredCount);
+            int meanGreen = (int) (greenTotal / coloredCount);
+            int meanBlue = (int) (blueTotal / coloredCount);
+            int outRed = (meanRed * 3 + (salientColor & 0xFF) + 2) >>> 2;
+            int outGreen = (meanGreen * 3 + ((salientColor >>> 8) & 0xFF) + 2) >>> 2;
+            int outBlue = (meanBlue * 3 + ((salientColor >>> 16) & 0xFF) + 2) >>> 2;
+            return new ReducedColor(true, packMeanColor(outRed, outGreen, outBlue));
         }
 
         private static int packMeanColor(int red, int green, int blue) {

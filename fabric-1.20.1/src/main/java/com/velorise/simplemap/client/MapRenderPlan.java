@@ -188,9 +188,9 @@ public final class MapRenderPlan {
         private final long[] pendingSet = new long[512];
         private final boolean[] pendingSetUsed = new boolean[512];
         /** One-plan region availability cache; avoids repeated synchronized/file-cache probes. */
-        private final long[] sourceRegionKeys = new long[256];
-        private final byte[] sourceRegionStates = new byte[256];
-        private final boolean[] sourceRegionUsed = new boolean[256];
+        private final long[] sourceRegionKeys = new long[4096];
+        private final byte[] sourceRegionStates = new byte[4096];
+        private final boolean[] sourceRegionUsed = new boolean[4096];
         private int pendingCount;
         private int instanceCount;
         private int exactPages;

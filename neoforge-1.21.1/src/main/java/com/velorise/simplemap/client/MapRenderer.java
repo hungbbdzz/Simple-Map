@@ -416,13 +416,8 @@ public class MapRenderer {
         }
         MapRequestLane renderLane = isMinimap
                 ? MapRequestLane.MINIMAP : MapRequestLane.FULLSCREEN;
-        boolean branchOnly = caveMode
-                ? CaveMode.branchOnly(activePolicyScale, renderLane)
-                : (renderLane == MapRequestLane.FULLSCREEN
-                        && (activePolicyScale <= 0.25f || scale <= 0.25f
-                                || MapRegionLodPolicy.regionAuthorityOnly(scale)
-                                || MapRegionLodPolicy.regionAuthorityOnly(activePolicyScale)));
-        boolean caveBranchOnly = branchOnly;
+        boolean caveBranchOnly = caveMode
+                && CaveMode.branchOnly(activePolicyScale, renderLane);
         /*
          * Both visible-map pipelines are anchored to their viewport. The cursor is
          * reserved for coordinate inspection, waypoint interaction and tooltips;
@@ -503,7 +498,7 @@ public class MapRenderer {
             int planMaxCellX = maxVisiblePageX;
             int planMinCellZ = minVisiblePageZ;
             int planMaxCellZ = maxVisiblePageZ;
-            if ((branchOnly || !isMinimap) && hierarchyLevel > 0) {
+            if ((caveBranchOnly || !isMinimap) && hierarchyLevel > 0) {
                 int pageSpan = MapLodPolicy.pageSpanForBranch(hierarchyLevel);
                 planMinCellX = Math.floorDiv(minVisiblePageX, pageSpan);
                 planMaxCellX = Math.floorDiv(maxVisiblePageX, pageSpan);
@@ -587,7 +582,7 @@ public class MapRenderer {
                     long planBuildStartedNanos = System.nanoTime();
                     boolean logicalFullscreenExact = false;
                     MapRenderPlan plan = buildRenderPlan(caveMode, fullCaveView,
-                            caveLayerY, hierarchyLevel, branchOnly, activePolicyScale,
+                            caveLayerY, hierarchyLevel, caveBranchOnly, activePolicyScale,
                             true, true, logicalFullscreenExact,
                             minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                             minVisiblePageX, maxVisiblePageX,
@@ -1146,7 +1141,7 @@ public class MapRenderer {
     }
 
     private MapRenderPlan buildRenderPlan(boolean caveMode, boolean fullCaveView,
-            int caveLayerY, int hierarchyLevel, boolean branchOnly, float scale,
+            int caveLayerY, int hierarchyLevel, boolean caveBranchOnly, float scale,
             boolean collectPending, boolean centerOutTraversal,
             boolean logicalExactCoverage,
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
@@ -1227,7 +1222,7 @@ public class MapRenderer {
                     minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                     minVisiblePageX, maxVisiblePageX,
                     minVisiblePageZ, maxVisiblePageZ,
-                    hierarchyLevel, scale, branchOnly,
+                    hierarchyLevel, scale, caveBranchOnly,
                     attentionPageX, attentionPageZ, centerOutTraversal,
                     pageTableCoverage, drawnRegions);
             if (collectPending) {
@@ -1244,10 +1239,7 @@ public class MapRenderer {
             }
         } else {
             MapManager manager = MapManager.getInstance();
-            long totalVisiblePages = (long) (maxVisiblePageX - minVisiblePageX + 1)
-                    * (long) (maxVisiblePageZ - minVisiblePageZ + 1);
-            boolean regionOnly = MapRegionLodPolicy.regionAuthorityOnly(scale)
-                    || totalVisiblePages > 4096L;
+            boolean regionOnly = MapRegionLodPolicy.regionAuthorityOnly(scale);
             /*
              * The engine never lets a finer texture become the sole visual authority.
              * World Map crops a loaded root texture into a child that is still cold,
@@ -1284,8 +1276,7 @@ public class MapRenderer {
                             minRegionX, maxRegionX, minRegionZ, maxRegionZ,
                             minVisiblePageX, maxVisiblePageX,
                             minVisiblePageZ, maxVisiblePageZ,
-                            hierarchyLevel, scale, branchOnly,
-                            attentionPageX, attentionPageZ,
+                            hierarchyLevel, scale, attentionPageX, attentionPageZ,
                             manager, collectPending, centerOutTraversal);
                 }
             } else {
@@ -1345,25 +1336,23 @@ public class MapRenderer {
                         }
                     }
                 }
-                if (MapConfig.minimapNightMode != 0) {
-                    for (int pageZ = minVisiblePageZ;
-                            pageZ <= maxVisiblePageZ; pageZ++) {
-                        int rz = Math.floorDiv(pageZ, MapPageLayout.PAGES_PER_REGION);
-                        int prevCheckedRx = Integer.MIN_VALUE;
-                        boolean prevRegionHasPages = false;
-                        for (int pageX = minVisiblePageX;
-                                pageX <= maxVisiblePageX; pageX++) {
-                            if (!pageTableCoverage) {
-                                int rx = Math.floorDiv(pageX, MapPageLayout.PAGES_PER_REGION);
-                                if (rx != prevCheckedRx) {
-                                    prevCheckedRx = rx;
-                                    prevRegionHasPages = surfaceTextures.hasAnyPageTexture(rx, rz);
-                                }
-                                if (!prevRegionHasPages) continue;
+                for (int pageZ = minVisiblePageZ;
+                        pageZ <= maxVisiblePageZ; pageZ++) {
+                    int rz = Math.floorDiv(pageZ, MapPageLayout.PAGES_PER_REGION);
+                    int prevCheckedRx = Integer.MIN_VALUE;
+                    boolean prevRegionHasPages = false;
+                    for (int pageX = minVisiblePageX;
+                            pageX <= maxVisiblePageX; pageX++) {
+                        if (!pageTableCoverage) {
+                            int rx = Math.floorDiv(pageX, MapPageLayout.PAGES_PER_REGION);
+                            if (rx != prevCheckedRx) {
+                                prevCheckedRx = rx;
+                                prevRegionHasPages = surfaceTextures.hasAnyPageTexture(rx, rz);
                             }
-                            collectSurfaceGlowLeaf(builder, surfaceTextures,
-                                    pageX, pageZ, pageTableCoverage);
+                            if (!prevRegionHasPages) continue;
                         }
+                        collectSurfaceGlowLeaf(builder, surfaceTextures,
+                                pageX, pageZ, pageTableCoverage);
                     }
                 }
             }
@@ -2025,37 +2014,25 @@ public class MapRenderer {
             int minRegionX, int maxRegionX, int minRegionZ, int maxRegionZ,
             int minVisiblePageX, int maxVisiblePageX,
             int minVisiblePageZ, int maxVisiblePageZ,
-            int level, float scale, boolean branchOnly,
-            int focusPageX, int focusPageZ,
+            int level, float scale, int focusPageX, int focusPageZ,
             MapManager manager, boolean collectPending,
             boolean centerOutTraversal) {
         int minPageX = minVisiblePageX;
         int maxPageX = maxVisiblePageX;
         int minPageZ = minVisiblePageZ;
         int maxPageZ = maxVisiblePageZ;
-        if (branchOnly && level > 0) {
-            int pageSpan = MapLodPolicy.pageSpanForBranch(level);
-            minPageX = Math.floorDiv(minPageX, pageSpan) * pageSpan;
-            maxPageX = (Math.floorDiv(maxPageX, pageSpan) + 1) * pageSpan - 1;
-            minPageZ = Math.floorDiv(minPageZ, pageSpan) * pageSpan;
-            maxPageZ = (Math.floorDiv(maxPageZ, pageSpan) + 1) * pageSpan - 1;
-        }
-        CaveTraversalBudget traversalBudget = branchOnly
-                ? new CaveTraversalBudget(caveBranchVisitBudget(scale), CAVE_BRANCH_PLAN_MAX_QUADS)
-                : new CaveTraversalBudget(SURFACE_HIERARCHY_MAX_VISITS, 4096);
         int pageSpan = MapLodPolicy.pageSpanForBranch(level);
         int minNodeX = Math.floorDiv(minPageX, pageSpan);
         int maxNodeX = Math.floorDiv(maxPageX, pageSpan);
         int minNodeZ = Math.floorDiv(minPageZ, pageSpan);
         int maxNodeZ = Math.floorDiv(maxPageZ, pageSpan);
+        surfaceHierarchyVisitsRemaining = SURFACE_HIERARCHY_MAX_VISITS;
         if (!centerOutTraversal) {
             for (int nodeX = minNodeX; nodeX <= maxNodeX; nodeX++) {
                 for (int nodeZ = minNodeZ; nodeZ <= maxNodeZ; nodeZ++) {
-                    if (traversalBudget.exhausted()) return;
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending,
-                            branchOnly, false, traversalBudget);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
             }
             return;
@@ -2072,39 +2049,31 @@ public class MapRenderer {
             if (top >= minNodeZ && top <= maxNodeZ) {
                 for (int nodeX = Math.max(minNodeX, left);
                         nodeX <= Math.min(maxNodeX, right); nodeX++) {
-                    if (traversalBudget.exhausted()) return;
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, top, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending,
-                            branchOnly, false, traversalBudget);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
             }
             if (radius == 0) continue;
             for (int nodeZ = Math.max(minNodeZ, top + 1);
                     nodeZ <= Math.min(maxNodeZ, bottom - 1); nodeZ++) {
                 if (left >= minNodeX && left <= maxNodeX) {
-                    if (traversalBudget.exhausted()) return;
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, left, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending,
-                            branchOnly, false, traversalBudget);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
                 if (right != left && right >= minNodeX && right <= maxNodeX) {
-                    if (traversalBudget.exhausted()) return;
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, right, nodeZ, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending,
-                            branchOnly, false, traversalBudget);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
             }
             if (bottom >= minNodeZ && bottom <= maxNodeZ) {
                 for (int nodeX = Math.max(minNodeX, left);
                         nodeX <= Math.min(maxNodeX, right); nodeX++) {
-                    if (traversalBudget.exhausted()) return;
                     collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                             level, nodeX, bottom, minPageX, maxPageX,
-                            minPageZ, maxPageZ, scale, manager, collectPending,
-                            branchOnly, false, traversalBudget);
+                            minPageZ, maxPageZ, scale, manager, collectPending, false);
                 }
             }
         }
@@ -2116,9 +2085,7 @@ public class MapRenderer {
             int level, int nodeX, int nodeZ,
             int minPageX, int maxPageX, int minPageZ, int maxPageZ,
             float scale, MapManager manager, boolean collectPending,
-            boolean branchOnly, boolean inheritedCoverage,
-            CaveTraversalBudget traversalBudget) {
-        if (!traversalBudget.visit()) return;
+            boolean inheritedCoverage) {
         int pageSpan = MapLodPolicy.pageSpanForBranch(level);
         int firstPageX = nodeX * pageSpan;
         int firstPageZ = nodeZ * pageSpan;
@@ -2126,123 +2093,116 @@ public class MapRenderer {
         int lastPageZ = firstPageZ + pageSpan - 1;
         if (lastPageX < minPageX || firstPageX > maxPageX
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
+        if (surfaceHierarchyVisitsRemaining-- <= 0) return;
 
         boolean exactResident = surfaceTextures.hasResidentPageInNode(
                 level, nodeX, nodeZ);
-        boolean sourceAvailable = surfaceNodeHasSource(builder, manager,
-                Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
-                Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
-        if (!exactResident && !sourceAvailable) return;
-
+        boolean branchResident = overviewTextures.hasResidentSurfaceBranchInSubtree(
+                level, nodeX, nodeZ);
+        boolean sourceAvailable = exactResident || branchResident
+                || surfaceNodeHasSource(builder, manager,
+                        Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
+                        Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
+        if (!exactResident && !branchResident && !sourceAvailable) return;
         CaveAtlasRegion branch = overviewTextures.peekSurfaceBranch(level, nodeX, nodeZ);
-        CaveAtlasRegion ancestor = branch == null
-                ? findSurfaceAncestor(overviewTextures, level, nodeX, nodeZ) : null;
+        CaveAtlasRegion ancestor = null;
+        boolean nodeCovered = inheritedCoverage;
 
-        if (branchOnly) {
-            if (level == 1) {
-                if (branch != null && (branch.completeMask() & 0xFL) == 0xFL) {
-                    if (traversalBudget.emitQuad()) {
-                        addNodeQuad(builder, branch, nodeX, nodeZ, level);
+        if (level == 1) {
+            boolean allChildrenComplete = branch != null
+                    && (branch.completeMask() & 0xFL) == 0xFL;
+            if (allChildrenComplete
+                    && useBranchInsteadOfExact(scale, 1, true)) {
+                addNodeQuad(builder, branch, nodeX, nodeZ, 1);
+                return;
+            }
+            for (int childX = 0; childX < 2; childX++) {
+                for (int childZ = 0; childZ < 2; childZ++) {
+                    int childIndex = childZ * 2 + childX;
+                    int pageX = firstPageX + childX;
+                    int pageZ = firstPageZ + childZ;
+                    if (pageX < minPageX || pageX > maxPageX
+                            || pageZ < minPageZ || pageZ > maxPageZ) continue;
+                    boolean childKnown = branch != null
+                            && branch.childKnown(childIndex);
+                    boolean childComplete = branch != null
+                            && branch.childComplete(childIndex);
+                    boolean branchPrimary = branch != null
+                            && useBranchInsteadOfExact(scale, 1, childKnown);
+                    if (branchPrimary && childComplete) {
+                        addAncestorQuad(builder, branch, 0, pageX, pageZ);
+                        continue;
                     }
-                    return;
-                }
-                for (int childX = 0; childX < 2 && !traversalBudget.exhausted(); childX++) {
-                    for (int childZ = 0; childZ < 2 && !traversalBudget.exhausted(); childZ++) {
-                        int childIndex = childZ * 2 + childX;
-                        int pageX = firstPageX + childX;
-                        int pageZ = firstPageZ + childZ;
-                        if (pageX < minPageX || pageX > maxPageX
-                                || pageZ < minPageZ || pageZ > maxPageZ) continue;
-                        if (branch != null && branch.childComplete(childIndex)) {
-                            if (traversalBudget.emitQuad()) {
-                                addAncestorQuad(builder, branch, 0, pageX, pageZ);
-                            }
-                            continue;
-                        }
-                        if (!traversalBudget.emitQuad()) return;
+                    if (branchPrimary) {
+                        addAncestorQuad(builder, branch, 0, pageX, pageZ);
                         collectSurfaceLeaf(builder, surfaceTextures, pageX, pageZ,
-                                manager, collectPending, MapRenderPlan.PHASE_L1_EXACT_UNDERLAY, false);
+                                manager, collectPending,
+                                MapRenderPlan.PHASE_L1_EXACT_UNDERLAY, false);
+                        continue;
                     }
-                }
-                return;
-            }
-            if (branch != null) {
-                if (traversalBudget.emitQuad()) {
-                    addNodeQuad(builder, branch, nodeX, nodeZ, level);
-                }
-                return;
-            }
-            if (ancestor != null) {
-                if (traversalBudget.emitQuad()) {
-                    addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
-                }
-                return;
-            }
-            if (!surfaceTextures.hasResidentPageInNode(level, nodeX, nodeZ)) return;
-            for (int childX = 0; childX < 2 && !traversalBudget.exhausted(); childX++) {
-                for (int childZ = 0; childZ < 2 && !traversalBudget.exhausted(); childZ++) {
-                    collectSurfaceNode(builder, overviewTextures, surfaceTextures,
-                            level - 1, nodeX * 2 + childX, nodeZ * 2 + childZ,
-                            minPageX, maxPageX, minPageZ, maxPageZ,
-                            scale, manager, collectPending, true, inheritedCoverage,
-                            traversalBudget);
+                    boolean drewExact = collectSurfaceLeaf(builder, surfaceTextures,
+                            pageX, pageZ, manager, collectPending,
+                            MapRenderPlan.PHASE_EXACT, false);
+                    boolean exactFull = drewExact
+                            && (surfaceTextures.completeSubtileMask(pageX, pageZ)
+                                    & MapPageLayout.FULL_SUBTILE_MASK)
+                                    == MapPageLayout.FULL_SUBTILE_MASK;
+                    if (!exactFull) {
+                        CaveAtlasRegion fallback = childKnown ? branch : null;
+                        if (fallback == null && !inheritedCoverage) {
+                            if (ancestor == null) {
+                                ancestor = findSurfaceAncestor(
+                                        overviewTextures, 1, nodeX, nodeZ);
+                            }
+                            fallback = ancestor;
+                        }
+                        if (fallback != null) {
+                            addAncestorQuad(builder, fallback, 0, pageX, pageZ);
+                        }
+                    }
                 }
             }
             return;
         }
 
-        boolean nodeCovered = inheritedCoverage;
         if (branch != null) {
             addNodeQuad(builder, branch, nodeX, nodeZ, level);
             nodeCovered = true;
         } else if (!nodeCovered) {
+            // Never expose a black hole while the requested LOD/exact leaf is
+            // pending. A coarser GPU-resident ancestor remains as an underlay and
+            // is cropped to this node until finer data is published.
+            ancestor = findSurfaceAncestor(
+                    overviewTextures, level, nodeX, nodeZ);
             if (ancestor != null) {
                 addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
                 nodeCovered = true;
             }
         }
 
-        if (branch == null && !exactResident) {
+        // Source exists but neither an exact descendant nor a branch is resident
+        // yet. Record pending once per overlapping region.
+        if (branch == null && !exactResident && !branchResident) {
             if (collectPending) recordPendingSurfaceRegions(builder, manager,
                     Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
                     Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
             return;
         }
 
-        if (level == 1) {
-            for (int childX = 0; childX < 2 && !traversalBudget.exhausted(); childX++) {
-                for (int childZ = 0; childZ < 2 && !traversalBudget.exhausted(); childZ++) {
-                    int childIndex = childZ * 2 + childX;
-                    int pageX = firstPageX + childX;
-                    int pageZ = firstPageZ + childZ;
-                    if (pageX < minPageX || pageX > maxPageX
-                            || pageZ < minPageZ || pageZ > maxPageZ) continue;
-                    boolean branchPrimary = branch != null
-                            && useBranchInsteadOfExact(
-                                    scale, level, branch.childKnown(childIndex));
-                    if (branchPrimary && branch.childComplete(childIndex)) continue;
-                    int phase = branchPrimary
-                            ? MapRenderPlan.PHASE_L1_EXACT_UNDERLAY
-                            : MapRenderPlan.PHASE_EXACT;
-                    collectSurfaceLeaf(builder, surfaceTextures, pageX, pageZ,
-                            manager, collectPending, phase, false);
-                }
-            }
-            return;
-        }
-        for (int childX = 0; childX < 2 && !traversalBudget.exhausted(); childX++) {
-            for (int childZ = 0; childZ < 2 && !traversalBudget.exhausted(); childZ++) {
+        for (int childX = 0; childX < 2; childX++) {
+            for (int childZ = 0; childZ < 2; childZ++) {
                 int childIndex = childZ * 2 + childX;
                 int childNodeX = nodeX * 2 + childX;
                 int childNodeZ = nodeZ * 2 + childZ;
                 if (branch != null && branch.childComplete(childIndex)
                         && !surfaceTextures.hasResidentPageInNode(level - 1,
-                                childNodeX, childNodeZ)) continue;
+                                childNodeX, childNodeZ)
+                        && !overviewTextures.hasResidentSurfaceBranchInSubtree(
+                                level - 1, childNodeX, childNodeZ)) continue;
                 collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                         level - 1, childNodeX, childNodeZ,
                         minPageX, maxPageX, minPageZ, maxPageZ,
-                        scale, manager, collectPending, false, nodeCovered,
-                        traversalBudget);
+                        scale, manager, collectPending, nodeCovered);
             }
         }
     }
@@ -2831,14 +2791,20 @@ public class MapRenderer {
     private CaveAtlasRegion findSurfaceAncestor(
             MapOverviewTextureManager source, int targetLevel,
             int targetNodeX, int targetNodeZ) {
+        int maxAncestorLevel = Math.min(3, SurfaceLodTree.MAX_LEVEL);
         for (int ancestorLevel = targetLevel + 1;
-                ancestorLevel <= SurfaceLodTree.MAX_LEVEL; ancestorLevel++) {
+                ancestorLevel <= maxAncestorLevel; ancestorLevel++) {
             int shift = ancestorLevel - targetLevel;
             int ancestorX = Math.floorDiv(targetNodeX, 1 << shift);
             int ancestorZ = Math.floorDiv(targetNodeZ, 1 << shift);
             CaveAtlasRegion ancestor = source.peekSurfaceBranch(
                     ancestorLevel, ancestorX, ancestorZ);
-            if (ancestor != null) return ancestor;
+            if (ancestor == null) continue;
+            int childShift = shift - 1;
+            int childX = Math.floorMod(targetNodeX >> childShift, 2);
+            int childZ = Math.floorMod(targetNodeZ >> childShift, 2);
+            int childIndex = childZ * 2 + childX;
+            if (ancestor.childKnown(childIndex)) return ancestor;
         }
         return null;
     }
@@ -3744,7 +3710,7 @@ public class MapRenderer {
 
     private static boolean useBranchInsteadOfExact(float scale, int level,
             boolean childKnown) {
-        return level == 1 && scale < 0.50f && childKnown;
+        return level == 1 && scale < 0.35f && childKnown;
     }
 
     /**

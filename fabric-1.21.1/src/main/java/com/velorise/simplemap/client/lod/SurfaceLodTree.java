@@ -36,9 +36,9 @@ public final class SurfaceLodTree {
     private static final long GPU_RETRY_MAX_NANOS = 160_000_000L;
     /** Exact pages publish immediately; only derived branches wait for a short
      * quiet window so a burst of child revisions collapses into one reduction. */
-    private static final long FOREGROUND_LEAF_QUIET_NANOS = 40_000_000L;
-    private static final long BACKGROUND_LEAF_QUIET_NANOS = 80_000_000L;
-    private static final long FOREGROUND_LEAF_MAX_WAIT_NANOS = 160_000_000L;
+    private static final long FOREGROUND_LEAF_QUIET_NANOS = 15_000_000L;
+    private static final long BACKGROUND_LEAF_QUIET_NANOS = 45_000_000L;
+    private static final long FOREGROUND_LEAF_MAX_WAIT_NANOS = 90_000_000L;
     private static final long BACKGROUND_LEAF_MAX_WAIT_NANOS = 300_000_000L;
     /** Clean leaf authority is LRU-bounded; dirty state is never discarded. */
     private static final int MAX_RETAINED_LEAF_STATES = 16_384;
@@ -162,6 +162,34 @@ public final class SurfaceLodTree {
         if (node != null && node.knownMask != 0L) return true;
         LodBranchDiskCache.Metadata metadata = diskCache.metadata(diskKey(key));
         return metadata != null && metadata.knownMask() != 0L;
+    }
+
+    /**
+     * Returns true when this node or any finer branch descendant in its subtree
+     * is GPU-resident, matching CaveTextureManager's residentBranchMasks check.
+     */
+    public boolean hasResidentBranchInSubtree(String dimension, int level,
+            int nodeX, int nodeZ) {
+        drainDiskLoads();
+        if (level < 1 || level > MAX_LEVEL) return false;
+        for (int candidateLevel = level; candidateLevel >= 1; candidateLevel--) {
+            int shift = level - candidateLevel;
+            int minX = nodeX << shift;
+            int maxX = ((nodeX + 1) << shift) - 1;
+            int minZ = nodeZ << shift;
+            int maxZ = ((nodeZ + 1) << shift) - 1;
+            for (int z = minZ; z <= maxZ; z++) {
+                for (int x = minX; x <= maxX; x++) {
+                    Node node = nodes.get(
+                            new NodeKey(dimension, candidateLevel, x, z));
+                    if (node != null && node.initialized && node.atlasSlot >= 0
+                            && node.uploadedKnownMask != 0L) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -729,27 +757,46 @@ public final class SurfaceLodTree {
         int greenTotal = 0;
         int blueTotal = 0;
         int count = 0;
+        int[] sampleColors = new int[4];
         for (int child = 0; child < 4; child++) {
             int sourceX = x + (child & 1);
             int sourceY = y + (child >>> 1);
             if ((rows[sourceY] & (1L << sourceX)) == 0L) continue;
             int value = pixels[sourceY * 64 + sourceX];
             if (value == 0 || ((value >>> 24) & 0xFF) == 0) continue;
+            sampleColors[count] = value;
             redTotal += value & 0xFF;
             greenTotal += (value >>> 8) & 0xFF;
             blueTotal += (value >>> 16) & 0xFF;
             count++;
         }
         if (count == 0) return 0;
-        /* PASS118: this hierarchy is a minification filter, not a terrain
-         * classifier. Selecting one real child nearest the mean aliases repeated
-         * seabed/foliage detail into long 2x/4x stripes. Branch downsampling
-         * textures through linear texture filtering; arithmetic averaging is the
-         * CPU equivalent for our retained hierarchy. */
         int meanRed = redTotal / count;
         int meanGreen = greenTotal / count;
         int meanBlue = blueTotal / count;
-        return 0xFF000000 | (meanBlue << 16) | (meanGreen << 8) | meanRed;
+        int salientColor = sampleColors[0];
+        int bestSalience = Integer.MIN_VALUE;
+        for (int i = 0; i < count; i++) {
+            int c = sampleColors[i];
+            int r = c & 0xFF;
+            int g = (c >>> 8) & 0xFF;
+            int b = (c >>> 16) & 0xFF;
+            int maxChannel = Math.max(r, Math.max(g, b));
+            int minChannel = Math.min(r, Math.min(g, b));
+            int chroma = maxChannel - minChannel;
+            int contrast = Math.abs(r - meanRed)
+                    + Math.abs(g - meanGreen)
+                    + Math.abs(b - meanBlue);
+            int salience = chroma * 2 + contrast;
+            if (salience > bestSalience) {
+                bestSalience = salience;
+                salientColor = c;
+            }
+        }
+        int outRed = (meanRed * 3 + (salientColor & 0xFF) + 2) >>> 2;
+        int outGreen = (meanGreen * 3 + ((salientColor >>> 8) & 0xFF) + 2) >>> 2;
+        int outBlue = (meanBlue * 3 + ((salientColor >>> 16) & 0xFF) + 2) >>> 2;
+        return 0xFF000000 | (outBlue << 16) | (outGreen << 8) | outRed;
     }
 
     private static void setBit(long[] rows, int x, int y, boolean value) {
@@ -1065,6 +1112,7 @@ public final class SurfaceLodTree {
 
         private boolean derivationSettled(long now) {
             if (firstDirtyNanos == 0L || lastDirtyNanos == 0L) return true;
+            if (complete && derivedRevision == 0L) return true;
             boolean foreground = lane == MapRequestLane.MINIMAP
                     || lane == MapRequestLane.FULLSCREEN;
             long quiet = foreground

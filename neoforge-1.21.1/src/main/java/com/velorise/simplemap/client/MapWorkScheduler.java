@@ -2609,6 +2609,8 @@ public static final class MapTextureBuildWorker {
                     long green = 0L;
                     long blue = 0L;
                     int colored = 0;
+                    int salientColor = 0;
+                    int bestChroma = Integer.MIN_VALUE;
                     for (int dz = 0; dz < 2; dz++) {
                         int sourceY = sampleY + dz;
                         int knownRowOffset = (sourceY + halo) * stride + halo;
@@ -2622,20 +2624,30 @@ public static final class MapTextureBuildWorker {
                             int r = color & 0xFF;
                             int g = (color >>> 8) & 0xFF;
                             int b = (color >>> 16) & 0xFF;
-                            int lum = Math.max(r, Math.max(g, b));
-                            int w = (r + g + b >= 380 || lum >= 195) ? 4 : 1;
-                            colored += w;
-                            red += (long) r * w;
-                            green += (long) g * w;
-                            blue += (long) b * w;
+                            int chroma = Math.max(r, Math.max(g, b))
+                                    - Math.min(r, Math.min(g, b));
+                            if (chroma > bestChroma) {
+                                bestChroma = chroma;
+                                salientColor = color;
+                            }
+                            colored++;
+                            red += r;
+                            green += g;
+                            blue += b;
                         }
                     }
                     if (knownCount > 0) knownRows[y] |= 1L << x;
                     if (colored > 0) {
+                        int meanRed = (int) (red / colored);
+                        int meanGreen = (int) (green / colored);
+                        int meanBlue = (int) (blue / colored);
+                        int outRed = (meanRed * 3 + (salientColor & 0xFF) + 2) >>> 2;
+                        int outGreen = (meanGreen * 3 + ((salientColor >>> 8) & 0xFF) + 2) >>> 2;
+                        int outBlue = (meanBlue * 3 + ((salientColor >>> 16) & 0xFF) + 2) >>> 2;
                         output[y * 64 + x] = 0xFF000000
-                                | ((int) (blue / colored) << 16)
-                                | ((int) (green / colored) << 8)
-                                | (int) (red / colored);
+                                | (outBlue << 16)
+                                | (outGreen << 8)
+                                | outRed;
                     }
                 }
             }

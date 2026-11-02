@@ -256,6 +256,11 @@ public final class MapOverviewTextureManager {
         return surfaceLodTree.hasData(currentDimension(), level, nodeX, nodeZ);
     }
 
+    public boolean hasResidentSurfaceBranchInSubtree(int level, int nodeX, int nodeZ) {
+        return surfaceLodTree.hasResidentBranchInSubtree(
+                currentDimension(), level, nodeX, nodeZ);
+    }
+
     /** Receives one exact 64x64 surface leaf from the shared texture store. */
     public void updateSurfaceLeafPage(int globalPageX, int globalPageZ,
             int[] pixels64, long[] knownRows, boolean complete) {
@@ -510,14 +515,18 @@ public final class MapOverviewTextureManager {
         }
         surfaceLodTree.synchronizeStorage();
         MapPerformanceGovernor governor = MapPerformanceGovernor.getInstance();
-        long deadline = System.nanoTime() + Math.max(500_000L,
+        long totalSliceNanos = Math.max(750_000L,
                 governor.textureUploadBudgetNanos(focus) / 2);
-        // M4 region authority always receives the first publication slice.
-        regionLodService.publish(focus, deadline);
+        long nowNanos = System.nanoTime();
+        long deadline = nowNanos + totalSliceNanos;
         int legacyBudget = regionLodService.legacyPublishBudget(focus);
-        if (legacyBudget > 0 && System.nanoTime() < deadline) {
-            surfaceLodTree.publish(legacyBudget, deadline,
+        if (legacyBudget > 0) {
+            long treeDeadline = nowNanos + (totalSliceNanos * 3) / 5;
+            surfaceLodTree.publish(legacyBudget, treeDeadline,
                     preferredSurfaceBranchLevel);
+        }
+        if (System.nanoTime() < deadline) {
+            regionLodService.publish(focus, deadline);
         }
     }
 
@@ -540,13 +549,15 @@ public final class MapOverviewTextureManager {
                 styleRefresh ? governor.textureUploadBudgetNanos(true)
                         : governor.textureUploadBudgetNanos(focus) / 2);
 
-        // Manual compatibility path: M4 region coverage publishes first,
-        // followed by the old factor-2 refinement adapter.
-        regionLodService.publish(focus, deadline);
         int legacyBudget = regionLodService.legacyPublishBudget(focus);
         if (legacyBudget > 0 && System.nanoTime() < deadline) {
-            surfaceLodTree.publish(legacyBudget, deadline,
+            long treeDeadline = System.nanoTime() + Math.max(350_000L,
+                    (deadline - System.nanoTime()) * 3 / 5);
+            surfaceLodTree.publish(legacyBudget, treeDeadline,
                     preferredSurfaceBranchLevel);
+        }
+        if (System.nanoTime() < deadline) {
+            regionLodService.publish(focus, deadline);
         }
         if (System.nanoTime() >= deadline) return;
 
