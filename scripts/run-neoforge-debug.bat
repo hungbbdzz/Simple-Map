@@ -82,8 +82,11 @@ if "%EXITCODE%"=="0" (
 echo =====================================================================
 
 set "LATEST_LOG_TXT=%REPO_ROOT%\neoforge-1.21.1\run\simplemap-debug\latest.txt"
+set "LATEST_DIR="
 if exist "%LATEST_LOG_TXT%" (
-    set /p LATEST_DIR=<"%LATEST_LOG_TXT%"
+    for /f "usebackq delims=" %%i in ("%LATEST_LOG_TXT%") do set "LATEST_DIR=%%i"
+)
+if defined LATEST_DIR (
     echo.
     echo [Telemetry Output] Thu muc ket qua phan tich session gan nhat:
     echo   !LATEST_DIR!

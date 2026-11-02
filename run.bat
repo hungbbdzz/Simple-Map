@@ -27,15 +27,39 @@ echo ---------------------------------------------------------------------
 set /p "CHOICE=Select an option [1-8]: "
 
 :HANDLE_CHOICE
-if "%CHOICE%"=="1" ( call "%~dp0scripts\run-fabric.bat" 1 & exit /b )
-if "%CHOICE%"=="2" ( call "%~dp0scripts\run-neoforge.bat" 1 & exit /b )
-if "%CHOICE%"=="3" ( call "%~dp0scripts\run-forge-1.20.1.bat" 1 & exit /b )
-if "%CHOICE%"=="4" ( call "%~dp0scripts\run-fabric.bat" 2 & exit /b )
+if "%CHOICE%"=="1" (
+    call "%~dp0scripts\run-fabric.bat" 1
+    exit /b %ERRORLEVEL%
+)
+if "%CHOICE%"=="2" (
+    call "%~dp0scripts\run-neoforge.bat" 1
+    exit /b %ERRORLEVEL%
+)
+if "%CHOICE%"=="3" (
+    call "%~dp0scripts\run-forge-1.20.1.bat" 1
+    exit /b %ERRORLEVEL%
+)
+if "%CHOICE%"=="4" (
+    call "%~dp0scripts\run-fabric.bat" 2
+    exit /b %ERRORLEVEL%
+)
 
-if "%CHOICE%"=="5" ( call "%~dp0scripts\run-fabric-debug.bat" & exit /b )
-if "%CHOICE%"=="6" ( call "%~dp0scripts\run-neoforge-debug.bat" & exit /b )
-if "%CHOICE%"=="7" ( call "%~dp0scripts\run-forge-1.20.1-debug.bat" & exit /b )
-if "%CHOICE%"=="8" ( call "%~dp0scripts\run-fabric-1.20.1-debug.bat" & exit /b )
+if "%CHOICE%"=="5" (
+    call "%~dp0scripts\run-fabric-debug.bat"
+    exit /b %ERRORLEVEL%
+)
+if "%CHOICE%"=="6" (
+    call "%~dp0scripts\run-neoforge-debug.bat"
+    exit /b %ERRORLEVEL%
+)
+if "%CHOICE%"=="7" (
+    call "%~dp0scripts\run-forge-1.20.1-debug.bat"
+    exit /b %ERRORLEVEL%
+)
+if "%CHOICE%"=="8" (
+    call "%~dp0scripts\run-fabric-1.20.1-debug.bat"
+    exit /b %ERRORLEVEL%
+)
 
 if "%CHOICE%"=="0" exit /b 0
 
