@@ -2169,24 +2169,40 @@ public class MapRenderer {
             return;
         }
 
-        if (branch != null) {
-            addNodeQuad(builder, branch, nodeX, nodeZ, level);
-            nodeCovered = true;
-        } else if (!nodeCovered) {
-            // Never expose a black hole while the requested LOD/exact leaf is
-            // pending. A coarser GPU-resident ancestor remains as an underlay and
-            // is cropped to this node until finer data is published.
-            ancestor = findSurfaceAncestor(
-                    overviewTextures, level, nodeX, nodeZ);
-            if (ancestor != null) {
-                addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
-                nodeCovered = true;
+        if (useBranchInsteadOfExact(scale, level, true)) {
+            if (branch != null) {
+                addNodeQuad(builder, branch, nodeX, nodeZ, level);
+                return;
             }
+            if (ancestor != null || (ancestor = findSurfaceAncestor(overviewTextures, level, nodeX, nodeZ)) != null) {
+                addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
+                return;
+            }
+            if (!exactResident && !branchResident) {
+                if (collectPending) recordPendingSurfaceRegions(builder, manager,
+                        Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
+                        Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
+                return;
+            }
+            for (int childX = 0; childX < 2; childX++) {
+                for (int childZ = 0; childZ < 2; childZ++) {
+                    int childNodeX = nodeX * 2 + childX;
+                    int childNodeZ = nodeZ * 2 + childZ;
+                    collectSurfaceNode(builder, overviewTextures, surfaceTextures,
+                            level - 1, childNodeX, childNodeZ,
+                            minPageX, maxPageX, minPageZ, maxPageZ,
+                            scale, manager, collectPending, false);
+                }
+            }
+            return;
         }
 
-        // Source exists but neither an exact descendant nor a branch is resident
-        // yet. Record pending once per overlapping region.
         if (branch == null && !exactResident && !branchResident) {
+            ancestor = findSurfaceAncestor(overviewTextures, level, nodeX, nodeZ);
+            if (ancestor != null) {
+                addAncestorQuad(builder, ancestor, level, nodeX, nodeZ);
+                return;
+            }
             if (collectPending) recordPendingSurfaceRegions(builder, manager,
                     Math.max(firstPageX, minPageX), Math.min(lastPageX, maxPageX),
                     Math.max(firstPageZ, minPageZ), Math.min(lastPageZ, maxPageZ));
@@ -2199,10 +2215,10 @@ public class MapRenderer {
                 int childNodeX = nodeX * 2 + childX;
                 int childNodeZ = nodeZ * 2 + childZ;
                 if (branch != null && branch.childComplete(childIndex)
-                        && !surfaceTextures.hasResidentPageInNode(level - 1,
-                                childNodeX, childNodeZ)
-                        && !overviewTextures.hasResidentSurfaceBranchInSubtree(
-                                level - 1, childNodeX, childNodeZ)) continue;
+                        && scale < (level <= 2 ? 0.25f : 0.125f)) {
+                    addAncestorQuad(builder, branch, level - 1, childNodeX, childNodeZ);
+                    continue;
+                }
                 collectSurfaceNode(builder, overviewTextures, surfaceTextures,
                         level - 1, childNodeX, childNodeZ,
                         minPageX, maxPageX, minPageZ, maxPageZ,
@@ -2989,6 +3005,19 @@ public class MapRenderer {
                 || lastPageZ < minPageZ || firstPageZ > maxPageZ) return;
 
         CaveAtlasRegion branch = overviewTextures.peekSurfaceBranch(level, nodeX, nodeZ);
+        if (useBranchInsteadOfExact(scale, level, branch != null)) {
+            if (branch != null) {
+                drawAtlasNode(guiGraphics, branch, nodeX, nodeZ);
+                stats.branchNodes++;
+                return;
+            }
+            CaveAtlasRegion ancestor = findSurfaceAncestor(overviewTextures, level, nodeX, nodeZ);
+            if (ancestor != null) {
+                drawCaveAncestorSubRect(guiGraphics, ancestor, level, nodeX, nodeZ);
+                stats.branchNodes++;
+                return;
+            }
+        }
         boolean l1BranchOverlay = level == 1 && branch != null && scale < 0.50f;
         // Direct compatibility rendering has no phase sorter. At far L1 zoom, draw
         // exact fallback first and the partially transparent branch afterwards so
@@ -3714,7 +3743,10 @@ public class MapRenderer {
 
     private static boolean useBranchInsteadOfExact(float scale, int level,
             boolean childKnown) {
-        return level == 1 && scale < 0.35f && childKnown;
+        if (!childKnown) return false;
+        if (level >= 3) return scale < 0.15f;
+        if (level == 2) return scale < 0.25f;
+        return scale < 0.35f;
     }
 
     /**

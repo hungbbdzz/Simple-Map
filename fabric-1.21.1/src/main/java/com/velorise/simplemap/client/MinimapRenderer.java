@@ -252,9 +252,9 @@ public class MinimapRenderer {
         int y = position[1];
 
         int borderThickness = MapConfig.minimapCircle
-                ? Math.max(2, size / 32)
+                ? (MapConfig.minimapFrameStyle == 2 ? 0 : 1)
                 : (MapConfig.minimapFrameStyle == 1 ? VANILLA_FRAME_PAD
-                        : (MapConfig.minimapFrameStyle == 2 ? 0 : Math.max(2, size / 32)));
+                        : (MapConfig.minimapFrameStyle == 2 ? 0 : 1));
         int tHalf = Math.max(1, borderThickness / 2);
         double dimScale = MapManager.getInstance().getCrossDimensionCoordinateScale();
         double interpX = net.minecraft.util.Mth.lerp(partialTick, player.xo, player.getX()) * dimScale;
@@ -283,23 +283,7 @@ public class MinimapRenderer {
             if (MapConfig.minimapFrameStyle == 1) {
                 renderVanillaMapFrame9Slice(guiGraphics, resolveFrameTexture(mc), x, y, size);
             } else if (MapConfig.minimapFrameStyle == 0) {
-                guiGraphics.renderOutline(x - borderThickness - 1, y - borderThickness - 1,
-                        size + borderThickness * 2 + 2, size + borderThickness * 2 + 2, 0xFF000000);
-                // Main colored border
-                guiGraphics.fill(x - borderThickness, y - borderThickness, x + size + borderThickness, y - tHalf,
-                        MapConfig.minimapRingColor); // Top
-                guiGraphics.fill(x - borderThickness, y + size + tHalf, x + size + borderThickness,
-                        y + size + borderThickness, MapConfig.minimapRingColor); // Bottom
-                guiGraphics.fill(x - borderThickness, y - tHalf, x - tHalf, y + size + tHalf,
-                        MapConfig.minimapRingColor); // Left
-                guiGraphics.fill(x + size + tHalf, y - tHalf, x + size + borderThickness, y + size + tHalf,
-                        MapConfig.minimapRingColor); // Right
-
-                // Inner slate outline (thickness tHalf)
-                guiGraphics.fill(x - tHalf, y - tHalf, x + size + tHalf, y, MapConfig.minimapRingColor); // Top
-                guiGraphics.fill(x - tHalf, y + size, x + size + tHalf, y + size + tHalf, MapConfig.minimapRingColor); // Bottom
-                guiGraphics.fill(x - tHalf, y, x, y + size, MapConfig.minimapRingColor); // Left
-                guiGraphics.fill(x + size, y, x + size + tHalf, y + size, MapConfig.minimapRingColor); // Right
+                guiGraphics.renderOutline(x - 1, y - 1, size + 2, size + 2, MapConfig.minimapRingColor);
             }
 
             // Draw map through the fixed-resolution minimap target. If the GPU or
@@ -418,7 +402,7 @@ public class MinimapRenderer {
         float radius = size / 2.0f;
         float cx = x + radius;
         float cy = y + radius;
-        float ringWidth = Math.max(1.5f, size / 72.0f);
+        float ringWidth = 1.0f;
         float innerRingRadius = radius - 0.5f;
         float outerRingRadius = innerRingRadius + ringWidth;
 
@@ -470,10 +454,19 @@ public class MinimapRenderer {
 
         MapRenderer.getInstance().drawMinimapPlayerOverlay(
                 guiGraphics, cx, cy, MapConfig.minimapRotate, partialTick);
-        // Sleek, thin circular bezel ring
-        drawCircleRing(guiGraphics, cx, cy, innerRingRadius - 0.5f, innerRingRadius, CIRCLE_SEGMENTS, 0x77000000);
-        drawCircleRing(guiGraphics, cx, cy, innerRingRadius, outerRingRadius, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
-        drawCircleRing(guiGraphics, cx, cy, outerRingRadius, outerRingRadius + 0.75f, CIRCLE_SEGMENTS, 0xE0000000);
+        switch (MapConfig.minimapFrameStyle) {
+            case 2 -> {
+                // Frameless: draw nothing
+            }
+            case 1 -> {
+                // Vanilla parchment ring: 1.5px clean parchment ring
+                drawCircleRing(guiGraphics, cx, cy, innerRingRadius - 0.5f, innerRingRadius + 1.0f, CIRCLE_SEGMENTS, 0xFFD6BE96);
+            }
+            case 0 -> {
+                // Minimal: 1.0px single crisp ring with user-selected ring color
+                drawCircleRing(guiGraphics, cx, cy, innerRingRadius, outerRingRadius, CIRCLE_SEGMENTS, MapConfig.minimapRingColor);
+            }
+        }
         guiGraphics.flush();
         drawCompassDirections(guiGraphics, mc, cx, cy, radius, ringWidth, player, true, partialTick);
     }
@@ -512,7 +505,7 @@ public class MinimapRenderer {
         if (isCircle) {
             limit = radius * 0.915f;
         } else {
-            limit = radius + borderThickness / 2.0f;
+            limit = radius + (MapConfig.minimapFrameStyle == 1 ? borderThickness / 2.0f : 0.0f);
         }
 
         int letterColor = MapRenderer.getInstance().getActualPointerColor(MapConfig.compassLetterColor);
