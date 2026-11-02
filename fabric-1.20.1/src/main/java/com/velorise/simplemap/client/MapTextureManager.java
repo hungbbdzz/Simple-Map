@@ -2758,6 +2758,7 @@ public class MapTextureManager {
         // page is complete). This removes synchronous render-thread amplification
         // without hiding progressive exploration.
         if (firstGpuPublication
+                || mergedSubtiles != previousCompleteSubtiles
                 || mergedSubtiles == MapPageLayout.FULL_SUBTILE_MASK
                 || (completeSubtileCount & 3) == 0) {
             MapOverviewTextureManager.getInstance().updateSurfaceLeafPage(
