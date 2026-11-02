@@ -2716,8 +2716,7 @@ public class MapScreen extends Screen {
 
     private static final int SCAN_CHUNK_MIN = 4;
     private static final int SCAN_CHUNK_MAX = 390; // 390 represents AUTO/MAX
-    private static final int PALETTE_LABEL_Y = 104;
-    private static final int PALETTE_SWATCH_Y = 116;
+    private int paletteLabelY = 104;
 
     public MapConfigScreen(Screen parent) {
         super(Component.translatable("gui.simplemap.settings_title"));
@@ -2789,13 +2788,13 @@ public class MapScreen extends Screen {
 
         // ==================== RESPONSIVE LEFT PANEL ====================
         panelLeft = Math.max(4, Math.min(10, this.width / 24));
-        panelTop = 15;
-        panelWidth = Math.min(270, Math.max(210, this.width / 2 - 10));
+        panelTop = Math.max(6, Math.min(15, (this.height - 224) / 2));
+        panelWidth = Math.min(270, Math.max(210, this.width - 120));
         panelRight = panelLeft + panelWidth;
-        panelBottom = Math.max(240, Math.min(252, this.height - 10));
+        panelBottom = panelTop + 224;
 
         // ==================== TABS (Top of Left Panel) ====================
-        int tabY = 16;
+        int tabY = panelTop + 1;
         int tabSpacing = 4;
         int startX = panelLeft + 4;
         int tabW = Math.max(48, (panelWidth - 8 - tabSpacing * 3) / 4);
@@ -2850,14 +2849,15 @@ public class MapScreen extends Screen {
         int colW = Math.max(90, (panelWidth - 12 - columnGap) / 2);
         int col2X = col1X + colW + columnGap;
         int gridWidth = colW * 2 + columnGap;
-        int r1Y = 44;
-        int r2Y = 68;
-        int r3Y = 92;
-        int r4Y = 116;
-        int r5Y = 140;
-        int r6Y = 164;
-        int r7Y = 188;
+        int r1Y = tabY + 28;
+        int r2Y = r1Y + 24;
+        int r3Y = r2Y + 24;
+        int r4Y = r3Y + 24;
+        int r5Y = r4Y + 24;
+        int r6Y = r5Y + 24;
+        int r7Y = r6Y + 24;
         int doneY = r7Y + 24;
+        paletteLabelY = r3Y + 12;
 
         // Row 1
         minimapToggleButton = Button.builder(
@@ -3746,13 +3746,6 @@ public class MapScreen extends Screen {
         if (!selectedMinimap && !selectedCoords) {
             // Semi-transparent dark overlay — game view shows through behind
             guiGraphics.fill(0, 0, this.width, this.height, 0xAA000000);
-
-            // Draw the same responsive card geometry used by init().
-            panelBottom = Math.max(panelTop + 80, this.height - 10);
-            guiGraphics.fill(panelLeft, panelTop, panelRight, panelBottom, 0xDD111215);
-            guiGraphics.renderOutline(panelLeft - 1, panelTop - 1,
-                    panelWidth + 2, panelBottom - panelTop + 2, 0xFF2D3033);
-            guiGraphics.fill(panelLeft, 41, panelRight, 42, 0xFF2D3033);
         } else {
             guiGraphics.fill(0, 0, this.width, this.height, 0x30000000);
         }
@@ -3960,7 +3953,7 @@ public class MapScreen extends Screen {
                     ? "gui.simplemap.palette.empty_hint"
                     : "gui.simplemap.palette.saved_hint").getString();
             guiGraphics.drawString(this.font, paletteLabel, panelLeft + 6,
-                    PALETTE_LABEL_Y, 0xFFB0B0B0, false);
+                    paletteLabelY, 0xFFB0B0B0, false);
         }
 
         // Draw widgets (sliders, buttons, editbox)
