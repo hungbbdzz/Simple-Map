@@ -120,7 +120,7 @@ function Copy-ReleaseJar(
         }
 
         # Remove older version jars for the same loader
-        $prefix = $Jar.Name -replace '-\d+\.\d+\.\d+.*\.jar$', ''
+        $prefix = $Jar.Name -replace '-[^-]+$', ''
         if (-not [string]::IsNullOrWhiteSpace($prefix)) {
             Get-ChildItem -Path $destGlobalDir -Filter "$prefix-*.jar" -File |
                 Where-Object { $_.Name -ne $Jar.Name } |
