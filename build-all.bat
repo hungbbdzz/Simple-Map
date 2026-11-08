@@ -15,7 +15,6 @@ $ErrorActionPreference = 'Stop'
 $WorkspaceParent = Split-Path -Parent $Root.TrimEnd('\', '/')
 
 # Destination for compiled release jars
-$LocalModsDir = Join-Path $Root 'mods'
 $GlobalModsDir = Join-Path $WorkspaceParent 'mods'
 
 $OriginalJavaHome = $env:JAVA_HOME
@@ -149,10 +148,7 @@ $successCount = 0
 try {
     # 1. NeoForge 1.21.1
     if (Invoke-Build 'NeoForge 1.21.1' 'neoforge-1.21.1' 'JAVA21_HOME' 'JDK 21') {
-        $jar = Get-LatestReleaseJar (Join-Path $Root 'neoforge-1.21.1\build\libs') 'simplemap-1.21.1-neoforge-*.jar' 'NeoForge 1.21.1'
-        if ($null -eq $jar) {
-            $jar = Get-LatestReleaseJar $LocalModsDir 'simplemap-1.21.1-neoforge-*.jar' 'NeoForge 1.21.1'
-        }
+        $jar = Get-LatestReleaseJar (Join-Path $Root 'neoforge-1.21.1\build\libs') 'simplemap-*.jar' 'NeoForge 1.21.1'
         Copy-ReleaseJar $jar 'NeoForge 1.21.1'
         $successCount++
     }

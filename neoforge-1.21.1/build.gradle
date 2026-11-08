@@ -95,10 +95,6 @@ tasks.named('test', Test) {
     }
 }
 
-jar {
-    destinationDirectory = file("../mods")
-}
-
 // Dependency-light state checks for the M2/M3 migration and M4 foundation.
 tasks.register('m2m3CoreCheck', JavaExec) {
     dependsOn testClasses
