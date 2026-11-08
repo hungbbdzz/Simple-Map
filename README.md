@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v2.0.3-brightgreen.svg" alt="Release" />
+  <img src="https://img.shields.io/badge/Release-v2.0.4-brightgreen.svg" alt="Release" />
   <img src="https://img.shields.io/badge/Minecraft-1.21.1%20%7C%201.20.1-blue.svg" alt="Minecraft Versions" />
   <img src="https://img.shields.io/badge/Loaders-NeoForge%20%7C%20Fabric%20%7C%20Forge-orange.svg" alt="Mod Loaders" />
 </p>
@@ -23,14 +23,14 @@ This repository contains all official editions of Velorise Simple Map:
 
 | Subfolder | Minecraft Version | Mod Loader | Java | Status | Release Artifact |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| [`neoforge-1.21.1/`](neoforge-1.21.1/) | **1.21.1** | NeoForge 21.1.65+ | Java 21 | Stable Release | `simplemap-1.21.1-neoforge-2.0.3.jar` |
-| [`fabric-1.21.1/`](fabric-1.21.1/) | **1.21.1** | Fabric Loader 0.16.9+ | Java 21 | Stable Release | `simplemap-1.21.1-fabric-2.0.3.jar` |
-| [`forge-1.20.1/`](forge-1.20.1/) | **1.20.1** | Forge 47.3.0+ | Java 17 | Stable Release | `simplemap-1.20.1-forge-2.0.3.jar` |
-| [`fabric-1.20.1/`](fabric-1.20.1/) | **1.20.1** | Fabric Loader 0.16.9+ | Java 17 | Stable Release | `simplemap-1.20.1-fabric-2.0.3.jar` |
+| [`neoforge-1.21.1/`](neoforge-1.21.1/) | **1.21.1** | NeoForge 21.1.65+ | Java 21 | Stable Release | `simplemap-1.21.1-neoforge-2.0.4.jar` |
+| [`fabric-1.21.1/`](fabric-1.21.1/) | **1.21.1** | Fabric Loader 0.16.9+ | Java 21 | Stable Release | `simplemap-1.21.1-fabric-2.0.4.jar` |
+| [`forge-1.20.1/`](forge-1.20.1/) | **1.20.1** | Forge 47.3.0+ | Java 17 | Stable Release | `simplemap-1.20.1-forge-2.0.4.jar` |
+| [`fabric-1.20.1/`](fabric-1.20.1/) | **1.20.1** | Fabric Loader 0.16.9+ | Java 17 | Stable Release | `simplemap-1.20.1-fabric-2.0.4.jar` |
 
 ---
 
-## ⚡ Key Architectural Features (v2.0.3)
+## ⚡ Key Architectural Features (v2.0.4)
 
 1. **Retained Framebuffer Geometry Pipeline**:
    - Zero-allocation NDC circular winding geometry eliminates standard stencil flushes and buffer recreation spikes.
@@ -40,8 +40,9 @@ This repository contains all official editions of Velorise Simple Map:
    - Dynamic `BakedModel` quad inspection and `BlockColors` provider probing.
    - 100% color accuracy for all vanilla and modded blocks, grass, leaves, and custom biome foliage across all loaders.
 
-3. **Multi-Band Cave Engine**:
-   - Layer-sliced cave visualization with instant (0 ms) brightness cycling and zero CPU alloc per step.
+3. **Multi-Band Cave Engine (Legit AUTO & Full Manual)**:
+   - Dynamic cave detection with fair-play **AUTO** mode (activates only when underground, preventing above-ground X-ray).
+   - Full manual slicing mode with instant (0 ms) layer cycling and zero CPU alloc per step.
    - Seamless Anvil `.mca` chunk reconstruction for offline and remote world exploration.
 
 4. **Map Book Sharing System**:
@@ -57,7 +58,7 @@ Run the master PowerShell automation script from the root folder:
 ```cmd
 build-all.bat
 ```
-* Built `.jar` files will automatically be assembled and copied into `mods/`.
+* Built `.jar` files will automatically be assembled into the centralized release directory (`../mods/simplemap/`).
 * Requires JDK 21 (`JAVA21_HOME`) and JDK 17 (`JAVA17_HOME`).
 
 ### 2. Build or Run a Specific Loader
@@ -99,8 +100,9 @@ When launched via any of the debug scripts:
 * **`F10`**: **Mark Debug Issue**: Triggers 20-second burst capture (250 ms rate) and records an explicit `USER_MARKER` event into `events.jsonl` with an immediate file flush.
 * Telemetry files are written into `<loader>/run/simplemap-debug/<session>/` (`metrics.csv` & `events.jsonl`).
 
-### 4. Known Issues & Diagnostic Notes
-See [`BUG_NOTES.md`](BUG_NOTES.md) for full technical diagnosis and reproduction notes regarding multi-loader port status.
+### 4. Changelogs & Issue Tracker
+* **Changelog**: See [`CHANGELOG.md`](CHANGELOG.md) for full release notes and detailed version history.
+* **Bug Reports & Feedback**: Encountered an issue or have a feature request? Please submit a ticket on our [GitHub Issue Tracker](https://github.com/hungbbdzz/Simple-Map/issues).
 
 ---
 
