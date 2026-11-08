@@ -143,6 +143,11 @@ public final class CaveMode {
         return modeRevision;
     }
 
+    public static synchronized void notifyModeChanged() {
+        modeRevision++;
+        beginTransition();
+    }
+
     /**
      * Holds the current automatic Top-Y briefly while teleport chunk/light packets
      * settle. Manual Top-Y is never modified.
@@ -171,7 +176,7 @@ public final class CaveMode {
         // render the previous dimension under the new live session. An intentional
         // remote map view is different: its explicit override may use manual Cave.
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
-        if (hasManualTopY(mc)) return true;
+        if (MapConfig.getEffectiveCaveMapMode() == 2 && hasManualTopY(mc)) return true;
         DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
         boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
         boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();
@@ -199,7 +204,7 @@ public final class CaveMode {
         MapManager manager = MapManager.getInstance();
         boolean acceptsLive = manager.acceptsLiveLevel(mc.level);
         if (manager.isViewingLiveDimension() && !acceptsLive) return false;
-        if (hasManualTopY(mc)) return true;
+        if (MapConfig.getEffectiveCaveMapMode() == 2 && hasManualTopY(mc)) return true;
         DimensionMapProfile viewedProfile = manager.getCurrentDimensionProfile();
         boolean viewedHasCeiling = viewedProfile != null ? viewedProfile.hasCeiling() : mc.level.dimensionType().hasCeiling();
         boolean viewedHasSkyLight = viewedProfile != null ? viewedProfile.hasSkyLight() : mc.level.dimensionType().hasSkyLight();
@@ -219,7 +224,7 @@ public final class CaveMode {
         // revision merely because the player climbed or fell in the Nether.
         if (isFullView(mc)) return Integer.MIN_VALUE;
         Integer manual = getManualTopY(mc);
-        if (manual != null && MapConfig.getEffectiveCaveMapMode() != 0) {
+        if (manual != null && MapConfig.getEffectiveCaveMapMode() == 2) {
             return clampViewedY(mc,
                     CaveLayerBand.projectionTopY(CaveView.LAYERED, manual));
         }
@@ -299,7 +304,7 @@ public final class CaveMode {
     }
 
     public static synchronized void setManualLayer(Minecraft mc, int topY) {
-        if (MapConfig.getEffectiveCaveMapMode() == 0 || mc == null || mc.level == null) return;
+        if (MapConfig.getEffectiveCaveMapMode() != 2 || mc == null || mc.level == null) return;
         String dimension = dimensionKey(mc);
         int clamped = clampViewedY(mc,
                 CaveLayerBand.projectionTopY(CaveView.LAYERED, topY));
@@ -323,6 +328,7 @@ public final class CaveMode {
     }
 
     public static synchronized boolean hasManualTopY(Minecraft mc) {
+        if (MapConfig.getEffectiveCaveMapMode() != 2) return false;
         return getManualTopY(mc) != null;
     }
 
@@ -433,6 +439,7 @@ public final class CaveMode {
     }
 
     private static synchronized Integer getManualTopY(Minecraft mc) {
+        if (MapConfig.getEffectiveCaveMapMode() != 2) return null;
         if (mc == null || mc.level == null) return null;
         String dimension = dimensionKey(mc);
         Integer cached = MANUAL_TOP_Y.get(dimension);

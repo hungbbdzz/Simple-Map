@@ -75,6 +75,7 @@ public final class ClientNetworkHandler {
                 // OFF/CAVE/FULL type and manual cave start for the next allowed world.
                 CaveMapManager.getInstance().deactivate();
             }
+            CaveMode.notifyModeChanged();
             LOGGER.info("SimpleMap synced server config: requireBook={}, caveMode={}",
                     payload.requireMapBook(), MapConfig.serverCaveMapMode);
         });

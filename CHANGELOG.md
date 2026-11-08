@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **[Forge & NeoForge]** Added defensive registry checks across recipes (`CopyMapBookRecipe`, `MergeMapBooksRecipe`) and creative inventory tabs (`BuildCreativeModeTabContentsEvent`).
 - **[Forge & NeoForge]** Added safe guard checks in `hasMapBookInInventory` to prevent registry lookups on unbound items.
 
+### Changed
+- **[All Loaders]** Separated Cave Map **AUTO** mode from **ON** mode:
+  - In **AUTO** mode (Fair-Play Explorer), manual layer selection is restricted; the layer slider is locked and hidden to prevent above-ground X-ray inspection of subterranean bases or ores. The cave map dynamically activates only when the player physically ventures underground.
+  - In **ON** mode, full manual layer slicing and slider controls remain freely accessible from anywhere.
+  - Live configuration changes and server sync events now immediately trigger cache invalidation and UI state refreshes.
+
 ### Optimized
 - **[Fabric]** Optimized crafting event performance by skipping client-side processing early, preventing unnecessary NBT tag copying on the render thread.
 

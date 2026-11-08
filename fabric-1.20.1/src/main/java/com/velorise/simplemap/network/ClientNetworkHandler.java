@@ -5,6 +5,7 @@ import com.velorise.simplemap.client.MapManager.MapConfig;
 import com.velorise.simplemap.client.MapTextureManager;
 import com.velorise.simplemap.client.RegionDataStore;
 import com.velorise.simplemap.client.cave.CaveTextureManager.CaveMapManager;
+import com.velorise.simplemap.client.cave.CaveMode;
 import com.velorise.simplemap.network.payload.AckLearnRegionPayload;
 import com.velorise.simplemap.network.payload.LearnBookCompletePayload;
 import com.velorise.simplemap.network.payload.RequestRegionFilePayload;
@@ -101,6 +102,7 @@ public final class ClientNetworkHandler {
             if (MapConfig.serverCaveMapMode == 0) {
                 CaveMapManager.getInstance().deactivate();
             }
+            CaveMode.notifyModeChanged();
             LOGGER.info("SimpleMap synced server config: requireBook={}, caveMode={}",
                     payload.requireMapBook(), MapConfig.serverCaveMapMode);
         });

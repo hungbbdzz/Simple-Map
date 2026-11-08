@@ -112,25 +112,26 @@ function Copy-ReleaseJar(
 ) {
     if ($null -eq $Jar) { return }
 
-    # Copy to local mods folder if not already there
-    $destLocal = Join-Path $LocalModsDir $Jar.Name
-    $sourceResolved = (Resolve-Path $Jar.FullName).Path
-    $destResolved = if (Test-Path $destLocal) { (Resolve-Path $destLocal).Path } else { $null }
-
-    if ($null -eq $destResolved -or $sourceResolved -ne $destResolved) {
-        Copy-Item -Path $Jar.FullName -Destination $destLocal -Force
-        Write-Host "Copied $DisplayName -> $destLocal" -ForegroundColor Green
-    } else {
-        Write-Host "Present $DisplayName -> $destLocal" -ForegroundColor Green
-    }
-
     # Copy to global workspace mods folder if available
     if (Test-Path $GlobalModsDir) {
         $destGlobalDir = Join-Path $GlobalModsDir 'simplemap'
         if (-not (Test-Path $destGlobalDir)) {
             New-Item -ItemType Directory -Path $destGlobalDir -Force | Out-Null
         }
+
+        # Remove older version jars for the same loader
+        $prefix = $Jar.Name -replace '-\d+\.\d+\.\d+.*\.jar$', ''
+        if (-not [string]::IsNullOrWhiteSpace($prefix)) {
+            Get-ChildItem -Path $destGlobalDir -Filter "$prefix-*.jar" -File |
+                Where-Object { $_.Name -ne $Jar.Name } |
+                ForEach-Object {
+                    Remove-Item -Path $_.FullName -Force
+                    Write-Host "Removed old version -> $($_.Name)" -ForegroundColor Yellow
+                }
+        }
+
         $destGlobal = Join-Path $destGlobalDir $Jar.Name
+        $sourceResolved = (Resolve-Path $Jar.FullName).Path
         $destGlobalResolved = if (Test-Path $destGlobal) { (Resolve-Path $destGlobal).Path } else { $null }
         if ($null -eq $destGlobalResolved -or $sourceResolved -ne $destGlobalResolved) {
             Copy-Item -Path $Jar.FullName -Destination $destGlobal -Force
@@ -139,9 +140,8 @@ function Copy-ReleaseJar(
     }
 }
 
-New-Item -ItemType Directory -Path $LocalModsDir -Force | Out-Null
 if (Test-Path $WorkspaceParent) {
-    New-Item -ItemType Directory -Path $GlobalModsDir -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $GlobalModsDir 'simplemap') -Force | Out-Null
 }
 
 $successCount = 0
@@ -181,7 +181,7 @@ try {
     Write-Host ""
     Write-Host "----------------------------------------------------" -ForegroundColor Green
     Write-Host "Completed: $successCount project(s) built successfully!" -ForegroundColor Green
-    Write-Host "Release destination: $LocalModsDir" -ForegroundColor Cyan
+    Write-Host "Release destination: $(Join-Path $GlobalModsDir 'simplemap')" -ForegroundColor Cyan
     Write-Host "----------------------------------------------------" -ForegroundColor Green
 }
 finally {

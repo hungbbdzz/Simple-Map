@@ -514,8 +514,9 @@ public class MapScreen extends Screen {
         // Keeps the cave-start AUTO/manual control available for both
         // layered CAVE and FULL. FULL ignores the exact Top Y for projection, but
         // the value still decides whether cave mode is manually active.
-        caveLayerSlider.visible = caveType != CaveMode.CaveType.OFF;
-        caveLayerSlider.active = caveType != CaveMode.CaveType.OFF;
+        boolean manualAllowed = MapConfig.getEffectiveCaveMapMode() == 2;
+        caveLayerSlider.visible = caveType != CaveMode.CaveType.OFF && manualAllowed;
+        caveLayerSlider.active = caveType != CaveMode.CaveType.OFF && manualAllowed;
         if (!caveLayerSlider.visible) return;
 
         caveLayerSlider.setWidth(Math.min(190, availableWidth));
@@ -2756,6 +2757,7 @@ public class MapScreen extends Screen {
                             if (MapConfig.localCaveMapMode == 0) {
                                 CaveMapManager.getInstance().deactivate();
                             }
+                            CaveMode.notifyModeChanged();
                             MapConfig.save();
                             button.setMessage(getServerCaveModeMessage(true, false));
                             return;
@@ -2765,6 +2767,7 @@ public class MapScreen extends Screen {
                         if (ServerConfig.caveMapMode == 0) {
                             CaveMapManager.getInstance().deactivate();
                         }
+                        CaveMode.notifyModeChanged();
                         ServerConfig.save();
                         syncIntegratedServerConfig();
                         button.setMessage(getServerCaveModeMessage(false, false));
