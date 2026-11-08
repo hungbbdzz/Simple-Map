@@ -31,6 +31,7 @@ import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.CreativeModeTabs;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
@@ -93,8 +94,12 @@ public class SimpleMap {
 
     private void addCreative(BuildCreativeModeTabContentsEvent event) {
         if (event.getTabKey() == CreativeModeTabs.TOOLS_AND_UTILITIES) {
-            event.accept(ModItems.EMPTY_MAP_BOOK.get());
-            event.accept(ModItems.MAP_BOOK.get());
+            if (ModItems.EMPTY_MAP_BOOK.isPresent()) {
+                event.accept(ModItems.EMPTY_MAP_BOOK.get());
+            }
+            if (ModItems.MAP_BOOK.isPresent()) {
+                event.accept(ModItems.MAP_BOOK.get());
+            }
         }
     }
 
@@ -218,22 +223,30 @@ public class SimpleMap {
 
         @SubscribeEvent
         public static void onItemCrafted(PlayerEvent.ItemCraftedEvent event) {
-            ItemStack result = event.getCrafting();
-            CompoundTag tag = result.getTag();
+            Player player = event.getEntity();
+            if (player == null || player.level().isClientSide) {
+                return; // Server only
+            }
 
-            if (result.is(ModItems.MAP_BOOK.get()) && tag != null && tag.contains("PendingMerge")) {
-                Player player = event.getEntity();
-                if (player.level().isClientSide) return; // Server only
+            try {
+                ItemStack result = event.getCrafting();
+                if (result == null || result.isEmpty() || !ModItems.MAP_BOOK.isPresent()) {
+                    return;
+                }
 
-                String firstId = null;
-                String secondId = null;
-                net.minecraft.world.Container container = event.getInventory();
+                Item mapBookItem = ModItems.MAP_BOOK.get();
+                CompoundTag tag = result.getTag();
 
-                for (int i = 0; i < container.getContainerSize(); i++) {
-                    ItemStack stack = container.getItem(i);
-                    CompoundTag stackTag = stack.getTag();
+                if (result.is(mapBookItem) && tag != null && tag.contains("PendingMerge")) {
+                    String firstId = null;
+                    String secondId = null;
+                    net.minecraft.world.Container container = event.getInventory();
 
-                    if (stack.is(ModItems.MAP_BOOK.get()) && stackTag != null) {
+                    for (int i = 0; i < container.getContainerSize(); i++) {
+                        ItemStack stack = container.getItem(i);
+                        CompoundTag stackTag = stack.getTag();
+
+                        if (stack.is(mapBookItem) && stackTag != null) {
                         String id = stackTag.getString("MapBookID");
                         if (!id.isEmpty()) {
                             if (firstId == null) {
@@ -322,6 +335,9 @@ public class SimpleMap {
                     });
                 }
 
+                }
+            } catch (Exception exception) {
+                LOGGER.error("[SimpleMap] Unexpected error while handling crafted item", exception);
             }
         }
 
@@ -830,11 +846,12 @@ public class SimpleMap {
     }
 
     public static boolean hasMapBookInInventory(Player player) {
-        if (player == null) return false;
+        if (player == null || !ModItems.MAP_BOOK.isPresent()) return false;
+        Item mapBookItem = ModItems.MAP_BOOK.get();
         // main inventory slots + armor slots + offhand slot (covers all slots)
         for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
             ItemStack stack = player.getInventory().getItem(i);
-            if (stack.is(ModItems.MAP_BOOK.get())) {
+            if (stack.is(mapBookItem)) {
                 CompoundTag tag = stack.getTag();
                 if (tag != null && tag.contains("MapBookID")) {
                     return true;

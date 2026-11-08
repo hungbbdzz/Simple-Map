@@ -20,6 +20,7 @@ public class MergeMapBooksRecipe extends CustomRecipe {
 
     @Override
     public boolean matches(CraftingInput input, Level level) {
+        if (!ModItems.MAP_BOOK.isBound()) return false;
         int bookWithDataCount = 0;
 
         for (int i = 0; i < input.size(); i++) {
@@ -44,6 +45,7 @@ public class MergeMapBooksRecipe extends CustomRecipe {
 
     @Override
     public ItemStack assemble(CraftingInput input, HolderLookup.Provider registries) {
+        if (!ModItems.MAP_BOOK.isBound()) return ItemStack.EMPTY;
         ItemStack result = new ItemStack(ModItems.MAP_BOOK.get(), 1);
         
         CompoundTag tag = new CompoundTag();

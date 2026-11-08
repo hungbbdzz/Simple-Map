@@ -19,6 +19,7 @@ public class CopyMapBookRecipe extends CustomRecipe {
 
     @Override
     public boolean matches(CraftingInput input, Level level) {
+        if (!ModItems.MAP_BOOK.isBound() || !ModItems.EMPTY_MAP_BOOK.isBound()) return false;
         int bookWithDataCount = 0;
         int emptyBookCount = 0;
 
@@ -46,6 +47,7 @@ public class CopyMapBookRecipe extends CustomRecipe {
 
     @Override
     public ItemStack assemble(CraftingInput input, HolderLookup.Provider registries) {
+        if (!ModItems.MAP_BOOK.isBound()) return ItemStack.EMPTY;
         ItemStack sourceBook = ItemStack.EMPTY;
 
         for (int i = 0; i < input.size(); i++) {

@@ -194,13 +194,12 @@ public class SimpleMap implements ModInitializer {
         }
 
         public static void onItemCrafted(Player player, ItemStack result, Container container) {
-            if (player == null || result == null || container == null) return;
+            if (player == null || player.level().isClientSide || result == null || result.isEmpty() || container == null) return;
             net.minecraft.world.item.component.CustomData customData =
                     result.get(net.minecraft.core.component.DataComponents.CUSTOM_DATA);
             CompoundTag tag = customData != null ? customData.copyTag() : null;
 
             if (result.is(ModItems.MAP_BOOK.get()) && tag != null && tag.contains("PendingMerge")) {
-                if (player.level().isClientSide) return; // Server only
 
                 String firstId = null;
                 String secondId = null;

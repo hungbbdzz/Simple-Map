@@ -19,6 +19,7 @@ public class MergeMapBooksRecipe extends CustomRecipe {
 
     @Override
     public boolean matches(CraftingContainer input, Level level) {
+        if (!ModItems.MAP_BOOK.isPresent()) return false;
         int bookWithDataCount = 0;
 
         for (int i = 0; i < input.getContainerSize(); i++) {
@@ -42,6 +43,7 @@ public class MergeMapBooksRecipe extends CustomRecipe {
 
     @Override
     public ItemStack assemble(CraftingContainer input, RegistryAccess registries) {
+        if (!ModItems.MAP_BOOK.isPresent()) return ItemStack.EMPTY;
         ItemStack result = new ItemStack(ModItems.MAP_BOOK.get(), 1);
 
         CompoundTag tag = new CompoundTag();
