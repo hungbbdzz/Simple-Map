@@ -86,6 +86,26 @@ tasks.named('processResources', ProcessResources).configure {
     }
 }
 
+def verifyForgeRefmap = { File jarFile ->
+    if (!jarFile.isFile()) {
+        throw new GradleException("Expected Forge jar not found: ${jarFile}")
+    }
+    def zip = new java.util.zip.ZipFile(jarFile)
+    try {
+        def refmap = zip.getEntry('simplemap.refmap.json')
+        if (refmap == null || refmap.size <= 0L) {
+            throw new GradleException(
+                "Missing or empty simplemap.refmap.json inside ${jarFile.name}. " +
+                "Ensure compileJava is not restored from Gradle build cache."
+            )
+        }
+    } finally {
+        zip.close()
+    }
+}
+
+def jarArchive = tasks.named('jar', Jar).flatMap { it.archiveFile }
+
 tasks.named('jar', Jar).configure {
     manifest {
         attributes([
@@ -98,10 +118,22 @@ tasks.named('jar', Jar).configure {
             'MixinConfigs'            : 'simplemap.mixins.json'
         ])
     }
+    doLast {
+        verifyForgeRefmap(archiveFile.get().asFile)
+    }
     finalizedBy 'reobfJar'
+}
+
+tasks.matching { it.name == 'reobfJar' }.configureEach {
+    doLast {
+        verifyForgeRefmap(jarArchive.get().asFile)
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release = 17
+    // MixinGradle emits refmap and tsrg files into build/tmp/compileJava outside Gradle's cacheable
+    // class outputs; disabling compileJava caching guarantees clean builds keep simplemap.refmap.json.
+    outputs.cacheIf { false }
 }

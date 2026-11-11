@@ -11,11 +11,21 @@ if not "%RESULT%"=="0" (
 exit /b %RESULT%
 #>
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $WorkspaceParent = Split-Path -Parent $Root.TrimEnd('\', '/')
 
 # Destination for compiled release jars
 $GlobalModsDir = Join-Path $WorkspaceParent 'mods'
+$BuildOnlyTargets = if ([string]::IsNullOrWhiteSpace($env:BUILD_ONLY)) {
+    @()
+} else {
+    $env:BUILD_ONLY.ToLowerInvariant().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+}
+
+function Should-Build([string]$TargetKey) {
+    return $BuildOnlyTargets.Count -eq 0 -or ($BuildOnlyTargets -contains $TargetKey.ToLowerInvariant())
+}
 
 $OriginalJavaHome = $env:JAVA_HOME
 $OriginalPath = $env:Path
@@ -105,11 +115,42 @@ function Get-LatestReleaseJar(
     return $jar
 }
 
+function Assert-ReleaseJarRefmap(
+    [System.IO.FileInfo]$Jar,
+    [string]$DisplayName
+) {
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Jar.FullName)
+    try {
+        $mixinsEntry = $zip.GetEntry('simplemap.mixins.json')
+        if ($null -eq $mixinsEntry) {
+            throw "$DisplayName jar $($Jar.Name) is missing simplemap.mixins.json"
+        }
+        $reader = New-Object System.IO.StreamReader($mixinsEntry.Open())
+        try {
+            $mixinsJson = $reader.ReadToEnd() | ConvertFrom-Json
+        }
+        finally {
+            $reader.Close()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($mixinsJson.refmap)) {
+            $refmapEntry = $zip.GetEntry($mixinsJson.refmap)
+            if ($null -eq $refmapEntry -or $refmapEntry.Length -le 0) {
+                throw "$DisplayName jar $($Jar.Name) declares refmap '$($mixinsJson.refmap)' but it is missing or empty!"
+            }
+            Write-Host "Verified $DisplayName refmap $($mixinsJson.refmap) ($($refmapEntry.Length) bytes)" -ForegroundColor DarkGreen
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
+}
+
 function Copy-ReleaseJar(
     [System.IO.FileInfo]$Jar,
     [string]$DisplayName
 ) {
     if ($null -eq $Jar) { return }
+    Assert-ReleaseJarRefmap $Jar $DisplayName
 
     # Copy to global workspace mods folder if available
     if (Test-Path $GlobalModsDir) {
@@ -147,28 +188,28 @@ $successCount = 0
 
 try {
     # 1. NeoForge 1.21.1
-    if (Invoke-Build 'NeoForge 1.21.1' 'neoforge-1.21.1' 'JAVA21_HOME' 'JDK 21') {
+    if ((Should-Build 'neoforge-1.21.1') -and (Invoke-Build 'NeoForge 1.21.1' 'neoforge-1.21.1' 'JAVA21_HOME' 'JDK 21')) {
         $jar = Get-LatestReleaseJar (Join-Path $Root 'neoforge-1.21.1\build\libs') 'simplemap-*.jar' 'NeoForge 1.21.1'
         Copy-ReleaseJar $jar 'NeoForge 1.21.1'
         $successCount++
     }
 
     # 2. Fabric 1.21.1
-    if (Invoke-Build 'Fabric 1.21.1' 'fabric-1.21.1' 'JAVA21_HOME' 'JDK 21') {
+    if ((Should-Build 'fabric-1.21.1') -and (Invoke-Build 'Fabric 1.21.1' 'fabric-1.21.1' 'JAVA21_HOME' 'JDK 21')) {
         $jar = Get-LatestReleaseJar (Join-Path $Root 'fabric-1.21.1\build\libs') 'simplemap-*.jar' 'Fabric 1.21.1'
         Copy-ReleaseJar $jar 'Fabric 1.21.1'
         $successCount++
     }
 
-    # 3. Forge 1.20.1 (When ready)
-    if (Invoke-Build 'Forge 1.20.1' 'forge-1.20.1' 'JAVA17_HOME' 'JDK 17') {
+    # 3. Forge 1.20.1
+    if ((Should-Build 'forge-1.20.1') -and (Invoke-Build 'Forge 1.20.1' 'forge-1.20.1' 'JAVA17_HOME' 'JDK 17')) {
         $jar = Get-LatestReleaseJar (Join-Path $Root 'forge-1.20.1\build\libs') 'simplemap-*.jar' 'Forge 1.20.1'
         Copy-ReleaseJar $jar 'Forge 1.20.1'
         $successCount++
     }
 
-    # 4. Fabric 1.20.1 (When ready)
-    if (Invoke-Build 'Fabric 1.20.1' 'fabric-1.20.1' 'JAVA17_HOME' 'JDK 17') {
+    # 4. Fabric 1.20.1
+    if ((Should-Build 'fabric-1.20.1') -and (Invoke-Build 'Fabric 1.20.1' 'fabric-1.20.1' 'JAVA17_HOME' 'JDK 17')) {
         $jar = Get-LatestReleaseJar (Join-Path $Root 'fabric-1.20.1\build\libs') 'simplemap-*.jar' 'Fabric 1.20.1'
         Copy-ReleaseJar $jar 'Fabric 1.20.1'
         $successCount++

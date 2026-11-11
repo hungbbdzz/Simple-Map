@@ -25,7 +25,7 @@ This repository contains all official editions of Velorise Simple Map:
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | [`neoforge-1.21.1/`](neoforge-1.21.1/) | **1.21.1** | NeoForge 21.1.65+ | Java 21 | Stable Release | `simplemap-1.21.1-neoforge-2.0.4.jar` |
 | [`fabric-1.21.1/`](fabric-1.21.1/) | **1.21.1** | Fabric Loader 0.16.9+ | Java 21 | Stable Release | `simplemap-1.21.1-fabric-2.0.4.jar` |
-| [`forge-1.20.1/`](forge-1.20.1/) | **1.20.1** | Forge 47.3.0+ | Java 17 | Stable Release | `simplemap-1.20.1-forge-2.0.4.jar` |
+| [`forge-1.20.1/`](forge-1.20.1/) | **1.20.1** | Forge 47.3.0+ | Java 17 | Stable Release | `simplemap-1.20.1-forge-2.0.4.1.jar` |
 | [`fabric-1.20.1/`](fabric-1.20.1/) | **1.20.1** | Fabric Loader 0.16.9+ | Java 17 | Stable Release | `simplemap-1.20.1-fabric-2.0.4.jar` |
 
 ---

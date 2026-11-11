@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.0.4.1] - 2026-11-12
+
+### Fixed
+- **[Forge 1.20.1]** Fixed a critical Mixin crash (`InvalidInjectionException ... No refMap loaded`) triggered when opening the Server List, joining worlds, or launching alongside mods such as Simple Voice Chat ([#7](https://github.com/hungbbdzz/Simple-Map/issues/7)). The previous Forge 1.20.1 package omitted `simplemap.refmap.json` because Gradle restored `compileJava` from build cache after `clean`.
+- **[Build System]** Disabled Gradle build caching on Forge `compileJava` so MixinGradle always generates `simplemap.refmap.json`, and added automated post-build refmap verification across `forge-1.20.1/build.gradle` and `build-all.bat`.
+
+---
+
 ## [2.0.4] - 2026-11-08
 
 ### Fixed
